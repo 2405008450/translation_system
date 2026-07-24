@@ -41,6 +41,7 @@ import {
   Strikethrough,
   Subscript,
   Superscript,
+  Tags,
   Type,
   Underline,
   Undo2,
@@ -5727,6 +5728,14 @@ function toggleVisibleCharacters() {
 }
 
 /**
+ * 切换译文样式标记（⟦n⟧）显示
+ */
+function toggleFormatMarks() {
+  const enabled = richTextEditor.toggleFormatMarks()
+  toast.info(enabled ? '已显示译文样式标记' : '已隐藏译文样式标记')
+}
+
+/**
  * 关闭所有下拉菜单
  */
 function closeAllMenus() {
@@ -7641,6 +7650,7 @@ onBeforeRouteLeave(async () => {
             <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-strikethrough" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
               <span class="icon-text-area"><span class="tool-item"><Strikethrough class="tool-label-icon" :size="15" /></span></span>
             </button>
+            <span class="tool-line style-item tool-button is-placeholder" aria-hidden="true"><span class="icon-text-area"><span class="tool-item"></span></span></span>
           </span>
           <span class="tool-col align-left">
             <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-italic" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
@@ -7649,6 +7659,7 @@ onBeforeRouteLeave(async () => {
             <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-superscript" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
               <span class="icon-text-area"><span class="tool-item"><Superscript class="tool-label-icon" :size="15" /></span></span>
             </button>
+            <span class="tool-line style-item tool-button is-placeholder" aria-hidden="true"><span class="icon-text-area"><span class="tool-item"></span></span></span>
           </span>
           <span class="tool-col align-left">
             <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-underline" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
@@ -7657,6 +7668,7 @@ onBeforeRouteLeave(async () => {
             <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-subscript" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
               <span class="icon-text-area"><span class="tool-item"><Subscript class="tool-label-icon" :size="15" /></span></span>
             </button>
+            <span class="tool-line style-item tool-button is-placeholder" aria-hidden="true"><span class="icon-text-area"><span class="tool-item"></span></span></span>
           </span>
           <span class="tool-col align-left">
             <div class="case-menu">
@@ -7675,6 +7687,9 @@ onBeforeRouteLeave(async () => {
             </div>
             <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
               <span class="icon-text-area"><span class="tool-item"><Pilcrow class="tool-label-icon" :size="15" /></span></span>
+            </button>
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.formatMarksVisible.value }" title="显示/隐藏译文样式标记" @click="toggleFormatMarks">
+              <span class="icon-text-area"><span class="tool-item"><Tags class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
         </div>
@@ -9015,6 +9030,7 @@ onBeforeRouteLeave(async () => {
                       :target-search-query="targetSearchQuery"
                       :search-case-sensitive="searchCaseSensitive"
                       :show-visible-chars="richTextEditor.visibleCharactersEnabled.value"
+                      :show-format-marks="richTextEditor.formatMarksVisible.value"
                       :pending-formats="pendingFormatsForEditor"
                       @focus="segmentStore.setActiveSentence"
                       @activate-target="handleSegmentTargetActivate"
@@ -11494,6 +11510,12 @@ onBeforeRouteLeave(async () => {
   width: 23px;
   height: 23px;
   padding: 0;
+}
+
+/* 样式区第三行占位：保持 4 列网格对齐，仅“译文样式标记”按钮实际可见 */
+.style-item.tool-button.is-placeholder {
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .style-item .dropdown-link {

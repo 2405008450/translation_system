@@ -162,6 +162,7 @@ from app.services.file_record_service import (
     _can_auto_merge_stale_segment,
     apply_segment_status,
     backfill_file_record_source_html,
+    backfill_file_record_pptx_layout,
     batch_update_segments,
     calculate_file_record_progress,
     create_file_record_with_segments,
@@ -5136,6 +5137,39 @@ def _get_llm_write_skip_reason(segment: Segment, task: LLMTranslationTask, scope
     return None
 
 
+def _segment_metadata_layout_text(segment: Any) -> str:
+    """从句段 segment_metadata 里取带行内格式标签的版式原文（PPTX 解析注入）。
+
+    无 DB 迁移方案：标签化版式原文随 segment_metadata JSON 落库，翻译阶段在此还原，
+    供 LLM 保留 run 级格式。解析失败或字段缺失时返回空串，回退到 display_text。
+    """
+    raw = getattr(segment, "segment_metadata", None)
+    if not raw:
+        return ""
+    try:
+        metadata = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("source_layout_text") or "")
+
+
+def _segment_metadata_format_map(segment: Any) -> dict:
+    """从句段 segment_metadata 取逐标记样式表（供前端渲染译文行内样式）。"""
+    raw = getattr(segment, "segment_metadata", None)
+    if not raw:
+        return {}
+    try:
+        metadata = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(metadata, dict):
+        return {}
+    format_map = metadata.get("source_layout_formats")
+    return format_map if isinstance(format_map, dict) else {}
+
+
 def _build_llm_translation_tasks(
     db: Session,
     file_record_id: UUID,
@@ -5200,6 +5234,7 @@ def _build_llm_translation_tasks(
         matched_source_text = getattr(segment, "matched_source_text", None)
         source_layout_text = (
             getattr(segment, "source_layout_text", "")
+            or _segment_metadata_layout_text(segment)
             or getattr(segment, "display_text", "")
             or ""
         )
@@ -9972,6 +10007,7 @@ def _serialize_workbench_segment(
     source_layout_text = getattr(seg, "source_layout_text", "") or ""
     if not source_layout_text and "\n" in (seg.display_text or ""):
         source_layout_text = seg.display_text or ""
+    source_format_map = _segment_metadata_format_map(seg)
     resolved_workflow_step_id = seg.workflow_step_id
     if resolved_workflow_step_id is None and workflow_step_by_id:
         resolved_workflow_step_id = next(iter(workflow_step_by_id.keys()), None)
@@ -9998,6 +10034,7 @@ def _serialize_workbench_segment(
         "display_text": seg.display_text,
         "source_body_text": seg.source_text,
         "source_layout_text": source_layout_text or None,
+        "source_format_map": source_format_map or None,
         "automatic_numbering_text": automatic_numbering_text or None,
         "target_automatic_numbering_text": target_automatic_numbering_text or None,
         "source_html": seg.source_html,
@@ -10940,7 +10977,7 @@ def get_file_record(
     if clear_stale_file_operation_lock(db, file_record):
         db.commit()
         db.refresh(file_record)
-    if backfill_file_record_source_html(db, file_record):
+    if backfill_file_record_source_html(db, file_record) or backfill_file_record_pptx_layout(db, file_record):
         db.commit()
         result = get_file_record_with_segments(
             db,

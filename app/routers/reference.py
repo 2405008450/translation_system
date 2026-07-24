@@ -700,6 +700,20 @@ def _build_reference_translation_guidelines(
     return "\n\n".join(parts)
 
 
+def _segment_metadata_layout_text(segment) -> str:
+    """从句段 segment_metadata 取带行内格式标签的版式原文（PPTX 解析注入）。"""
+    raw = getattr(segment, "segment_metadata", None)
+    if not raw:
+        return ""
+    try:
+        metadata = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("source_layout_text") or "")
+
+
 def _build_reference_translation_tasks(
     db: Session,
     file_record_id: uuid.UUID,
@@ -734,6 +748,10 @@ def _build_reference_translation_tasks(
             if segment.status not in target_statuses:
                 should_translate = False
         
+        source_layout_text = (
+            _segment_metadata_layout_text(segment)
+            or (segment.display_text or "")
+        )
         tasks.append(LLMTranslationTask(
             sentence_id=segment.sentence_id,
             status=segment.status,
@@ -744,6 +762,7 @@ def _build_reference_translation_tasks(
             block_index=segment.block_index or 0,
             row_index=segment.row_index,
             cell_index=segment.cell_index,
+            source_layout_text=source_layout_text,
             matched_source_text=segment.matched_source_text,
             tm_target_text=None,  # 由参考翻译指南替代
             should_translate=should_translate,

@@ -27,6 +27,8 @@ const props = withDefaults(defineProps<{
   targetSearchQuery?: string
   searchCaseSensitive?: boolean
   showVisibleChars?: boolean
+  /** 是否在译文（非编辑态）显示行内样式标记（⟦1⟧…⟦/1⟧）；关闭时隐藏，聚焦编辑时始终显示以便安全编辑 */
+  showFormatMarks?: boolean
   pendingFormats?: Record<TextFormat, boolean> & { _overrideActive?: boolean }
   /** 句段对外标识：单文件模式即 sentence_id；合并模式为复合键 ${file_record_id}:${sentence_id} */
   segmentKey?: string
@@ -43,6 +45,7 @@ const props = withDefaults(defineProps<{
   targetSearchQuery: '',
   searchCaseSensitive: false,
   showVisibleChars: false,
+  showFormatMarks: false,
   pendingFormats: () => ({
     bold: false,
     italic: false,
@@ -609,12 +612,78 @@ function hasSourceHighlights(): boolean {
   return Boolean(resolveSearchKeyword(props.sourceSearchQuery)) || (props.matchedTerms || []).some((term) => Boolean(term.source_text))
 }
 
-function renderTargetTextWithHighlights(text: string): string {
-  const parts = getTargetHighlightParts(text)
-  if (!parts) {
-    return textToVisibleChars(text)
+// 行内样式标记：⟦1⟧ … ⟦/1⟧（容忍括号内空格），与后端 pptx_inline_tags 一致
+const FORMAT_MARK_RE = /⟦\s*\/?\s*\d+\s*⟧/g
+const FORMAT_MARK_TEST_RE = /⟦\s*\/?\s*\d+\s*⟧/
+
+function hasFormatMarks(text: string): boolean {
+  return FORMAT_MARK_TEST_RE.test(text || '')
+}
+
+/**
+ * 把译文里的行内样式标记包成不可编辑的原子 chip。
+ * 标记始终保留在 DOM 中（序列化时按文本原样读回，不丢标记）；是否可见由编辑器
+ * 上的 hide-format-marks 类通过 CSS 控制——因此“显示/隐藏”纯 CSS 切换，聚焦编辑
+ * 时也一致（默认隐藏，只有点开按钮才显示）。
+ */
+function wrapFormatMarks(html: string): string {
+  if (!html) return html
+  FORMAT_MARK_RE.lastIndex = 0
+  return html.replace(
+    FORMAT_MARK_RE,
+    (mark) => `<span class="segment-row__fmt-mark" contenteditable="false">${mark}</span>`,
+  )
+}
+
+/**
+ * 多样式译文渲染：按 ⟦n⟧ 标记用逐标记样式表包裹对应词语（内联 style span，
+ * 序列化会忽略、不污染 target_html），并保留标记为不可编辑 chip（显隐由开关控制、
+ * 序列化时按文本读回，保证编辑往返不丢标记）。
+ */
+function renderMarkedTargetHtml(text: string, formatMap: Record<string, [string, string]>): string {
+  const base = formatMap.base || ['', '']
+  const out: string[] = []
+  const re = /⟦\s*(\/?)\s*(\d+)\s*⟧/g
+  let cursor = 0
+  let currentId: string | null = null
+  let match: RegExpExecArray | null
+
+  const emitText = (piece: string, id: string | null) => {
+    if (!piece) return
+    const [open, close] = id === null ? base : (formatMap[id] || base)
+    out.push(`${open}${textToVisibleChars(piece)}${close}`)
   }
-  return renderHighlightPartsAsHtml(parts, text)
+
+  while ((match = re.exec(text)) !== null) {
+    emitText(text.slice(cursor, match.index), currentId)
+    cursor = match.index + match[0].length
+    out.push(`<span class="segment-row__fmt-mark" contenteditable="false">${match[0]}</span>`)
+    currentId = match[1] ? null : match[2]
+  }
+  emitText(text.slice(cursor), currentId)
+  return out.join('')
+}
+
+function renderTargetTextWithHighlights(text: string): string {
+  const formatMap = props.segment.source_format_map
+  if (formatMap && Object.keys(formatMap).length > 0) {
+    // 多样式句段：按 ⟦n⟧ 逐词还原样式
+    if (hasFormatMarks(text)) {
+      return renderMarkedTargetHtml(text, formatMap as Record<string, [string, string]>)
+    }
+    // 统一样式句段（无标记）：整段套用 base 样式，与原文一致
+    const base = formatMap.base
+    if (base && (base[0] || base[1])) {
+      const highlightParts = getTargetHighlightParts(text)
+      const inner = !highlightParts
+        ? textToVisibleChars(text)
+        : renderHighlightPartsAsHtml(highlightParts, text)
+      return `${base[0]}${inner}${base[1]}`
+    }
+  }
+  const parts = getTargetHighlightParts(text)
+  const html = !parts ? textToVisibleChars(text) : renderHighlightPartsAsHtml(parts, text)
+  return wrapFormatMarks(html)
 }
 
 function shouldRenderTargetHighlights(): boolean {
@@ -741,7 +810,7 @@ function renderTargetHtmlWithHighlights(targetHtml: string): string {
 
 const sourceHtmlContent = computed(() => {
   if (props.segment.source_html && !hasAutomaticNumbering.value) {
-    return renderSourceHtmlWithHighlights(sanitizeHtml(props.segment.source_html))
+    return renderSourceHtmlWithHighlights(sanitizeSourceHtml(props.segment.source_html))
   }
   return renderHighlightPartsAsHtml(highlightedSourceText.value, sourceTextContent.value)
 })
@@ -765,7 +834,11 @@ function renderTargetTextHtml(text: string): string {
 // 保存和恢复光标位置
 function renderTargetWithSourceFormats(text: string): string {
   const targetHtml = renderTargetTextHtml(text)
-  if (!text || !props.segment.source_html) {
+  // 有逐标记样式表时，renderTargetTextHtml 已按标记/ base 完整套好样式，不再叠加
+  // 源文首个 run 的基础格式，避免重复加粗或整段错误统一格式。
+  const formatMap = props.segment.source_format_map
+  const hasFormatMap = Boolean(formatMap && Object.keys(formatMap).length > 0)
+  if (!text || !props.segment.source_html || hasFormatMarks(text) || hasFormatMap) {
     return targetHtml
   }
   const sourceFormatTags = getPrimarySourceFormatTags(props.segment.source_html)
@@ -1932,6 +2005,72 @@ function sanitizeHtml(
 }
 
 /**
+ * 原文列展示专用清理：在基础格式标签之外，额外保留 span 上的颜色/字号/字体族等
+ * 内联样式，使原文列能真实反映 PPTX 同一文本框内 run 级的字体/字号/颜色差异。
+ * 仅用于只读展示，不影响译文编辑所用的基础格式模型（sanitizeHtml）。
+ */
+function sanitizeSourceHtml(html: string): string {
+  if (typeof document === 'undefined') {
+    return escapeHtml(html)
+  }
+
+  const tempDiv = document.createElement('div')
+  tempDiv.innerHTML = html
+
+  function pickSafeStyles(el: HTMLElement): string {
+    const style = el.style
+    const declarations: string[] = []
+    const color = style.color.trim()
+    if (color) declarations.push(`color:${color}`)
+    const background = style.backgroundColor.trim()
+    if (background) declarations.push(`background-color:${background}`)
+    const fontSize = style.fontSize.trim()
+    if (fontSize) declarations.push(`font-size:${fontSize}`)
+    const fontFamily = style.fontFamily.trim()
+    if (fontFamily) declarations.push(`font-family:${fontFamily}`)
+    return declarations.join(';')
+  }
+
+  function processNode(node: Node): string {
+    if (node.nodeType === Node.TEXT_NODE) {
+      return escapeHtml(node.textContent || '')
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return ''
+    }
+
+    const el = node as HTMLElement
+    const tagName = el.tagName.toLowerCase()
+    if (DROPPED_HTML_TAGS.has(tagName)) {
+      return ''
+    }
+    if (tagName === 'br') {
+      return '\n'
+    }
+
+    let content = Array.from(el.childNodes).map(processNode).join('')
+
+    const formatTags: BasicFormatTag[] = []
+    const normalizedBasicTag = normalizeBasicFormatTag(tagName)
+    if (normalizedBasicTag) {
+      formatTags.push(normalizedBasicTag)
+    }
+    formatTags.push(...getStyleFormatTags(el))
+    if (formatTags.length > 0) {
+      content = wrapWithBasicFormats(content, formatTags)
+    }
+
+    const safeStyles = pickSafeStyles(el)
+    if (safeStyles) {
+      content = `<span style="${safeStyles}">${content}</span>`
+    }
+    return content
+  }
+
+  return processNode(tempDiv)
+}
+
+/**
  * 只把句段编辑中允许渲染的基础格式规范化为内部标签名。
  */
 function getPrimarySourceFormatTags(sourceHtml: string): BasicFormatTag[] {
@@ -2434,7 +2573,7 @@ watch(
           ref="editorRef"
           class="segment-row__editor"
           :class="[
-            { 'is-focused': isFocused, 'has-revision': hasPendingRevision },
+            { 'is-focused': isFocused, 'has-revision': hasPendingRevision, 'hide-format-marks': !showFormatMarks && !isFocused },
             revisionAuthorClass,
           ]"
           :style="revisionColorStyle"
@@ -3035,6 +3174,18 @@ watch(
 .segment-row__source-editor :deep(.visible-char--newline),
 .segment-row__editor :deep(.visible-char--newline) {
   color: #ef4444;
+}
+
+/* 译文行内样式标记 chip：默认由 hide-format-marks 隐藏，仅点开按钮时显示 */
+.segment-row__editor :deep(.segment-row__fmt-mark) {
+  color: #b06f00;
+  opacity: 0.9;
+  font-size: 0.85em;
+  padding: 0 1px;
+}
+
+.segment-row__editor.hide-format-marks :deep(.segment-row__fmt-mark) {
+  display: none;
 }
 
 /* 富文本格式样式 */

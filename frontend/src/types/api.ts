@@ -471,6 +471,8 @@ export interface Segment {
   display_text: string
   source_body_text?: string
   source_layout_text?: string | null
+  /** 逐标记样式表：{标签 id / "base": [开 span, 闭 span]}，用于把译文里的 ⟦n⟧ 渲染为行内样式 */
+  source_format_map?: Record<string, [string, string]> | null
   automatic_numbering_text?: string | null
   target_automatic_numbering_text?: string | null
   source_html?: string | null

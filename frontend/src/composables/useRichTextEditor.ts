@@ -23,6 +23,8 @@ const VISIBLE_CHAR_REVERSE_MAP: Record<string, string> = {
 
 export function useRichTextEditor() {
   const visibleCharactersEnabled = ref(false)
+  // 是否在译文（非编辑态）显示行内样式标记（⟦1⟧…⟦/1⟧）。默认隐藏，保持译文整洁。
+  const formatMarksVisible = ref(false)
 
   // 当前激活的格式状态（用于按钮高亮显示和新输入文本的格式）
   const activeFormats = reactive<Record<TextFormat, boolean>>({
@@ -177,6 +179,14 @@ export function useRichTextEditor() {
   }
 
   /**
+   * 切换译文样式标记（⟦n⟧）的显示/隐藏。
+   */
+  function toggleFormatMarks(): boolean {
+    formatMarksVisible.value = !formatMarksVisible.value
+    return formatMarksVisible.value
+  }
+
+  /**
    * 将文本转换为显示标记模式
    */
   function textToVisibleChars(text: string): string {
@@ -311,6 +321,8 @@ export function useRichTextEditor() {
 
   return {
     visibleCharactersEnabled,
+    formatMarksVisible,
+    toggleFormatMarks,
     activeFormats,
     formatOverrideActive,
     getSelection,

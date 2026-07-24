@@ -169,8 +169,17 @@ def _failures_for_tasks(tasks: list[LLMTranslationTask], message: str) -> list[L
 NUMERIC_LIKE_FRAGMENT_RE = re.compile(r"^[0-9\s,.\-+/%()（）$€¥￥£:：]+$")
 MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_\d+⟧")
 LINE_BREAK_PLACEHOLDER_RE = re.compile(r"⟦LB_\d+⟧")
+# 行内格式标签：⟦1⟧…⟦/1⟧（纯数字 id，容忍模型在括号内塞空格）。
+# 注意与 ⟦MATH_n⟧ / ⟦LB_n⟧ 不冲突，因为那两个带字母前缀。
+FORMAT_TAG_RE = re.compile(r"⟦\s*(/?)\s*(\d+)\s*⟧")
 SYMBOL_VALIDATION_ERROR_MESSAGE = "复选框或特殊符号未按原文原样保留。"
 LINE_BREAK_VALIDATION_ERROR_MESSAGE = "版式换行未按原文保留。"
+FORMAT_TAG_VALIDATION_ERROR_MESSAGE = "行内格式标签未按原文原样保留。"
+FORMAT_TAG_SYSTEM_RULE = (
+    "如果原文包含形如 ⟦1⟧…⟦/1⟧ 的行内格式标签，它们标记了需要保留特殊格式的文字。"
+    "必须原样保留每个标签及其开闭配对，只翻译标签内外的文字，并把标签精准包裹在语义对应的目标语言词汇上；"
+    "不得翻译、删除、新增、拆分标签，也不得改变标签的数字编号。"
+)
 STRICT_PRESERVE_SYMBOLS = frozenset(
     {
         "□",
@@ -223,7 +232,9 @@ def _task_layout_source_text(task: LLMTranslationTask) -> str:
 
 def _task_preservation_source_text(task: LLMTranslationTask) -> str:
     layout_text = _task_layout_source_text(task)
-    return layout_text if "\n" in layout_text else task.source_text
+    if "\n" in layout_text or _has_format_tags(layout_text):
+        return layout_text
+    return task.source_text
 
 
 def _encode_line_break_placeholders(text: str) -> str:
@@ -245,16 +256,24 @@ def _decode_line_break_placeholders(text: str) -> str:
 
 def _format_source_for_prompt(task: LLMTranslationTask) -> str:
     layout_text = _task_layout_source_text(task)
-    if "\n" not in layout_text:
-        return task.source_text
-    return _encode_line_break_placeholders(layout_text)
+    if "\n" in layout_text:
+        # 换行占位符编码时格式标签作为普通字符原样透传
+        return _encode_line_break_placeholders(layout_text)
+    if _has_format_tags(layout_text):
+        return layout_text
+    return task.source_text
 
 
 def _format_batch_source_for_prompt(task: LLMTranslationTask) -> str:
     source = _format_source_for_prompt(task)
-    line_break_instruction = _line_break_instruction(task)
-    if line_break_instruction:
-        return f"{source}\n    {line_break_instruction}"
+    notes = [
+        note
+        for note in (_line_break_instruction(task), _format_tag_instruction(task))
+        if note
+    ]
+    if notes:
+        joined = "\n    ".join(notes)
+        return f"{source}\n    {joined}"
     return source
 
 
@@ -757,6 +776,8 @@ def _build_messages(
     line_break_instruction = _line_break_instruction(task)
     line_break_prompt_block = f"{line_break_instruction}\n" if line_break_instruction else ""
     fuzzy_line_break_requirement = f"5. {line_break_instruction}\n" if line_break_instruction else ""
+    format_tag_instruction = _format_tag_instruction(task)
+    format_tag_prompt_block = f"{format_tag_instruction}\n" if format_tag_instruction else ""
     fuzzy_final_requirement_index = 6 if line_break_instruction else 5
     system_prompt = (
         f"你是专业的文档翻译专家，当前任务语言对为：{language_pair}。"
@@ -774,6 +795,7 @@ def _build_messages(
             "\n\n以下是本项目的翻译细则，请在翻译时严格遵守：\n"
             + translation_guidelines
         )
+    system_prompt += FORMAT_TAG_SYSTEM_RULE
     if _has_glossary_matches([task]):
         system_prompt += "\n\n" + _glossary_system_instruction()
     retry_instruction = ""
@@ -822,7 +844,8 @@ def _build_messages(
                     "如果内容中包含可翻译文字，只翻译文字部分，并尽量保留数字和原有排版格式。\n"
                     "除非原文明确体现需要按目标语言转换的数字单位或本地格式，否则不要擅自改动千分位、小数点、货币符号、编号格式或特殊符号。\n\n"
                     f"原文：{prompt_source}\n"
-                    f"{line_break_prompt_block}\n"
+                    f"{line_break_prompt_block}"
+                    f"{format_tag_prompt_block}\n"
                     f"{_optional_glossary_prompt_block(task)}"
                     f"只输出最终结果。{retry_instruction}"
                 ),
@@ -838,7 +861,8 @@ def _build_messages(
                 "不要补充未提供的上下文，也不要参考前后句。"
                 "\n"
                 f"原文：{prompt_source}\n"
-                f"{line_break_prompt_block}\n"
+                f"{line_break_prompt_block}"
+                f"{format_tag_prompt_block}\n"
                 f"{_optional_glossary_prompt_block(task)}"
                 f"请严格保留原文中的数字、复选框、勾选框、项目符号、箭头和特殊符号，不得擅自新增、替换或改变其状态。\n\n只输出{target_label}译文。{retry_instruction}"
             ),
@@ -902,6 +926,31 @@ def _extract_math_placeholder_sequence(text: str) -> list[str]:
     return MATH_PLACEHOLDER_RE.findall(text)
 
 
+def _extract_format_tag_sequence(text: str) -> list[str]:
+    """提取并规范化行内格式标签（折叠括号内空格）。"""
+    return [
+        f"⟦{'/' if match.group(1) else ''}{match.group(2)}⟧"
+        for match in FORMAT_TAG_RE.finditer(text or "")
+    ]
+
+
+def _has_format_tags(text: str) -> bool:
+    return bool(FORMAT_TAG_RE.search(text or ""))
+
+
+def _format_tag_instruction(task: LLMTranslationTask) -> str:
+    tags = _extract_format_tag_sequence(_task_preservation_source_text(task))
+    if not tags:
+        return ""
+    ids = sorted({int(tag.strip("⟦⟧/")) for tag in tags})
+    listed = ", ".join(f"⟦{tag_id}⟧…⟦/{tag_id}⟧" for tag_id in ids)
+    return (
+        f"原文包含 {len(ids)} 组行内格式标签（{listed}）。"
+        "这些标签必须在译文中原样保留、成对出现，并包裹到语义对应的目标语言词汇上，"
+        "不得翻译、删除、新增或拆分。"
+    )
+
+
 def _validate_or_repair_translation_output(task: LLMTranslationTask, translated_text: str) -> str:
     translated_text = _decode_line_break_placeholders(translated_text)
     try:
@@ -941,6 +990,14 @@ def _validate_translation_output(task: LLMTranslationTask, translated_text: str)
         output_math_placeholders = _extract_math_placeholder_sequence(translated_text)
         if output_math_placeholders != source_math_placeholders:
             raise LLMResponseValidationError("数学公式占位符未按原文原样保留。")
+
+    # 行内格式标签：允许语序重排（用排序后的多重集比较），但标签集合与配对必须完全一致。
+    # 更严格的扁平/嵌套校验在导出端 rebuild 时执行，失败则整段回退第一个 run。
+    source_format_tags = sorted(_extract_format_tag_sequence(_task_preservation_source_text(task)))
+    if source_format_tags:
+        output_format_tags = sorted(_extract_format_tag_sequence(translated_text))
+        if output_format_tags != source_format_tags:
+            raise LLMResponseValidationError(FORMAT_TAG_VALIDATION_ERROR_MESSAGE)
 
     source_line_breaks = _line_break_count(_task_layout_source_text(task))
     if source_line_breaks and _line_break_count(translated_text) != source_line_breaks:
@@ -1217,6 +1274,7 @@ def _build_paragraph_messages(
     )
     if translation_guidelines:
         system_prompt += "\n\n以下是本项目的翻译细则，请严格遵守：\n" + translation_guidelines
+    system_prompt += FORMAT_TAG_SYSTEM_RULE
     if _has_glossary_matches(group.tasks):
         system_prompt += "\n\n" + _glossary_system_instruction()
 
@@ -1237,9 +1295,15 @@ def _build_paragraph_messages(
             "source_text": task.source_text,
         }
         layout_source = _task_layout_source_text(task)
-        if "\n" in layout_source:
+        if "\n" in layout_source or _has_format_tags(layout_source):
             item["source_layout_text"] = _encode_line_break_placeholders(layout_source)
-            item["layout_note"] = _line_break_instruction(task)
+            layout_notes = [
+                note
+                for note in (_line_break_instruction(task), _format_tag_instruction(task))
+                if note
+            ]
+            if layout_notes:
+                item["layout_note"] = " ".join(layout_notes)
         if task.should_translate:
             required_sentence_ids.append(task.sentence_id)
         if task.status == "fuzzy":
@@ -1267,6 +1331,7 @@ def _build_paragraph_messages(
     user_content = (
         "请翻译 JSON 中 translate=true 的句子。translate=false 的句子只用于理解上下文，不要返回它们的译文。\n"
         "如果某条句子包含 source_layout_text，请优先翻译 source_layout_text；其中的 ⟦LB_n⟧ 是原文换行标记，必须在 target_text 中按数量保留，不能翻译、删除或重排为普通文字。\n"
+        "source_layout_text 中形如 ⟦1⟧…⟦/1⟧ 的行内格式标签必须原样保留、成对出现，并包裹到语义对应的译文词汇上，不能翻译、删除、新增或拆分（语序可随译文调整，但每组标签需完整跟随其内容）。\n"
         "返回 JSON 的 translations 键集合必须与 required_sentence_ids 完全一致；不要依赖顺序。\n"
         "每个 source_hash 必须原样带回，target_text 只写最终译文。\n\n"
         "输入：\n"
@@ -1364,6 +1429,7 @@ def _build_batch_messages(
             "\n\n以下是本项目的翻译细则，请在翻译时严格遵守：\n"
             + translation_guidelines
         )
+    system_prompt += FORMAT_TAG_SYSTEM_RULE
 
     retry_instruction = ""
     if strict_retry:

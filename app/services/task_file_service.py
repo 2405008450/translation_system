@@ -670,13 +670,26 @@ def build_task_workspace(
         context = _build_segment_context(parse_result.ast, segment.block_path, fallback_index=index)
 
         # 获取 segment metadata（包含 DXF/DWG 实体信息如 handle, layer 等）
-        seg_metadata = getattr(segment, 'metadata', {}) or {}
+        seg_metadata = dict(getattr(segment, 'metadata', {}) or {})
+        # 整段带标签文本/格式表是节点级中间产物，逐句注入后不入库，避免冗余膨胀。
+        seg_metadata.pop("source_layout_tagged", None)
+        seg_metadata.pop("source_layout_html_tagged", None)
+        seg_metadata.pop("source_layout_formats", None)
+        segment_layout_text = getattr(segment, "source_layout_text", "") or ""
+        if segment_layout_text:
+            seg_metadata["source_layout_text"] = segment_layout_text
+        segment_format_map = getattr(segment, "source_format_map", {}) or {}
+        if segment_format_map:
+            # 逐标记样式表：供前端把译文里的 ⟦n⟧ 渲染成对应 run 级样式
+            seg_metadata["source_layout_formats"] = segment_format_map
+        segment_source_html = getattr(segment, "source_html", "") or ""
         existing_target_text = str(context.get("target") or "").strip()
         segments.append(
             {
                 "sentence_id": segment.segment_id,
                 "source_text": segment.source_text,
                 "display_text": segment.display_text,
+                "source_html": segment_source_html or None,
                 "target_text": existing_target_text or match_result.target_text or "",
                 "status": "confirmed" if existing_target_text else match_result.status,
                 "score": match_result.score,

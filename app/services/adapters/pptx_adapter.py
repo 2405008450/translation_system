@@ -161,17 +161,19 @@ class PptxAdapter(FormatAdapter):
             text = self._collect_paragraph_text(paragraph)
             if not text:
                 return
+            metadata = {
+                "item_type": "paragraph",
+                "part_name": part_name,
+                "part_kind": part_kind,
+                "part_index": part_index,
+                "paragraph_index": paragraph_index,
+            }
+            self._attach_paragraph_layout(metadata, paragraph)
             nodes.append(
                 BlockNode(
                     node_type=NodeType.NOTE if part_kind == "notes" else NodeType.PARAGRAPH,
                     text_content=text,
-                    metadata={
-                        "item_type": "paragraph",
-                        "part_name": part_name,
-                        "part_kind": part_kind,
-                        "part_index": part_index,
-                        "paragraph_index": paragraph_index,
-                    },
+                    metadata=metadata,
                 )
             )
 
@@ -349,6 +351,36 @@ class PptxAdapter(FormatAdapter):
 
     def _collect_paragraph_text(self, paragraph: ET.Element) -> str:
         return "".join((element.text or "") for element in paragraph.findall(".//a:t", NS)).strip()
+
+    def _attach_paragraph_layout(self, metadata: dict[str, Any], paragraph: ET.Element) -> None:
+        """把段落的带标签版式原文与格式表写入节点 metadata。
+
+        - ``source_layout_tagged``：仅当存在 run 级“异类”样式（has_tags）时写入，
+          驱动 LLM 逐句版式原文（保留并重排行内格式）。
+        - ``source_layout_html_tagged`` / ``source_layout_formats``：只要段落带任意可见
+          基础格式（含整段统一加粗/下划线这类无“异类” run 的情况）就写入，驱动前端
+          原文列样式展示。
+
+        标签引擎依赖本模块的命名空间常量，延迟导入以避免模块级循环引用。这些键是
+        节点级中间产物，逐句注入后不入库（见 build_task_workspace 的清理）。
+        """
+        from app.services.adapters.pptx_inline_tags import (
+            build_paragraph_format_map,
+            build_tagged_paragraph,
+        )
+
+        tagged = build_tagged_paragraph(paragraph)
+        if tagged is None:
+            return
+
+        if tagged.has_tags:
+            metadata["source_layout_tagged"] = tagged.tagged_text
+
+        format_map = build_paragraph_format_map(tagged)
+        has_visible_format = any(open_tag or close_tag for open_tag, close_tag in format_map.values())
+        if has_visible_format:
+            metadata["source_layout_html_tagged"] = tagged.tagged_text
+            metadata["source_layout_formats"] = format_map
 
     def _collect_text(self, elements: Iterable[ET.Element]) -> str:
         return "".join((element.text or "") for element in elements).strip()
