@@ -392,3 +392,57 @@ def rebuild_paragraph_runs(paragraph: ET.Element, translated_text: str) -> bool:
     for offset, run in enumerate(new_runs):
         paragraph.insert(insert_at + offset, run)
     return True
+
+
+def _build_translated_runs(paragraph: ET.Element, translated_text: str) -> list[ET.Element] | None:
+    """根据带标签译文构造译文 run 列表（尽量还原 run 级格式）。
+
+    成功返回 run 列表；无法按标签重建时回退为“单个 run + 基准/首个 run 样式 + 去标记
+    纯文本”，仍返回一个 run；无有效文本返回 ``None``。
+    """
+    tagged = build_tagged_paragraph(paragraph)
+
+    if tagged is not None and tagged.has_tags:
+        text = sanitize_tagged_text(translated_text or "")
+        pieces = _partition_by_tags(text, set(tagged.id_to_rpr.keys()))
+        if pieces is not None:
+            runs: list[ET.Element] = []
+            for tag_id, piece_text in pieces:
+                if piece_text == "":
+                    continue
+                rpr = tagged.base_rpr if tag_id is None else tagged.id_to_rpr.get(tag_id)
+                runs.append(_make_run(rpr, piece_text))
+            if runs:
+                return runs
+
+    # 降级：整段译文写进一个 run，套用基准样式（或首个 run 样式），并剥离标记
+    plain = strip_format_tags(translated_text or "").strip()
+    if not plain:
+        return None
+    base_rpr = tagged.base_rpr if tagged is not None else None
+    if base_rpr is None:
+        first_run = paragraph.find(f"{_A}r")
+        first_rpr = first_run.find(f"{_A}rPr") if first_run is not None else None
+        base_rpr = copy.deepcopy(first_rpr) if first_rpr is not None else None
+    return [_make_run(base_rpr, plain)]
+
+
+def append_translation_runs(paragraph: ET.Element, translated_text: str) -> bool:
+    """双语导出：保留原段落 run（原文格式不动），追加换行 + 译文 run。
+
+    与 :func:`rebuild_paragraph_runs` 不同——它不清空原有 run，因此原文的 run 级格式
+    完整保留；译文另起一行、按标签尽量还原自身格式。成功返回 ``True``。
+    """
+    new_runs = _build_translated_runs(paragraph, translated_text)
+    if not new_runs:
+        return False
+
+    end_pr = paragraph.find(f"{_A}endParaRPr")
+    children = list(paragraph)
+    insert_at = children.index(end_pr) if end_pr is not None else len(children)
+
+    line_break = ET.Element(f"{_A}br")
+    paragraph.insert(insert_at, line_break)
+    for offset, run in enumerate(new_runs):
+        paragraph.insert(insert_at + 1 + offset, run)
+    return True

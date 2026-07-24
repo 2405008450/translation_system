@@ -10,7 +10,7 @@ from xml.etree import ElementTree as ET
 
 from app.services.adapters.models import BlockNode, DocumentAST
 from app.services.adapters.pptx_adapter import A_NS, C_NS, CORE_NS, DC_NS, DCTERMS_NS, EXTENDED_PROPS_NS, NS, P_NS, R_NS, PptxAdapter
-from app.services.adapters.pptx_inline_tags import rebuild_paragraph_runs, strip_format_tags
+from app.services.adapters.pptx_inline_tags import append_translation_runs, rebuild_paragraph_runs, strip_format_tags
 
 
 PPTX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
@@ -34,9 +34,13 @@ class Replacement:
     bilingual: bool = False
 
     @property
-    def text(self) -> str:
+    def target_text(self) -> str:
         separator = "\n" if "\n" in self.source_text else " "
-        target_text = separator.join(part for part in self.parts if part).strip()
+        return separator.join(part for part in self.parts if part).strip()
+
+    @property
+    def text(self) -> str:
+        target_text = self.target_text
         if not self.bilingual:
             return target_text
         source_text = self.source_text.strip()
@@ -178,7 +182,16 @@ class PptxExporter:
                 ):
                     if paragraph_index < len(paragraphs):
                         paragraph = paragraphs[paragraph_index]
-                        if rebuild_paragraph_runs(paragraph, replacement.text):
+                        if replacement.bilingual:
+                            # 双语：保留原文 run（原格式不动），另起一行追加译文 run
+                            if append_translation_runs(paragraph, replacement.target_text):
+                                parent_map = _build_parent_map(root)
+                            else:
+                                _replace_text_elements(
+                                    paragraph.findall(".//a:t", NS),
+                                    strip_format_tags(replacement.text),
+                                )
+                        elif rebuild_paragraph_runs(paragraph, replacement.text):
                             # run 序列已按标签重建，parent_map 需刷新供 autofit 使用
                             parent_map = _build_parent_map(root)
                         else:
