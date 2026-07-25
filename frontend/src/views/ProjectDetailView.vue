@@ -550,6 +550,12 @@ const creatingTranslationMemoryPair = ref('')
 const translationMemorySettingsError = ref('')
 const expandedTMCollectionKey = ref('')
 const tmSettingsSearchQuery = ref('')
+type ResourceSettingsView = 'all' | 'configured'
+const RESOURCE_SETTINGS_PAGE_SIZES = [20, 50, 100]
+const tmSettingsActiveGroupKey = ref('')
+const tmSettingsView = ref<ResourceSettingsView>('all')
+const tmSettingsPage = ref(1)
+const tmSettingsPageSize = ref(20)
 const showProjectResourceCreateDialog = ref(false)
 const projectResourceCreateKind = ref<ProjectResourceCreateKind>('tm')
 const projectResourceCreateGroupKey = ref('')
@@ -641,6 +647,10 @@ const pendingTermBaseTopMoves = new Map<string, Set<string>>()
 let resourceTopMoveTimer: number | null = null
 const termBaseSettingsError = ref('')
 const termBaseSettingsSearchQuery = ref('')
+const termBaseSettingsActiveGroupKey = ref('')
+const termBaseSettingsView = ref<ResourceSettingsView>('all')
+const termBaseSettingsPage = ref(1)
+const termBaseSettingsPageSize = ref(20)
 const termImportDialogContext = ref<{
   termBaseId: string
   termBaseName: string
@@ -3251,6 +3261,7 @@ async function loadProjectTermBaseSettings() {
     )
     preserveTermBaseSettingsDisplayOrder(data, termBaseSettings.value)
     termBaseSettings.value = data
+    syncActiveTermBaseSettingsGroup()
   } catch (error) {
     termBaseSettingsError.value = getErrorMessage(error, '术语库设置加载失败。')
   } finally {
@@ -3271,6 +3282,7 @@ async function loadProjectTranslationMemorySettings() {
     )
     preserveTranslationMemorySettingsDisplayOrder(data, translationMemorySettings.value)
     translationMemorySettings.value = data
+    syncActiveTMSettingsGroup()
   } catch (error) {
     translationMemorySettingsError.value = getErrorMessage(error, '记忆库设置加载失败。')
   } finally {
@@ -3482,6 +3494,33 @@ function getResourceSettingsSearchKeywords(value: string) {
   return normalizeResourceSettingsSearchText(value).split(/\s+/).filter(Boolean)
 }
 
+function syncActiveTMSettingsGroup() {
+  const groups = translationMemorySettings.value?.groups ?? []
+  if (!groups.some((group) => translationMemorySettingGroupKey(group) === tmSettingsActiveGroupKey.value)) {
+    tmSettingsActiveGroupKey.value = groups[0] ? translationMemorySettingGroupKey(groups[0]) : ''
+  }
+}
+
+function selectTMSettingsGroup(group: ProjectTranslationMemorySettingGroup) {
+  tmSettingsActiveGroupKey.value = translationMemorySettingGroupKey(group)
+  tmSettingsPage.value = 1
+  expandedTMCollectionKey.value = ''
+}
+
+function getActiveTMSettingsGroups() {
+  const groups = translationMemorySettings.value?.groups ?? []
+  const activeGroup = groups.find(
+    (group) => translationMemorySettingGroupKey(group) === tmSettingsActiveGroupKey.value,
+  ) ?? groups[0]
+  return activeGroup ? [activeGroup] : []
+}
+
+function getTMConfiguredCollectionCount(group: ProjectTranslationMemorySettingGroup) {
+  return group.collections.filter((collection) => (
+    isTMCollectionEnabled(group, collection.id) || isTMCollectionWritable(group, collection.id)
+  )).length
+}
+
 function getTMCollectionSearchText(
   group: ProjectTranslationMemorySettingGroup,
   collection: ProjectTranslationMemorySettingCollection,
@@ -3501,27 +3540,36 @@ function getTMCollectionSearchText(
 
 function getFilteredTMCollections(group: ProjectTranslationMemorySettingGroup) {
   const keywords = getResourceSettingsSearchKeywords(tmSettingsSearchQuery.value)
-  if (keywords.length === 0) {
-    return group.collections
-  }
   return group.collections.filter((collection) => {
+    if (
+      tmSettingsView.value === 'configured'
+      && !isTMCollectionEnabled(group, collection.id)
+      && !isTMCollectionWritable(group, collection.id)
+    ) {
+      return false
+    }
+    if (keywords.length === 0) {
+      return true
+    }
     const searchText = getTMCollectionSearchText(group, collection)
     return keywords.every((keyword) => searchText.includes(keyword))
   })
 }
 
-function getFilteredTMSettingsCollectionCount() {
-  return translationMemorySettings.value?.groups.reduce(
-    (total, group) => total + getFilteredTMCollections(group).length,
-    0,
-  ) ?? 0
+function getTMSettingsPage(group: ProjectTranslationMemorySettingGroup) {
+  const totalPages = Math.max(1, Math.ceil(getFilteredTMCollections(group).length / tmSettingsPageSize.value))
+  return Math.min(tmSettingsPage.value, totalPages)
 }
 
-function getTMSettingsCollectionCount() {
-  return translationMemorySettings.value?.groups.reduce(
-    (total, group) => total + group.collections.length,
-    0,
-  ) ?? 0
+function getPaginatedTMCollections(group: ProjectTranslationMemorySettingGroup) {
+  const page = getTMSettingsPage(group)
+  const start = (page - 1) * tmSettingsPageSize.value
+  return getFilteredTMCollections(group).slice(start, start + tmSettingsPageSize.value)
+}
+
+function setTMSettingsPageSize(size: number) {
+  tmSettingsPageSize.value = size
+  tmSettingsPage.value = 1
 }
 
 function isTMCollectionEnabled(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
@@ -4229,6 +4277,30 @@ function getTermBaseSettingPairLabel(group: ProjectTermBaseSettingGroup) {
   return formatLanguagePair(group.source_language, group.target_language)
 }
 
+function syncActiveTermBaseSettingsGroup() {
+  const groups = termBaseSettings.value?.groups ?? []
+  if (!groups.some((group) => termBaseSettingGroupKey(group) === termBaseSettingsActiveGroupKey.value)) {
+    termBaseSettingsActiveGroupKey.value = groups[0] ? termBaseSettingGroupKey(groups[0]) : ''
+  }
+}
+
+function selectTermBaseSettingsGroup(group: ProjectTermBaseSettingGroup) {
+  termBaseSettingsActiveGroupKey.value = termBaseSettingGroupKey(group)
+  termBaseSettingsPage.value = 1
+}
+
+function getActiveTermBaseSettingsGroups() {
+  const groups = termBaseSettings.value?.groups ?? []
+  const activeGroup = groups.find(
+    (group) => termBaseSettingGroupKey(group) === termBaseSettingsActiveGroupKey.value,
+  ) ?? groups[0]
+  return activeGroup ? [activeGroup] : []
+}
+
+function getConfiguredTermBaseCount(group: ProjectTermBaseSettingGroup) {
+  return group.term_bases.filter((row) => row.enabled || row.writable || row.qa).length
+}
+
 function getTermBaseSearchText(
   group: ProjectTermBaseSettingGroup,
   row: ProjectTermBaseSettingRow,
@@ -4248,28 +4320,42 @@ function getTermBaseSearchText(
 
 function getFilteredTermBaseRows(group: ProjectTermBaseSettingGroup) {
   const keywords = getResourceSettingsSearchKeywords(termBaseSettingsSearchQuery.value)
-  if (keywords.length === 0) {
-    return group.term_bases
-  }
   return group.term_bases.filter((row) => {
+    if (termBaseSettingsView.value === 'configured' && !row.enabled && !row.writable && !row.qa) {
+      return false
+    }
+    if (keywords.length === 0) {
+      return true
+    }
     const searchText = getTermBaseSearchText(group, row)
     return keywords.every((keyword) => searchText.includes(keyword))
   })
 }
 
-function getFilteredTermBaseSettingsRowCount() {
-  return termBaseSettings.value?.groups.reduce(
-    (total, group) => total + getFilteredTermBaseRows(group).length,
-    0,
-  ) ?? 0
+function getTermBaseSettingsPage(group: ProjectTermBaseSettingGroup) {
+  const totalPages = Math.max(1, Math.ceil(getFilteredTermBaseRows(group).length / termBaseSettingsPageSize.value))
+  return Math.min(termBaseSettingsPage.value, totalPages)
 }
 
-function getTermBaseSettingsRowCount() {
-  return termBaseSettings.value?.groups.reduce(
-    (total, group) => total + group.term_bases.length,
-    0,
-  ) ?? 0
+function getPaginatedTermBaseRows(group: ProjectTermBaseSettingGroup) {
+  const page = getTermBaseSettingsPage(group)
+  const start = (page - 1) * termBaseSettingsPageSize.value
+  return getFilteredTermBaseRows(group).slice(start, start + termBaseSettingsPageSize.value)
 }
+
+function setTermBaseSettingsPageSize(size: number) {
+  termBaseSettingsPageSize.value = size
+  termBaseSettingsPage.value = 1
+}
+
+watch([tmSettingsSearchQuery, tmSettingsView], () => {
+  tmSettingsPage.value = 1
+  expandedTMCollectionKey.value = ''
+})
+
+watch([termBaseSettingsSearchQuery, termBaseSettingsView], () => {
+  termBaseSettingsPage.value = 1
+})
 
 function sortTermBaseSettings(settings: ProjectTermBaseSettingsResponse) {
   for (const group of settings.groups) {
@@ -5915,30 +6001,27 @@ onBeforeUnmount(() => {
                       <span>开启后，已确认且有译文的句段会进入后台队列，写入当前文件的主写入记忆库。</span>
                     </div>
                   </div>
-                  <div class="resource-settings-search">
-                    <label class="resource-settings-search__field">
-                      <Search :size="14" />
-                      <input
-                        v-model="tmSettingsSearchQuery"
-                        type="search"
-                        placeholder="搜索记忆库名称、说明、语言或条目数"
-                      >
-                    </label>
-                    <span class="resource-settings-search__summary">
-                      显示 {{ getFilteredTMSettingsCollectionCount() }} / {{ getTMSettingsCollectionCount() }} 个记忆库
-                    </span>
+                  <div class="resource-settings-pair-tabs" role="tablist" aria-label="翻译记忆库语言对">
                     <button
-                      v-if="tmSettingsSearchQuery"
-                      class="resource-settings-search__clear"
+                      v-for="group in translationMemorySettings.groups"
+                      :key="translationMemorySettingGroupKey(group)"
+                      class="resource-settings-pair-tab"
+                      :class="{ 'is-active': translationMemorySettingGroupKey(group) === tmSettingsActiveGroupKey }"
                       type="button"
-                      title="清空搜索"
-                      @click="tmSettingsSearchQuery = ''"
+                      role="tab"
+                      :aria-selected="translationMemorySettingGroupKey(group) === tmSettingsActiveGroupKey"
+                      @click="selectTMSettingsGroup(group)"
                     >
-                      <X :size="14" />
+                      <span>{{ getTranslationMemorySettingPairLabel(group) }}</span>
+                      <small>{{ group.file_count }} 个文件</small>
+                      <strong>{{ group.collections.length }}</strong>
+                      <em v-if="getTMConfiguredCollectionCount(group) > 0">
+                        已配置 {{ getTMConfiguredCollectionCount(group) }}
+                      </em>
                     </button>
                   </div>
                   <section
-                    v-for="group in translationMemorySettings.groups"
+                    v-for="group in getActiveTMSettingsGroups()"
                     :key="translationMemorySettingGroupKey(group)"
                     class="tm-settings__panel"
                   >
@@ -5999,6 +6082,52 @@ onBeforeUnmount(() => {
                       </div>
                     </div>
 
+                    <div class="resource-settings-toolbar">
+                      <div class="resource-settings-toolbar__main">
+                        <div class="resource-settings-searchbox">
+                          <label class="resource-settings-search__field">
+                            <Search :size="15" />
+                            <input
+                              v-model="tmSettingsSearchQuery"
+                              type="search"
+                              placeholder="搜索当前语言对的记忆库"
+                            >
+                          </label>
+                          <button
+                            v-if="tmSettingsSearchQuery"
+                            class="resource-settings-search__clear"
+                            type="button"
+                            title="清空搜索"
+                            aria-label="清空记忆库搜索"
+                            @click="tmSettingsSearchQuery = ''"
+                          >
+                            <X :size="14" />
+                          </button>
+                        </div>
+                        <div class="resource-settings-view-switch" aria-label="记忆库显示范围">
+                          <button
+                            type="button"
+                            :class="{ 'is-active': tmSettingsView === 'all' }"
+                            @click="tmSettingsView = 'all'"
+                          >
+                            全部
+                            <span>{{ group.collections.length }}</span>
+                          </button>
+                          <button
+                            type="button"
+                            :class="{ 'is-active': tmSettingsView === 'configured' }"
+                            @click="tmSettingsView = 'configured'"
+                          >
+                            已配置
+                            <span>{{ getTMConfiguredCollectionCount(group) }}</span>
+                          </button>
+                        </div>
+                      </div>
+                      <span class="resource-settings-search__summary">
+                        找到 {{ getFilteredTMCollections(group).length }} 个记忆库
+                      </span>
+                    </div>
+
                     <div v-if="group.collections.length === 0" class="empty-state">
                       当前语言对暂无记忆库。
                     </div>
@@ -6034,9 +6163,9 @@ onBeforeUnmount(() => {
                           <tr v-if="getFilteredTMCollections(group).length === 0">
                             <td colspan="10">没有匹配的记忆库。</td>
                           </tr>
-                          <template v-for="(collection, collectionIndex) in getFilteredTMCollections(group)" :key="collection.id">
+                          <template v-for="(collection, collectionIndex) in getPaginatedTMCollections(group)" :key="collection.id">
                             <tr>
-                              <td>{{ collectionIndex + 1 }}</td>
+                              <td>{{ (getTMSettingsPage(group) - 1) * tmSettingsPageSize + collectionIndex + 1 }}</td>
                               <td>
                                 <label class="term-settings__toggle">
                                   <input
@@ -6162,6 +6291,16 @@ onBeforeUnmount(() => {
                         </tbody>
                       </table>
                     </div>
+                    <Pagination
+                      v-if="getFilteredTMCollections(group).length > RESOURCE_SETTINGS_PAGE_SIZES[0]"
+                      class="resource-settings-pagination"
+                      :total="getFilteredTMCollections(group).length"
+                      :page="getTMSettingsPage(group)"
+                      :page-size="tmSettingsPageSize"
+                      :page-sizes="RESOURCE_SETTINGS_PAGE_SIZES"
+                      @update:page="tmSettingsPage = $event"
+                      @update:page-size="setTMSettingsPageSize"
+                    />
                   </section>
                 </div>
               </div>
@@ -6204,30 +6343,27 @@ onBeforeUnmount(() => {
                   当前项目还没有可配置语言对的文件。
                 </div>
                 <div v-else class="term-settings__groups">
-                  <div class="resource-settings-search">
-                    <label class="resource-settings-search__field">
-                      <Search :size="14" />
-                      <input
-                        v-model="termBaseSettingsSearchQuery"
-                        type="search"
-                        placeholder="搜索术语库名称、说明、语言、条目数或 QA"
-                      >
-                    </label>
-                    <span class="resource-settings-search__summary">
-                      显示 {{ getFilteredTermBaseSettingsRowCount() }} / {{ getTermBaseSettingsRowCount() }} 个术语库
-                    </span>
+                  <div class="resource-settings-pair-tabs" role="tablist" aria-label="术语库语言对">
                     <button
-                      v-if="termBaseSettingsSearchQuery"
-                      class="resource-settings-search__clear"
+                      v-for="group in termBaseSettings.groups"
+                      :key="termBaseSettingGroupKey(group)"
+                      class="resource-settings-pair-tab"
+                      :class="{ 'is-active': termBaseSettingGroupKey(group) === termBaseSettingsActiveGroupKey }"
                       type="button"
-                      title="清空搜索"
-                      @click="termBaseSettingsSearchQuery = ''"
+                      role="tab"
+                      :aria-selected="termBaseSettingGroupKey(group) === termBaseSettingsActiveGroupKey"
+                      @click="selectTermBaseSettingsGroup(group)"
                     >
-                      <X :size="14" />
+                      <span>{{ getTermBaseSettingPairLabel(group) }}</span>
+                      <small>{{ group.file_count }} 个文件</small>
+                      <strong>{{ group.term_bases.length }}</strong>
+                      <em v-if="getConfiguredTermBaseCount(group) > 0">
+                        已配置 {{ getConfiguredTermBaseCount(group) }}
+                      </em>
                     </button>
                   </div>
                   <section
-                    v-for="group in termBaseSettings.groups"
+                    v-for="group in getActiveTermBaseSettingsGroups()"
                     :key="termBaseSettingGroupKey(group)"
                     class="term-settings__group"
                   >
@@ -6239,29 +6375,77 @@ onBeforeUnmount(() => {
                         </template>
                         <template v-else>{{ group.term_bases.length }} 个术语库</template>
                       </span>
-                      <button
-                        class="button term-settings__create"
-                        type="button"
-                        :disabled="Boolean(creatingTermBasePair)"
-                        :title="`创建 ${getTermBaseSettingPairLabel(group)} 术语库`"
-                        :aria-label="`创建 ${getTermBaseSettingPairLabel(group)} 术语库`"
-                        @click="createTermBaseForGroup(group)"
-                      >
-                        <Loader2 v-if="creatingTermBasePair === termBaseSettingGroupKey(group)" class="lucide-spin" :size="14" />
-                        <Plus v-else :size="14" />
-                        新建
-                      </button>
-                      <button
-                        class="button term-settings__create"
-                        type="button"
-                        :disabled="projectResourceLanguageLoading || projectResourceLanguageSubmitting"
-                        :title="`复制已有术语库为 ${getTermBaseSettingPairLabel(group)}`"
-                        :aria-label="`复制已有术语库为 ${getTermBaseSettingPairLabel(group)}`"
-                        @click="openProjectResourceLanguageDialog('term', group)"
-                      >
-                        <Settings2 :size="14" />
-                        复制语言对
-                      </button>
+                      <div class="term-settings__group-actions">
+                        <button
+                          class="button term-settings__create"
+                          type="button"
+                          :disabled="Boolean(creatingTermBasePair)"
+                          :title="`创建 ${getTermBaseSettingPairLabel(group)} 术语库`"
+                          :aria-label="`创建 ${getTermBaseSettingPairLabel(group)} 术语库`"
+                          @click="createTermBaseForGroup(group)"
+                        >
+                          <Loader2 v-if="creatingTermBasePair === termBaseSettingGroupKey(group)" class="lucide-spin" :size="14" />
+                          <Plus v-else :size="14" />
+                          新建
+                        </button>
+                        <button
+                          class="button term-settings__create"
+                          type="button"
+                          :disabled="projectResourceLanguageLoading || projectResourceLanguageSubmitting"
+                          :title="`复制已有术语库为 ${getTermBaseSettingPairLabel(group)}`"
+                          :aria-label="`复制已有术语库为 ${getTermBaseSettingPairLabel(group)}`"
+                          @click="openProjectResourceLanguageDialog('term', group)"
+                        >
+                          <Settings2 :size="14" />
+                          复制语言对
+                        </button>
+                      </div>
+                    </div>
+
+                    <div class="resource-settings-toolbar">
+                      <div class="resource-settings-toolbar__main">
+                        <div class="resource-settings-searchbox">
+                          <label class="resource-settings-search__field">
+                            <Search :size="15" />
+                            <input
+                              v-model="termBaseSettingsSearchQuery"
+                              type="search"
+                              placeholder="搜索当前语言对的术语库"
+                            >
+                          </label>
+                          <button
+                            v-if="termBaseSettingsSearchQuery"
+                            class="resource-settings-search__clear"
+                            type="button"
+                            title="清空搜索"
+                            aria-label="清空术语库搜索"
+                            @click="termBaseSettingsSearchQuery = ''"
+                          >
+                            <X :size="14" />
+                          </button>
+                        </div>
+                        <div class="resource-settings-view-switch" aria-label="术语库显示范围">
+                          <button
+                            type="button"
+                            :class="{ 'is-active': termBaseSettingsView === 'all' }"
+                            @click="termBaseSettingsView = 'all'"
+                          >
+                            全部
+                            <span>{{ group.term_bases.length }}</span>
+                          </button>
+                          <button
+                            type="button"
+                            :class="{ 'is-active': termBaseSettingsView === 'configured' }"
+                            @click="termBaseSettingsView = 'configured'"
+                          >
+                            已配置
+                            <span>{{ getConfiguredTermBaseCount(group) }}</span>
+                          </button>
+                        </div>
+                      </div>
+                      <span class="resource-settings-search__summary">
+                        找到 {{ getFilteredTermBaseRows(group).length }} 个术语库
+                      </span>
                     </div>
 
                     <div class="term-settings__table-wrap">
@@ -6289,7 +6473,7 @@ onBeforeUnmount(() => {
                           <tr v-else-if="getFilteredTermBaseRows(group).length === 0">
                             <td colspan="6">没有匹配的术语库。</td>
                           </tr>
-                          <tr v-for="row in getFilteredTermBaseRows(group)" :key="row.id">
+                          <tr v-for="row in getPaginatedTermBaseRows(group)" :key="row.id">
                             <td>
                               <span class="term-settings__name">{{ row.name }}</span>
                               <span class="term-settings__meta">{{ row.entry_count }} 条术语</span>
@@ -6368,6 +6552,16 @@ onBeforeUnmount(() => {
                         </tbody>
                       </table>
                     </div>
+                    <Pagination
+                      v-if="getFilteredTermBaseRows(group).length > RESOURCE_SETTINGS_PAGE_SIZES[0]"
+                      class="resource-settings-pagination"
+                      :total="getFilteredTermBaseRows(group).length"
+                      :page="getTermBaseSettingsPage(group)"
+                      :page-size="termBaseSettingsPageSize"
+                      :page-sizes="RESOURCE_SETTINGS_PAGE_SIZES"
+                      @update:page="termBaseSettingsPage = $event"
+                      @update:page-size="setTermBaseSettingsPageSize"
+                    />
                   </section>
                 </div>
               </div>
@@ -10961,23 +11155,129 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 
-.resource-settings-search {
+.resource-settings-pair-tabs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 2px 1px 6px;
+  scrollbar-width: thin;
+}
+
+.resource-settings-pair-tab {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 10px;
+  min-width: 220px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--surface-panel);
+  color: var(--text-secondary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color var(--motion-base) var(--ease-standard),
+    background var(--motion-base) var(--ease-standard),
+    box-shadow var(--motion-base) var(--ease-standard);
+}
+
+.resource-settings-pair-tab:hover {
+  border-color: var(--line-strong);
+  background: color-mix(in srgb, var(--surface-muted) 54%, var(--surface-panel));
+}
+
+.resource-settings-pair-tab.is-active {
+  border-color: color-mix(in srgb, var(--brand-700) 52%, var(--line-soft));
+  background: color-mix(in srgb, var(--brand-050) 68%, var(--surface-panel));
+  box-shadow: inset 0 -2px 0 var(--brand-700);
+}
+
+.resource-settings-pair-tab:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.resource-settings-pair-tab > span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resource-settings-pair-tab > small {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.resource-settings-pair-tab > strong {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  display: inline-grid;
+  place-items: center;
+  min-width: 34px;
+  height: 24px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-muted) 82%, var(--surface-panel));
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.resource-settings-pair-tab.is-active > strong {
+  background: var(--brand-700);
+  color: #ffffff;
+}
+
+.resource-settings-pair-tab > em {
+  grid-column: 1 / -1;
+  width: fit-content;
+  margin-top: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--brand-700) 10%, transparent);
+  color: var(--brand-700);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.resource-settings-toolbar {
   display: flex;
   align-items: center;
-  gap: 6px;
+  justify-content: space-between;
+  gap: 10px;
   flex-wrap: wrap;
-  padding: 7px 9px;
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--surface-muted) 46%, var(--surface-panel));
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--surface-muted) 36%, var(--surface-panel));
+}
+
+.resource-settings-toolbar__main {
+  display: flex;
+  flex: 1 1 520px;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.resource-settings-searchbox {
+  position: relative;
+  flex: 1 1 320px;
+  min-width: min(100%, 260px);
 }
 
 .resource-settings-search__field {
   position: relative;
   display: flex;
   align-items: center;
-  flex: 1 1 280px;
-  min-width: min(100%, 240px);
+  width: 100%;
 }
 
 .resource-settings-search__field svg {
@@ -10999,6 +11299,12 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
+.resource-settings-searchbox .resource-settings-search__field input {
+  height: 34px;
+  padding-right: 36px;
+  border-radius: 8px;
+}
+
 .resource-settings-search__field input:focus {
   border-color: var(--brand-700);
   outline: none;
@@ -11013,21 +11319,80 @@ onBeforeUnmount(() => {
 }
 
 .resource-settings-search__clear {
+  position: absolute;
+  top: 50%;
+  right: 5px;
+  z-index: 1;
   display: inline-grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   padding: 0;
-  border: 1px solid var(--line-soft);
-  border-radius: 6px;
-  background: var(--surface-panel);
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
   color: var(--text-muted);
   cursor: pointer;
+  transform: translateY(-50%);
 }
 
 .resource-settings-search__clear:hover {
-  border-color: var(--line-strong);
+  background: var(--surface-muted);
   color: var(--brand-700);
+}
+
+.resource-settings-view-switch {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-muted) 74%, var(--surface-panel));
+}
+
+.resource-settings-view-switch button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 26px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.resource-settings-view-switch button:hover {
+  color: var(--text-primary);
+}
+
+.resource-settings-view-switch button.is-active {
+  background: var(--surface-panel);
+  color: var(--brand-700);
+  box-shadow: 0 1px 3px rgba(20, 53, 45, 0.08);
+}
+
+.resource-settings-view-switch span {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-muted) 86%, var(--surface-panel));
+  color: inherit;
+  font-size: 11px;
+}
+
+.resource-settings-pagination {
+  padding: 9px 10px;
+  border-top: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--surface-muted) 26%, var(--surface-panel));
 }
 
 .project-resource-language-dialog {
@@ -11582,6 +11947,13 @@ onBeforeUnmount(() => {
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.term-settings__group-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
 }
 
 .term-settings__table-wrap,
@@ -12303,6 +12675,30 @@ onBeforeUnmount(() => {
 
   .resource-settings-block__head {
     align-items: stretch;
+  }
+
+  .resource-settings-pair-tab {
+    min-width: 190px;
+  }
+
+  .resource-settings-toolbar__main {
+    flex-direction: column;
+    align-items: stretch;
+    flex-basis: 100%;
+  }
+
+  .resource-settings-searchbox {
+    flex-basis: auto;
+    width: 100%;
+  }
+
+  .resource-settings-view-switch {
+    width: 100%;
+  }
+
+  .resource-settings-view-switch button {
+    flex: 1 1 0;
+    justify-content: center;
   }
 
   .pd-settings-save {

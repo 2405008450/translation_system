@@ -71,13 +71,18 @@ PAGE_NUMBER_FIELD_NAMES = {"PAGE", "NUMPAGES", "SECTIONPAGES"}
 INTERNAL_REFERENCE_FIELD_NAMES = {"REF", "PAGEREF", "NOTEREF"}
 NUMBERING_PLACEHOLDER_RE = re.compile(r"%(\d+)")
 PAGE_NUMBER_WRAPPER_RE = re.compile(r"[\s\-\u2013\u2014\u2212\uff0d_./\\|:：()\[\]{}（）【】<>《》·•]+")
+DOCX_BULLET_PRIVATE_USE_RANGE = range(0xF000, 0xF100)
+DOCX_BULLET_GLYPH_MAP = {
+    ("wingdings", "\uf06c"): "\u25cf",
+    ("symbol", "\uf0b7"): "\u2022",
+}
 CELL_SENTENCE_END_CHARS = frozenset("。？！?!.；;:：")
 CELL_GROUP_MAX_CHARS = 200
 CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 PAGE_BREAK_SENTINEL = "\uE001"
 PAGE_BREAK_HTML = '<span class="doc-page-break" aria-hidden="true"></span>'
 DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
-DOCX_PARSE_CACHE_VERSION = "11"
+DOCX_PARSE_CACHE_VERSION = "12"
 DOCUMENT_PARSE_MODE_FULL = "full"
 DOCUMENT_PARSE_MODE_BODY_ONLY = "body_only"
 SUPPORTED_DOCUMENT_PARSE_MODES = {
@@ -595,6 +600,11 @@ def _parse_numbering_level(level: ET.Element | None) -> NumberingLevel | None:
     lvl_text_element = level.find("./w:lvlText", NS)
     if lvl_text_element is not None:
         lvl_text = lvl_text_element.get(_qn("w", "val"), lvl_text)
+    if num_fmt == "bullet":
+        lvl_text = _normalize_docx_bullet_text(
+            lvl_text,
+            _get_numbering_level_font(level),
+        )
 
     suffix = "tab"
     suffix_element = level.find("./w:suff", NS)
@@ -614,6 +624,38 @@ def _parse_numbering_level(level: ET.Element | None) -> NumberingLevel | None:
         suffix=suffix,
         p_style=p_style,
     )
+
+
+def _get_numbering_level_font(level: ET.Element) -> str:
+    """读取自动项目符号自身的字体，而不是段落正文的字体。"""
+    fonts = level.find("./w:rPr/w:rFonts", NS)
+    if fonts is None:
+        return ""
+
+    for attribute_name in ("ascii", "hAnsi", "eastAsia", "cs"):
+        font_name = fonts.get(_qn("w", attribute_name))
+        if font_name:
+            return font_name.strip()
+    return ""
+
+
+def _normalize_docx_bullet_text(lvl_text: str, font_name: str) -> str:
+    """将符号字体私用区项目符号转换为浏览器可稳定显示的 Unicode。"""
+    normalized_font = font_name.casefold()
+    normalized_chars: list[str] = []
+    for char in lvl_text:
+        mapped_char = DOCX_BULLET_GLYPH_MAP.get((normalized_font, char))
+        if mapped_char is not None:
+            normalized_chars.append(mapped_char)
+            continue
+
+        # Word 常用 U+F000-U+F0FF 搭配 Wingdings/Symbol 表示项目符号。
+        # 浏览器缺少对应字体时会显示方框；未知样式降级为通用圆点。
+        if ord(char) in DOCX_BULLET_PRIVATE_USE_RANGE:
+            normalized_chars.append("\u2022")
+            continue
+        normalized_chars.append(char)
+    return "".join(normalized_chars)
 
 
 def _iter_instance_levels(
