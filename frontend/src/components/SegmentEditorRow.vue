@@ -29,6 +29,8 @@ const props = withDefaults(defineProps<{
   showVisibleChars?: boolean
   /** 是否在译文（非编辑态）显示行内样式标记（⟦1⟧…⟦/1⟧）；关闭时隐藏，聚焦编辑时始终显示以便安全编辑 */
   showFormatMarks?: boolean
+  /** 标签编辑模式：开启后样式预览区可选中文字一键加/删样式标签（只写 target_layout_text） */
+  tagEditMode?: boolean
   pendingFormats?: Record<TextFormat, boolean> & { _overrideActive?: boolean }
   /** 句段对外标识：单文件模式即 sentence_id；合并模式为复合键 ${file_record_id}:${sentence_id} */
   segmentKey?: string
@@ -46,6 +48,7 @@ const props = withDefaults(defineProps<{
   searchCaseSensitive: false,
   showVisibleChars: false,
   showFormatMarks: false,
+  tagEditMode: false,
   pendingFormats: () => ({
     bold: false,
     italic: false,
@@ -61,6 +64,7 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   update: [sentenceId: string, value: string, html?: string]
   updateSource: [sentenceId: string, value: string]
+  updateTargetLayout: [sentenceId: string, targetLayoutText: string]
   focus: [sentenceId: string]
   activateTarget: [sentenceId: string]
   activateSource: [sentenceId: string]
@@ -621,26 +625,21 @@ function hasFormatMarks(text: string): boolean {
 }
 
 /**
- * 把译文里的行内样式标记包成不可编辑的原子 chip。
- * 标记始终保留在 DOM 中（序列化时按文本原样读回，不丢标记）；是否可见由编辑器
- * 上的 hide-format-marks 类通过 CSS 控制——因此“显示/隐藏”纯 CSS 切换，聚焦编辑
- * 时也一致（默认隐藏，只有点开按钮才显示）。
+ * 前端侧有效性判定，作为后端校验之外的一层防御：只读预览必须严格基于“剥标签后
+ * 与当前纯译文逐字相同”的 target_layout_text，否则宁可不预览，也不能让预览与
+ * 实际译文错位（例如本地刚编辑过、还没和服务端同步）。
  */
-function wrapFormatMarks(html: string): string {
-  if (!html) return html
-  FORMAT_MARK_RE.lastIndex = 0
-  return html.replace(
-    FORMAT_MARK_RE,
-    (mark) => `<span class="segment-row__fmt-mark" contenteditable="false">${mark}</span>`,
-  )
+function isTargetLayoutValid(targetText: string, targetLayoutText: string): boolean {
+  if (!targetLayoutText) return false
+  return targetLayoutText.replace(FORMAT_MARK_RE, '') === (targetText || '')
 }
 
 /**
- * 多样式译文渲染：按 ⟦n⟧ 标记用逐标记样式表包裹对应词语（内联 style span，
- * 序列化会忽略、不污染 target_html），并保留标记为不可编辑 chip（显隐由开关控制、
- * 序列化时按文本读回，保证编辑往返不丢标记）。
+ * 只读样式预览渲染：按 ⟦n⟧ 把对应译文片段包上逐词样式（内联 style span）。
+ * 只用于独立的只读预览元素（segment-row__target-preview），绝不进入可编辑 DOM——
+ * 编辑框永远只显示/编辑纯 target_text，这是避免“显示一会就消失/编辑卡死”的关键。
  */
-function renderMarkedTargetHtml(text: string, formatMap: Record<string, [string, string]>): string {
+function renderStyledTargetPreview(text: string, formatMap: Record<string, [string, string]>): string {
   const base = formatMap.base || ['', '']
   const out: string[] = []
   const re = /⟦\s*(\/?)\s*(\d+)\s*⟧/g
@@ -648,45 +647,277 @@ function renderMarkedTargetHtml(text: string, formatMap: Record<string, [string,
   let currentId: string | null = null
   let match: RegExpExecArray | null
 
-  const emitText = (piece: string, id: string | null) => {
+  const emit = (piece: string, id: string | null) => {
     if (!piece) return
     const [open, close] = id === null ? base : (formatMap[id] || base)
-    out.push(`${open}${textToVisibleChars(piece)}${close}`)
+    out.push(`${open}${escapeHtml(piece)}${close}`)
   }
 
   while ((match = re.exec(text)) !== null) {
-    emitText(text.slice(cursor, match.index), currentId)
+    emit(text.slice(cursor, match.index), currentId)
     cursor = match.index + match[0].length
-    out.push(`<span class="segment-row__fmt-mark" contenteditable="false">${match[0]}</span>`)
     currentId = match[1] ? null : match[2]
   }
-  emitText(text.slice(cursor), currentId)
+  emit(text.slice(cursor), currentId)
   return out.join('')
 }
 
-function renderTargetTextWithHighlights(text: string): string {
+/**
+ * 译文只读样式预览的 HTML：
+ * - 有有效 target_layout_text（剥标签后与当前 target_text 逐字相同）：按标签逐词渲染；
+ * - 否则统一用 base 样式包裹整句（无论 formatMap 是否只有 base）——这样多样式句段
+ *   即使还没被标注（AI 未检查/标注已失效），预览框依然会渲染出来，虚线框和选词
+ *   加/删标签的交互入口才不会被隐藏。只要 formatMap 存在且非空就会有预览。
+ */
+const targetPreviewHtml = computed(() => {
   const formatMap = props.segment.source_format_map
-  if (formatMap && Object.keys(formatMap).length > 0) {
-    // 兼容旧数据：译文若仍带 ⟦n⟧ 标记，按标记逐词还原样式
-    if (hasFormatMarks(text)) {
-      return renderMarkedTargetHtml(text, formatMap as Record<string, [string, string]>)
+  if (!formatMap || Object.keys(formatMap).length === 0) {
+    return ''
+  }
+  const text = props.segment.target_text || ''
+  if (!text) {
+    return ''
+  }
+  const layout = props.segment.target_layout_text || ''
+  if (layout && isTargetLayoutValid(text, layout)) {
+    return renderStyledTargetPreview(layout, formatMap as Record<string, [string, string]>)
+  }
+  const base = formatMap.base
+  if (base && (base[0] || base[1])) {
+    return `${base[0]}${escapeHtml(text)}${base[1]}`
+  }
+  return escapeHtml(text)
+})
+
+/**
+ * 是否展示只读样式预览元素（替代可编辑框的视觉呈现，但编辑框本身始终挂载、
+ * 内容始终是纯译文——用 v-show 切换可见性，不销毁/重建，聚焦行为不受影响）。
+ */
+const showTargetPreview = computed(() => (
+  Boolean(props.showFormatMarks)
+    && !isFocused.value
+    && !hasPendingRevision.value
+    && Boolean(targetPreviewHtml.value)
+))
+
+async function focusTargetPreview() {
+  if (props.disabled) return
+  if (props.tagEditMode) {
+    // 标签编辑模式下点击/聚焦预览区不再跳转到纯文本编辑框，避免打断选词加/删标签操作。
+    return
+  }
+  // 预览元素用 v-show 隐藏编辑框（display:none 时无法 focus）。先把 isFocused 置为
+  // true 让 showTargetPreview 计算为 false、等一次 DOM 更新恢复编辑框可见，再真正
+  // 聚焦——聚焦后原生 focus 事件会走 handleFocus，其余副作用（emit、缓存光标）照常触发。
+  isFocused.value = true
+  await nextTick()
+  focusTargetEditorAtEnd()
+}
+
+// ─────────────────────────────────────────
+// 手动选词标注：在只读样式预览区选中文字，一键加/删 ⟦n⟧ 样式标签。
+// 只操作 target_layout_text，绝不触碰 target_text；结构规则与后端
+// pptx_inline_tags.validate_tagged_text_structure 完全一致（标签成对、扁平、
+// 每个 id 最多出现一次）——为保证这一点，任何被选区“部分”触及的已有标签，
+// 加/删时都会整段清空该标签，而不是留下断裂的两段同 id 标记。
+// ─────────────────────────────────────────
+
+const targetPreviewRef = ref<HTMLDivElement | null>(null)
+
+interface TagPopoverState {
+  x: number
+  y: number
+  start: number
+  end: number
+  hasExistingTag: boolean
+}
+
+const tagPopover = ref<TagPopoverState | null>(null)
+
+const availableStyleTagIds = computed(() => {
+  const formatMap = props.segment.source_format_map as Record<string, [string, string]> | undefined
+  if (!formatMap) return []
+  return Object.keys(formatMap)
+    .filter((key) => key !== 'base' && /^\d+$/.test(key))
+    .map((key) => Number(key))
+    .sort((a, b) => a - b)
+})
+
+function styleTagPreviewLabelHtml(id: number): string {
+  const formatMap = props.segment.source_format_map as Record<string, [string, string]> | undefined
+  const tokens = formatMap?.[String(id)]
+  if (!tokens) return 'Aa'
+  const [open, close] = tokens
+  return `${open || ''}Aa${close || ''}`
+}
+
+/** 用 Range.toString() 的长度差技巧计算选区在预览纯文本中的字符偏移（与 target_text 对齐）。 */
+function getPlainTextSelectionInPreview(root: HTMLElement): { start: number; end: number } | null {
+  const selection = window.getSelection()
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    return null
+  }
+  const range = selection.getRangeAt(0)
+  if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) {
+    return null
+  }
+  const startRange = document.createRange()
+  startRange.selectNodeContents(root)
+  startRange.setEnd(range.startContainer, range.startOffset)
+  const start = startRange.toString().length
+
+  const endRange = document.createRange()
+  endRange.selectNodeContents(root)
+  endRange.setEnd(range.endContainer, range.endOffset)
+  const end = endRange.toString().length
+
+  return { start: Math.min(start, end), end: Math.max(start, end) }
+}
+
+/** 把带标签文本展开为逐字符的 tagId 数组（null 表示未打标签/base）。 */
+function charTagArrayFromLayout(plainLength: number, layoutText: string): (number | null)[] {
+  const result: (number | null)[] = new Array(plainLength).fill(null)
+  if (!layoutText) return result
+  const markerRe = /⟦\s*(\/?)\s*(\d+)\s*⟧/g
+  let currentId: number | null = null
+  let cursor = 0
+  let plainIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = markerRe.exec(layoutText)) !== null) {
+    const piece = layoutText.slice(cursor, match.index)
+    for (let k = 0; k < piece.length && plainIndex < plainLength; k += 1, plainIndex += 1) {
+      result[plainIndex] = currentId
     }
-    // 统一样式句段（格式表只有 base）：整段套用 base 样式，与原文一致。
-    // 多样式句段的译文是纯译文、无逐词映射，保持纯文本展示。
-    const keys = Object.keys(formatMap)
-    const isUniform = keys.length === 1 && keys[0] === 'base'
-    const base = formatMap.base
-    if (isUniform && base && (base[0] || base[1])) {
-      const highlightParts = getTargetHighlightParts(text)
-      const inner = !highlightParts
-        ? textToVisibleChars(text)
-        : renderHighlightPartsAsHtml(highlightParts, text)
-      return `${base[0]}${inner}${base[1]}`
+    cursor = match.index + match[0].length
+    currentId = match[1] ? null : Number(match[2])
+  }
+  const tail = layoutText.slice(cursor)
+  for (let k = 0; k < tail.length && plainIndex < plainLength; k += 1, plainIndex += 1) {
+    result[plainIndex] = currentId
+  }
+  return result
+}
+
+/** 把逐字符 tagId 数组重新序列化为带 ⟦n⟧ 标签的文本（同 id 只会有一段，见下方清空逻辑）。 */
+function serializeCharTagArray(text: string, tags: (number | null)[]): string {
+  const parts: string[] = []
+  let i = 0
+  while (i < text.length) {
+    const tagId = tags[i]
+    let j = i + 1
+    while (j < text.length && tags[j] === tagId) {
+      j += 1
+    }
+    const piece = text.slice(i, j)
+    parts.push(tagId === null ? piece : `⟦${tagId}⟧${piece}⟦/${tagId}⟧`)
+    i = j
+  }
+  return parts.join('')
+}
+
+/**
+ * 清空所有与 [start,end) 有交集的标签的整段范围（不只是交集部分），保证每个 id
+ * 清空后不会残留断裂的两段——加/删标签前都先调用它，是维持“每个 id 最多一段”
+ * 结构合法性的关键。
+ */
+function clearTouchedTagRuns(tags: (number | null)[], start: number, end: number): void {
+  const touchedIds = new Set<number>()
+  for (let i = start; i < end; i += 1) {
+    const id = tags[i]
+    if (id !== null) touchedIds.add(id)
+  }
+  if (touchedIds.size === 0) return
+  for (let i = 0; i < tags.length; i += 1) {
+    if (tags[i] !== null && touchedIds.has(tags[i] as number)) {
+      tags[i] = null
     }
   }
-  const parts = getTargetHighlightParts(text)
-  const html = !parts ? textToVisibleChars(text) : renderHighlightPartsAsHtml(parts, text)
-  return wrapFormatMarks(html)
+}
+
+function currentCharTagArray(): (number | null)[] {
+  const text = props.segment.target_text || ''
+  const layout = props.segment.target_layout_text || ''
+  const layoutIsValid = layout && isTargetLayoutValid(text, layout)
+  return charTagArrayFromLayout(text.length, layoutIsValid ? layout : '')
+}
+
+function emitTargetLayoutUpdate(tags: (number | null)[]): void {
+  const text = props.segment.target_text || ''
+  const hasAnyTag = tags.some((id) => id !== null)
+  const nextLayout = hasAnyTag ? serializeCharTagArray(text, tags) : ''
+  emit('updateTargetLayout', segmentKey.value, nextLayout)
+  tagPopover.value = null
+}
+
+function applyAddStyleTag(id: number): void {
+  if (!tagPopover.value) return
+  const { start, end } = tagPopover.value
+  const tags = currentCharTagArray()
+  clearTouchedTagRuns(tags, start, end)
+  // 该 id 若在选区之外还存在旧的标注，一并清掉，确保标签移动后仍只有一段。
+  for (let i = 0; i < tags.length; i += 1) {
+    if (tags[i] === id) tags[i] = null
+  }
+  for (let i = start; i < end; i += 1) {
+    tags[i] = id
+  }
+  emitTargetLayoutUpdate(tags)
+  window.getSelection()?.removeAllRanges()
+}
+
+function applyRemoveStyleTag(): void {
+  if (!tagPopover.value) return
+  const { start, end } = tagPopover.value
+  const tags = currentCharTagArray()
+  clearTouchedTagRuns(tags, start, end)
+  emitTargetLayoutUpdate(tags)
+  window.getSelection()?.removeAllRanges()
+}
+
+function closeTagPopover(): void {
+  tagPopover.value = null
+}
+
+function handleTargetPreviewMouseUp(): void {
+  if (!props.tagEditMode || props.disabled) {
+    return
+  }
+  const root = targetPreviewRef.value
+  if (!root) return
+  const selectionRange = getPlainTextSelectionInPreview(root)
+  if (!selectionRange || selectionRange.end <= selectionRange.start) {
+    tagPopover.value = null
+    return
+  }
+  const domRange = window.getSelection()?.getRangeAt(0)
+  const rect = domRange?.getBoundingClientRect()
+  const tags = currentCharTagArray()
+  const hasExistingTag = tags.slice(selectionRange.start, selectionRange.end).some((id) => id !== null)
+  tagPopover.value = {
+    x: rect ? rect.left + rect.width / 2 : 0,
+    y: rect ? rect.top : 0,
+    start: selectionRange.start,
+    end: selectionRange.end,
+    hasExistingTag,
+  }
+}
+
+function handleTargetPreviewClick(event: MouseEvent): void {
+  if (props.tagEditMode) {
+    // 标签编辑模式下点击不再触发“聚焦纯文本编辑框”，只在 mouseup 里处理选区。
+    event.preventDefault()
+    return
+  }
+  void focusTargetPreview()
+}
+
+function renderTargetTextWithHighlights(text: string): string {
+  // 编辑框永远只展示纯文本（+搜索/术语高亮）。样式/标记只在独立的只读预览元素里
+  // 渲染，绝不进入这里——避免样式标记与可编辑 DOM 相互干扰。
+  // 对可能残留 ⟦n⟧ 的历史数据做一次防御性剥离，避免裸标记泄漏到编辑框里。
+  const plainText = hasFormatMarks(text) ? text.replace(FORMAT_MARK_RE, '') : text
+  const parts = getTargetHighlightParts(plainText)
+  return !parts ? textToVisibleChars(plainText) : renderHighlightPartsAsHtml(parts, plainText)
 }
 
 function shouldRenderTargetHighlights(): boolean {
@@ -812,7 +1043,9 @@ function renderTargetHtmlWithHighlights(targetHtml: string): string {
 }
 
 const sourceHtmlContent = computed(() => {
-  if (props.segment.source_html && !hasAutomaticNumbering.value) {
+  // 原文列的样式展示与译文样式预览共用同一个开关：关闭时原文也退回纯文本
+  // （仍保留搜索/术语高亮），保证“开关控制原文+译文样式显示”的一致体验。
+  if (props.segment.source_html && !hasAutomaticNumbering.value && props.showFormatMarks) {
     return renderSourceHtmlWithHighlights(sanitizeSourceHtml(props.segment.source_html))
   }
   return renderHighlightPartsAsHtml(highlightedSourceText.value, sourceTextContent.value)
@@ -1143,11 +1376,9 @@ function getCurrentEditorText(): string {
 }
 
 function getPropTargetStateText(): string {
-  if (props.pendingRevision) {
-    return props.pendingRevision.after_text ?? ''
-  }
-  // 多样式句段以“带标签版式译文”为编辑对象（内联标签编辑）；纯译文由后端拆分派生。
-  return props.segment.target_layout_text || props.segment.target_text || ''
+  // 编辑对象永远是纯译文。带标签版式译文（target_layout_text）只读，走独立的样式
+  // 预览/标签编辑通道，绝不进入可编辑 DOM——这是之前“显示一会就消失/编辑卡死”的根源。
+  return props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
 }
 
 function getPropTargetStateHtml(): string | null {
@@ -2281,15 +2512,35 @@ function syncSourceEditorFromState(preserveCaret: boolean) {
   }
 }
 
+function handleDocumentClickForTagPopover(event: MouseEvent) {
+  if (!tagPopover.value) return
+  const target = event.target as HTMLElement | null
+  if (target?.closest('.segment-row__tag-popover') || target?.closest('.segment-row__target-preview')) {
+    return
+  }
+  tagPopover.value = null
+}
+
 onMounted(() => {
   if (editorRef.value) {
     editorRef.value.innerHTML = editorHtmlContent.value
   }
+  document.addEventListener('mousedown', handleDocumentClickForTagPopover)
 })
 
 onBeforeUnmount(() => {
   clearRevisionRerenderTimer()
+  document.removeEventListener('mousedown', handleDocumentClickForTagPopover)
 })
+
+watch(
+  () => props.tagEditMode,
+  (enabled) => {
+    if (!enabled) {
+      tagPopover.value = null
+    }
+  },
+)
 
 watch(
   () => props.segment.sentence_id,
@@ -2580,7 +2831,7 @@ watch(
           ref="editorRef"
           class="segment-row__editor"
           :class="[
-            { 'is-focused': isFocused, 'has-revision': hasPendingRevision, 'hide-format-marks': !showFormatMarks && !isFocused },
+            { 'is-focused': isFocused, 'has-revision': hasPendingRevision },
             revisionAuthorClass,
           ]"
           :style="revisionColorStyle"
@@ -2603,13 +2854,67 @@ watch(
           @compositionend="handleCompositionEnd"
           @beforeinput="handleBeforeInput"
           @input="handleInput"
+          v-show="!showTargetPreview"
           @paste="handlePaste"
           @copy="handleCopy"
           @cut="handleCut"
         />
+        <div
+          ref="targetPreviewRef"
+          v-show="showTargetPreview"
+          class="segment-row__target-preview"
+          :class="{ 'is-tag-edit-mode': tagEditMode }"
+          data-testid="segment-target-preview"
+          :aria-label="`translation style preview for segment ${index + 1}`"
+          tabindex="0"
+          @click="handleTargetPreviewClick"
+          @focus="focusTargetPreview"
+          @mouseup="handleTargetPreviewMouseUp"
+          v-html="targetPreviewHtml"
+        ></div>
       </div>
       </div>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="tagPopover"
+        class="segment-row__tag-popover"
+        :style="{ left: tagPopover.x + 'px', top: tagPopover.y + 'px' }"
+        data-testid="segment-tag-popover"
+        @mousedown.prevent
+      >
+        <template v-if="availableStyleTagIds.length > 0">
+          <button
+            v-for="tagId in availableStyleTagIds"
+            :key="tagId"
+            class="segment-row__tag-popover-item"
+            type="button"
+            :title="`标注为样式 ⟦${tagId}⟧`"
+            @click="applyAddStyleTag(tagId)"
+          >
+            <span v-html="styleTagPreviewLabelHtml(tagId)"></span>
+          </button>
+        </template>
+        <button
+          v-if="tagPopover.hasExistingTag"
+          class="segment-row__tag-popover-item segment-row__tag-popover-item--remove"
+          type="button"
+          title="删除选中范围内的样式标签"
+          @click="applyRemoveStyleTag"
+        >
+          删除标签
+        </button>
+        <button
+          class="segment-row__tag-popover-item segment-row__tag-popover-item--close"
+          type="button"
+          title="关闭"
+          @click="closeTagPopover"
+        >
+          ×
+        </button>
+      </div>
+    </Teleport>
 
     <div class="segment-row__cell segment-row__cell--state" :title="stateCellTitle">
       <span
@@ -3183,16 +3488,81 @@ watch(
   color: #ef4444;
 }
 
-/* 译文行内样式标记 chip：默认由 hide-format-marks 隐藏，仅点开按钮时显示 */
-.segment-row__editor :deep(.segment-row__fmt-mark) {
-  color: #b06f00;
-  opacity: 0.9;
-  font-size: 0.85em;
-  padding: 0 1px;
+/* 译文只读样式预览：只读、非编辑框，展示逐词样式（开关开+非编辑态时替代编辑框的
+   视觉呈现）。点击/聚焦转发到真正的编辑框（focusTargetPreview），编辑内容始终纯净。 */
+.segment-row__target-preview {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-height: 76px;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  font-size: var(--segment-editor-target-font-size, 15px);
+  line-height: var(--segment-editor-target-line-height, 1.58);
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  overflow: auto;
+  cursor: text;
 }
 
-.segment-row__editor.hide-format-marks :deep(.segment-row__fmt-mark) {
-  display: none;
+/* 标签编辑模式：预览区改为“选词”光标，提示可以拖选文字加/删样式标签 */
+.segment-row__target-preview.is-tag-edit-mode {
+  cursor: text;
+  outline: 1px dashed rgba(13, 122, 104, 0.35);
+  outline-offset: -1px;
+}
+
+/* 手动标签选择弹出菜单：Teleport 到 body，跟随选区定位（fixed 坐标） */
+.segment-row__tag-popover {
+  position: fixed;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  background: #ffffff;
+  border: 1px solid #d8e2e6;
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(15, 40, 45, 0.18);
+  transform: translate(-50%, -100%) translateY(-8px);
+  white-space: nowrap;
+}
+
+.segment-row__tag-popover-item {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: #f3f7f9;
+  color: #23805f;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.segment-row__tag-popover-item:hover {
+  background: #e6f4ea;
+  border-color: #23805f;
+}
+
+.segment-row__tag-popover-item--remove {
+  color: #c0392b;
+}
+
+.segment-row__tag-popover-item--remove:hover {
+  background: #fdecec;
+  border-color: #c0392b;
+}
+
+.segment-row__tag-popover-item--close {
+  color: #9aaab1;
+  font-weight: 700;
 }
 
 /* 富文本格式样式 */

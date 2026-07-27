@@ -23,8 +23,12 @@ const VISIBLE_CHAR_REVERSE_MAP: Record<string, string> = {
 
 export function useRichTextEditor() {
   const visibleCharactersEnabled = ref(false)
-  // 是否在译文（非编辑态）显示行内样式标记（⟦1⟧…⟦/1⟧）。默认隐藏，保持译文整洁。
-  const formatMarksVisible = ref(false)
+  // 译文样式预览开关：非编辑态用 target_layout_text + source_format_map 渲染逐词
+  // 样式（只读，编辑框本身始终是纯文本）。按需求默认开启。
+  const formatMarksVisible = ref(true)
+  // 标签编辑模式：开启后可在样式预览区选中译文一键加/删样式标签（只写
+  // target_layout_text，绝不改动 target_text）。默认关闭，需要样式预览同时开启才生效。
+  const tagEditModeEnabled = ref(false)
 
   // 当前激活的格式状态（用于按钮高亮显示和新输入文本的格式）
   const activeFormats = reactive<Record<TextFormat, boolean>>({
@@ -183,7 +187,22 @@ export function useRichTextEditor() {
    */
   function toggleFormatMarks(): boolean {
     formatMarksVisible.value = !formatMarksVisible.value
+    if (!formatMarksVisible.value) {
+      tagEditModeEnabled.value = false
+    }
     return formatMarksVisible.value
+  }
+
+  /**
+   * 切换标签编辑模式（选中译文样式预览中的文字一键加/删 ⟦n⟧ 标签）。
+   * 必须在样式预览开启的前提下才有意义，关闭样式预览时自动关闭。
+   */
+  function toggleTagEditMode(): boolean {
+    if (!formatMarksVisible.value) {
+      formatMarksVisible.value = true
+    }
+    tagEditModeEnabled.value = !tagEditModeEnabled.value
+    return tagEditModeEnabled.value
   }
 
   /**
@@ -323,6 +342,8 @@ export function useRichTextEditor() {
     visibleCharactersEnabled,
     formatMarksVisible,
     toggleFormatMarks,
+    tagEditModeEnabled,
+    toggleTagEditMode,
     activeFormats,
     formatOverrideActive,
     getSelection,

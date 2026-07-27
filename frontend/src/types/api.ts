@@ -473,7 +473,10 @@ export interface Segment {
   source_layout_text?: string | null
   /** 逐标记样式表：{标签 id / "base": [开 span, 闭 span]}，用于把译文里的 ⟦n⟧ 渲染为行内样式 */
   source_format_map?: Record<string, [string, string]> | null
-  /** 带标签版式译文（内联标签编辑用）；target_text 是它剥标签后的纯译文 */
+  /**
+   * 带标签版式译文，仅供只读样式预览/标签编辑使用（后端已校验有效性：
+   * strip 后等于 target_text 才会下发）。绝不作为译文编辑框的取值来源。
+   */
   target_layout_text?: string | null
   automatic_numbering_text?: string | null
   target_automatic_numbering_text?: string | null
@@ -666,6 +669,49 @@ export interface NumberCheckReport {
   status: string
   created_at: string | null
   items: NumberCheckReportItem[]
+}
+
+export interface StyleTagCheckReportItem {
+  id: string
+  report_id: string
+  project_id: string | null
+  file_record_id: string
+  segment_id: string | null
+  sentence_id: string
+  file_name: string
+  source_text: string
+  source_layout_text: string
+  target_text: string
+  format_map: Record<string, [string, string]>
+  suggested_target_layout_text: string | null
+  original_target_layout_text: string | null
+  ai_error_status: string
+  ai_checked: boolean
+  applied: boolean
+  applied_at: string | null
+  status: 'pending' | 'open' | 'applied' | 'rejected' | 'failed'
+  can_apply: boolean
+  block_index: number
+  row_index: number | null
+  cell_index: number | null
+  created_at: string | null
+}
+
+export interface StyleTagCheckReport {
+  id: string
+  project_id: string | null
+  file_record_id: string | null
+  scope: string
+  file_ids: string[]
+  total_files: number
+  total_segments: number
+  candidate_count: number
+  applied_count: number
+  failed_count: number
+  ai_checked: boolean
+  status: string
+  created_at: string | null
+  items: StyleTagCheckReportItem[]
 }
 
 export interface ProjectSegmentSyncSummary {

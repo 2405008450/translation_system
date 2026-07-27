@@ -305,6 +305,46 @@ REQUIRED_SCHEMA = {
         "cell_index",
         "created_at",
     },
+    "style_tag_check_reports": {
+        "id",
+        "project_id",
+        "file_record_id",
+        "created_by_id",
+        "scope",
+        "file_ids",
+        "total_files",
+        "total_segments",
+        "candidate_count",
+        "applied_count",
+        "failed_count",
+        "ai_checked",
+        "status",
+        "created_at",
+    },
+    "style_tag_check_report_items": {
+        "id",
+        "report_id",
+        "project_id",
+        "file_record_id",
+        "segment_id",
+        "sentence_id",
+        "file_name",
+        "source_text",
+        "source_layout_text",
+        "target_text",
+        "format_map",
+        "suggested_target_layout_text",
+        "original_target_layout_text",
+        "ai_error_status",
+        "ai_checked",
+        "applied",
+        "applied_at",
+        "status",
+        "block_index",
+        "row_index",
+        "cell_index",
+        "created_at",
+    },
     "pptx_layout_reports": {
         "id",
         "file_record_id",
@@ -2840,6 +2880,86 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_number_check_report_items_status
             ON number_check_report_items (status)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS style_tag_check_reports (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE,
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                scope VARCHAR(20) NOT NULL DEFAULT 'file',
+                file_ids TEXT NOT NULL DEFAULT '[]',
+                total_files INTEGER NOT NULL DEFAULT 0,
+                total_segments INTEGER NOT NULL DEFAULT 0,
+                candidate_count INTEGER NOT NULL DEFAULT 0,
+                applied_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                ai_checked BOOLEAN NOT NULL DEFAULT FALSE,
+                status VARCHAR(20) NOT NULL DEFAULT 'completed',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS style_tag_check_report_items (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                report_id UUID NOT NULL REFERENCES style_tag_check_reports(id) ON DELETE CASCADE,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                segment_id UUID REFERENCES segments(id) ON DELETE SET NULL,
+                sentence_id VARCHAR(100) NOT NULL DEFAULT '',
+                file_name VARCHAR(255) NOT NULL DEFAULT '',
+                source_text TEXT NOT NULL DEFAULT '',
+                source_layout_text TEXT NOT NULL DEFAULT '',
+                target_text TEXT NOT NULL DEFAULT '',
+                format_map TEXT NOT NULL DEFAULT '{{}}',
+                suggested_target_layout_text TEXT NOT NULL DEFAULT '',
+                original_target_layout_text TEXT NOT NULL DEFAULT '',
+                ai_error_status VARCHAR(40) NOT NULL DEFAULT '',
+                ai_checked BOOLEAN NOT NULL DEFAULT FALSE,
+                applied BOOLEAN NOT NULL DEFAULT FALSE,
+                applied_at TIMESTAMP,
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                block_index INTEGER NOT NULL DEFAULT 0,
+                row_index INTEGER,
+                cell_index INTEGER,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_style_tag_check_reports_project_id
+            ON style_tag_check_reports (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_style_tag_check_reports_file_record_id
+            ON style_tag_check_reports (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_style_tag_check_reports_created_by_id
+            ON style_tag_check_reports (created_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_style_tag_check_reports_created_at
+            ON style_tag_check_reports (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_style_tag_check_report_items_report_id
+            ON style_tag_check_report_items (report_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_style_tag_check_report_items_project_id
+            ON style_tag_check_report_items (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_style_tag_check_report_items_file_record_id
+            ON style_tag_check_report_items (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_style_tag_check_report_items_segment_id
+            ON style_tag_check_report_items (segment_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_style_tag_check_report_items_status
+            ON style_tag_check_report_items (status)
             """,
             f"""
             CREATE TABLE IF NOT EXISTS pptx_layout_reports (

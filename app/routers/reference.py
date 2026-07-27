@@ -33,7 +33,6 @@ from app.services.llm_service import (
     LLMTranslationFailure,
     LLMTranslationTask,
     iter_batch_translate,
-    split_format_tagged_translation,
     validate_provider_choice,
 )
 from app.services.reference_sync_service import (
@@ -44,7 +43,7 @@ from app.services.file_operation_lock_service import (
     FILE_OPERATION_TOKEN_HEADER,
     ensure_file_record_write_allowed,
 )
-from app.services.file_record_service import SEGMENT_ORDERING, set_segment_target_layout_text
+from app.services.file_record_service import SEGMENT_ORDERING
 from app.services.analytics_service import count_source_words, record_translation_metric_event
 from app.services.normalizer import normalize_text
 from app.services.segment_status import apply_segment_status
@@ -941,12 +940,8 @@ async def reference_ai_translate(
             
             try:
                 before_text = segment.target_text
-                # 拆分：纯译文入库 target_text，带标签版式译文单独存放供导出
-                clean_translated_text, layout_translated_text = split_format_tagged_translation(
-                    result.translated_text
-                )
-                segment.target_text = clean_translated_text
-                set_segment_target_layout_text(segment, layout_translated_text)
+                # 翻译链路不感知标签；不触碰 target_layout_text（只由样式标记检查/人工标签编辑写入）
+                segment.target_text = result.translated_text
                 segment.target_html = None
                 segment.source = "llm"
                 segment.version = int(segment.version or 1) + 1
@@ -956,13 +951,13 @@ async def reference_ai_translate(
                 apply_segment_status(segment, _resolve_segment_status(segment))
                 
                 # 记录修订历史
-                if (before_text or "") != (clean_translated_text or ""):
+                if (before_text or "") != (result.translated_text or ""):
                     db.add(SegmentRevision(
                         file_record_id=uuid.UUID(file_record_id),
                         segment_id=segment.id,
                         sentence_id=segment.sentence_id,
                         before_text=before_text or "",
-                        after_text=clean_translated_text or "",
+                        after_text=result.translated_text or "",
                         source="llm",
                         status="pending",
                         author_id=current_user.id if current_user else None,
@@ -972,7 +967,7 @@ async def reference_ai_translate(
                     db,
                     segment=segment,
                     before_text=before_text,
-                    after_text=clean_translated_text,
+                    after_text=result.translated_text,
                     source="llm",
                     current_user=current_user,
                 )

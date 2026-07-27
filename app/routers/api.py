@@ -65,6 +65,8 @@ from app.models import (
     Segment,
     SegmentQAIssue,
     SegmentRevision,
+    StyleTagCheckReport,
+    StyleTagCheckReportItem,
     TMCollection,
     TermQAReport,
     TermQAReportItem,
@@ -217,7 +219,6 @@ from app.services.llm_service import (
     LLMTranslationFailure,
     LLMTranslationTask,
     iter_batch_translate,
-    split_format_tagged_translation,
     validate_provider_choice,
 )
 from app.services.term_entry_service import build_term_entry_conflict_items, save_term_entries_batch
@@ -405,6 +406,18 @@ from app.services.number_check_service import (
     run_ai_number_check_for_report,
     serialize_number_check_report,
     set_number_check_item_ignored,
+)
+from app.services.style_tag_check_service import (
+    aiter_style_tag_check_generation,
+    apply_all_style_tag_check_items,
+    apply_style_tag_check_item,
+    create_style_tag_check_report,
+    load_style_tag_check_items,
+    reject_style_tag_check_item,
+    restore_style_tag_check_item,
+    rerun_style_tag_check_item,
+    run_ai_style_tag_check_for_report,
+    serialize_style_tag_check_report,
 )
 from app.services.tm_vector import sync_tm_embeddings
 from app.services.translation_memory_service import TMUpsertEntry, batch_upsert_tm_entries
@@ -1492,6 +1505,11 @@ class SegmentUpdate(BaseModel):
 
 class SegmentSourceUpdate(BaseModel):
     source_text: str
+
+
+class SegmentTargetLayoutUpdate(BaseModel):
+    """人工标签编辑：只写带标签版式译文，绝不改动 target_text 本身。"""
+    target_layout_text: str = ""
 
 
 class SegmentProjectSyncUpdate(BaseModel):
@@ -5172,7 +5190,11 @@ def _segment_metadata_format_map(segment: Any) -> dict:
     return format_map if isinstance(format_map, dict) else {}
 
 def _segment_metadata_target_layout_text(segment: Any) -> str:
-    """从句段 segment_metadata 取带标签版式译文（供前端内联标签编辑）。"""
+    """从句段 segment_metadata 取带标签版式译文（供前端只读样式预览/标签编辑）。
+
+    下发前校验有效性：strip(layout) 必须等于当前 target_text，否则说明译文已被改动，
+    标注已失效，不下发（前端展示纯译文，导出侧走兜底），避免预览与实际译文错位。
+    """
     raw = getattr(segment, "segment_metadata", None)
     if not raw:
         return ""
@@ -5182,7 +5204,14 @@ def _segment_metadata_target_layout_text(segment: Any) -> str:
         return ""
     if not isinstance(metadata, dict):
         return ""
-    return str(metadata.get("target_layout_text") or "")
+    layout_text = str(metadata.get("target_layout_text") or "")
+    if not layout_text:
+        return ""
+
+    from app.services.adapters.pptx_inline_tags import is_target_layout_valid
+
+    target_text = str(getattr(segment, "target_text", "") or "")
+    return layout_text if is_target_layout_valid(target_text, layout_text) else ""
 
 
 def _build_llm_translation_tasks(
@@ -9107,6 +9136,318 @@ def ignore_all_number_check_report_items(
     db.refresh(report)
     result = serialize_number_check_report(report, load_number_check_items(db, report.id))
     result["updated_count"] = updated_count
+    return result
+
+
+class StyleTagCheckRecheckRequest(BaseModel):
+    item_ids: list[UUID] = Field(default_factory=list)
+
+
+def _get_style_tag_check_report_or_404(db: Session, report_id: UUID) -> StyleTagCheckReport:
+    report = (
+        db.query(StyleTagCheckReport)
+        .filter(StyleTagCheckReport.id == report_id)
+        .first()
+    )
+    if not report:
+        raise HTTPException(status_code=404, detail="样式标记专检报告不存在。")
+    return report
+
+
+def _get_style_tag_check_item_or_404(db: Session, item_id: UUID) -> StyleTagCheckReportItem:
+    item = (
+        db.query(StyleTagCheckReportItem)
+        .filter(StyleTagCheckReportItem.id == item_id)
+        .first()
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="样式标记专检报告项不存在。")
+    return item
+
+
+def _require_style_tag_check_report_read_access(
+    report: StyleTagCheckReport,
+    current_user: User,
+    db: Session,
+) -> None:
+    if report.file_record_id:
+        file_record = get_file_record_model(db, report.file_record_id)
+        if file_record:
+            _require_file_record_read_access(file_record, current_user)
+            return
+    if report.project_id:
+        project = db.query(Project).filter(Project.id == report.project_id).first()
+        if project:
+            _require_project_read_access(project, current_user, db)
+            return
+    if not can_access_all_projects(current_user):
+        raise HTTPException(status_code=403, detail="无权访问该样式标记专检报告。")
+
+
+def _require_style_tag_check_report_write_access(
+    db: Session,
+    report: StyleTagCheckReport,
+    current_user: User,
+) -> None:
+    file_ids = {
+        row.file_record_id
+        for row in db.query(StyleTagCheckReportItem.file_record_id)
+        .filter(StyleTagCheckReportItem.report_id == report.id)
+        .distinct()
+        .all()
+    }
+    for file_record_id in file_ids:
+        file_record = get_file_record_model(db, file_record_id)
+        if file_record is None:
+            continue
+        _require_file_record_work_access(file_record, current_user)
+
+
+@router.post("/file-records/{file_record_id}/style-tag-check-reports")
+async def create_file_record_style_tag_check_report(
+    file_record_id: UUID,
+    run_ai: bool = Query(default=True),
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    project = _resolve_file_record_project(db, file_record)
+    report = create_style_tag_check_report(
+        db,
+        project=project,
+        files=[file_record],
+        current_user=current_user,
+        scope="file",
+    )
+    if run_ai and report.candidate_count > 0:
+        await run_ai_style_tag_check_for_report(db, report, provider=provider, model=model)
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+def _build_style_tag_check_stream(
+    db: Session,
+    request: Request,
+    *,
+    project: Project | None,
+    files: list[FileRecord],
+    current_user: User,
+    scope: str,
+    provider: str,
+    model: str | None,
+):
+    async def event_stream():
+        report_id: str | None = None
+        try:
+            async for event in aiter_style_tag_check_generation(
+                db,
+                project=project,
+                files=files,
+                current_user=current_user,
+                scope=scope,
+                provider=provider,
+                model=model,
+            ):
+                if await request.is_disconnected():
+                    break
+                stage = event.get("stage")
+                if stage == "complete":
+                    report_id = event.get("report_id")
+                    break
+                yield _sse_event(stage, event)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("style-tag-check stream failed")
+            yield _sse_event("error", {"message": str(exc)})
+            return
+
+        if report_id is not None and not await request.is_disconnected():
+            report = _get_style_tag_check_report_or_404(db, UUID(report_id))
+            yield _sse_event(
+                "complete",
+                {"report": serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))},
+            )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/file-records/{file_record_id}/style-tag-check-reports/stream")
+async def stream_file_record_style_tag_check_report(
+    file_record_id: UUID,
+    request: Request,
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    project = _resolve_file_record_project(db, file_record)
+    return _build_style_tag_check_stream(
+        db,
+        request,
+        project=project,
+        files=[file_record],
+        current_user=current_user,
+        scope="file",
+        provider=provider,
+        model=model,
+    )
+
+
+@router.get("/file-records/{file_record_id}/style-tag-check-reports")
+def list_file_record_style_tag_check_reports(
+    file_record_id: UUID,
+    limit: int = 1,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    safe_limit = min(max(int(limit), 1), 20)
+    reports = (
+        db.query(StyleTagCheckReport)
+        .filter(StyleTagCheckReport.file_record_id == file_record_id)
+        .order_by(StyleTagCheckReport.created_at.desc(), StyleTagCheckReport.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+    return {
+        "items": [
+            serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+            for report in reports
+        ]
+    }
+
+
+@router.get("/style-tag-check-reports/{report_id}")
+def get_style_tag_check_report(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_style_tag_check_report_or_404(db, report_id)
+    _require_style_tag_check_report_read_access(report, current_user, db)
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+@router.post("/style-tag-check-reports/{report_id}/ai-recheck")
+async def recheck_style_tag_check_report(
+    report_id: UUID,
+    payload: StyleTagCheckRecheckRequest | None = None,
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_style_tag_check_report_or_404(db, report_id)
+    _require_style_tag_check_report_read_access(report, current_user, db)
+    item_ids = list(dict.fromkeys((payload.item_ids if payload else []) or [])) or None
+    await run_ai_style_tag_check_for_report(
+        db,
+        report,
+        item_ids=item_ids,
+        provider=provider,
+        model=model,
+    )
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+@router.post("/style-tag-check-report-items/{item_id}/rerun")
+async def rerun_style_tag_check_report_item(
+    item_id: UUID,
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_style_tag_check_item_or_404(db, item_id)
+    file_record = get_file_record_model(db, item.file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="对应文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
+    await rerun_style_tag_check_item(db, item, provider=provider, model=model)
+    report = _get_style_tag_check_report_or_404(db, item.report_id)
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+@router.patch("/style-tag-check-report-items/{item_id}/apply")
+def apply_style_tag_check_report_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_style_tag_check_item_or_404(db, item_id)
+    file_record = get_file_record_model(db, item.file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="对应文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
+    apply_style_tag_check_item(db, item)
+    report = _get_style_tag_check_report_or_404(db, item.report_id)
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+@router.patch("/style-tag-check-report-items/{item_id}/reject")
+def reject_style_tag_check_report_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_style_tag_check_item_or_404(db, item_id)
+    file_record = get_file_record_model(db, item.file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="对应文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
+    reject_style_tag_check_item(db, item)
+    report = _get_style_tag_check_report_or_404(db, item.report_id)
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+@router.patch("/style-tag-check-report-items/{item_id}/restore")
+def restore_style_tag_check_report_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_style_tag_check_item_or_404(db, item_id)
+    file_record = get_file_record_model(db, item.file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="对应文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
+    restore_style_tag_check_item(db, item)
+    report = _get_style_tag_check_report_or_404(db, item.report_id)
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+@router.post("/style-tag-check-reports/{report_id}/apply-all")
+def apply_all_style_tag_check_report_items(
+    report_id: UUID,
+    payload: StyleTagCheckRecheckRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_style_tag_check_report_or_404(db, report_id)
+    _require_style_tag_check_report_write_access(db, report, current_user)
+    item_ids = list(dict.fromkeys((payload.item_ids if payload else []) or [])) or None
+    applied_count = apply_all_style_tag_check_items(db, report, item_ids=item_ids)
+    db.refresh(report)
+    result = serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+    result["applied_count"] = applied_count
     return result
 
 
@@ -13819,6 +14160,69 @@ def update_segment_source(
     }
 
 
+@router.put("/file-records/{file_record_id}/segments/{sentence_id}/target-layout")
+@router.put("/documents/{file_record_id}/segments/{sentence_id}/target-layout", include_in_schema=False)
+def update_segment_target_layout(
+    file_record_id: UUID,
+    sentence_id: str,
+    update: SegmentTargetLayoutUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    """人工标签编辑：写入/清除带标签版式译文（target_layout_text）。
+
+    只用于“选中译文加/删样式标签”，绝不改动 target_text 本身——不产生 revision、
+    不改 version，和译文编辑完全解耦。写入前做两道强制校验：
+    1. 剥标签后必须与当前 target_text 逐字相同（不允许借道改写译文）；
+    2. 标签结构必须合法（扁平成对、每个 id 最多一次、id 必须来自该句段的样式表），
+       与导出端使用的是同一套规则，校验通过即保证导出时一定能重建。
+    传空串等价于清除标注。
+    """
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not segment:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+    _require_segment_work_access(db, file_record, segment, current_user)
+
+    from app.services.adapters.pptx_inline_tags import (
+        sanitize_tagged_text,
+        strip_format_tags,
+        validate_tagged_text_structure,
+    )
+
+    layout_text = sanitize_tagged_text(update.target_layout_text or "")
+    if layout_text:
+        current_target_text = segment.target_text or ""
+        if strip_format_tags(layout_text) != current_target_text:
+            raise HTTPException(
+                status_code=400,
+                detail="标签内容与当前译文不一致：只能在原有文字上增删标签，不能改动译文本身。",
+            )
+        format_map = _segment_metadata_format_map(segment)
+        valid_ids = {int(key) for key in format_map.keys() if key != "base" and key.isdigit()}
+        if not validate_tagged_text_structure(layout_text, valid_ids):
+            raise HTTPException(
+                status_code=400,
+                detail="标签结构不合法：需成对出现、不可交叉嵌套，且标签编号必须来自该句段的可用样式。",
+            )
+
+    set_segment_target_layout_text(segment, layout_text)
+    db.commit()
+    db.refresh(segment)
+    publish_segment_changes([file_record_id])
+
+    return {
+        "sentence_id": segment.sentence_id,
+        "target_text": segment.target_text,
+        "target_layout_text": layout_text or None,
+    }
+
+
 @router.patch("/file-records/{file_record_id}/segments/{sentence_id}/project-sync")
 def update_segment_project_sync(
     file_record_id: UUID,
@@ -15489,22 +15893,20 @@ async def llm_translate_file_record(
                     try:
                         with fdb.begin_nested():
                             before_text = segment.target_text
-                            # 拆分：纯译文入库 target_text，带标签版式译文单独存放供导出
-                            clean_translated_text, layout_translated_text = split_format_tagged_translation(
-                                result.translated_text
-                            )
+                            # 翻译链路彻底不感知行内格式标签：模型只收纯文本、只回纯文本，
+                            # 这里不再拆分，也绝不触碰 target_layout_text（它只由样式标记
+                            # 检查/人工标签编辑写入，翻译写回不应清空既有标注）。
                             translated_text = (
                                 strip_automatic_numbering_prefix(
-                                    clean_translated_text,
+                                    result.translated_text,
                                     source_text=segment.source_text,
                                     display_text=segment.display_text,
                                     reference_texts=[segment.matched_source_text],
                                 )
                                 if is_word_document
-                                else clean_translated_text
+                                else result.translated_text
                             )
                             segment.target_text = translated_text
-                            set_segment_target_layout_text(segment, layout_translated_text)
                             segment.target_html = None
                             segment.source = "llm"
                             segment.last_modified_by_id = current_user_id
@@ -15555,8 +15957,7 @@ async def llm_translate_file_record(
                         "segment",
                         {
                             "sentence_id": segment.sentence_id,
-                            # 带标签版式译文优先下发，前端据此拆分：纯译文展示、带标签供内联编辑
-                            "target_text": layout_translated_text or segment.target_text,
+                            "target_text": segment.target_text,
                             "status": segment.status,
                             "source": segment.source,
                             "provider": result.provider,

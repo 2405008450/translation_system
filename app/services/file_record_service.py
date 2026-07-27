@@ -798,11 +798,11 @@ def _merge_segment_layout_metadata(segment: Segment, layout_text: str, format_ma
 _FORMAT_MARK_RE = re.compile(r"⟦\s*/?\s*\d+\s*⟧")
 
 
-def _split_format_tagged_text(text: str) -> tuple[str, str]:
-    """把（可能带 ⟦n⟧ 标签的）译文拆成 (纯译文, 带标签版式译文)。无标签时版式译文为空串。"""
-    if not text or not _FORMAT_MARK_RE.search(text):
-        return text, ""
-    return _FORMAT_MARK_RE.sub("", text), text
+def strip_target_format_tags(text: str) -> str:
+    """剥掉译文里的行内格式标签（⟦n⟧），用于校验 target_layout_text 与 target_text 一致。"""
+    if not text:
+        return text
+    return _FORMAT_MARK_RE.sub("", text)
 
 
 def set_segment_target_layout_text(segment: Segment, layout_text: str) -> None:
@@ -1208,10 +1208,10 @@ def update_segment_target(
         target_text,
         target_html,
     )
-    target_text, layout_target_text = _split_format_tagged_text(target_text)
+    # target_text 永远存纯文本；不触碰 target_layout_text（只由样式标记检查/人工标签
+    # 编辑接口写入，译文本身的编辑与它解耦，靠 hash 判定是否失效）。
     before_text = segment.target_text
     segment.target_text = target_text
-    set_segment_target_layout_text(segment, layout_target_text)
     segment.target_html = target_html if target_html else None
     segment.source = source
     if source != "project_sync":
@@ -1278,10 +1278,9 @@ def update_segment_by_sentence_id(
         target_text,
         target_html,
     )
-    target_text, layout_target_text = _split_format_tagged_text(target_text)
+    # target_text 永远存纯文本；不触碰 target_layout_text（同上）。
     before_text = segment.target_text
     segment.target_text = target_text
-    set_segment_target_layout_text(segment, layout_target_text)
     segment.target_html = target_html if target_html else None
     segment.source = source
     if source != "project_sync":
@@ -1443,11 +1442,10 @@ def batch_update_segments(
             target_html,
             clean_numbering=clean_numbering,
         )
-        target_text, layout_target_text = _split_format_tagged_text(target_text)
+        # target_text 永远存纯文本；不触碰 target_layout_text（同上）。
         track_revision = bool(item.get("track_revision", True))
         confirm = bool(item.get("confirm", False))
         segment.target_text = target_text
-        set_segment_target_layout_text(segment, layout_target_text)
         segment.target_html = target_html if target_html else None
         segment.source = source
         if source != "project_sync":

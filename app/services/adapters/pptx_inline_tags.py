@@ -60,6 +60,19 @@ def strip_format_tags(text: str) -> str:
     return _MARKER_RE.sub("", text)
 
 
+def is_target_layout_valid(target_text: str, target_layout_text: str | None) -> bool:
+    """判定 ``target_layout_text`` 对当前 ``target_text`` 是否仍然有效。
+
+    有效性用等式判定，不需要额外的哈希/失效标记字段：只要
+    ``strip_format_tags(target_layout_text) == target_text`` 恒成立，标签位置就一定
+    落在当前译文的字符偏移上；译文一旦被改动（人工编辑/重新翻译），两者不再相等，
+    版式译文自动失效，写标签/导出/前端预览都据此统一判断。
+    """
+    if not target_layout_text:
+        return False
+    return strip_format_tags(target_layout_text) == (target_text or "")
+
+
 def slice_tagged_paragraph(
     tagged_text: str, sentence_bounds: list[tuple[int, int]]
 ) -> list[str] | None:
@@ -326,7 +339,8 @@ def _partition_by_tags(
 
     严格校验（任一不满足即返回 ``None``，触发降级）：
     - 标签必须成对、扁平（open 后紧跟同 id 的 close，不允许嵌套/交叉）；
-    - 每个 id 恰好出现一次；
+    - 每个 id 最多出现一次（不要求出现——允许只标注一部分，其余按基准样式处理，
+      这样人工/AI 标注不必覆盖所有异类 run 才能生效）；
     - 不允许未知 id、重复 id、未闭合标签。
     """
     result: list[tuple[int | None, str]] = []
@@ -355,11 +369,20 @@ def _partition_by_tags(
 
     if expected_close is not None:
         return None
-    if seen_ids != valid_ids:
-        return None
     if cursor < len(text):
         result.append((None, text[cursor:]))
     return result
+
+
+def validate_tagged_text_structure(text: str, valid_ids: set[int]) -> bool:
+    """校验带标签文本的标签结构是否合法。
+
+    规则与导出端 :func:`rebuild_paragraph_runs` 使用的完全一致：标签必须扁平成对、
+    每个 id 最多出现一次、且 id 必须在 ``valid_ids`` 范围内（不要求覆盖全部 id，允许
+    只标注一部分）。供人工标签编辑接口在写入前做结构校验，保证“这里校验通过 = 导出
+    时一定能重建”。
+    """
+    return _partition_by_tags(sanitize_tagged_text(text or ""), valid_ids) is not None
 
 
 def _make_run(rpr: ET.Element | None, text: str) -> ET.Element:

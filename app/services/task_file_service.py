@@ -1122,8 +1122,16 @@ def build_export_segments_from_source(
             except (TypeError, _json.JSONDecodeError):
                 db_metadata = {}
 
-            # 带标签版式译文：导出时优先用它还原 run 级格式（译文本身保持纯净）
-            target_layout_text = str(db_metadata.get("target_layout_text") or "")
+            # 带标签版式译文：导出时优先用它还原 run 级格式（译文本身保持纯净）。
+            # 有效性用等式判定：strip(layout) 必须等于当前 target_text，否则说明译文
+            # 已经改动过（人工编辑/重新翻译），标注失效，丢弃走兜底，避免导出错位。
+            raw_target_layout_text = str(db_metadata.get("target_layout_text") or "")
+            current_target_text = str(_get_segment_value(translated_segment, "target_text", "") or "")
+            if raw_target_layout_text:
+                from app.services.adapters.pptx_inline_tags import is_target_layout_valid
+
+                if is_target_layout_valid(current_target_text, raw_target_layout_text):
+                    target_layout_text = raw_target_layout_text
 
             # 如果数据库中有合并信息，覆盖解析的 metadata
             if db_metadata.get("is_merged"):

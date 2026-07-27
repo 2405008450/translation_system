@@ -27,6 +27,7 @@ import {
   Maximize2,
   MessageSquare,
   Minimize2,
+  Palette,
   Pilcrow,
   Redo2,
   RotateCcw,
@@ -41,6 +42,7 @@ import {
   Strikethrough,
   Subscript,
   Superscript,
+  Tag as TagIcon,
   Tags,
   Type,
   Underline,
@@ -91,6 +93,16 @@ import {
   restoreNumberCheckItem,
   setNumberCheckItemIgnored,
 } from '../api/numberCheck'
+import {
+  applyAllStyleTagCheckItems,
+  applyStyleTagCheckItem,
+  createFileStyleTagCheckReport,
+  fetchFileStyleTagCheckReport,
+  recheckStyleTagCheckReport,
+  rejectStyleTagCheckItem,
+  rerunStyleTagCheckItem,
+  restoreStyleTagCheckItem,
+} from '../api/styleTagCheck'
 import { refreshGlobalNotifications } from '../utils/notifications'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
@@ -139,6 +151,8 @@ import type {
   WorkbenchQAResultItem,
   NumberCheckReport,
   NumberCheckReportItem,
+  StyleTagCheckReport,
+  StyleTagCheckReportItem,
   WorkflowProgress,
 } from '../types/api'
 import { buildDocumentPreviewHtml } from '../utils/documentPreview'
@@ -156,8 +170,8 @@ const props = defineProps<{
   mergeViewId?: string
 }>()
 
-type BottomToolKey = 'qa-result' | 'number-check' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
-type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result' | 'number-check'>
+type BottomToolKey = 'qa-result' | 'number-check' | 'style-tag-check' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
+type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result' | 'number-check' | 'style-tag-check'>
 type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes' | 'reference'
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
@@ -585,6 +599,20 @@ const selectedNumberCheckItemIds = ref<Set<string>>(new Set())
 const numberCheckItemBusyId = ref<string | null>(null)
 const numberCheckBulkBusy = ref(false)
 const locatingNumberCheckItemId = ref<string | null>(null)
+
+type StyleTagCheckFilter = 'all' | 'open' | 'applied' | 'rejected' | 'failed'
+const styleTagCheckReport = ref<StyleTagCheckReport | null>(null)
+const loadingStyleTagCheck = ref(false)
+const generatingStyleTagCheck = ref(false)
+const recheckingStyleTagCheck = ref(false)
+const styleTagCheckFilter = ref<StyleTagCheckFilter>('all')
+const styleTagCheckVisibleLimit = ref(100)
+const styleTagCheckModel = ref<string>('')
+const showStyleTagCheckSettings = ref(false)
+const selectedStyleTagCheckItemIds = ref<Set<string>>(new Set())
+const styleTagCheckItemBusyId = ref<string | null>(null)
+const styleTagCheckBulkBusy = ref(false)
+const locatingStyleTagCheckItemId = ref<string | null>(null)
 
 interface NumberCheckProgress {
   stage: 'program' | 'ai' | 'done'
@@ -3507,6 +3535,22 @@ async function updateSegmentSource(sentenceId: string, sourceText: string) {
   }
 }
 
+async function updateSegmentTargetLayout(sentenceId: string, targetLayoutText: string) {
+  const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
+  if (segment && !segment.can_write) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
+  try {
+    await segmentStore.updateTargetLayoutText(sentenceId, targetLayoutText)
+  } catch (error) {
+    toast.error({
+      title: '标签操作失败',
+      message: getErrorMessage(error, '译文可能已发生变化，请重试。'),
+    })
+  }
+}
+
 async function toggleProjectSegmentSync(sentenceId: string, disabled: boolean) {
   const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
   if (segment && !segment.can_write) {
@@ -5245,6 +5289,440 @@ async function focusNumberCheckReportItem(item: NumberCheckReportItem) {
   }
 }
 
+const NUMBER_CHECK_RENDER_STEP_STYLE = 100
+
+const styleTagCheckFilteredItems = computed(() => {
+  const items = styleTagCheckReport.value?.items ?? []
+  if (styleTagCheckFilter.value === 'all') {
+    return items
+  }
+  return items.filter((item) => item.status === styleTagCheckFilter.value)
+})
+
+const visibleStyleTagCheckItems = computed(() => (
+  styleTagCheckFilteredItems.value.slice(0, styleTagCheckVisibleLimit.value)
+))
+
+const styleTagCheckHasMore = computed(() => (
+  styleTagCheckVisibleLimit.value < styleTagCheckFilteredItems.value.length
+))
+
+const styleTagCheckCountText = computed(() => {
+  const total = styleTagCheckFilteredItems.value.length
+  const shown = Math.min(styleTagCheckVisibleLimit.value, total)
+  return `${shown} / ${total}`
+})
+
+function onStyleTagCheckScroll(event: Event) {
+  const el = event.target as HTMLElement | null
+  if (!el) {
+    return
+  }
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 200 && styleTagCheckHasMore.value) {
+    styleTagCheckVisibleLimit.value += NUMBER_CHECK_RENDER_STEP_STYLE
+  }
+}
+
+const styleTagCheckSelectableItems = computed(() => (
+  styleTagCheckFilteredItems.value.filter((item) => item.status === 'open')
+))
+
+const selectedStyleTagCheckItems = computed(() => (
+  (styleTagCheckReport.value?.items ?? []).filter((item) => selectedStyleTagCheckItemIds.value.has(item.id))
+))
+
+const allStyleTagCheckItemsSelected = computed(() => (
+  styleTagCheckSelectableItems.value.length > 0
+  && styleTagCheckSelectableItems.value.every((item) => selectedStyleTagCheckItemIds.value.has(item.id))
+))
+
+const styleTagCheckMetaText = computed(() => {
+  const report = styleTagCheckReport.value
+  if (!report) {
+    return ''
+  }
+  return [
+    `候选 ${report.candidate_count} 处`,
+    report.ai_checked ? `已应用 ${report.applied_count} 处` : 'AI 未标注',
+    report.failed_count ? `失败 ${report.failed_count} 处` : '',
+    formatWorkbenchStatusTime(report.created_at),
+  ].filter(Boolean).join(' · ')
+})
+
+const canRunStyleTagCheck = computed(() => {
+  if (generatingStyleTagCheck.value) {
+    return false
+  }
+  if (isMergeWorkbench.value) {
+    return false
+  }
+  return Boolean(segmentStore.fileRecord)
+})
+
+const styleTagCheckButtonTitle = computed(() => {
+  if (isMergeWorkbench.value) {
+    return '样式标记专检暂不支持合并工作台'
+  }
+  return styleTagCheckReport.value
+    ? `样式标记专检：${styleTagCheckReport.value.candidate_count} 处候选`
+    : '生成样式标记专检'
+})
+
+interface StyleTagCheckStatusTag {
+  text: string
+  tone: 'ok' | 'warn' | 'muted' | 'done'
+}
+
+function styleTagCheckStatusTag(item: StyleTagCheckReportItem): StyleTagCheckStatusTag {
+  switch (item.status) {
+    case 'applied':
+      return { text: '已应用', tone: 'done' }
+    case 'rejected':
+      return { text: '已拒绝', tone: 'muted' }
+    case 'failed':
+      return { text: `AI失败·${item.ai_error_status || ''}`, tone: 'warn' }
+    case 'open':
+      return { text: 'AI已标注·待审校', tone: 'ok' }
+    default:
+      return { text: '待标注', tone: 'muted' }
+  }
+}
+
+function styleTagPreviewHtml(text: string, formatMap: Record<string, [string, string]>): string {
+  const base = formatMap.base || ['', '']
+  const out: string[] = []
+  const re = /⟦\s*(\/?)\s*(\d+)\s*⟧/g
+  let cursor = 0
+  let currentId: string | null = null
+  let match: RegExpExecArray | null
+
+  const emit = (piece: string, id: string | null) => {
+    if (!piece) return
+    const [open, close] = id === null ? base : (formatMap[id] || base)
+    out.push(`${open}${escapeStyleTagCheckHtml(piece)}${close}`)
+  }
+
+  while ((match = re.exec(text)) !== null) {
+    emit(text.slice(cursor, match.index), currentId)
+    cursor = match.index + match[0].length
+    currentId = match[1] ? null : match[2]
+  }
+  emit(text.slice(cursor), currentId)
+  return out.join('')
+}
+
+function escapeStyleTagCheckHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+function styleTagCheckSourcePreviewHtml(item: StyleTagCheckReportItem): string {
+  return styleTagPreviewHtml(item.source_layout_text, item.format_map)
+}
+
+function styleTagCheckSuggestedPreviewHtml(item: StyleTagCheckReportItem): string {
+  const suggested = item.status === 'applied'
+    ? (item.suggested_target_layout_text || '')
+    : (item.suggested_target_layout_text || '')
+  if (!suggested) {
+    return ''
+  }
+  return styleTagPreviewHtml(suggested, item.format_map)
+}
+
+function setCurrentStyleTagCheckReport(
+  report: StyleTagCheckReport | null,
+  options: { keepPage?: boolean; keepSelection?: boolean } = {},
+) {
+  styleTagCheckReport.value = report
+  if (!options.keepPage) {
+    styleTagCheckVisibleLimit.value = NUMBER_CHECK_RENDER_STEP_STYLE
+  }
+  if (!options.keepSelection) {
+    selectedStyleTagCheckItemIds.value = new Set()
+  }
+}
+
+function setStyleTagCheckFilter(filter: StyleTagCheckFilter) {
+  styleTagCheckFilter.value = filter
+  styleTagCheckVisibleLimit.value = NUMBER_CHECK_RENDER_STEP_STYLE
+}
+
+function toggleStyleTagCheckItemSelection(itemId: string, event: Event) {
+  const checked = (event.target as HTMLInputElement | null)?.checked ?? false
+  const next = new Set(selectedStyleTagCheckItemIds.value)
+  if (checked) {
+    next.add(itemId)
+  } else {
+    next.delete(itemId)
+  }
+  selectedStyleTagCheckItemIds.value = next
+}
+
+function toggleAllStyleTagCheckItems(selected: boolean) {
+  const next = new Set(selectedStyleTagCheckItemIds.value)
+  for (const item of styleTagCheckSelectableItems.value) {
+    if (selected) {
+      next.add(item.id)
+    } else {
+      next.delete(item.id)
+    }
+  }
+  selectedStyleTagCheckItemIds.value = next
+}
+
+async function loadStyleTagCheckReport() {
+  if (!segmentStore.fileRecord) {
+    return
+  }
+  loadingStyleTagCheck.value = true
+  try {
+    const report = await fetchFileStyleTagCheckReport(segmentStore.fileRecord.id)
+    setCurrentStyleTagCheckReport(report)
+  } catch (error) {
+    // 尚无报告时忽略错误
+  } finally {
+    loadingStyleTagCheck.value = false
+  }
+}
+
+async function openStyleTagCheck() {
+  if (loadingStyleTagCheck.value || generatingStyleTagCheck.value) {
+    return
+  }
+  if (activeBottomTool.value === 'style-tag-check') {
+    closeBottomDrawer()
+    return
+  }
+  previewPanelRendering.value = false
+  activeBottomTool.value = 'style-tag-check'
+  await scrollBottomPanelIntoView()
+  if (!styleTagCheckReport.value) {
+    await loadStyleTagCheckReport()
+  }
+}
+
+function resolveStyleTagCheckGenerateOptions() {
+  const model = styleTagCheckModel.value.trim()
+  const provider = model
+    ? (llmModelOptions.find((option) => option.id === model)?.provider || 'auto')
+    : 'auto'
+  return {
+    runAi: true,
+    provider,
+    model: model || undefined,
+  }
+}
+
+async function generateStyleTagCheckReport() {
+  if (generatingStyleTagCheck.value || !canRunStyleTagCheck.value || !segmentStore.fileRecord) {
+    return
+  }
+  generatingStyleTagCheck.value = true
+  activeBottomTool.value = 'style-tag-check'
+  await scrollBottomPanelIntoView()
+  try {
+    const options = resolveStyleTagCheckGenerateOptions()
+    const report = await createFileStyleTagCheckReport(segmentStore.fileRecord.id, options)
+    setCurrentStyleTagCheckReport(report)
+    toast.show({
+      title: '样式标记专检完成',
+      message: `共 ${report.candidate_count} 处多样式候选句段`,
+    })
+  } catch (error) {
+    toast.error({
+      title: '样式标记专检失败',
+      message: getErrorMessage(error, '无法生成样式标记专检结果。'),
+    })
+  } finally {
+    generatingStyleTagCheck.value = false
+  }
+}
+
+async function recheckSelectedStyleTagCheck() {
+  const ids = selectedStyleTagCheckItems.value.map((item) => item.id)
+  if (ids.length === 0 || !styleTagCheckReport.value || recheckingStyleTagCheck.value) {
+    return
+  }
+  recheckingStyleTagCheck.value = true
+  try {
+    const options = resolveStyleTagCheckGenerateOptions()
+    const report = await recheckStyleTagCheckReport(styleTagCheckReport.value.id, ids, options)
+    setCurrentStyleTagCheckReport(report, { keepPage: true, keepSelection: true })
+    toast.show({ title: 'AI 重新标注完成', message: `已重新标注 ${ids.length} 项` })
+  } catch (error) {
+    toast.error({
+      title: 'AI 重新标注失败',
+      message: getErrorMessage(error, '无法完成 AI 重新标注。'),
+    })
+  } finally {
+    recheckingStyleTagCheck.value = false
+  }
+}
+
+async function rerunStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
+  if (styleTagCheckItemBusyId.value) {
+    return
+  }
+  styleTagCheckItemBusyId.value = item.id
+  try {
+    const options = resolveStyleTagCheckGenerateOptions()
+    const report = await rerunStyleTagCheckItem(item.id, options)
+    setCurrentStyleTagCheckReport(report, { keepPage: true, keepSelection: true })
+  } catch (error) {
+    toast.error({
+      title: '重新标注失败',
+      message: getErrorMessage(error, '无法重新标注该项。'),
+    })
+  } finally {
+    styleTagCheckItemBusyId.value = null
+  }
+}
+
+async function refreshAfterStyleTagCheckChange() {
+  try {
+    await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize)
+  } catch (error) {
+    // 编辑器刷新失败不影响报告操作
+  }
+}
+
+async function applyStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
+  if (styleTagCheckItemBusyId.value) {
+    return
+  }
+  styleTagCheckItemBusyId.value = item.id
+  try {
+    const report = await applyStyleTagCheckItem(item.id)
+    setCurrentStyleTagCheckReport(report, { keepPage: true, keepSelection: true })
+    await refreshAfterStyleTagCheckChange()
+    toast.show({ title: '已应用样式标注', message: '译文样式预览已更新，纯译文未受影响。' })
+  } catch (error) {
+    toast.error({
+      title: '应用失败',
+      message: getErrorMessage(error, '无法应用样式标注建议。'),
+    })
+  } finally {
+    styleTagCheckItemBusyId.value = null
+  }
+}
+
+async function rejectStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
+  if (styleTagCheckItemBusyId.value) {
+    return
+  }
+  styleTagCheckItemBusyId.value = item.id
+  try {
+    const report = await rejectStyleTagCheckItem(item.id)
+    setCurrentStyleTagCheckReport(report, { keepPage: true, keepSelection: true })
+  } catch (error) {
+    toast.error({
+      title: '操作失败',
+      message: getErrorMessage(error, '无法拒绝该建议。'),
+    })
+  } finally {
+    styleTagCheckItemBusyId.value = null
+  }
+}
+
+async function restoreStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
+  if (styleTagCheckItemBusyId.value) {
+    return
+  }
+  styleTagCheckItemBusyId.value = item.id
+  try {
+    const report = await restoreStyleTagCheckItem(item.id)
+    setCurrentStyleTagCheckReport(report, { keepPage: true, keepSelection: true })
+    await refreshAfterStyleTagCheckChange()
+    toast.show({ title: '已恢复', message: '样式标注已恢复到应用前的状态。' })
+  } catch (error) {
+    toast.error({
+      title: '恢复失败',
+      message: getErrorMessage(error, '无法恢复该项。'),
+    })
+  } finally {
+    styleTagCheckItemBusyId.value = null
+  }
+}
+
+const styleTagCheckApplicableCount = computed(() => (
+  (styleTagCheckReport.value?.items ?? []).filter((item) => item.status === 'open').length
+))
+
+async function applyAllStyleTagCheck() {
+  if (!styleTagCheckReport.value || styleTagCheckBulkBusy.value) {
+    return
+  }
+  const ids = selectedStyleTagCheckItems.value.map((item) => item.id)
+  styleTagCheckBulkBusy.value = true
+  try {
+    const report = await applyAllStyleTagCheckItems(styleTagCheckReport.value.id, ids)
+    setCurrentStyleTagCheckReport(report, { keepPage: true })
+    await refreshAfterStyleTagCheckChange()
+    toast.show({
+      title: '一键应用完成',
+      message: `已应用 ${report.applied_count} 处标注`,
+    })
+  } catch (error) {
+    toast.error({
+      title: '一键应用失败',
+      message: getErrorMessage(error, '无法批量应用标注。'),
+    })
+  } finally {
+    styleTagCheckBulkBusy.value = false
+  }
+}
+
+async function focusStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
+  if (locatingStyleTagCheckItemId.value) {
+    return
+  }
+  const fileRecord = segmentStore.fileRecord
+  if (!fileRecord) {
+    return
+  }
+
+  locatingStyleTagCheckItemId.value = item.id
+  try {
+    const currentPageIndex = editorSegments.value.findIndex((segment) => (
+      segment.sentence_id === item.sentence_id
+    ))
+    if (currentPageIndex >= 0) {
+      await focusEditorSegmentAtIndex(currentPageIndex)
+      return
+    }
+
+    const synced = await syncPendingWorkbenchEdits()
+    if (!synced) {
+      return
+    }
+
+    const data = (await http.get<SegmentPositionResponse>(
+      `/file-records/${fileRecord.id}/segments/${encodeURIComponent(item.sentence_id)}/position`,
+      { params: { page_size: segmentStore.pageSize } },
+    )).data
+    await clearSegmentFiltersForTermQANavigation()
+    await refreshSegmentPage(data.page, data.page_size)
+    const targetIndex = editorSegments.value.findIndex((segment) => (
+      segment.sentence_id === item.sentence_id
+    ))
+    if (targetIndex === -1) {
+      toast.warn('已切换到目标页，但未找到对应句段。')
+      return
+    }
+    await focusEditorSegmentAtIndex(targetIndex)
+  } catch (error) {
+    toast.error({
+      title: '跳转句段失败',
+      message: getErrorMessage(error, '无法定位报告中的句段。'),
+    })
+  } finally {
+    locatingStyleTagCheckItemId.value = null
+  }
+}
+
 async function downloadCurrentTermQAReport() {
   if (!termQAReport.value || downloadingTermQAReport.value) {
     return
@@ -5728,11 +6206,20 @@ function toggleVisibleCharacters() {
 }
 
 /**
- * 切换译文样式标记（⟦n⟧）显示
+ * 切换译文样式预览（非编辑态按标签渲染逐词样式，只读；编辑框始终是纯文本）
  */
 function toggleFormatMarks() {
   const enabled = richTextEditor.toggleFormatMarks()
-  toast.info(enabled ? '已显示译文样式标记' : '已隐藏译文样式标记')
+  toast.info(enabled ? '已开启原文/译文样式预览' : '已关闭原文/译文样式预览')
+}
+
+/**
+ * 切换标签编辑模式：开启后可在译文样式预览区选中文字一键加/删样式标签
+ * （只写 target_layout_text，不改动译文本身）。开启时会自动打开样式预览。
+ */
+function toggleTagEditMode() {
+  const enabled = richTextEditor.toggleTagEditMode()
+  toast.info(enabled ? '已开启标签编辑：可在译文中选词加/删样式标签' : '已关闭标签编辑')
 }
 
 /**
@@ -7688,8 +8175,11 @@ onBeforeRouteLeave(async () => {
             <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
               <span class="icon-text-area"><span class="tool-item"><Pilcrow class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.formatMarksVisible.value }" title="显示/隐藏译文样式标记" @click="toggleFormatMarks">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.formatMarksVisible.value }" title="显示/隐藏原文与译文样式预览" @click="toggleFormatMarks">
               <span class="icon-text-area"><span class="tool-item"><Tags class="tool-label-icon" :size="15" /></span></span>
+            </button>
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.tagEditModeEnabled.value }" :disabled="!activeSegmentCanWrite" title="选中译文样式预览中的文字，一键加/删样式标签" @click="toggleTagEditMode">
+              <span class="icon-text-area"><span class="tool-item"><TagIcon class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
         </div>
@@ -9031,6 +9521,7 @@ onBeforeRouteLeave(async () => {
                       :search-case-sensitive="searchCaseSensitive"
                       :show-visible-chars="richTextEditor.visibleCharactersEnabled.value"
                       :show-format-marks="richTextEditor.formatMarksVisible.value"
+                      :tag-edit-mode="richTextEditor.tagEditModeEnabled.value"
                       :pending-formats="pendingFormatsForEditor"
                       @focus="segmentStore.setActiveSentence"
                       @activate-target="handleSegmentTargetActivate"
@@ -9039,6 +9530,7 @@ onBeforeRouteLeave(async () => {
                       @copy-source-to-target="copySourceToTargetForSegment"
                       @update="updateSegmentTarget"
                       @update-source="updateSegmentSource"
+                      @update-target-layout="updateSegmentTargetLayout"
                       @toggle-project-sync="toggleProjectSegmentSync"
                       @apply-partial-revision="handleApplyPartialRevision"
                       @ctrl-click="handleSegmentClick"
@@ -9127,6 +9619,27 @@ onBeforeRouteLeave(async () => {
               </span>
             </button>
             <button
+              v-if="!isMergeWorkbench"
+              class="segment-editor-bottom-tool segment-editor-bottom-tool--qa"
+              :class="{ 'is-active': activeBottomTool === 'style-tag-check' }"
+              type="button"
+              :title="styleTagCheckButtonTitle"
+              :aria-pressed="activeBottomTool === 'style-tag-check'"
+              :disabled="loadingStyleTagCheck || generatingStyleTagCheck"
+              @click="void openStyleTagCheck()"
+            >
+              <Loader2 v-if="loadingStyleTagCheck || generatingStyleTagCheck" class="lucide-spin" :size="14" />
+              <Palette v-else :size="14" />
+              <span>样式标记专检</span>
+              <span
+                v-if="styleTagCheckReport"
+                class="segment-editor-bottom-tool__badge"
+                :class="{ 'is-clean': styleTagCheckReport.candidate_count === 0 }"
+              >
+                {{ styleTagCheckReport.candidate_count }}
+              </span>
+            </button>
+            <button
               v-for="tool in bottomToolButtons"
               :key="tool.key"
               class="segment-editor-bottom-tool"
@@ -9160,7 +9673,7 @@ onBeforeRouteLeave(async () => {
               :class="[
                 `workbench-bottom-drawer--${activeBottomTool}`,
                 {
-                  'is-wide': activeBottomTool === 'split-preview' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check',
+                  'is-wide': activeBottomTool === 'split-preview' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check' || activeBottomTool === 'style-tag-check',
                   'is-loading': bottomDrawerPreviewBusy,
                   'is-resizable': isBottomDrawerResizable,
                   'is-resizing': isBottomDrawerResizing,
@@ -9186,7 +9699,7 @@ onBeforeRouteLeave(async () => {
               />
 
               <button
-                v-if="activeBottomTool === 'history' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check'"
+                v-if="activeBottomTool === 'history' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check' || activeBottomTool === 'style-tag-check'"
                 class="workbench-bottom-drawer__close"
                 type="button"
                 title="关闭"
@@ -9768,6 +10281,235 @@ onBeforeRouteLeave(async () => {
                     @click="void generateNumberCheckReport()"
                   >
                     <Loader2 v-if="generatingNumberCheck" class="lucide-spin" :size="14" />
+                    开始检查
+                  </button>
+                </div>
+              </div>
+
+              <div v-else-if="activeBottomTool === 'style-tag-check'" class="workbench-bottom-drawer__qa">
+                <div class="workbench-bottom-drawer__header workbench-bottom-drawer__header--qa">
+                  <div class="workbench-bottom-drawer__header-lead">
+                    <div class="section-title section-title--tight">样式标记专检</div>
+                    <p class="panel-subtitle">根据原文样式为多样式句段的译文补全样式，不改动译文本身。</p>
+                  </div>
+
+                  <div v-if="styleTagCheckReport" class="term-qa-dialog__summary">
+                    <span class="term-qa-stat">
+                      <em class="term-qa-stat__value">{{ styleTagCheckApplicableCount }}</em>
+                      <span class="term-qa-stat__label">待审校</span>
+                    </span>
+                    <span class="term-qa-stat is-muted">
+                      <em class="term-qa-stat__value">{{ styleTagCheckReport.applied_count }}</em>
+                      <span class="term-qa-stat__label">已应用</span>
+                    </span>
+                    <span class="term-qa-dialog__meta">{{ styleTagCheckMetaText }}</span>
+                  </div>
+
+                  <div class="term-qa-dialog__actions">
+                    <div class="number-check__settings">
+                      <button
+                        class="button button--ghost term-qa-dialog__action-button"
+                        type="button"
+                        title="样式标记专检设置"
+                        @click="showStyleTagCheckSettings = true"
+                      >
+                        <Settings :size="14" />
+                        设置
+                      </button>
+                    </div>
+                    <select
+                      v-if="styleTagCheckReport"
+                      class="term-qa-dialog__filter-select"
+                      :value="styleTagCheckFilter"
+                      title="筛选报告项"
+                      @change="setStyleTagCheckFilter(($event.target as HTMLSelectElement).value as StyleTagCheckFilter)"
+                    >
+                      <option value="all">全部</option>
+                      <option value="open">待审校</option>
+                      <option value="applied">已应用</option>
+                      <option value="rejected">已拒绝</option>
+                      <option value="failed">AI失败</option>
+                    </select>
+                    <button
+                      v-if="styleTagCheckReport"
+                      class="button button--ghost term-qa-dialog__action-button"
+                      type="button"
+                      :disabled="styleTagCheckApplicableCount === 0 || styleTagCheckBulkBusy"
+                      :title="selectedStyleTagCheckItems.length ? '对所选项一键应用标注' : '对全部待审校项一键应用标注'"
+                      @click="void applyAllStyleTagCheck()"
+                    >
+                      <Loader2 v-if="styleTagCheckBulkBusy" class="lucide-spin" :size="14" />
+                      一键应用{{ selectedStyleTagCheckItems.length ? ` ${selectedStyleTagCheckItems.length}` : '' }}
+                    </button>
+                    <button
+                      v-if="styleTagCheckReport"
+                      class="button button--ghost term-qa-dialog__action-button"
+                      type="button"
+                      :disabled="selectedStyleTagCheckItems.length === 0 || recheckingStyleTagCheck"
+                      title="对所选项重新运行 AI 标注"
+                      @click="void recheckSelectedStyleTagCheck()"
+                    >
+                      <Loader2 v-if="recheckingStyleTagCheck" class="lucide-spin" :size="14" />
+                      重新标注选中{{ selectedStyleTagCheckItems.length ? ` ${selectedStyleTagCheckItems.length}` : '' }}
+                    </button>
+                    <button
+                      class="button button--ghost term-qa-dialog__action-button"
+                      type="button"
+                      :disabled="!canRunStyleTagCheck"
+                      :title="styleTagCheckButtonTitle"
+                      @click="void generateStyleTagCheckReport()"
+                    >
+                      <Loader2 v-if="generatingStyleTagCheck" class="lucide-spin" :size="14" />
+                      {{ styleTagCheckReport ? '重新检查' : '开始检查' }}
+                    </button>
+                  </div>
+                </div>
+
+                <div v-if="loadingStyleTagCheck && !generatingStyleTagCheck" class="empty-state">
+                  <Loader2 class="lucide-spin" :size="28" />
+                  正在加载样式标记专检结果
+                </div>
+
+                <template v-else-if="styleTagCheckReport">
+                  <div v-if="styleTagCheckFilteredItems.length === 0" class="empty-state">
+                    未发现需要标注的多样式候选句段。
+                  </div>
+                  <div v-else class="term-qa-dialog__table-wrap" @scroll="onStyleTagCheckScroll">
+                    <table class="term-qa-dialog__table number-check__table">
+                      <thead>
+                        <tr>
+                          <th class="term-qa-dialog__col-select">
+                            <input
+                              type="checkbox"
+                              :checked="allStyleTagCheckItemsSelected"
+                              :disabled="styleTagCheckSelectableItems.length === 0"
+                              aria-label="全选"
+                              @change="toggleAllStyleTagCheckItems(!allStyleTagCheckItemsSelected)"
+                            >
+                          </th>
+                          <th class="term-qa-dialog__col-segment">序号</th>
+                          <th class="number-check__col-reason">原文（含样式）</th>
+                          <th class="number-check__col-target">AI 标注建议</th>
+                          <th class="number-check__col-status">状态</th>
+                          <th class="number-check__col-action">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr
+                          v-for="item in visibleStyleTagCheckItems"
+                          :key="item.id"
+                          class="term-qa-dialog__row"
+                          :class="{
+                            'is-locating': locatingStyleTagCheckItemId === item.id,
+                            'is-ignored': item.status === 'rejected',
+                          }"
+                          tabindex="0"
+                          @click="void focusStyleTagCheckReportItem(item)"
+                          @keydown.enter.prevent="void focusStyleTagCheckReportItem(item)"
+                          @keydown.space.prevent="void focusStyleTagCheckReportItem(item)"
+                        >
+                          <td>
+                            <input
+                              type="checkbox"
+                              :checked="selectedStyleTagCheckItemIds.has(item.id)"
+                              :disabled="item.status !== 'open'"
+                              aria-label="选择报告项"
+                              @click.stop
+                              @change.stop="toggleStyleTagCheckItemSelection(item.id, $event)"
+                            >
+                          </td>
+                          <td>
+                            <span class="term-qa-dialog__segment" :title="item.sentence_id">
+                              <Loader2
+                                v-if="locatingStyleTagCheckItemId === item.id"
+                                class="lucide-spin"
+                                :size="13"
+                              />
+                              {{ formatTermQASegmentNumber(item.sentence_id) }}
+                            </span>
+                          </td>
+                          <td class="number-check__cell">
+                            <div class="number-check__reason" v-html="styleTagCheckSourcePreviewHtml(item)"></div>
+                          </td>
+                          <td class="number-check__cell">
+                            <div v-if="item.suggested_target_layout_text" class="number-check__fix" v-html="styleTagCheckSuggestedPreviewHtml(item)"></div>
+                            <span v-else class="number-check__no-fix">{{ item.target_text }}</span>
+                          </td>
+                          <td class="number-check__cell">
+                            <div class="number-check__status">
+                              <span
+                                class="number-check__status-tag"
+                                :class="`number-check__status-tag--${styleTagCheckStatusTag(item).tone}`"
+                              >{{ styleTagCheckStatusTag(item).text }}</span>
+                            </div>
+                          </td>
+                          <td>
+                            <div class="term-qa-dialog__inline-actions number-check__actions">
+                              <button
+                                v-if="item.status === 'open'"
+                                class="button button--ghost term-qa-dialog__inline-action number-check__action"
+                                type="button"
+                                title="应用该标注建议"
+                                :disabled="styleTagCheckItemBusyId === item.id"
+                                @click.stop="void applyStyleTagCheckReportItem(item)"
+                              >
+                                <Loader2 v-if="styleTagCheckItemBusyId === item.id" class="lucide-spin" :size="14" />
+                                应用
+                              </button>
+                              <button
+                                v-else-if="item.status === 'applied'"
+                                class="button button--ghost term-qa-dialog__inline-action number-check__action"
+                                type="button"
+                                title="恢复应用前的样式预览"
+                                :disabled="styleTagCheckItemBusyId === item.id"
+                                @click.stop="void restoreStyleTagCheckReportItem(item)"
+                              >
+                                <Loader2 v-if="styleTagCheckItemBusyId === item.id" class="lucide-spin" :size="14" />
+                                恢复
+                              </button>
+                              <button
+                                v-if="item.status === 'open'"
+                                class="button button--ghost term-qa-dialog__inline-action number-check__action"
+                                type="button"
+                                title="拒绝该标注建议"
+                                :disabled="styleTagCheckItemBusyId === item.id"
+                                @click.stop="void rejectStyleTagCheckReportItem(item)"
+                              >
+                                拒绝
+                              </button>
+                              <button
+                                v-if="item.status === 'failed' || item.status === 'rejected'"
+                                class="button button--ghost term-qa-dialog__inline-action number-check__action"
+                                type="button"
+                                title="重新运行 AI 标注"
+                                :disabled="styleTagCheckItemBusyId === item.id"
+                                @click.stop="void rerunStyleTagCheckReportItem(item)"
+                              >
+                                <Loader2 v-if="styleTagCheckItemBusyId === item.id" class="lucide-spin" :size="14" />
+                                重新标注
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                    <div v-if="styleTagCheckFilteredItems.length > 0" class="number-check__count">
+                      已显示 {{ styleTagCheckCountText }}
+                      <span v-if="styleTagCheckHasMore" class="number-check__count-hint">（向下滚动加载更多）</span>
+                    </div>
+                  </div>
+                </template>
+
+                <div v-else-if="!generatingStyleTagCheck" class="empty-state">
+                  暂无样式标记专检结果
+                  <button
+                    class="button"
+                    type="button"
+                    :disabled="!canRunStyleTagCheck"
+                    :title="styleTagCheckButtonTitle"
+                    @click="void generateStyleTagCheckReport()"
+                  >
+                    <Loader2 v-if="generatingStyleTagCheck" class="lucide-spin" :size="14" />
                     开始检查
                   </button>
                 </div>
@@ -10383,6 +11125,34 @@ onBeforeRouteLeave(async () => {
 
       <template #footer>
         <button class="button button--primary" type="button" @click="showNumberCheckSettings = false">
+          完成
+        </button>
+      </template>
+    </Modal>
+
+    <Modal
+      :open="showStyleTagCheckSettings"
+      title="样式标记专检设置"
+      width="min(420px, calc(100vw - 32px))"
+      @close="showStyleTagCheckSettings = false"
+    >
+      <div class="number-check__settings-dialog">
+        <div class="number-check__settings-group">
+          <div class="number-check__settings-label">AI 模型</div>
+          <select class="term-qa-dialog__filter-select" v-model="styleTagCheckModel">
+            <option value="">使用配置默认模型</option>
+            <option
+              v-for="modelOption in llmModelOptions"
+              :key="modelOption.id"
+              :value="modelOption.id"
+            >{{ modelOption.name }}</option>
+          </select>
+        </div>
+        <p class="hint-text">设置在下次“开始检查 / 重新标注选中”时生效。批量标注时模型需要连续输出多个 ⟦n⟧ 标签，若某模型经常出现标签格式错误（校验失败率高），可换用其他模型试试。</p>
+      </div>
+
+      <template #footer>
+        <button class="button button--primary" type="button" @click="showStyleTagCheckSettings = false">
           完成
         </button>
       </template>
