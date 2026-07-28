@@ -731,6 +731,7 @@ export interface FileRecordDetail {
   id: string
   project_id: string | null
   filename: string
+  translated_filename?: string | null
   status: string
   active_operation: string | null
   active_operation_message: string

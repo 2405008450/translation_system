@@ -197,6 +197,7 @@ class FileRecord(Base):
         nullable=True,
     )
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    translated_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
     file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
     document_parse_mode: Mapped[str] = mapped_column(

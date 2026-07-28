@@ -7303,6 +7303,25 @@ async function exportWithType(exportType: string) {
   await exportWithTypeForFile(exportType, segmentStore.fileRecord?.id)
 }
 
+const translatingFilename = ref(false)
+
+async function translateCurrentFilename() {
+  const fileRecordId = segmentStore.fileRecord?.id
+  if (!fileRecordId || translatingFilename.value) return
+  translatingFilename.value = true
+  try {
+    const translated = await segmentStore.translateFilename(fileRecordId)
+    toast.success(`文件名已翻译：${translated}`)
+  } catch (error) {
+    toast.error({
+      title: '文件名翻译失败',
+      message: getErrorMessage(error, '无法翻译文件名，请稍后重试。'),
+    })
+  } finally {
+    translatingFilename.value = false
+  }
+}
+
 // 点击外部关闭导出菜单
 function handleClickOutside(event: MouseEvent) {
   const target = event.target as HTMLElement
@@ -7799,6 +7818,26 @@ onBeforeRouteLeave(async () => {
               <ChevronDown :size="12" />
             </button>
             <div v-if="showExportMenu" class="export-dropdown__menu">
+              <div class="export-dropdown__group">
+                <div class="export-dropdown__group-title">文件名翻译</div>
+                <div class="export-dropdown__filename-translate">
+                  <span v-if="segmentStore.fileRecord?.translated_filename" class="export-dropdown__filename-translated">
+                    {{ segmentStore.fileRecord.translated_filename }}
+                  </span>
+                  <span v-else class="export-dropdown__filename-translated export-dropdown__filename-translated--empty">
+                    尚未翻译文件名
+                  </span>
+                  <button
+                    type="button"
+                    class="export-dropdown__item export-dropdown__filename-translate-btn"
+                    :disabled="translatingFilename"
+                    @click="translateCurrentFilename"
+                  >
+                    <Loader2 v-if="translatingFilename" class="lucide-spin" :size="14" />
+                    <span>{{ translatingFilename ? '翻译中' : (segmentStore.fileRecord?.translated_filename ? '重新翻译' : '翻译文件名') }}</span>
+                  </button>
+                </div>
+              </div>
               <div v-if="loadingExportOptions" class="export-dropdown__loading">
                 <Loader2 class="lucide-spin" :size="14" />
                 <span>{{ t('common.loading') }}</span>
@@ -8669,6 +8708,26 @@ onBeforeRouteLeave(async () => {
               {{ t('workbench.exportStyleSettings.button') }}
             </button>
             <div v-if="showExportMenu" class="export-dropdown__menu">
+              <div class="export-dropdown__group">
+                <div class="export-dropdown__group-title">文件名翻译</div>
+                <div class="export-dropdown__filename-translate">
+                  <span v-if="segmentStore.fileRecord?.translated_filename" class="export-dropdown__filename-translated">
+                    {{ segmentStore.fileRecord.translated_filename }}
+                  </span>
+                  <span v-else class="export-dropdown__filename-translated export-dropdown__filename-translated--empty">
+                    尚未翻译文件名
+                  </span>
+                  <button
+                    type="button"
+                    class="export-dropdown__item export-dropdown__filename-translate-btn"
+                    :disabled="translatingFilename"
+                    @click="translateCurrentFilename"
+                  >
+                    <Loader2 v-if="translatingFilename" class="lucide-spin" :size="14" />
+                    <span>{{ translatingFilename ? '翻译中' : (segmentStore.fileRecord?.translated_filename ? '重新翻译' : '翻译文件名') }}</span>
+                  </button>
+                </div>
+              </div>
               <div v-if="loadingExportOptions" class="export-dropdown__loading">
                 <Loader2 class="lucide-spin" :size="14" />
                 <span>{{ t('common.loading') }}</span>
@@ -16250,6 +16309,37 @@ onBeforeRouteLeave(async () => {
   color: #6b7c85;
   font-size: 11px;
   font-weight: 700;
+}
+
+.export-dropdown__filename-translate {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 8px 6px;
+}
+
+.export-dropdown__filename-translated {
+  font-size: 13px;
+  color: #2c3e50;
+  overflow-wrap: anywhere;
+}
+
+.export-dropdown__filename-translated--empty {
+  color: #9aa7ad;
+}
+
+.export-dropdown__filename-translate-btn {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #0d7a68;
+  background: rgba(13, 122, 104, 0.08);
+}
+
+.export-dropdown__filename-translate-btn:hover {
+  background: rgba(13, 122, 104, 0.16);
 }
 
 .export-dropdown__item {

@@ -424,6 +424,19 @@ def _run_file_export_task(task_id: UUID) -> None:
                 _set_file_export_task_status(db, task, "failed", progress=100, message="导出失败。")
 
 
+def _resolve_export_filename(file_record: FileRecord, source_filename: str) -> str:
+    """若文件记录已翻译文件名（translated_filename），导出命名时优先使用其词干，
+    保留原文件的扩展名，避免下游各导出器的格式判断出错。"""
+    translated_filename = (getattr(file_record, "translated_filename", None) or "").strip()
+    if not translated_filename:
+        return source_filename
+    translated_stem = Path(translated_filename).stem.strip() or Path(translated_filename).name.strip()
+    if not translated_stem:
+        return source_filename
+    extension = Path(source_filename).suffix
+    return f"{translated_stem}{extension}"
+
+
 def build_file_record_exported_file(
     db: Session,
     file_record: FileRecord,
@@ -433,6 +446,7 @@ def build_file_record_exported_file(
 ):
     raw_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
+    export_filename = _resolve_export_filename(file_record, source_filename)
 
     if export_type == "source":
         if raw_bytes is None:
@@ -456,7 +470,7 @@ def build_file_record_exported_file(
         return _apply_style_settings_to_export(
             export_translated_task_file(
                 raw_bytes=raw_bytes,
-                filename=source_filename,
+                filename=export_filename,
                 segments=segments,
                 document_parse_mode=document_parse_mode,
                 document_parse_options=document_parse_options,
@@ -472,7 +486,7 @@ def build_file_record_exported_file(
         return _apply_style_settings_to_export(
             export_bilingual_task_docx_with_layout(
                 raw_bytes=raw_bytes,
-                filename=source_filename,
+                filename=export_filename,
                 segments=segments,
                 order=BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS[export_type],
                 document_parse_mode=document_parse_mode,
@@ -488,7 +502,7 @@ def build_file_record_exported_file(
             raise ValueError("Only XLSX source files support original-format bilingual Excel export.")
         return export_bilingual_xlsx_task_file(
             raw_bytes=raw_bytes,
-            filename=source_filename,
+            filename=export_filename,
             segments=segments,
             document_parse_options=document_parse_options,
         )
@@ -499,7 +513,7 @@ def build_file_record_exported_file(
         return _apply_style_settings_to_export(
             export_bilingual_pptx_task_file(
                 raw_bytes=raw_bytes,
-                filename=source_filename,
+                filename=export_filename,
                 segments=segments,
                 document_parse_options=document_parse_options,
             ),
@@ -521,7 +535,7 @@ def build_file_record_exported_file(
     export_kwargs = {
         "export_type": export_type,
         "segments": segment_dicts,
-        "filename": file_record.filename,
+        "filename": export_filename,
         "original_bytes": raw_bytes,
     }
     if export_type in LANGUAGE_TAGGED_EXPORT_TYPES:

@@ -857,6 +857,17 @@ export const useSegmentStore = defineStore('segment', () => {
     return data
   }
 
+  async function translateFilename(fileRecordId: string, provider = 'openrouter', model?: string | null) {
+    const { data } = await http.post<{ file_record_id: string; filename: string; translated_filename: string }>(
+      `/file-records/${fileRecordId}/translate-filename`,
+      { provider, model: model || null },
+    )
+    if (fileRecord.value && fileRecord.value.id === fileRecordId) {
+      fileRecord.value = { ...fileRecord.value, translated_filename: data.translated_filename }
+    }
+    return data.translated_filename
+  }
+
   async function fetchSegmentPage(fileRecordId: string, query: SegmentPageQuery = {}) {
     const resolved = resolvePageQuery(query)
     const requestPage = async (pageQuery: typeof resolved) => {
@@ -2819,6 +2830,7 @@ export const useSegmentStore = defineStore('segment', () => {
 
   return {
     fileRecord,
+    translateFilename,
     segments,
     previewHtml,
     previewSupported,

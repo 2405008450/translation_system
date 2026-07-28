@@ -219,6 +219,7 @@ from app.services.llm_service import (
     LLMTranslationFailure,
     LLMTranslationTask,
     iter_batch_translate,
+    translate_filename as llm_translate_filename,
     validate_provider_choice,
 )
 from app.services.term_entry_service import build_term_entry_conflict_items, save_term_entries_batch
@@ -11432,6 +11433,7 @@ def get_file_record(
         "id": file_record.id,
         "project_id": str(file_record.project_id) if file_record.project_id else None,
         "filename": file_record.filename,
+        "translated_filename": getattr(file_record, "translated_filename", None),
         "status": file_record.status,
         "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
         "document_parse_options": _get_file_record_document_parse_options(file_record),
@@ -15715,6 +15717,57 @@ def save_file_record_extracted_terms(
         entries=[entry.model_dump() for entry in payload.entries],
         current_user=current_user,
     )
+
+
+class TranslateFilenameRequest(BaseModel):
+    provider: Literal["auto", "deepseek", "openrouter"] = "openrouter"
+    model: str | None = Field(default=None, max_length=120)
+
+
+@router.post("/file-records/{file_record_id}/translate-filename")
+async def translate_file_record_filename(
+    file_record_id: UUID,
+    payload: TranslateFilenameRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    """使用 LLM 翻译文件名，写回 translated_filename，导出时可选用作为输出文件名。"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    _require_file_record_work_access(file_record, current_user)
+    ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
+    source_language, target_language = _resolve_file_record_language_pair(file_record)
+
+    body = payload or TranslateFilenameRequest()
+    requested_model = normalize_text(body.model or "") or None
+    try:
+        validate_provider_choice(body.provider, model_override=requested_model)
+    except LLMConfigurationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    source_filename = get_file_record_source_filename(file_record)
+    try:
+        translated_filename = await llm_translate_filename(
+            source_filename,
+            source_language,
+            target_language,
+            provider=body.provider,
+            model_override=requested_model,
+        )
+    except LLMRequestError as exc:
+        raise HTTPException(status_code=502, detail=f"文件名翻译失败：{exc}") from exc
+
+    file_record.translated_filename = translated_filename
+    db.commit()
+
+    return {
+        "file_record_id": str(file_record_id),
+        "filename": file_record.filename,
+        "translated_filename": translated_filename,
+    }
 
 
 @router.post("/file-records/{file_record_id}/llm-translate")

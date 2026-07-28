@@ -763,6 +763,54 @@ async def request_chat_completion(
         return await _run_with_clients(clients)
 
 
+async def translate_filename(
+    filename: str,
+    source_language: str | None,
+    target_language: str | None,
+    provider: LLMProvider = "auto",
+    *,
+    model_override: str | None = None,
+) -> str:
+    """翻译文件名（不含扩展名部分），返回翻译后的文件名（保留原扩展名）。"""
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    extension = filename[len(stem):]
+    stem = stem.strip()
+    if not stem:
+        return filename
+
+    source_label = _format_language_for_prompt(source_language, "源语言")
+    target_label = _format_language_for_prompt(target_language, "目标语言")
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"你是专业的文档翻译专家，请将文件名从{source_label}翻译为{target_label}。"
+                "只输出翻译后的文件名本身，不要输出扩展名，不要加引号、路径或解释，"
+                "不要使用文件系统不允许的字符（如 / \\ : * ? \" < > |）。"
+            ),
+        },
+        {"role": "user", "content": stem},
+    ]
+    result = await request_chat_completion(
+        messages,
+        provider=provider,
+        model_override=model_override,
+        temperature=0.2,
+    )
+    translated_stem = _sanitize_translated_filename_stem(result.content) or stem
+    return f"{translated_stem}{extension}"
+
+
+_INVALID_FILENAME_CHARS_PATTERN = re.compile(r'[\\/:*?"<>|\r\n]+')
+
+
+def _sanitize_translated_filename_stem(raw_text: str) -> str:
+    text = raw_text.strip().strip('"').strip("'")
+    text = _INVALID_FILENAME_CHARS_PATTERN.sub(" ", text)
+    text = " ".join(text.split())
+    return text[:200]
+
+
 def _build_messages(
     task: LLMTranslationTask,
     strict_retry: bool = False,

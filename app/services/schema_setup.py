@@ -178,6 +178,7 @@ REQUIRED_SCHEMA = {
         "tm_last_matched_at",
         "deadline",
         "access_level",
+        "translated_filename",
     },
     "file_export_tasks": {
         "id",
@@ -1786,6 +1787,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS file_records
             ADD COLUMN IF NOT EXISTS access_level VARCHAR(20) NOT NULL DEFAULT 'team'
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS translated_filename VARCHAR(255)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_file_records_project_id
