@@ -24,8 +24,8 @@ const VISIBLE_CHAR_REVERSE_MAP: Record<string, string> = {
 export function useRichTextEditor() {
   const visibleCharactersEnabled = ref(false)
   // 译文样式预览开关：非编辑态用 target_layout_text + source_format_map 渲染逐词
-  // 样式（只读，编辑框本身始终是纯文本）。按需求默认开启。
-  const formatMarksVisible = ref(true)
+  // 样式（只读，编辑框本身始终是纯文本）。默认关闭，需要时点击开启。
+  const formatMarksVisible = ref(false)
   // 标签编辑模式：开启后可在样式预览区选中译文一键加/删样式标签（只写
   // target_layout_text，绝不改动 target_text）。默认关闭，需要样式预览同时开启才生效。
   const tagEditModeEnabled = ref(false)
