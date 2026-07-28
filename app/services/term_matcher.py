@@ -40,8 +40,12 @@ def _is_acronym_like_term(term: str) -> bool:
     )
 
 
-def _use_case_sensitive_match(term: str, case_sensitive: bool) -> bool:
-    return case_sensitive or _is_acronym_like_term(term)
+def _use_case_sensitive_match(
+    term: str,
+    case_sensitive: bool,
+    acronym_case_sensitive: bool,
+) -> bool:
+    return case_sensitive or (acronym_case_sensitive and _is_acronym_like_term(term))
 
 
 def _has_ascii_word_boundary(text: str, start: int, end: int, term: str) -> bool:
@@ -57,12 +61,22 @@ def _has_ascii_word_boundary(text: str, start: int, end: int, term: str) -> bool
     return True
 
 
-def find_term_text_matches(text: str, term: str, *, case_sensitive: bool = False) -> list[TermTextMatch]:
+def find_term_text_matches(
+    text: str,
+    term: str,
+    *,
+    case_sensitive: bool = False,
+    acronym_case_sensitive: bool = True,
+) -> list[TermTextMatch]:
     clean_term = (term or "").strip()
     if not text or not clean_term:
         return []
 
-    use_case_sensitive = _use_case_sensitive_match(clean_term, case_sensitive)
+    use_case_sensitive = _use_case_sensitive_match(
+        clean_term,
+        case_sensitive,
+        acronym_case_sensitive,
+    )
     haystack = text if use_case_sensitive else text.lower()
     needle = clean_term if use_case_sensitive else clean_term.lower()
 
@@ -81,8 +95,19 @@ def find_term_text_matches(text: str, term: str, *, case_sensitive: bool = False
     return matches
 
 
-def text_contains_term(text: str | None, term: str | None, *, case_sensitive: bool = False) -> bool:
-    return bool(find_term_text_matches(text or "", term or "", case_sensitive=case_sensitive))
+def text_contains_term(
+    text: str | None,
+    term: str | None,
+    *,
+    case_sensitive: bool = False,
+    acronym_case_sensitive: bool = True,
+) -> bool:
+    return bool(find_term_text_matches(
+        text or "",
+        term or "",
+        case_sensitive=case_sensitive,
+        acronym_case_sensitive=acronym_case_sensitive,
+    ))
 
 
 def find_non_overlapping_term_text_matches(
@@ -91,6 +116,7 @@ def find_non_overlapping_term_text_matches(
     get_term_text: Callable[[T], str | None],
     *,
     case_sensitive: bool = False,
+    acronym_case_sensitive: bool = True,
 ) -> list[SelectedTermTextMatch[T]]:
     ordered_items = sorted(
         list(items),
@@ -101,7 +127,12 @@ def find_non_overlapping_term_text_matches(
 
     for item in ordered_items:
         term_text = get_term_text(item) or ""
-        for text_match in find_term_text_matches(text, term_text, case_sensitive=case_sensitive):
+        for text_match in find_term_text_matches(
+            text,
+            term_text,
+            case_sensitive=case_sensitive,
+            acronym_case_sensitive=acronym_case_sensitive,
+        ):
             overlaps = any(
                 not (text_match.end <= matched_start or text_match.start >= matched_end)
                 for matched_start, matched_end in matched_positions

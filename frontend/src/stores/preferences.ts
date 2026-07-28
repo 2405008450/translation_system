@@ -12,6 +12,7 @@ const THEME_STORAGE_KEY = 'tm-workbench-theme'
 const WORKBENCH_AUTO_FILL_EXACT_STORAGE_KEY = 'tm-workbench-auto-fill-exact'
 const WORKBENCH_AUTO_FILL_FUZZY_STORAGE_KEY = 'tm-workbench-auto-fill-fuzzy'
 const WORKBENCH_CONFIRM_JUMP_STORAGE_KEY = 'tm-workbench-confirm-jump'
+const WORKBENCH_QA_BATCH_IGNORE_IDENTICAL_STORAGE_KEY = 'tm-workbench-qa-batch-ignore-identical'
 
 function normalizeLocale(value: string | null | undefined): AppLocale {
   return isSupportedUILocale(value) ? value : DEFAULT_LOCALE
@@ -38,6 +39,7 @@ export const usePreferencesStore = defineStore('preferences', () => {
   const autoFillExactMatches = ref(true)
   const autoFillFuzzyMatches = ref(true)
   const confirmJumpMode = ref<WorkbenchConfirmJumpMode>('next_unconfirmed')
+  const batchIgnoreIdenticalQA = ref(true)
 
   const isDark = computed(() => theme.value === 'dark')
 
@@ -60,6 +62,7 @@ export const usePreferencesStore = defineStore('preferences', () => {
     autoFillExactMatches.value = getStoredBoolean(WORKBENCH_AUTO_FILL_EXACT_STORAGE_KEY, true)
     autoFillFuzzyMatches.value = getStoredBoolean(WORKBENCH_AUTO_FILL_FUZZY_STORAGE_KEY, true)
     confirmJumpMode.value = normalizeConfirmJumpMode(savedConfirmJumpMode)
+    batchIgnoreIdenticalQA.value = getStoredBoolean(WORKBENCH_QA_BATCH_IGNORE_IDENTICAL_STORAGE_KEY, true)
 
     applyLocale()
     applyTheme()
@@ -92,12 +95,18 @@ export const usePreferencesStore = defineStore('preferences', () => {
     window.localStorage.setItem(WORKBENCH_CONFIRM_JUMP_STORAGE_KEY, confirmJumpMode.value)
   }
 
+  function setBatchIgnoreIdenticalQA(enabled: boolean) {
+    batchIgnoreIdenticalQA.value = enabled
+    window.localStorage.setItem(WORKBENCH_QA_BATCH_IGNORE_IDENTICAL_STORAGE_KEY, enabled ? '1' : '0')
+  }
+
   return {
     locale,
     theme,
     autoFillExactMatches,
     autoFillFuzzyMatches,
     confirmJumpMode,
+    batchIgnoreIdenticalQA,
     isDark,
     bootstrap,
     setLocale,
@@ -105,5 +114,6 @@ export const usePreferencesStore = defineStore('preferences', () => {
     setAutoFillExactMatches,
     setAutoFillFuzzyMatches,
     setConfirmJumpMode,
+    setBatchIgnoreIdenticalQA,
   }
 })

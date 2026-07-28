@@ -1658,6 +1658,15 @@ body.modal-open {
   --workbench-stat-active-shadow: rgba(79, 168, 115, 0.14);
 }
 
+::highlight(segment-spelling-error) {
+  color: inherit;
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
+  text-decoration-color: #d92d20;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+}
+
 .workbench-page .workbench-stat--project-sync {
   --workbench-stat-bg: linear-gradient(180deg, #e7f6fb, #fbfeff);
   --workbench-stat-border: #91cbdc;

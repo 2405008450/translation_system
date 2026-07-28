@@ -1626,6 +1626,7 @@ function createQualityQARuleDraft(): QualityQARuleDraft {
 
 const qualityQADraft = reactive({
   rules: createQualityQARuleDraft(),
+  termQACaseSensitive: false,
 })
 
 const enabledQualityQARuleCount = computed(() => (
@@ -1650,6 +1651,9 @@ function syncQualityQADraftFromSettings(data: QualityQASettingsResponse) {
   for (const rule of qualityQARules) {
     qualityQADraft.rules[rule.key] = getSavedQualityQARuleEnabledFrom(data, rule)
   }
+  qualityQADraft.termQACaseSensitive = Boolean(
+    data.settings.rules?.term_inconsistency?.case_sensitive,
+  )
 }
 
 function getSavedQualityQARuleEnabledFrom(data: QualityQASettingsResponse, rule: typeof qualityQARules[number]) {
@@ -1667,9 +1671,12 @@ function buildQualityQARulesPayload() {
   return qualityQARules.reduce((payload, rule) => {
     payload[rule.key] = {
       enabled: qualityQADraft.rules[rule.key],
+      ...(rule.key === 'term_inconsistency'
+        ? { case_sensitive: qualityQADraft.termQACaseSensitive }
+        : {}),
     }
     return payload
-  }, {} as Record<QualityQARuleKey, { enabled: boolean }>)
+  }, {} as Record<QualityQARuleKey, { enabled: boolean; case_sensitive?: boolean }>)
 }
 
 function setAllQualityQARules(checked: boolean) {
@@ -2564,8 +2571,8 @@ usePageHeader(() => ({
 useWorkbenchShortcuts({
   save: () => { void saveNow() },
   runAI: () => { void runLLMTranslation() },
-  focusPrev: () => { void focusSentenceByOffset(-1) },
-  focusNext: () => { void focusSentenceByOffset(1) },
+  focusPrev: () => { void focusSentenceByOffset(-1, { caretAtEnd: true }) },
+  focusNext: () => { void focusSentenceByOffset(1, { caretAtEnd: true }) },
   focusPrevSearchResult: () => { void focusSearchResultByOffset(-1) },
   focusNextSearchResult: () => { void focusSearchResultByOffset(1) },
   confirmSegment: () => { void confirmAndMoveToNextUnconfirmed() },
@@ -4480,26 +4487,71 @@ function toggleAllActiveTermQAItems(checked: boolean) {
   ])
 }
 
+function getTermQAItemDuplicateFingerprint(item: WorkbenchQAResultItem) {
+  return JSON.stringify([
+    item.source_kind,
+    item.rule_key,
+    item.message,
+    item.detail,
+    item.suggestion,
+    item.source_text,
+    item.target_text,
+  ])
+}
+
+function resolveTermQAIgnoreItemIds(itemIds: string[], ignored: boolean) {
+  const requestedIds = [...new Set(itemIds)]
+  const reportItems = termQAReport.value?.items || []
+  if (!ignored || !preferencesStore.batchIgnoreIdenticalQA || reportItems.length === 0) {
+    return requestedIds
+  }
+
+  const requestedIdSet = new Set(requestedIds)
+  const duplicateFingerprints = new Set(
+    reportItems
+      .filter((item) => !item.ignored && requestedIdSet.has(item.id))
+      .map(getTermQAItemDuplicateFingerprint),
+  )
+  if (duplicateFingerprints.size === 0) {
+    return requestedIds
+  }
+
+  const resolvedIds = new Set(requestedIds)
+  for (const item of reportItems) {
+    if (!item.ignored && duplicateFingerprints.has(getTermQAItemDuplicateFingerprint(item))) {
+      resolvedIds.add(item.id)
+    }
+  }
+  return [...resolvedIds]
+}
+
 async function setTermQAReportItemsIgnored(itemIds: string[], ignored: boolean) {
   if (!termQAReport.value || updatingTermQAIgnore.value || itemIds.length === 0) {
     return
   }
-  const nextItem = ignored ? findNextActiveTermQAReportItemAfter(itemIds) : null
+  const requestedItemIds = [...new Set(itemIds)]
+  const resolvedItemIds = resolveTermQAIgnoreItemIds(requestedItemIds, ignored)
+  const autoIncludedCount = Math.max(resolvedItemIds.length - requestedItemIds.length, 0)
+  const nextItem = ignored ? findNextActiveTermQAReportItemAfter(resolvedItemIds) : null
   updatingTermQAIgnore.value = true
   try {
     await http.patch(
       '/qa-result-items/ignore',
       {
-        item_ids: itemIds,
+        item_ids: resolvedItemIds,
         ignored,
       },
     )
-    updateCurrentTermQAReportItemsIgnored(itemIds, ignored)
+    updateCurrentTermQAReportItemsIgnored(resolvedItemIds, ignored)
     if (nextItem) {
       setTermQAReportPageForItem(nextItem.id)
       await focusTermQAReportItem(nextItem)
     }
-    toast.success(ignored ? '已忽略所选 QA 问题。' : '已恢复所选 QA 问题。')
+    if (ignored && autoIncludedCount > 0) {
+      toast.success(`已忽略 ${resolvedItemIds.length} 条 QA 问题（自动包含 ${autoIncludedCount} 条相同问题）。`)
+    } else {
+      toast.success(`${ignored ? '已忽略' : '已恢复'} ${resolvedItemIds.length} 条 QA 问题。`)
+    }
   } catch (error) {
     toast.error({
       title: ignored ? '忽略失败' : '恢复失败',
@@ -4511,33 +4563,7 @@ async function setTermQAReportItemsIgnored(itemIds: string[], ignored: boolean) 
 }
 
 async function setSingleTermQAReportItemIgnored(item: WorkbenchQAResultItem, ignored: boolean) {
-  if (updatingTermQAIgnore.value) {
-    return
-  }
-  const nextItem = ignored ? findNextActiveTermQAReportItemAfter([item.id]) : null
-  updatingTermQAIgnore.value = true
-  try {
-    await http.patch(
-      '/qa-result-items/ignore',
-      {
-        item_ids: [item.id],
-        ignored,
-      },
-    )
-    updateCurrentTermQAReportItemsIgnored([item.id], ignored)
-    if (nextItem) {
-      setTermQAReportPageForItem(nextItem.id)
-      await focusTermQAReportItem(nextItem)
-    }
-    toast.success(ignored ? '已忽略该 QA 问题。' : '已恢复该 QA 问题。')
-  } catch (error) {
-    toast.error({
-      title: ignored ? '忽略失败' : '恢复失败',
-      message: getErrorMessage(error, ignored ? '忽略 QA 问题失败。' : '恢复 QA 问题失败。'),
-    })
-  } finally {
-    updatingTermQAIgnore.value = false
-  }
+  await setTermQAReportItemsIgnored([item.id], ignored)
 }
 
 async function ignoreSelectedTermQAReportItems() {
@@ -4647,7 +4673,7 @@ async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
         : segment.sentence_id === item.sentence_id
     ))
     if (currentPageIndex >= 0) {
-      await focusEditorSegmentAtIndex(currentPageIndex)
+      await focusEditorSegmentAtIndex(currentPageIndex, { caretAtEnd: true })
       return
     }
 
@@ -4686,7 +4712,7 @@ async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
       toast.warn('已切换到目标页，但未找到对应句段。')
       return
     }
-    await focusEditorSegmentAtIndex(targetIndex)
+    await focusEditorSegmentAtIndex(targetIndex, { caretAtEnd: true })
   } catch (error) {
     toast.error({
       title: '跳转 QA 句段失败',
@@ -6389,7 +6415,7 @@ function clearActiveTarget() {
   toast.success(t('workbench.ribbon.messages.targetCleared'))
 }
 
-function setActiveTargetSpacePlaceholder() {
+async function setActiveTargetSpacePlaceholder() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
@@ -6399,12 +6425,15 @@ function setActiveTargetSpacePlaceholder() {
     return
   }
 
+  const sentenceId = segmentKeyOf(activeSegment.value)
   updateSegmentTarget(
-    segmentKeyOf(activeSegment.value),
+    sentenceId,
     ' ',
     undefined,
     { recordUndo: true, undoInputType: 'spacePlaceholder' },
   )
+  await nextTick()
+  segmentEditorRowRefs.get(sentenceId)?.focusTargetEditorAtEnd()
   toast.success(t('workbench.ribbon.messages.spacePlaceholderSet'))
 }
 
@@ -7270,9 +7299,21 @@ async function exportWithTypeForFile(exportType: string, fileRecordId?: string |
 
     const styleActive = exportStyleSettings.value.enabled || Boolean(exportStyleSettings.value.pptx?.enabled)
     const stylePayload = styleActive ? exportStyleSettings.value : null
+    const includeRevisionMarks = (
+      exportType === 'original'
+      && segmentStore.revisionTrackingEnabled
+    )
+    const exportPayload = (
+      stylePayload || includeRevisionMarks
+        ? {
+            ...(stylePayload ? { style_settings: stylePayload } : {}),
+            ...(includeRevisionMarks ? { include_revision_marks: true } : {}),
+          }
+        : null
+    )
     const { data: task } = await http.post<FileExportTask>(
       `/file-records/${targetFileRecordId}/exports`,
-      stylePayload ? { style_settings: stylePayload } : null,
+      exportPayload,
       { params: { type: exportType } },
     )
     const completedTask = await waitForFileExportTask(task)
@@ -9567,7 +9608,7 @@ onBeforeRouteLeave(async () => {
                       :revision-settings="segmentStore.revisionSettings"
                       :revision-busy="revisionActionLoading"
                       :matched-terms="segmentStore.activeSentenceId === segmentKeyOf(item) ? activeMatchedTerms : []"
-                      :qa-issues="item.qa_issues || []"
+                      :qa-issues="segmentStore.getInlineSpellingIssues(item)"
                       :source-search-query="sourceSearchQuery"
                       :target-search-query="targetSearchQuery"
                       :search-case-sensitive="searchCaseSensitive"
@@ -9856,6 +9897,21 @@ onBeforeRouteLeave(async () => {
                   </div>
 
                   <div class="term-qa-dialog__actions">
+                    <label
+                      v-if="termQAReport && termQAReport.items.length > 0"
+                      class="term-qa-dialog__toggle term-qa-dialog__batch-ignore-toggle"
+                      :class="{ 'is-disabled': updatingTermQAIgnore }"
+                      title="开启后，忽略时会同时处理当前 QA 结果中跨分页、跨文件的完全相同问题"
+                    >
+                      <input
+                        type="checkbox"
+                        :checked="preferencesStore.batchIgnoreIdenticalQA"
+                        :disabled="updatingTermQAIgnore"
+                        aria-label="相同问题批量忽略"
+                        @change="preferencesStore.setBatchIgnoreIdenticalQA(($event.target as HTMLInputElement).checked)"
+                      >
+                      <span>相同问题批量忽略</span>
+                    </label>
                     <select
                       v-if="termQAReport && termQAReport.items.length > 0"
                       v-model="termQAReportFilter"
@@ -10932,7 +10988,7 @@ onBeforeRouteLeave(async () => {
                 </thead>
                 <tbody>
                   <tr v-for="item in resourceSearchItems" :key="`${item.type}-${item.id}`">
-                    <td>
+                    <td data-label="类型">
                       <span
                         class="resource-search-panel__badge"
                         :class="`is-${item.type}`"
@@ -10940,14 +10996,19 @@ onBeforeRouteLeave(async () => {
                       >
                         {{ item.type === 'tm' ? 'TM' : 'TB' }}
                       </span>
+                      <span v-if="item.library_name" class="resource-search-panel__library-name">
+                        {{ item.library_name }}
+                      </span>
                     </td>
                     <td
                       class="resource-search-panel__text"
+                      data-label="原文"
                       :title="item.source_text"
                       v-html="renderResourceSearchResultText(item.source_text)"
                     ></td>
                     <td
                       class="resource-search-panel__text"
+                      data-label="译文"
                       :title="item.target_text"
                       v-html="renderResourceSearchResultText(item.target_text)"
                     ></td>
@@ -11098,18 +11159,36 @@ onBeforeRouteLeave(async () => {
           </div>
 
           <div class="quality-qa-adjust-dialog__options">
-            <label
+            <div
               v-for="rule in qualityQARules"
               :key="rule.key"
               class="quality-qa-adjust-dialog__option"
             >
-              <input
-                v-model="qualityQADraft.rules[rule.key]"
-                type="checkbox"
-                :disabled="savingQualityQASettings"
+              <label class="quality-qa-adjust-dialog__option-main">
+                <input
+                  v-model="qualityQADraft.rules[rule.key]"
+                  type="checkbox"
+                  :disabled="savingQualityQASettings"
+                >
+                <span class="quality-qa-adjust-dialog__option-label">{{ rule.label }}</span>
+              </label>
+              <button
+                v-if="rule.key === 'term_inconsistency'"
+                class="quality-qa-adjust-dialog__case-switch"
+                :class="{ 'is-active': qualityQADraft.termQACaseSensitive }"
+                type="button"
+                role="switch"
+                :aria-checked="qualityQADraft.termQACaseSensitive"
+                :aria-label="qualityQADraft.termQACaseSensitive ? '术语不一致检查区分大小写' : '术语不一致检查不区分大小写'"
+                :disabled="savingQualityQASettings || !qualityQADraft.rules.term_inconsistency"
+                @click="qualityQADraft.termQACaseSensitive = !qualityQADraft.termQACaseSensitive"
               >
-              <span>{{ rule.label }}</span>
-            </label>
+                <span class="quality-qa-adjust-dialog__case-switch-track" aria-hidden="true">
+                  <span class="quality-qa-adjust-dialog__case-switch-thumb"></span>
+                </span>
+                <span>{{ qualityQADraft.termQACaseSensitive ? '区分大小写' : '不区分大小写' }}</span>
+              </button>
+            </div>
           </div>
 
           <p v-if="qualityQASettingsError" class="form-message is-error">{{ qualityQASettingsError }}</p>
@@ -12941,6 +13020,20 @@ onBeforeRouteLeave(async () => {
   user-select: none;
 }
 
+.term-qa-dialog__toggle input {
+  margin: 0;
+  accent-color: #0d7a68;
+}
+
+.term-qa-dialog__toggle.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.term-qa-dialog__batch-ignore-toggle {
+  white-space: nowrap;
+}
+
 .number-check__col-reason {
   width: 34%;
 }
@@ -13225,7 +13318,6 @@ onBeforeRouteLeave(async () => {
   border: 1px solid var(--border-color, #dbe3ea);
   border-radius: 8px;
   background: #ffffff;
-  cursor: pointer;
 }
 
 .quality-qa-adjust-dialog__option:hover {
@@ -13240,11 +13332,68 @@ onBeforeRouteLeave(async () => {
   accent-color: #0d7a68;
 }
 
-.quality-qa-adjust-dialog__option span {
+.quality-qa-adjust-dialog__option-main {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.quality-qa-adjust-dialog__option-label {
+  flex: 1 1 auto;
   min-width: 0;
   color: var(--text-primary, #1f2f36);
   font-size: 13px;
   line-height: 1.35;
+}
+
+.quality-qa-adjust-dialog__case-switch {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary, #52646d);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.quality-qa-adjust-dialog__case-switch:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.quality-qa-adjust-dialog__case-switch-track {
+  position: relative;
+  width: 28px;
+  height: 16px;
+  border-radius: 999px;
+  background: #b8c5ca;
+  transition: background 0.18s ease;
+}
+
+.quality-qa-adjust-dialog__case-switch.is-active .quality-qa-adjust-dialog__case-switch-track {
+  background: #0d7a68;
+}
+
+.quality-qa-adjust-dialog__case-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 24%);
+  transition: transform 0.18s ease;
+}
+
+.quality-qa-adjust-dialog__case-switch.is-active .quality-qa-adjust-dialog__case-switch-thumb {
+  transform: translateX(12px);
 }
 
 .workbench-toolbar__progress {
@@ -14214,19 +14363,26 @@ onBeforeRouteLeave(async () => {
   padding: 18px;
   overflow: hidden;
   background: linear-gradient(180deg, #ffffff 0%, #f7fbfb 100%);
+  container-type: inline-size;
+  container-name: resource-search-panel;
 }
 
 .resource-search-panel__header {
   display: flex;
+  flex: 0 0 auto;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
 }
 
 .resource-search-panel__bar {
+  position: relative;
+  z-index: 2;
   display: grid;
   grid-template-columns: 118px minmax(0, 1fr) 44px;
+  flex: 0 0 auto;
   align-items: center;
+  min-height: 36px;
   overflow: hidden;
   border: 1px solid #c9d7dd;
   border-radius: 6px;
@@ -14272,6 +14428,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .resource-search-panel__message {
+  flex: 0 0 auto;
   min-height: 20px;
   color: #647780;
   font-size: 12px;
@@ -14282,6 +14439,7 @@ onBeforeRouteLeave(async () => {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
   border: 1px solid #d6e1e5;
   border-radius: 6px;
   background: #fff;
@@ -14372,8 +14530,85 @@ onBeforeRouteLeave(async () => {
   background: #5b8edc;
 }
 
+.resource-search-panel__library-name {
+  display: none;
+}
+
 .resource-search-panel__empty {
   margin-top: 16px;
+}
+
+@container resource-search-panel (max-width: 620px) {
+  .resource-search-panel__table {
+    display: block;
+  }
+
+  .resource-search-panel__table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .resource-search-panel__table tbody {
+    display: grid;
+    gap: 10px;
+    padding: 10px;
+  }
+
+  .resource-search-panel__table tr {
+    display: block;
+    overflow: hidden;
+    border: 1px solid #d8e4e9;
+    border-radius: 7px;
+    background: #fff;
+    box-shadow: 0 2px 7px rgba(31, 69, 81, 0.06);
+  }
+
+  .resource-search-panel__table tbody tr:nth-child(even) {
+    background: #fff;
+  }
+
+  .resource-search-panel__table td,
+  .resource-search-panel__table td:first-child {
+    display: block;
+    width: auto;
+    padding: 9px 11px;
+    border-bottom: 1px solid #e4edf0;
+    text-align: left;
+  }
+
+  .resource-search-panel__table td:first-child {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    background: #f3f8fa;
+  }
+
+  .resource-search-panel__table td:last-child {
+    border-bottom: 0;
+  }
+
+  .resource-search-panel__table td:not(:first-child)::before {
+    display: block;
+    margin-bottom: 4px;
+    color: #69808a;
+    content: attr(data-label);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+  }
+
+  .resource-search-panel__library-name {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    color: #526b75;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 }
 
 .segment-editor-bottom-tools {
@@ -15726,8 +15961,8 @@ onBeforeRouteLeave(async () => {
 }
 
 @media (max-width: 1180px) {
-  .workbench-layout,
-  .workbench-layout.has-active-tool {
+  .workbench-page.is-stable-grid .workbench-layout,
+  .workbench-page.is-stable-grid .workbench-layout.has-active-tool {
     grid-template-columns: minmax(0, 1fr);
   }
 
@@ -15736,7 +15971,7 @@ onBeforeRouteLeave(async () => {
     grid-row: 2;
   }
 
-  .segment-editor-side-tools {
+  .workbench-layout.has-active-tool .segment-editor-side-tools {
     grid-column: 1;
     grid-row: 1;
     order: -1;
@@ -15750,6 +15985,28 @@ onBeforeRouteLeave(async () => {
     padding: 4px 0;
     border-left: 0;
     border-bottom: 1px solid #d9e4e8;
+  }
+
+  .workbench-page.is-standalone .workbench-layout.has-active-tool {
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .workbench-page.is-standalone .workbench-layout.has-active-tool .panel--editor,
+  .workbench-page.is-standalone .workbench-layout.has-active-tool .workbench-sidecar {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .workbench-page.is-standalone .workbench-layout.has-active-tool .workbench-sidecar,
+  .workbench-page.is-standalone .workbench-layout.has-active-tool .workbench-sidecar__panel {
+    width: 100% !important;
+    min-width: 0;
+    height: 100%;
+    max-height: 100%;
+  }
+
+  .workbench-page.is-standalone .workbench-layout.has-active-tool .workbench-sidecar {
+    z-index: 4;
   }
 
   .segment-editor-side-tool {

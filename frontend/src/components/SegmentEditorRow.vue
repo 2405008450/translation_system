@@ -6,7 +6,7 @@ import InteractiveDiffText from './InteractiveDiffText.vue'
 
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
 import { useAuthStore } from '../stores/auth'
-import type { RevisionDisplaySettings, Segment, SegmentQAIssue, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
+import type { LiveSpellingIssue, RevisionDisplaySettings, Segment, SegmentQAIssue, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
 import { findTermTextRanges } from '../utils/termMatching'
 import { computeDiff } from '../utils/textDiff'
 import type { TextFormat } from '../composables/useRichTextEditor'
@@ -22,7 +22,7 @@ const props = withDefaults(defineProps<{
   revisionSettings?: RevisionDisplaySettings | null
   revisionBusy?: boolean
   matchedTerms?: TermEntryRecord[]
-  qaIssues?: SegmentQAIssue[]
+  qaIssues?: Array<SegmentQAIssue | LiveSpellingIssue>
   sourceSearchQuery?: string
   targetSearchQuery?: string
   searchCaseSensitive?: boolean
@@ -130,6 +130,8 @@ interface LocalEditorEcho {
 type HighlightKind = 'term' | 'search' | 'qa'
 type HighlightPart = { text: string; highlight: boolean; kind?: HighlightKind; title?: string }
 type BasicFormatTag = 'b' | 'i' | 'u' | 's' | 'sub' | 'sup'
+type BasicFormatRun = { text: string; tags: BasicFormatTag[] }
+type InlineSpellingIssue = SegmentQAIssue | LiveSpellingIssue
 
 const BASIC_FORMAT_TAGS = ['b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'sub', 'sup']
 const BASIC_FORMAT_RENDER_ORDER: BasicFormatTag[] = ['b', 'i', 'u', 's', 'sub', 'sup']
@@ -502,15 +504,21 @@ const activeQAIssues = computed(() => {
     .sort((a, b) => a.offset - b.offset || b.length - a.length)
 })
 
-function highlightQAText(text: string, issues: SegmentQAIssue[]): HighlightPart[] | null {
+function highlightQAText(
+  text: string,
+  issues: InlineSpellingIssue[],
+  absoluteOffset = 0,
+): HighlightPart[] | null {
   if (!text || issues.length === 0) {
     return null
   }
 
   const ranges: Array<{ start: number; end: number; title: string }> = []
   for (const issue of issues) {
-    const start = Math.max(0, issue.offset)
-    const end = Math.min(text.length, start + Math.max(0, issue.length))
+    const issueStart = Math.max(0, issue.offset)
+    const issueEnd = issueStart + Math.max(0, issue.length)
+    const start = Math.max(0, issueStart - absoluteOffset)
+    const end = Math.min(text.length, issueEnd - absoluteOffset)
     if (end <= start) continue
     const overlaps = ranges.some((range) => !(end <= range.start || start >= range.end))
     if (overlaps) continue
@@ -911,36 +919,33 @@ function handleTargetPreviewClick(event: MouseEvent): void {
   void focusTargetPreview()
 }
 
-function renderTargetTextWithHighlights(text: string): string {
+function renderTargetTextWithHighlights(text: string, absoluteOffset = 0): string {
   // 编辑框永远只展示纯文本（+搜索/术语高亮）。样式/标记只在独立的只读预览元素里
   // 渲染，绝不进入这里——避免样式标记与可编辑 DOM 相互干扰。
   // 对可能残留 ⟦n⟧ 的历史数据做一次防御性剥离，避免裸标记泄漏到编辑框里。
   const plainText = hasFormatMarks(text) ? text.replace(FORMAT_MARK_RE, '') : text
-  const parts = getTargetHighlightParts(plainText)
+  const parts = absoluteOffset > 0
+    ? highlightQAText(plainText, activeQAIssues.value, absoluteOffset)
+    : getTargetHighlightParts(plainText)
   return !parts ? textToVisibleChars(plainText) : renderHighlightPartsAsHtml(parts, plainText)
 }
 
-function shouldRenderTargetHighlights(): boolean {
-  return !isFocused.value
-}
-
 function getTargetHighlightParts(text: string): HighlightPart[] | null {
-  if (!shouldRenderTargetHighlights()) {
-    return null
-  }
-  return highlightSearchText(text, props.targetSearchQuery, props.searchCaseSensitive)
-    || highlightText(text, props.matchedTerms || [], 'target_text')
-    || highlightQAText(text, activeQAIssues.value)
-}
-
-function hasTargetHighlightSources(): boolean {
-  return Boolean(resolveSearchKeyword(props.targetSearchQuery))
-    || (props.matchedTerms || []).some((term) => Boolean(term.target_text))
-    || activeQAIssues.value.length > 0
+  return highlightQAText(text, activeQAIssues.value)
+    || (!isFocused.value
+      ? highlightSearchText(text, props.targetSearchQuery, props.searchCaseSensitive)
+        || highlightText(text, props.matchedTerms || [], 'target_text')
+      : null)
 }
 
 function hasRenderedTargetHighlights(): boolean {
-  return shouldRenderTargetHighlights() && hasTargetHighlightSources()
+  if (activeQAIssues.value.length > 0) {
+    return true
+  }
+  return !isFocused.value && (
+    Boolean(resolveSearchKeyword(props.targetSearchQuery))
+    || (props.matchedTerms || []).some((term) => Boolean(term.target_text))
+  )
 }
 
 function hasRenderedEditorDecorations(): boolean {
@@ -1002,19 +1007,26 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
 }
 
 function renderTargetHtmlWithHighlights(targetHtml: string): string {
-  if (!hasRenderedTargetHighlights() || typeof document === 'undefined') {
+  if (
+    (!hasRenderedTargetHighlights() && !props.showVisibleChars)
+    || typeof document === 'undefined'
+  ) {
     return targetHtml
   }
 
   const template = document.createElement('template')
   template.innerHTML = targetHtml
+  let absoluteOffset = 0
 
   function processNode(node: Node) {
     if (node.nodeType === Node.TEXT_NODE) {
       const text = node.textContent || ''
       if (!text) return
       const wrapper = document.createElement('span')
-      wrapper.innerHTML = renderTargetTextWithHighlights(text)
+      wrapper.innerHTML = hasRenderedTargetHighlights()
+        ? renderTargetTextWithHighlights(text, absoluteOffset)
+        : textToVisibleChars(text)
+      absoluteOffset += text.length
       const textNode = node as ChildNode
       textNode.replaceWith(...Array.from(wrapper.childNodes))
       return
@@ -1025,6 +1037,10 @@ function renderTargetHtmlWithHighlights(targetHtml: string): string {
     }
 
     const element = node as HTMLElement
+    if (element.tagName === 'BR') {
+      absoluteOffset += 1
+      return
+    }
     if (
       element.matches('script, style')
       || element.classList.contains('doc-math')
@@ -1077,8 +1093,11 @@ function renderTargetWithSourceFormats(text: string): string {
   if (!text || !props.segment.source_html || hasFormatMarks(text) || hasFormatMap) {
     return targetHtml
   }
-  const sourceFormatTags = getPrimarySourceFormatTags(props.segment.source_html)
-  return wrapWithBasicFormats(targetHtml, sourceFormatTags)
+  const inheritedHtml = projectSourceFormatsToTarget(props.segment.source_html, text)
+  if (!inheritedHtml) {
+    return renderTargetTextHtml(text)
+  }
+  return renderTargetHtmlWithHighlights(inheritedHtml)
 }
 
 function saveCaretPosition(el: HTMLElement): number {
@@ -1135,18 +1154,53 @@ function isRevisionDeleteNode(node: Node): boolean {
   return Boolean(element?.closest('[data-revision-type="delete"]'))
 }
 
+function isVisibleCharacterMarker(node: Node | null): node is HTMLElement {
+  return Boolean(
+    node
+    && node.nodeType === Node.ELEMENT_NODE
+    && (node as HTMLElement).classList.contains('visible-char'),
+  )
+}
+
+function isVisibleNewlineMarker(node: Node | null): node is HTMLElement {
+  return isVisibleCharacterMarker(node) && node.classList.contains('visible-char--newline')
+}
+
+/**
+ * 可见换行渲染为“¶ 标记 + \n 文本节点”。后面的 \n 只负责视觉断行，
+ * 序列化和光标偏移时必须忽略，否则每次状态回填都会把一个换行复制成两个。
+ */
+function getSerializableTextNodeValue(node: Node): string {
+  const text = node.textContent || ''
+  if (
+    node.nodeType === Node.TEXT_NODE
+    && isVisibleNewlineMarker(node.previousSibling)
+    && text.startsWith('\n')
+  ) {
+    return text.slice(1)
+  }
+  return text
+}
+
+function getSerializableTextNodeDomStart(node: Node): number {
+  return (
+    node.nodeType === Node.TEXT_NODE
+    && isVisibleNewlineMarker(node.previousSibling)
+    && (node.textContent || '').startsWith('\n')
+  ) ? 1 : 0
+}
+
 function getSerializableNodeLength(node: Node): number {
   if (isRevisionDeleteNode(node)) {
     return 0
   }
   if (
-    node.nodeType === Node.ELEMENT_NODE
-    && (node as HTMLElement).classList.contains('visible-char')
+    isVisibleCharacterMarker(node)
   ) {
     return 1
   }
   if (node.nodeType === Node.TEXT_NODE) {
-    return node.textContent?.length || 0
+    return getSerializableTextNodeValue(node).length
   }
   if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR') {
     return 1
@@ -1168,7 +1222,7 @@ function serializeEditorContent(node: Node): string {
     if (el.classList.contains('visible-char--newline')) return '\n'
   }
   if (node.nodeType === Node.TEXT_NODE) {
-    return node.textContent || ''
+    return getSerializableTextNodeValue(node)
   }
   if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR') {
     return '\n'
@@ -1190,7 +1244,7 @@ function serializeEditorContentWithFormat(node: Node): string {
     return escapeHtml(serializeEditorContent(node))
   }
   if (node.nodeType === Node.TEXT_NODE) {
-    return escapeHtml(node.textContent || '')
+    return escapeHtml(getSerializableTextNodeValue(node))
   }
   if (node.nodeType === Node.ELEMENT_NODE) {
     const el = node as HTMLElement
@@ -1229,9 +1283,10 @@ function getSerializableOffsetForPosition(el: HTMLElement, container: Node, posi
 
     if (node === container) {
       if (node.nodeType === Node.TEXT_NODE) {
-        offset += isRevisionDeleteNode(node)
-          ? 0
-          : (node.textContent || '').slice(0, positionOffset).length
+        if (!isRevisionDeleteNode(node)) {
+          const domStart = getSerializableTextNodeDomStart(node)
+          offset += Math.max(0, positionOffset - domStart)
+        }
       } else {
         const children = Array.from(node.childNodes).slice(0, positionOffset)
         offset += children.reduce((total, child) => total + getSerializableNodeLength(child), 0)
@@ -1240,7 +1295,11 @@ function getSerializableOffsetForPosition(el: HTMLElement, container: Node, posi
       return true
     }
 
-    if (node.nodeType === Node.TEXT_NODE || (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR')) {
+    if (
+      node.nodeType === Node.TEXT_NODE
+      || isVisibleCharacterMarker(node)
+      || (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR')
+    ) {
       offset += getSerializableNodeLength(node)
       return false
     }
@@ -1301,12 +1360,29 @@ function resolveSerializablePosition(el: HTMLElement, targetOffset: number): { n
       return false
     }
 
+    if (isVisibleCharacterMarker(node)) {
+      const parent = node.parentNode || el
+      const index = Math.max(0, getNodeIndex(node))
+      if (normalizedOffset <= currentOffset) {
+        resolved = { node: parent, offset: index }
+        return true
+      }
+      currentOffset += 1
+      fallback = { node: parent, offset: index + 1 }
+      if (normalizedOffset <= currentOffset) {
+        resolved = fallback
+        return true
+      }
+      return false
+    }
+
     if (node.nodeType === Node.TEXT_NODE) {
-      const textLength = node.textContent?.length || 0
+      const domStart = getSerializableTextNodeDomStart(node)
+      const textLength = getSerializableTextNodeValue(node).length
       if (currentOffset + textLength >= normalizedOffset) {
         resolved = {
           node,
-          offset: Math.max(0, Math.min(textLength, normalizedOffset - currentOffset)),
+          offset: domStart + Math.max(0, Math.min(textLength, normalizedOffset - currentOffset)),
         }
         return true
       }
@@ -1439,7 +1515,8 @@ function commitEditorContent(): CommittedEditorContent | null {
   const currentText = getTargetStateText()
   const currentHtml = getTargetStateHtml()
 
-  if (text !== currentText || (editorDirtySinceFocus.value && html !== currentHtml)) {
+  const shouldSyncInheritedHtml = currentHtml === null && html !== null
+  if (text !== currentText || ((editorDirtySinceFocus.value || shouldSyncInheritedHtml) && html !== currentHtml)) {
     setLocalEditorEcho(text, html)
     emit('update', segmentKey.value, text, html || undefined)
   }
@@ -1917,15 +1994,9 @@ function insertEditorLineBreak() {
   }
 
   recordUndoSnapshot(true, { force: true, inputType: 'insertLineBreak' })
-  if (props.showVisibleChars) {
-    document.execCommand(
-      'insertHTML',
-      false,
-      '<span class="visible-char visible-char--newline" contenteditable="false">¶</span>\n',
-    )
-  } else {
-    document.execCommand('insertLineBreak')
-  }
+  // 始终只编辑真实内容。¶ 属于显示层，状态同步后再按 showVisibleChars 渲染，
+  // 避免相邻换行被写成不可编辑的 “¶¶” DOM。
+  document.execCommand('insertLineBreak')
   handleInput()
 }
 
@@ -2311,20 +2382,26 @@ function sanitizeSourceHtml(html: string): string {
 /**
  * 只把句段编辑中允许渲染的基础格式规范化为内部标签名。
  */
-function getPrimarySourceFormatTags(sourceHtml: string): BasicFormatTag[] {
+function collectBasicSourceFormatRuns(sourceHtml: string): BasicFormatRun[] {
   if (typeof document === 'undefined') {
     return []
   }
 
   const template = document.createElement('template')
   template.innerHTML = sanitizeHtml(sourceHtml)
-  const textRuns: Array<{ text: string; tags: BasicFormatTag[] }> = []
+  const textRuns: BasicFormatRun[] = []
 
   function walk(node: Node, inheritedTags: BasicFormatTag[]) {
     if (node.nodeType === Node.TEXT_NODE) {
       const text = node.textContent || ''
       if (text) {
-        textRuns.push({ text, tags: normalizeFormatTagList(inheritedTags) })
+        const tags = normalizeFormatTagList(inheritedTags)
+        const previous = textRuns[textRuns.length - 1]
+        if (previous && formatTagKey(previous.tags) === formatTagKey(tags)) {
+          previous.text += text
+        } else {
+          textRuns.push({ text, tags })
+        }
       }
       return
     }
@@ -2344,11 +2421,105 @@ function getPrimarySourceFormatTags(sourceHtml: string): BasicFormatTag[] {
   }
 
   Array.from(template.content.childNodes).forEach((child) => walk(child, []))
-  const firstNonEmptyRun = textRuns.find((run) => run.text.trim())
-  if (firstNonEmptyRun?.tags.length) {
-    return firstNonEmptyRun.tags
+  return textRuns
+}
+
+/**
+ * 将源文档字符格式保守地投影到译文。
+ * 文本未变化时逐 run 保留；文本变化后只继承全段共同格式，并迁移唯一匹配的
+ * 带格式片段，避免把首个 run 的下划线或粗体扩散到整句。
+ */
+function projectSourceFormatsToTarget(sourceHtml: string, targetText: string): string | null {
+  if (!targetText || /<\s*a\b/i.test(sourceHtml)) {
+    return null
   }
-  return textRuns.find((run) => run.tags.length)?.tags || []
+
+  const sourceRuns = collectBasicSourceFormatRuns(sourceHtml)
+  if (!sourceRuns.some((run) => run.tags.length > 0)) {
+    return null
+  }
+
+  const sourceText = sourceRuns.map((run) => run.text).join('')
+  if (
+    sourceText === targetText
+    || collapseProjectionWhitespace(sourceText) === collapseProjectionWhitespace(targetText)
+  ) {
+    return sourceRuns
+      .map((run) => wrapWithBasicFormats(escapeHtml(run.text), run.tags))
+      .join('')
+  }
+
+  const meaningfulRuns = sourceRuns.filter((run) => run.text.trim())
+  const commonTags = BASIC_FORMAT_RENDER_ORDER.filter((tag) => (
+    meaningfulRuns.length > 0 && meaningfulRuns.every((run) => run.tags.includes(tag))
+  ))
+  const targetTags = Array.from(
+    { length: targetText.length },
+    () => new Set<BasicFormatTag>(commonTags),
+  )
+
+  const candidates = sourceRuns
+    .filter((run) => run.tags.length > 0 && (run.text.match(/[\p{L}\p{N}]/gu) || []).length >= 2)
+    .sort((left, right) => right.text.length - left.text.length)
+
+  candidates.forEach((run) => {
+    const matches = findWhitespaceFlexibleMatches(targetText, run.text)
+    if (matches.length !== 1) {
+      return
+    }
+    const [match] = matches
+    for (let index = match.start; index < match.end; index += 1) {
+      run.tags.forEach((tag) => targetTags[index].add(tag))
+    }
+  })
+
+  if (!targetTags.some((tags) => tags.size > 0)) {
+    return null
+  }
+  return renderTextWithFormatSets(targetText, targetTags)
+}
+
+function collapseProjectionWhitespace(text: string): string {
+  return text.trim().replace(/\s+/gu, ' ')
+}
+
+function findWhitespaceFlexibleMatches(text: string, candidate: string): EditorTextRange[] {
+  const stripped = candidate.trim()
+  if (!stripped) {
+    return []
+  }
+  const pattern = stripped
+    .split(/\s+/u)
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('\\s+')
+  const expression = new RegExp(pattern, 'gu')
+  return Array.from(text.matchAll(expression), (match) => ({
+    start: match.index,
+    end: match.index + match[0].length,
+  }))
+}
+
+function renderTextWithFormatSets(text: string, formatSets: Array<Set<BasicFormatTag>>): string {
+  const parts: string[] = []
+  let start = 0
+  while (start < text.length) {
+    const currentTags = normalizeFormatTagList(Array.from(formatSets[start]))
+    const currentKey = formatTagKey(currentTags)
+    let end = start + 1
+    while (
+      end < text.length
+      && formatTagKey(normalizeFormatTagList(Array.from(formatSets[end]))) === currentKey
+    ) {
+      end += 1
+    }
+    parts.push(wrapWithBasicFormats(escapeHtml(text.slice(start, end)), currentTags))
+    start = end
+  }
+  return parts.join('')
+}
+
+function formatTagKey(tags: BasicFormatTag[]): string {
+  return normalizeFormatTagList(tags).join('|')
 }
 
 function normalizeFormatTagList(tags: BasicFormatTag[]): BasicFormatTag[] {
@@ -2540,6 +2711,14 @@ watch(
       tagPopover.value = null
     }
   },
+)
+
+watch(
+  () => activeQAIssues.value
+    .map((issue) => `${issue.id}:${issue.offset}:${issue.length}:${issue.target_text_hash}`)
+    .join('|'),
+  () => syncFocusedTargetHighlightsFromState(),
+  { flush: 'post' },
 )
 
 watch(

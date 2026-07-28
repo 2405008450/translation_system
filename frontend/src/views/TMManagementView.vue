@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { FileCode2, FileSpreadsheet, GitMerge, Loader2, Pencil, Plus, Search, Trash2, X } from 'lucide-vue-next'
+import { FileCode2, FileSpreadsheet, GitMerge, ListPlus, Loader2, Pencil, Plus, Search, Trash2, X } from 'lucide-vue-next'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
@@ -43,6 +43,17 @@ interface TMCollectionMergeSummary {
   merged_rows: number
 }
 
+interface TMCollectionAppendSummary {
+  collection: TMCollection
+  source_count: number
+  created_rows: number
+  updated_rows: number
+  skipped_rows: number
+  appended_rows: number
+  refreshed_segments: number
+  duplicate_policy: 'keep' | 'overwrite'
+}
+
 const router = useRouter()
 const confirm = useConfirm()
 const authStore = useAuthStore()
@@ -69,6 +80,11 @@ const mergeName = ref('')
 const mergeDescription = ref('')
 const mergeMessage = ref('')
 const mergeSubmitting = ref(false)
+const showAppendDialog = ref(false)
+const appendTargetCollectionId = ref('')
+const appendDuplicatePolicy = ref<'keep' | 'overwrite'>('keep')
+const appendMessage = ref('')
+const appendSubmitting = ref(false)
 const deletingCollections = ref(false)
 const exportingKey = ref('')
 const currentExportTaskId = ref('')
@@ -134,6 +150,33 @@ const mergeLanguagePairLabel = computed(() => {
 })
 
 const canMergeSelectedCollections = computed(() => !getSelectedCollectionsMergeError())
+const appendTargetCollections = computed<TMCollection[]>(() => {
+  const first = selectedCollections.value[0]
+  if (!first) {
+    return []
+  }
+  const sourcePair = canonicalizeLanguagePair(first.source_language, first.target_language)
+  if (!sourcePair) {
+    return []
+  }
+  return tmCollections.value
+    .filter((collection) => {
+      if (selectedIds.value.has(collection.id)) {
+        return false
+      }
+      const candidatePair = canonicalizeLanguagePair(
+        collection.source_language,
+        collection.target_language,
+      )
+      return Boolean(
+        candidatePair
+        && candidatePair.source === sourcePair.source
+        && candidatePair.target === sourcePair.target,
+      )
+    })
+    .sort((left, right) => right.entry_count - left.entry_count || left.name.localeCompare(right.name))
+})
+const canAppendSelectedCollections = computed(() => !getSelectedCollectionsAppendError())
 const hasLanguageFilter = computed(() => Boolean(filterSourceLanguage.value || filterTargetLanguage.value))
 
 function formatDate(value: string) {
@@ -432,6 +475,104 @@ async function mergeSelectedCollections() {
   }
 }
 
+function getSelectedCollectionsAppendError() {
+  const collections = selectedCollections.value
+  if (collections.length < 1) {
+    return '请至少选择一个要追加的来源记忆库。'
+  }
+  const pairs = collections.map((collection) => (
+    canonicalizeLanguagePair(collection.source_language, collection.target_language)
+  ))
+  if (pairs.some((pair) => pair === null)) {
+    return '选中的来源记忆库缺少有效语言对，无法追加。'
+  }
+  const first = pairs[0]!
+  const hasMismatch = pairs.some(
+    (pair) => pair!.source !== first.source || pair!.target !== first.target,
+  )
+  if (hasMismatch) {
+    return '只能同时追加语言对完全一致的来源记忆库。'
+  }
+  return appendTargetCollections.value.length > 0
+    ? ''
+    : '没有可作为目标的同语言对记忆库。'
+}
+
+function openAppendDialog() {
+  if (!canManageResources.value) {
+    collectionMessage.value = '当前账号只能查看和导出记忆库。'
+    return
+  }
+  const error = getSelectedCollectionsAppendError()
+  if (error) {
+    collectionMessage.value = error
+    return
+  }
+  appendTargetCollectionId.value = ''
+  appendDuplicatePolicy.value = 'keep'
+  appendMessage.value = ''
+  showAppendDialog.value = true
+}
+
+function closeAppendDialog() {
+  if (appendSubmitting.value) {
+    return
+  }
+  showAppendDialog.value = false
+}
+
+async function appendSelectedCollections() {
+  if (!canManageResources.value) {
+    appendMessage.value = '当前账号只能查看和导出记忆库。'
+    return
+  }
+  const error = getSelectedCollectionsAppendError()
+  if (error) {
+    appendMessage.value = error
+    return
+  }
+  const targetCollection = appendTargetCollections.value.find(
+    (collection) => collection.id === appendTargetCollectionId.value,
+  )
+  if (!targetCollection) {
+    appendMessage.value = '请选择要追加到的目标记忆库。'
+    return
+  }
+  if (appendDuplicatePolicy.value === 'overwrite') {
+    const confirmed = await confirm({
+      title: '确认覆盖目标库重复条目',
+      message: `追加到“${targetCollection.name}”时，同原文条目将使用来源库译文覆盖。此操作会修改现有目标库，是否继续？`,
+      confirmText: '覆盖并追加',
+      danger: true,
+    })
+    if (!confirmed) {
+      return
+    }
+  }
+
+  appendSubmitting.value = true
+  appendMessage.value = ''
+  try {
+    const { data } = await http.post<TMCollectionAppendSummary>(
+      '/translation-memory/collections/append',
+      {
+        target_collection_id: targetCollection.id,
+        source_collection_ids: selectedCollections.value.map((collection) => collection.id),
+        duplicate_policy: appendDuplicatePolicy.value,
+      },
+    )
+    showAppendDialog.value = false
+    await loadCollections()
+    selectedIds.value = new Set([data.collection.id])
+    selectedCollectionId.value = data.collection.id
+    collectionMessage.value = `已将 ${data.source_count} 个来源库追加到“${data.collection.name}”：新增 ${data.created_rows} 条，覆盖 ${data.updated_rows} 条，跳过 ${data.skipped_rows} 条。`
+  } catch (error) {
+    appendMessage.value = getErrorMessage(error, '记忆库追加失败。')
+  } finally {
+    appendSubmitting.value = false
+  }
+}
+
 async function deleteCollection(collection: any) {
   if (!canManageResources.value) {
     collectionMessage.value = '当前账号只能查看和导出记忆库。'
@@ -630,6 +771,17 @@ onUnmounted(() => {
           >
             <GitMerge :size="14" />
             合并
+          </button>
+          <button
+            v-if="canManageResources"
+            class="button"
+            type="button"
+            :disabled="!canAppendSelectedCollections || appendSubmitting"
+            :title="canAppendSelectedCollections ? '将选中的记忆库追加到现有库' : getSelectedCollectionsAppendError()"
+            @click="openAppendDialog"
+          >
+            <ListPlus :size="14" />
+            追加
           </button>
           <button
             v-if="canManageResources"
@@ -893,6 +1045,70 @@ onUnmounted(() => {
         </button>
       </template>
     </Modal>
+
+    <Modal
+      :open="showAppendDialog"
+      title="追加到已有记忆库"
+      :description="`将选中的 ${selectedCollections.length} 个来源库写入一个现有目标库，来源库会继续保留。`"
+      width="min(680px, calc(100vw - 32px))"
+      @close="closeAppendDialog"
+    >
+      <div class="resource-merge-summary">
+        <span class="tag">语言对：{{ mergeLanguagePairLabel }}</span>
+        <span class="tag">来源：{{ selectedCollections.length }} 个</span>
+        <span class="tag">来源记录：{{ selectedCollectionEntryCount }} 条</span>
+      </div>
+
+      <div class="resource-merge-list">
+        <div v-for="collection in selectedCollections" :key="collection.id" class="resource-merge-item">
+          <strong>{{ collection.name }}</strong>
+          <span>{{ collection.entry_count }} 条</span>
+        </div>
+      </div>
+
+      <div class="upload-form form-grid-2 resource-merge-form">
+        <label class="field">
+          <span class="field__label">目标记忆库</span>
+          <select v-model="appendTargetCollectionId" class="field__control">
+            <option value="">请选择目标库</option>
+            <option
+              v-for="collection in appendTargetCollections"
+              :key="collection.id"
+              :value="collection.id"
+            >
+              {{ collection.name }}（{{ collection.entry_count }} 条）
+            </option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span class="field__label">重复原文处理</span>
+          <select v-model="appendDuplicatePolicy" class="field__control">
+            <option value="keep">保留目标库现有译文（推荐）</option>
+            <option value="overwrite">使用来源库译文覆盖</option>
+          </select>
+        </label>
+      </div>
+
+      <p class="resource-append-hint">
+        追加只修改目标库，不会删除来源库。选择“保留目标库”时，重复原文会计入跳过数量。
+      </p>
+      <p v-if="appendMessage" class="form-message is-error resource-modal-message">{{ appendMessage }}</p>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="appendSubmitting" @click="closeAppendDialog">取消</button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="appendSubmitting || !appendTargetCollectionId"
+          @click="appendSelectedCollections"
+        >
+          <Loader2 v-if="appendSubmitting" class="lucide-spin" :size="14" />
+          <ListPlus v-else :size="14" />
+          {{ appendSubmitting ? '追加中...' : '确认追加' }}
+        </button>
+      </template>
+    </Modal>
   </div>
 </template>
 
@@ -983,6 +1199,13 @@ onUnmounted(() => {
 
 .resource-merge-form {
   margin-top: 0;
+}
+
+.resource-append-hint {
+  margin: 12px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 @media (max-width: 720px) {

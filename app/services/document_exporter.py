@@ -4,6 +4,9 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from hashlib import sha1
+from html import escape as escape_html
 from html.parser import HTMLParser
 from io import BytesIO
 from itertools import count
@@ -153,6 +156,11 @@ ENGLISH_BOUNDARY_TRAILING_RE = re.compile(r"[,;:.!?][\"')\]\}]*$")
 ENGLISH_WORD_LEADING_RE = re.compile(r"^[\"'“‘(\[]*[A-Za-z0-9]")
 # 支持的格式标签
 FORMAT_TAG_RE = re.compile(r"<(/?)(b|strong|i|em|u|s|strike|del|sub|sup)>", re.IGNORECASE)
+REVISION_DIFF_TOKEN_RE = re.compile(
+    r"[a-zA-Z0-9]+(?:[-'][a-zA-Z0-9]+)*|[\u4e00-\u9fff]|\s+|[^\s\w\u4e00-\u9fff]+"
+)
+REVISION_MARKER_PREFIX = "\ue000DOCX_REVISION_"
+REVISION_MARKER_SUFFIX = "\ue001"
 EXPLICIT_FORMAT_RUN_PROPERTIES = {
     "b",
     "bCs",
@@ -176,6 +184,17 @@ class FormattedTextFragment:
     subscript: bool = False
     superscript: bool = False
 
+    @property
+    def formats(self) -> tuple[bool, bool, bool, bool, bool, bool]:
+        return (
+            self.bold,
+            self.italic,
+            self.underline,
+            self.strike,
+            self.subscript,
+            self.superscript,
+        )
+
 
 def _has_format_tags(html: str | None) -> bool:
     """检查 HTML 是否包含格式标签"""
@@ -185,51 +204,45 @@ def _has_format_tags(html: str | None) -> bool:
 
 
 def _parse_formatted_html(html: str) -> list[FormattedTextFragment]:
-    """解析带格式的 HTML，返回格式化文本片段列表"""
+    """解析编辑器或源文档 HTML，返回仅包含受支持基础格式的文本片段。"""
     fragments: list[FormattedTextFragment] = []
 
     class FormatHTMLParser(HTMLParser):
         def __init__(self):
             super().__init__()
-            self.format_stack: list[set[str]] = [set()]
+            self.format_stack: list[set[str]] = []
             self.current_formats: set[str] = set()
 
         def handle_starttag(self, tag: str, attrs):
             tag_lower = tag.lower()
-            if tag_lower in ('b', 'strong'):
-                self.current_formats.add('bold')
-            elif tag_lower in ('i', 'em'):
-                self.current_formats.add('italic')
-            elif tag_lower == 'u':
-                self.current_formats.add('underline')
-            elif tag_lower in ('s', 'strike', 'del'):
-                self.current_formats.add('strike')
-            elif tag_lower == 'sub':
-                self.current_formats.add('subscript')
-            elif tag_lower == 'sup':
-                self.current_formats.add('superscript')
             self.format_stack.append(self.current_formats.copy())
+            next_formats = self.current_formats.copy()
+            if tag_lower in ('b', 'strong'):
+                next_formats.add('bold')
+            elif tag_lower in ('i', 'em'):
+                next_formats.add('italic')
+            elif tag_lower == 'u':
+                next_formats.add('underline')
+            elif tag_lower in ('s', 'strike', 'del'):
+                next_formats.add('strike')
+            elif tag_lower == 'sub':
+                next_formats.add('subscript')
+            elif tag_lower == 'sup':
+                next_formats.add('superscript')
+
+            style = dict(attrs).get("style") or ""
+            next_formats.update(_formats_from_inline_css(style))
+            self.current_formats = next_formats
 
         def handle_endtag(self, tag: str):
-            tag_lower = tag.lower()
-            if tag_lower in ('b', 'strong'):
-                self.current_formats.discard('bold')
-            elif tag_lower in ('i', 'em'):
-                self.current_formats.discard('italic')
-            elif tag_lower == 'u':
-                self.current_formats.discard('underline')
-            elif tag_lower in ('s', 'strike', 'del'):
-                self.current_formats.discard('strike')
-            elif tag_lower == 'sub':
-                self.current_formats.discard('subscript')
-            elif tag_lower == 'sup':
-                self.current_formats.discard('superscript')
             if self.format_stack:
-                self.format_stack.pop()
+                self.current_formats = self.format_stack.pop()
+            else:
+                self.current_formats = set()
 
         def handle_data(self, data: str):
             if data:
-                fragments.append(FormattedTextFragment(
+                fragment = FormattedTextFragment(
                     text=data,
                     bold='bold' in self.current_formats,
                     italic='italic' in self.current_formats,
@@ -237,11 +250,178 @@ def _parse_formatted_html(html: str) -> list[FormattedTextFragment]:
                     strike='strike' in self.current_formats,
                     subscript='subscript' in self.current_formats,
                     superscript='superscript' in self.current_formats,
-                ))
+                )
+                if fragments and fragments[-1].formats == fragment.formats:
+                    previous = fragments[-1]
+                    fragments[-1] = FormattedTextFragment(
+                        text=previous.text + fragment.text,
+                        bold=fragment.bold,
+                        italic=fragment.italic,
+                        underline=fragment.underline,
+                        strike=fragment.strike,
+                        subscript=fragment.subscript,
+                        superscript=fragment.superscript,
+                    )
+                else:
+                    fragments.append(fragment)
 
     parser = FormatHTMLParser()
     parser.feed(html)
     return fragments
+
+
+def _formats_from_inline_css(style: str) -> set[str]:
+    declarations: dict[str, str] = {}
+    for declaration in style.split(";"):
+        if ":" not in declaration:
+            continue
+        name, value = declaration.split(":", 1)
+        declarations[name.strip().lower()] = value.strip().lower()
+
+    formats: set[str] = set()
+    font_weight = declarations.get("font-weight", "")
+    if font_weight in {"bold", "bolder"}:
+        formats.add("bold")
+    else:
+        try:
+            if int(font_weight) >= 600:
+                formats.add("bold")
+        except ValueError:
+            pass
+
+    font_style = declarations.get("font-style", "")
+    if "italic" in font_style or "oblique" in font_style:
+        formats.add("italic")
+
+    text_decoration = " ".join(
+        (
+            declarations.get("text-decoration", ""),
+            declarations.get("text-decoration-line", ""),
+        )
+    )
+    if "underline" in text_decoration:
+        formats.add("underline")
+    if "line-through" in text_decoration:
+        formats.add("strike")
+
+    vertical_align = declarations.get("vertical-align", "")
+    if vertical_align == "sub":
+        formats.add("subscript")
+    elif vertical_align in {"super", "sup"}:
+        formats.add("superscript")
+    return formats
+
+
+def _derive_target_html_from_source(source_html: str | None, target_text: str) -> str | None:
+    """保守地把源文档的基础字符格式投影到译文。
+
+    文本完全相同时逐 run 保留；文本变化后只保留全段共同格式，并迁移在译文中
+    唯一出现的带格式原文片段。这样可以保留姓名、日期等锚点，同时避免首个 run
+    的下划线或粗体错误扩散到整句。
+    """
+    if (
+        not source_html
+        or not target_text
+        or "\n" in target_text
+        or "\r" in target_text
+        or re.search(r"<\s*a\b", source_html, re.IGNORECASE)
+    ):
+        return None
+
+    source_fragments = _parse_formatted_html(source_html)
+    if not source_fragments or not any(any(fragment.formats) for fragment in source_fragments):
+        return None
+
+    source_text = "".join(fragment.text for fragment in source_fragments)
+    if (
+        source_text == target_text
+        or _collapse_html_projection_whitespace(source_text)
+        == _collapse_html_projection_whitespace(target_text)
+    ):
+        return "".join(_formatted_fragment_to_html(fragment) for fragment in source_fragments)
+
+    meaningful_fragments = [fragment for fragment in source_fragments if fragment.text.strip()]
+    common_formats = tuple(
+        bool(meaningful_fragments) and all(fragment.formats[index] for fragment in meaningful_fragments)
+        for index in range(6)
+    )
+    target_formats = [set(_format_names_from_flags(common_formats)) for _ in target_text]
+
+    candidates = sorted(
+        (
+            fragment for fragment in source_fragments
+            if any(fragment.formats) and len(re.sub(r"\W", "", fragment.text, flags=re.UNICODE)) >= 2
+        ),
+        key=lambda fragment: len(fragment.text),
+        reverse=True,
+    )
+    for fragment in candidates:
+        matches = _find_unique_whitespace_flexible_match(target_text, fragment.text)
+        if len(matches) != 1:
+            continue
+        start, end = matches[0]
+        names = _format_names_from_flags(fragment.formats)
+        for index in range(start, end):
+            target_formats[index].update(names)
+
+    if not any(target_formats):
+        return None
+    return _render_text_with_format_sets(target_text, target_formats)
+
+
+FORMAT_NAMES = ("bold", "italic", "underline", "strike", "subscript", "superscript")
+
+
+def _collapse_html_projection_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _format_names_from_flags(flags: tuple[bool, bool, bool, bool, bool, bool]) -> tuple[str, ...]:
+    return tuple(name for name, enabled in zip(FORMAT_NAMES, flags, strict=True) if enabled)
+
+
+def _find_unique_whitespace_flexible_match(text: str, candidate: str) -> list[tuple[int, int]]:
+    stripped = candidate.strip()
+    if not stripped:
+        return []
+    pieces = re.split(r"\s+", stripped)
+    pattern = r"\s+".join(re.escape(piece) for piece in pieces)
+    return [(match.start(), match.end()) for match in re.finditer(pattern, text)]
+
+
+def _formatted_fragment_to_html(fragment: FormattedTextFragment) -> str:
+    return _wrap_html_with_formats(escape_html(fragment.text), _format_names_from_flags(fragment.formats))
+
+
+def _render_text_with_format_sets(text: str, format_sets: list[set[str]]) -> str:
+    parts: list[str] = []
+    start = 0
+    while start < len(text):
+        current_formats = format_sets[start]
+        end = start + 1
+        while end < len(text) and format_sets[end] == current_formats:
+            end += 1
+        ordered_formats = tuple(name for name in FORMAT_NAMES if name in current_formats)
+        parts.append(_wrap_html_with_formats(escape_html(text[start:end]), ordered_formats))
+        start = end
+    return "".join(parts)
+
+
+def _wrap_html_with_formats(content: str, formats: tuple[str, ...]) -> str:
+    tag_by_format = {
+        "bold": "b",
+        "italic": "i",
+        "underline": "u",
+        "strike": "s",
+        "subscript": "sub",
+        "superscript": "sup",
+    }
+    for format_name in reversed(FORMAT_NAMES):
+        if format_name not in formats:
+            continue
+        tag = tag_by_format[format_name]
+        content = f"<{tag}>{content}</{tag}>"
+    return content
 
 
 @dataclass(frozen=True)
@@ -253,9 +433,26 @@ class ExportSegment:
     numbering_text: str = ""
     matched_source_text: str = ""
     target_html: str | None = None
+    source_html: str | None = None
     math_placeholders: dict[str, str] = field(default_factory=dict)
     sequence_index: int | None = None
     source_structure_changed: bool = False
+    revision: "ExportRevisionInfo | None" = None
+
+
+@dataclass(frozen=True)
+class ExportRevisionInfo:
+    revision_key: str
+    before_text: str
+    after_text: str
+    author: str
+    created_at: str | None = None
+
+
+@dataclass(frozen=True)
+class RevisionDiffPart:
+    kind: str
+    text: str
 
 
 @dataclass
@@ -361,6 +558,8 @@ def export_translated_docx(
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: Mapping[str, object] | str | None = None,
     target_language: str | None = None,
+    revisions: Iterable[Any] | None = None,
+    include_revision_marks: bool = False,
 ) -> bytes:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
@@ -377,6 +576,11 @@ def export_translated_docx(
         document_parse_options=document_parse_options,
     )
     source_segments = source_workspace["segments"]
+    revisions_by_sentence_id = (
+        _build_export_revision_lookup(revisions)
+        if include_revision_marks
+        else {}
+    )
     math_placeholders_by_sentence_id = {
         str(segment["sentence_id"]): dict(segment.get("math_placeholders") or {})
         for segment in source_segments
@@ -386,6 +590,7 @@ def export_translated_docx(
         segments,
         math_placeholders_by_sentence_id,
         source_segments=source_segments,
+        revisions_by_sentence_id=revisions_by_sentence_id,
     )
     _dump_source_and_target_blocks("译文导出(translated)", source_segments, segments_by_block)
     block_counter = count(0)
@@ -409,12 +614,18 @@ def export_translated_docx(
     if not document_parse_options.get("preserve_hyperlinks", True):
         _strip_story_hyperlinks(stories)
 
+    modified_part_names = (
+        {story.part_name for story in stories}
+        | _collect_related_chart_part_names(stories)
+        | {"word/numbering.xml"}
+    )
+    if revisions_by_sentence_id and _enable_word_revision_tracking(package):
+        modified_part_names.add("word/settings.xml")
+
     return _build_modified_docx(
         raw_bytes=raw_bytes,
         package=package,
-        part_names={story.part_name for story in stories}
-        | _collect_related_chart_part_names(stories)
-        | {"word/numbering.xml"},
+        part_names=modified_part_names,
     )
 
 
@@ -436,16 +647,80 @@ def _normalize_bilingual_layout_order(order: str) -> str:
     raise ValueError(f"Unsupported bilingual DOCX layout order: {order}")
 
 
+def _build_export_revision_lookup(
+    revisions: Iterable[Any] | None,
+) -> dict[str, ExportRevisionInfo]:
+    lookup: dict[str, ExportRevisionInfo] = {}
+    for revision in revisions or []:
+        status = str(_get_segment_value(revision, "status", "pending") or "pending")
+        source = str(_get_segment_value(revision, "source", "manual") or "manual")
+        sentence_id = str(_get_segment_value(revision, "sentence_id", "") or "")
+        if status != "pending" or source != "manual" or not sentence_id or sentence_id in lookup:
+            continue
+
+        before_text = str(_get_segment_value(revision, "before_text", "") or "")
+        after_text = str(_get_segment_value(revision, "after_text", "") or "")
+        if before_text == after_text:
+            continue
+
+        revision_key = str(_get_segment_value(revision, "id", sentence_id) or sentence_id)
+        created_at_value = _get_segment_value(revision, "created_at")
+        if hasattr(created_at_value, "isoformat"):
+            created_at = created_at_value.isoformat()
+        else:
+            created_at = str(created_at_value) if created_at_value else None
+
+        lookup[sentence_id] = ExportRevisionInfo(
+            revision_key=revision_key,
+            before_text=before_text,
+            after_text=after_text,
+            author=_resolve_revision_author_name(_get_segment_value(revision, "author")),
+            created_at=created_at,
+        )
+    return lookup
+
+
+def _resolve_revision_author_name(author: Any) -> str:
+    if author is None:
+        return "AI Translation System"
+    if isinstance(author, str):
+        return author.strip() or "AI Translation System"
+    for field_name in ("nickname", "username", "name"):
+        value = _get_segment_value(author, field_name)
+        if value and str(value).strip():
+            return str(value).strip()
+    return "AI Translation System"
+
+
+def _enable_word_revision_tracking(package: DocxPackage) -> bool:
+    settings_root = package.read_xml("word/settings.xml")
+    if settings_root is None:
+        return False
+    revision_view = settings_root.find("./w:revisionView", NS)
+    if revision_view is None:
+        revision_view = ET.Element(_qn("w", "revisionView"))
+        settings_root.append(revision_view)
+    revision_view.set(_qn("w", "markup"), "1")
+    revision_view.set(_qn("w", "insDel"), "1")
+
+    track_revisions = settings_root.find("./w:trackRevisions", NS)
+    if track_revisions is None:
+        settings_root.append(ET.Element(_qn("w", "trackRevisions")))
+    return True
+
+
 def _group_segments_by_block(
     segments: Iterable[Any],
     math_placeholders_by_sentence_id: Mapping[str, dict[str, str]] | None = None,
     source_segments: Iterable[Mapping[str, Any]] | None = None,
+    revisions_by_sentence_id: Mapping[str, ExportRevisionInfo] | None = None,
 ) -> dict[BlockKey, list[ExportSegment]]:
     grouped: dict[BlockKey, list[ExportSegment]] = defaultdict(list)
     math_map = math_placeholders_by_sentence_id or {}
     source_segment_list = list(source_segments or [])
     source_segment_by_sentence_id = _build_source_segment_lookup_by_sentence_id(source_segment_list)
     source_segment_by_text_key = _build_unique_source_segment_lookup_by_text(source_segment_list)
+    revision_map = revisions_by_sentence_id or {}
 
     for segment in segments:
         block_type = str(_get_segment_value(segment, "block_type", "paragraph") or "paragraph")
@@ -469,19 +744,35 @@ def _group_segments_by_block(
             source_segment_by_id
             and _export_segment_text_matches_source_segment(segment, source_segment_by_id)
         )
+        source_html = _get_segment_value(segment, "source_html")
+        if not source_html and has_original_source_match and source_segment_by_id is not None:
+            source_html = source_segment_by_id.get("source_html")
+        if not source_html and has_original_source_match and source_segment_by_text is not None:
+            source_html = source_segment_by_text.get("source_html")
+        resolved_target_html = str(target_html) if target_html else _derive_target_html_from_source(
+            str(source_html) if source_html else None,
+            str(_get_segment_value(segment, "target_text", "") or ""),
+        )
+        target_text = str(_get_segment_value(segment, "target_text", "") or "")
+        revision = revision_map.get(sentence_id)
+        if revision is not None and revision.after_text != target_text:
+            # 只导出仍对应当前译文的待审修订，避免把过期快照写入 Word。
+            revision = None
 
         grouped[block_key].append(
             ExportSegment(
                 sentence_id=sentence_id,
                 source_text=str(_get_segment_value(segment, "source_text", "") or ""),
-                target_text=str(_get_segment_value(segment, "target_text", "") or ""),
+                target_text=target_text,
                 display_text=str(_get_segment_value(segment, "display_text", "") or ""),
                 numbering_text=str(_get_segment_value(segment, "numbering_text", "") or ""),
                 matched_source_text=str(_get_segment_value(segment, "matched_source_text", "") or ""),
-                target_html=str(target_html) if target_html else None,
+                target_html=resolved_target_html,
+                source_html=str(source_html) if source_html else None,
                 math_placeholders=dict(math_map.get(sentence_id) or {}),
                 sequence_index=_get_export_sequence_index(segment),
                 source_structure_changed=bool(source_segment_list) and not has_original_source_match,
+                revision=revision,
             )
         )
 
@@ -2065,6 +2356,7 @@ def _replace_block_tokens(
     use_explicit_sequence = _has_complete_explicit_sequence(segments)
     previous_replacement = ""
     previous_span: SentenceSpan | None = None
+    pending_revision_markers: list[tuple[str, ExportSegment, str]] = []
     for span in spans:
         sentence_source = _normalize_segment_source_text(_collect_span_text(tokens, span, use_source=True))
         if not sentence_source:
@@ -2098,6 +2390,16 @@ def _replace_block_tokens(
                 current_replacement=replacement,
                 boundary_text=boundary_text,
             )
+        if _can_queue_word_revision_marker(tokens, span, segment):
+            marker = _build_revision_marker(
+                segment.revision.revision_key,
+                len(pending_revision_markers),
+            )
+            _queue_sentence_replacement(tokens, span, marker)
+            pending_revision_markers.append((marker, segment, replacement))
+            previous_replacement = replacement
+            previous_span = span
+            continue
         if not normalize_text(replacement):
             if _is_target_placeholder(segment.target_text) or not keep_source_when_empty:
                 _queue_sentence_replacement(
@@ -2129,6 +2431,216 @@ def _replace_block_tokens(
         previous_span = span
 
     _apply_token_edits(tokens)
+    _expand_word_revision_markers(tokens, pending_revision_markers)
+
+
+def _can_queue_word_revision_marker(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    segment: ExportSegment,
+) -> bool:
+    if (
+        segment.revision is None
+        or segment.source_structure_changed
+        or segment.math_placeholders
+    ):
+        return False
+
+    writable_tokens = [
+        token
+        for token in tokens
+        if token.element is not None
+        and token.start < span.end
+        and token.end > span.start
+    ]
+    if not writable_tokens or any(token.is_math or token.is_hyperlink for token in writable_tokens):
+        return False
+
+    anchor = writable_tokens[0]
+    return bool(
+        anchor.element is not None
+        and anchor.element.tag == _qn("w", "t")
+        and anchor.run_element is not None
+        and anchor.run_element.tag == _qn("w", "r")
+        and anchor.container_element is not None
+        and anchor.container_element.tag == _qn("w", "p")
+        and anchor.run_element in list(anchor.container_element)
+    )
+
+
+def _build_revision_marker(revision_key: str, marker_index: int) -> str:
+    digest = sha1(f"{revision_key}:{marker_index}".encode("utf-8")).hexdigest()[:16]
+    return f"{REVISION_MARKER_PREFIX}{digest}{REVISION_MARKER_SUFFIX}"
+
+
+def _expand_word_revision_markers(
+    tokens: list[TextToken],
+    pending_markers: list[tuple[str, ExportSegment, str]],
+) -> None:
+    paragraphs: list[ET.Element] = []
+    seen_paragraph_ids: set[int] = set()
+    for token in tokens:
+        paragraph = token.container_element
+        if (
+            paragraph is None
+            or paragraph.tag != _qn("w", "p")
+            or id(paragraph) in seen_paragraph_ids
+        ):
+            continue
+        seen_paragraph_ids.add(id(paragraph))
+        paragraphs.append(paragraph)
+
+    for marker, segment, replacement in pending_markers:
+        marker_context = _find_word_revision_marker_context(paragraphs, marker)
+        if marker_context is None or segment.revision is None:
+            continue
+
+        parent, run_element, text_element = marker_context
+
+        current_text = text_element.text or ""
+        prefix, suffix = current_text.split(marker, 1)
+        text_element.text = prefix
+        _sync_word_text_space_attribute(text_element)
+
+        insert_index = list(parent).index(run_element) + 1
+        if not _word_run_has_visible_content(run_element):
+            parent.remove(run_element)
+            insert_index -= 1
+
+        revision_nodes = _build_word_revision_nodes(
+            segment,
+            run_element,
+            effective_after_text=replacement,
+        )
+        for node in revision_nodes:
+            parent.insert(insert_index, node)
+            insert_index += 1
+
+        if suffix:
+            for suffix_run in _build_inserted_word_runs(suffix, run_element):
+                parent.insert(insert_index, suffix_run)
+                insert_index += 1
+
+
+def _find_word_revision_marker_context(
+    paragraphs: list[ET.Element],
+    marker: str,
+) -> tuple[ET.Element, ET.Element, ET.Element] | None:
+    for paragraph in paragraphs:
+        for run_element in paragraph.findall("./w:r", NS):
+            for text_element in run_element.findall("./w:t", NS):
+                if marker in (text_element.text or ""):
+                    return paragraph, run_element, text_element
+    return None
+
+
+def _sync_word_text_space_attribute(text_element: ET.Element) -> None:
+    text = text_element.text or ""
+    if _needs_space_preserve(text):
+        text_element.set(XML_SPACE_ATTR, "preserve")
+    else:
+        text_element.attrib.pop(XML_SPACE_ATTR, None)
+
+
+def _word_run_has_visible_content(run_element: ET.Element) -> bool:
+    for child in list(run_element):
+        if _local_name(child.tag) == "rPr":
+            continue
+        if _local_name(child.tag) in {"t", "delText", "instrText"}:
+            if child.text:
+                return True
+            continue
+        return True
+    return False
+
+
+def _build_word_revision_nodes(
+    segment: ExportSegment,
+    reference_run: ET.Element | None,
+    effective_after_text: str | None = None,
+) -> list[ET.Element]:
+    revision = segment.revision
+    if revision is None:
+        return _build_inserted_word_runs(_resolve_segment_replacement_text(segment), reference_run)
+
+    before_text = _resolve_revision_replacement_text(segment, revision.before_text)
+    resolved_after_text = _resolve_revision_replacement_text(segment, revision.after_text)
+    after_text = effective_after_text if effective_after_text is not None else resolved_after_text
+    if (
+        effective_after_text is not None
+        and resolved_after_text
+        and effective_after_text.endswith(resolved_after_text)
+    ):
+        # 多句共享同一 Word run 时，导出器可能为相邻英文句补前导空格。
+        # 该空格属于排版边界，不应额外显示为一次插入修订。
+        before_text = effective_after_text[:-len(resolved_after_text)] + before_text
+    nodes: list[ET.Element] = []
+    for part_index, part in enumerate(_compute_revision_diff(before_text, after_text)):
+        if part.kind == "equal":
+            nodes.extend(_build_inserted_word_runs(part.text, reference_run))
+            continue
+
+        wrapper = ET.Element(_qn("w", "del" if part.kind == "delete" else "ins"))
+        wrapper.set(
+            _qn("w", "id"),
+            _build_word_revision_id(revision.revision_key, part_index, part.kind),
+        )
+        wrapper.set(_qn("w", "author"), revision.author)
+        if revision.created_at:
+            wrapper.set(_qn("w", "date"), revision.created_at)
+
+        runs = _build_inserted_word_runs(part.text, reference_run)
+        if part.kind == "delete":
+            for run in runs:
+                for text_element in run.findall(".//w:t", NS):
+                    text_element.tag = _qn("w", "delText")
+        for run in runs:
+            wrapper.append(run)
+        nodes.append(wrapper)
+    return nodes
+
+
+def _resolve_revision_replacement_text(segment: ExportSegment, text: str) -> str:
+    return strip_automatic_numbering_prefix(
+        text,
+        source_text=segment.source_text,
+        display_text=segment.display_text,
+        numbering_text=segment.numbering_text,
+        reference_texts=[segment.matched_source_text],
+    )
+
+
+def _compute_revision_diff(before_text: str, after_text: str) -> list[RevisionDiffPart]:
+    before_tokens = REVISION_DIFF_TOKEN_RE.findall(before_text)
+    after_tokens = REVISION_DIFF_TOKEN_RE.findall(after_text)
+    matcher = SequenceMatcher(None, before_tokens, after_tokens, autojunk=False)
+    parts: list[RevisionDiffPart] = []
+
+    def append_part(kind: str, text: str) -> None:
+        if not text:
+            return
+        if parts and parts[-1].kind == kind:
+            previous = parts[-1]
+            parts[-1] = RevisionDiffPart(kind=kind, text=previous.text + text)
+        else:
+            parts.append(RevisionDiffPart(kind=kind, text=text))
+
+    for opcode, before_start, before_end, after_start, after_end in matcher.get_opcodes():
+        if opcode == "equal":
+            append_part("equal", "".join(before_tokens[before_start:before_end]))
+        elif opcode == "delete":
+            append_part("delete", "".join(before_tokens[before_start:before_end]))
+        elif opcode == "insert":
+            append_part("insert", "".join(after_tokens[after_start:after_end]))
+        else:
+            append_part("delete", "".join(before_tokens[before_start:before_end]))
+            append_part("insert", "".join(after_tokens[after_start:after_end]))
+    return parts
+
+
+def _build_word_revision_id(revision_key: str, part_index: int, kind: str) -> str:
+    digest = sha1(f"{revision_key}:{part_index}:{kind}".encode("utf-8")).digest()
+    return str(int.from_bytes(digest[:4], "big") & 0x7FFFFFFF)
 
 
 def _structure_text_key(text: str) -> str:
@@ -2397,6 +2909,7 @@ def _build_inline_bilingual_segments(
                 numbering_text=segment.numbering_text,
                 matched_source_text=segment.matched_source_text,
                 target_html=None,
+                source_html=segment.source_html,
                 math_placeholders=segment.math_placeholders,
                 sequence_index=segment.sequence_index,
                 source_structure_changed=segment.source_structure_changed,

@@ -1070,9 +1070,11 @@ defineExpose({
 }
 
 .match-summary {
-  flex: 1 1 auto;
-  min-height: 180px;
-  overflow: auto;
+  flex: 1 1 180px;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   background: #ffffff;
   scrollbar-gutter: stable;
   scrollbar-width: thin;
@@ -1226,12 +1228,16 @@ defineExpose({
 }
 
 .match-detail {
-  flex: 0 0 auto;
+  flex: 0 1 46%;
+  min-height: 0;
   max-height: 46%;
   padding: 10px 14px 14px;
   border-top: 1px solid #d8e4e7;
   background: #ffffff;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   font-size: 12px;
 }
 
@@ -1328,10 +1334,9 @@ defineExpose({
 }
 
 .match-detail__text {
-  max-height: 92px;
   color: #2d3b45;
   line-height: 1.55;
-  overflow: auto;
+  overflow: visible;
   white-space: pre-wrap;
   word-break: break-word;
   overflow-wrap: anywhere;

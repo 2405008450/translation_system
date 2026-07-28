@@ -427,6 +427,43 @@ test.describe.serial('核心 E2E 冒烟流程', () => {
     await focusPage.close()
   })
 
+  test('Ctrl 加上下方向键跳转句段后将译文光标放在文本末尾', async ({ page }) => {
+    await login(page)
+    const focusPage = await createProjectWithFixtureAndOpenFocusWorkbench(
+      page,
+      `E2E Shortcut Caret ${Date.now()}`,
+    )
+
+    const editors = focusPage.getByTestId('segment-target-editor')
+    await expect(editors).toHaveCount(2)
+    await editors.nth(0).fill('01')
+    await editors.nth(1).fill('第二句')
+
+    const expectCaretAtEnd = async (editorIndex: number, expectedOffset: number) => {
+      await expect.poll(async () => editors.nth(editorIndex).evaluate((element) => {
+        const selection = window.getSelection()
+        if (!selection || selection.rangeCount === 0) return -1
+        const range = selection.getRangeAt(0)
+        if (!element.contains(range.startContainer)) return -1
+        const beforeCaret = range.cloneRange()
+        beforeCaret.selectNodeContents(element)
+        beforeCaret.setEnd(range.startContainer, range.startOffset)
+        return beforeCaret.toString().length
+      })).toBe(expectedOffset)
+    }
+
+    await editors.nth(0).click()
+    await focusPage.keyboard.press('Control+ArrowDown')
+    await expect(editors.nth(1)).toBeFocused()
+    await expectCaretAtEnd(1, 3)
+
+    await focusPage.keyboard.press('Control+ArrowUp')
+    await expect(editors.nth(0)).toBeFocused()
+    await expectCaretAtEnd(0, 2)
+
+    await focusPage.close()
+  })
+
   test('AI 修正会回填手动清空的当前译文', async ({ page }) => {
     const originalText = `AI original ${Date.now()}`
 

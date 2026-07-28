@@ -252,6 +252,8 @@ from app.services.notification_service import (
     create_operation_notification,
 )
 from app.services.spelling_grammar_qa import (
+    LanguageToolBusyError,
+    LanguageToolUnavailableError,
     QA_ISSUE_STATUS_IGNORED,
     QA_ISSUE_STATUS_OPEN,
     QA_RULE_ENDING_PUNCTUATION_MISMATCH,
@@ -266,6 +268,7 @@ from app.services.spelling_grammar_qa import (
     QA_RULE_TERM_INCONSISTENCY,
     QA_RULE_UNMATCHED_CLOSING_TAG,
     QA_RULE_UNMATCHED_OPENING_TAG,
+    check_live_spelling_text,
     check_segments_with_languagetool,
     get_languagetool_language,
     get_supported_quality_qa_languages,
@@ -273,10 +276,12 @@ from app.services.spelling_grammar_qa import (
     load_open_segment_qa_issues_by_segment_id,
     load_quality_qa_settings,
     normalize_quality_qa_settings,
+    persist_cached_live_spelling_issues_for_segment_ids,
     run_spelling_grammar_qa_for_project,
     run_spelling_grammar_qa_for_segment_ids,
     serialize_segment_qa_issue,
     store_quality_qa_settings,
+    target_text_hash,
 )
 from app.services.local_qa import (
     LOCAL_QA_RULE_KEYS,
@@ -1511,6 +1516,10 @@ class SegmentSourceUpdate(BaseModel):
 class SegmentTargetLayoutUpdate(BaseModel):
     """人工标签编辑：只写带标签版式译文，绝不改动 target_text 本身。"""
     target_layout_text: str = ""
+
+
+class LiveSpellingPreviewRequest(BaseModel):
+    text: str = Field(default="", max_length=20000)
 
 
 class SegmentProjectSyncUpdate(BaseModel):
@@ -2847,6 +2856,12 @@ class TMCollectionMergePayload(BaseModel):
     description: str | None = None
 
 
+class TMCollectionAppendPayload(BaseModel):
+    target_collection_id: UUID
+    source_collection_ids: list[UUID]
+    duplicate_policy: Literal["keep", "overwrite"] = "keep"
+
+
 class TermBasePayload(BaseModel):
     name: str
     description: str | None = None
@@ -2929,6 +2944,7 @@ class ProjectFileZipExportPayload(BaseModel):
 class FileRecordExportPayload(BaseModel):
     """文件记录导出请求体，可选携带 DOCX 导出样式设置。"""
     style_settings: dict[str, Any] | None = None
+    include_revision_marks: bool = False
 
 
 def _build_unavailable_document_statistics() -> dict[str, Any]:
@@ -7111,8 +7127,18 @@ def _validate_term_base_setting_ids(
     return term_bases
 
 
-def _text_contains_case_insensitive(text: str | None, needle: str | None) -> bool:
-    return text_contains_term(text, needle)
+def _text_contains_qa_term(
+    text: str | None,
+    needle: str | None,
+    *,
+    case_sensitive: bool,
+) -> bool:
+    return text_contains_term(
+        text,
+        needle,
+        case_sensitive=case_sensitive,
+        acronym_case_sensitive=False,
+    )
 
 
 def _sort_term_qa_entries_for_matching(
@@ -7232,6 +7258,7 @@ def _create_term_qa_report(
     files: list[FileRecord],
     current_user: User,
     scope: Literal["project", "file", "merge_view"],
+    case_sensitive: bool = False,
 ) -> TermQAReport:
     if not files:
         raise HTTPException(status_code=400, detail="请选择要检查的文件。")
@@ -7351,6 +7378,8 @@ def _create_term_qa_report(
                 source_text,
                 applicable_entries,
                 lambda entry: entry.source_text,
+                case_sensitive=case_sensitive,
+                acronym_case_sensitive=False,
             )
             reported_entry_ids: set[UUID] = set()
             for source_match in source_matches:
@@ -7360,7 +7389,11 @@ def _create_term_qa_report(
                 reported_entry_ids.add(entry.id)
                 source_term = (entry.source_text or "").strip()
                 expected_target_term = (entry.target_text or "").strip()
-                if _text_contains_case_insensitive(target_text, expected_target_term):
+                if _text_contains_qa_term(
+                    target_text,
+                    expected_target_term,
+                    case_sensitive=case_sensitive,
+                ):
                     continue
                 term_base = term_base_by_id.get(entry.term_base_id)
                 db.add(TermQAReportItem(
@@ -7531,6 +7564,11 @@ def _is_workbench_qa_rule_enabled(settings: dict[str, Any], rule_key: str) -> bo
         if isinstance(spelling_grammar, dict):
             return bool(spelling_grammar.get("enabled"))
     return False
+
+
+def _is_term_qa_case_sensitive(settings: dict[str, Any]) -> bool:
+    rule = (settings.get("rules") or {}).get(QA_RULE_TERM_INCONSISTENCY)
+    return bool(rule.get("case_sensitive")) if isinstance(rule, dict) else False
 
 
 def _get_file_record_project_or_400(db: Session, file_record: FileRecord) -> Project:
@@ -7792,6 +7830,7 @@ def _maybe_create_workbench_term_qa_report(
     current_user: User,
     scope: Literal["file", "merge_view"],
     warnings: list[str],
+    case_sensitive: bool,
 ) -> TermQAReport | None:
     try:
         return _create_term_qa_report(
@@ -7800,6 +7839,7 @@ def _maybe_create_workbench_term_qa_report(
             files=files,
             current_user=current_user,
             scope=scope,
+            case_sensitive=case_sensitive,
         )
     except HTTPException as exc:
         if exc.status_code == 400 and str(exc.detail) == "未配置用于 QA 的术语库。":
@@ -7852,6 +7892,7 @@ def _build_workbench_qa_result(
                 current_user=current_user,
                 scope=scope,
                 warnings=warnings,
+                case_sensitive=_is_term_qa_case_sensitive(settings),
             )
         elif scope == "file" and len(files) == 1:
             term_report = _load_latest_term_qa_report_for_file(db, files[0].id)
@@ -8499,6 +8540,7 @@ def create_project_term_qa_report(
         files=files,
         current_user=current_user,
         scope="project",
+        case_sensitive=_is_term_qa_case_sensitive(load_quality_qa_settings(project)),
     )
     items = (
         db.query(TermQAReportItem)
@@ -8519,12 +8561,18 @@ def create_file_record_term_qa_report(
     if not file_record:
         raise HTTPException(status_code=404, detail="任务不存在。")
     _require_file_record_read_access(file_record, current_user)
+    project = file_record.project or (
+        db.query(Project).filter(Project.id == file_record.project_id).first()
+        if file_record.project_id
+        else None
+    )
     report = _create_term_qa_report(
         db,
         project_id=file_record.project_id,
         files=[file_record],
         current_user=current_user,
         scope="file",
+        case_sensitive=_is_term_qa_case_sensitive(load_quality_qa_settings(project)),
     )
     items = (
         db.query(TermQAReportItem)
@@ -9812,6 +9860,82 @@ def refresh_file_record_spelling_grammar_qa(
     }
 
 
+@router.post(
+    "/file-records/{file_record_id}/segments/{sentence_id}/qa-checks/spelling-grammar/preview"
+)
+async def preview_segment_spelling_grammar(
+    file_record_id: UUID,
+    sentence_id: str,
+    payload: LiveSpellingPreviewRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """检查未保存译文中的拼写问题，不写 QA 表或句段版本。"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    segment = (
+        db.query(Segment)
+        .filter(
+            Segment.file_record_id == file_record_id,
+            Segment.sentence_id == sentence_id,
+        )
+        .first()
+    )
+    if not segment:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+    _require_segment_work_access(db, file_record, segment, current_user)
+
+    project = file_record.project or (
+        db.query(Project).filter(Project.id == file_record.project_id).first()
+        if file_record.project_id
+        else None
+    )
+    if not project:
+        raise HTTPException(status_code=400, detail="当前文件未归属项目，无法使用项目 QA 设置。")
+    quality_settings = load_quality_qa_settings(project)
+    if not quality_settings[QA_RULE_SPELLING_GRAMMAR]["enabled"]:
+        raise HTTPException(status_code=400, detail="项目尚未启用拼写/语法 QA。")
+    if not is_languagetool_configured():
+        raise HTTPException(status_code=503, detail="LanguageTool 未配置，无法进行实时拼写检查。")
+    lt_language = get_languagetool_language(file_record.target_language)
+    if not lt_language:
+        raise HTTPException(status_code=400, detail="当前目标语言暂不支持实时拼写检查。")
+
+    severity = str(quality_settings[QA_RULE_SPELLING_GRAMMAR].get("severity") or "medium")
+    segment_id_value = str(segment.id)
+    sentence_id_value = segment.sentence_id
+    # 后续只等待自托管 LanguageTool；先结束只读事务，避免占用数据库连接。
+    db.rollback()
+    try:
+        result = await check_live_spelling_text(
+            text=payload.text,
+            language=lt_language,
+            severity=severity,
+        )
+    except LanguageToolBusyError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="实时拼写检查繁忙，请稍后重试。",
+            headers={"Retry-After": "1"},
+        ) from exc
+    except LanguageToolUnavailableError as exc:
+        logger.warning(
+            "live spelling check unavailable file_record_id=%s sentence_id=%s",
+            file_record_id,
+            sentence_id,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=503, detail="实时拼写检查暂不可用。") from exc
+
+    return {
+        "file_record_id": str(file_record_id),
+        "segment_id": segment_id_value,
+        "sentence_id": sentence_id_value,
+        **result,
+    }
+
+
 @router.patch("/segment-qa-issues/{issue_id}/ignore")
 def update_segment_qa_issue_ignore(
     issue_id: UUID,
@@ -10426,6 +10550,7 @@ def _serialize_workbench_segment(
         "qa_issues": [
             serialize_segment_qa_issue(issue)
             for issue in (qa_issues_by_segment_id or {}).get(seg.id, [])
+            if issue.target_text_hash == target_text_hash(seg.target_text or "")
         ],
         "updated_at": seg.updated_at.isoformat() if seg.updated_at else None,
     }
@@ -10464,6 +10589,24 @@ def _schedule_spelling_grammar_qa_for_segments(
         return
     background_tasks.add_task(
         _dispatch_spelling_grammar_qa_segments, file_record.id, segment_ids
+    )
+
+
+def _schedule_cached_live_spelling_backup_for_segments(
+    background_tasks: BackgroundTasks | None,
+    file_record: FileRecord,
+    segments: Iterable[Segment],
+) -> None:
+    """保存译文后复用实时检查缓存写入 QA 表，不额外调用 LanguageTool。"""
+    if background_tasks is None:
+        return
+    segment_ids = list(dict.fromkeys(segment.id for segment in segments))
+    if not segment_ids:
+        return
+    background_tasks.add_task(
+        persist_cached_live_spelling_issues_for_segment_ids,
+        file_record.id,
+        segment_ids,
     )
 
 
@@ -12763,6 +12906,7 @@ def _queue_file_record_export_for_current_user(
     db: Session,
     current_user: User,
     style_settings: dict[str, Any] | None = None,
+    include_revision_marks: bool = False,
 ) -> dict[str, Any]:
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
@@ -12791,6 +12935,7 @@ def _queue_file_record_export_for_current_user(
         export_type=export_type,
         current_user=current_user,
         style_settings=style_settings,
+        include_revision_marks=include_revision_marks,
     )
 
 
@@ -13208,6 +13353,7 @@ def create_merge_view_term_qa_report(
         files=files,
         current_user=current_user,
         scope="merge_view",
+        case_sensitive=_is_term_qa_case_sensitive(load_quality_qa_settings(project)),
     )
     items = _load_term_qa_report_items_for_files(db, report.id, file_ids)
     return _serialize_term_qa_report(report, items)
@@ -13683,6 +13829,7 @@ def create_file_record_export_task(
             db=db,
             current_user=current_user,
             style_settings=payload.style_settings if payload else None,
+            include_revision_marks=payload.include_revision_marks if payload else False,
         ),
     )
 
@@ -14093,6 +14240,7 @@ def update_segment(
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
     display_index_map = _get_segment_display_index_map(db, file_record_id, response_segments)
     _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
+    _schedule_cached_live_spelling_backup_for_segments(background_tasks, file_record, response_segments)
     _schedule_local_qa_for_segments(background_tasks, file_record, response_segments)
 
     return {
@@ -14811,6 +14959,7 @@ def batch_update(
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
     display_index_map = _get_segment_display_index_map(db, file_record_id, response_segments)
     _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
+    _schedule_cached_live_spelling_backup_for_segments(background_tasks, file_record, response_segments)
     _schedule_local_qa_for_segments(background_tasks, file_record, response_segments)
     return {
         "updated_count": result.updated_count,
@@ -16701,6 +16850,134 @@ def merge_tm_collections(
         "updated_rows": updated_rows,
         "skipped_rows": skipped_rows,
         "merged_rows": created_rows + updated_rows,
+    }
+
+
+@router.post("/translation-memory/collections/append")
+@router.post("/tm/collections/append", include_in_schema=False)
+def append_tm_collections(
+    payload: TMCollectionAppendPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_business_manager),
+):
+    source_collection_ids = list(dict.fromkeys(payload.source_collection_ids))
+    if not source_collection_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一个要追加的来源记忆库。")
+    if payload.target_collection_id in source_collection_ids:
+        raise HTTPException(status_code=400, detail="目标记忆库不能同时作为来源记忆库。")
+
+    requested_collection_ids = [payload.target_collection_id, *source_collection_ids]
+    collections = (
+        db.query(MemoryBase)
+        .filter(MemoryBase.id.in_(requested_collection_ids))
+        .all()
+    )
+    collection_by_id = {collection.id: collection for collection in collections}
+    missing_ids = [
+        collection_id
+        for collection_id in requested_collection_ids
+        if collection_id not in collection_by_id
+    ]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail="目标或来源记忆库不存在。")
+
+    target_collection = collection_by_id[payload.target_collection_id]
+    ordered_source_collections = [
+        collection_by_id[collection_id]
+        for collection_id in source_collection_ids
+    ]
+    try:
+        source_language, target_language = _require_same_tm_collection_language_pair(
+            [target_collection, *ordered_source_collections],
+        )
+    except HTTPException as exc:
+        if exc.status_code == 400:
+            raise HTTPException(
+                status_code=400,
+                detail="只能向语言对完全一致的目标记忆库追加内容。",
+            ) from exc
+        raise
+
+    created_rows = 0
+    updated_rows = 0
+    skipped_rows = 0
+    sync_rows: list[tuple[UUID, str]] = []
+    pending_entries: list[TMUpsertEntry] = []
+    append_batch_size = 1000
+
+    def flush_pending_entries() -> None:
+        nonlocal created_rows, updated_rows, skipped_rows, pending_entries
+        if not pending_entries:
+            return
+        summary = batch_upsert_tm_entries(
+            db,
+            pending_entries,
+            duplicate_policy=payload.duplicate_policy,
+        )
+        created_rows += summary.created_count
+        updated_rows += summary.updated_count
+        skipped_rows += summary.skipped_count
+        sync_rows.extend(summary.sync_rows or [])
+        pending_entries = []
+
+    try:
+        for source_collection_id in source_collection_ids:
+            source_entries = (
+                db.query(MemoryEntry)
+                .filter(MemoryEntry.collection_id == source_collection_id)
+                .order_by(MemoryEntry.created_at.asc(), MemoryEntry.id.asc())
+                .all()
+            )
+            for entry in source_entries:
+                pending_entries.append(TMUpsertEntry(
+                    collection_id=target_collection.id,
+                    source_text=entry.source_text,
+                    target_text=entry.target_text,
+                    source_language=source_language,
+                    target_language=target_language,
+                    creator_id=entry.creator_id or current_user.id,
+                    last_modified_by_id=current_user.id,
+                    external_tuid=entry.external_tuid,
+                    tmx_metadata=deepcopy(entry.tmx_metadata),
+                ))
+                if len(pending_entries) >= append_batch_size:
+                    flush_pending_entries()
+        flush_pending_entries()
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="追加记忆库失败，目标库中存在冲突条目。") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    sync_tm_embeddings(
+        db,
+        list({entry_id: source_text for entry_id, source_text in sync_rows}.items()),
+    )
+    refreshed_segments = 0
+    if created_rows > 0 or updated_rows > 0:
+        refreshed_segments = _notify_tm_collections_changed(db, [target_collection.id])
+
+    db.refresh(target_collection)
+    target_entry_count = (
+        db.query(func.count(MemoryEntry.id))
+        .filter(MemoryEntry.collection_id == target_collection.id)
+        .scalar()
+        or 0
+    )
+    return {
+        "collection": _serialize_tm_collection(
+            target_collection,
+            entry_count=int(target_entry_count),
+        ),
+        "source_count": len(source_collection_ids),
+        "created_rows": created_rows,
+        "updated_rows": updated_rows,
+        "skipped_rows": skipped_rows,
+        "appended_rows": created_rows + updated_rows,
+        "refreshed_segments": refreshed_segments,
+        "duplicate_policy": payload.duplicate_policy,
     }
 
 
