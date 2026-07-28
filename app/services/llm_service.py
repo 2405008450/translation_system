@@ -1374,7 +1374,6 @@ def _build_paragraph_messages(
     user_content = (
         "请翻译 JSON 中 translate=true 的句子。translate=false 的句子只用于理解上下文，不要返回它们的译文。\n"
         "如果某条句子包含 source_layout_text，请优先翻译 source_layout_text；其中的 ⟦LB_n⟧ 是原文换行标记，必须在 target_text 中按数量保留，不能翻译、删除或重排为普通文字。\n"
-        "source_layout_text 中形如 ⟦1⟧…⟦/1⟧ 的行内格式标签必须原样保留、成对出现，并包裹到语义对应的译文词汇上（注意区分译文原有的符号，不要返回错误的格式标签），不能翻译、删除、新增或拆分（语序可随译文调整，但每组标签需完整跟随其内容）。\n"
         "返回 JSON 的 translations 键集合必须与 required_sentence_ids 完全一致；不要依赖顺序。\n"
         "每个 source_hash 必须原样带回，target_text 只写最终译文。\n\n"
         "输入：\n"

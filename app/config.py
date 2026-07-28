@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     reference_llm_api_key: str | None = None
     reference_llm_model: str = "google/gemini-3.5-flash"
     reference_llm_base_url: str = "https://openrouter.ai/api/v1"
+    # 样式标记专检：AI 自动标注默认使用的 provider/model；留空 model 时沿用
+    # request_chat_completion 的通用默认（DEEPSEEK_MODEL / OPENROUTER_MODEL）。
+    # 前端设置面板若显式选择模型会覆盖此处配置。
+    style_tag_check_llm_provider: str = "auto"
+    style_tag_check_llm_model: str | None = None
     redis_url: str | None = None
     import_queue_backend: str = "local"
     arq_max_jobs: int = 1

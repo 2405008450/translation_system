@@ -31,6 +31,7 @@ from uuid import UUID
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.models import (
     FileRecord,
     Project,
@@ -74,6 +75,23 @@ _ERROR_TEXT_MISMATCH = "text_mismatch"
 _ERROR_STRUCTURE = "invalid_structure"
 
 _MARKER_RE = re.compile(r"⟦\s*/?\s*\d+\s*⟧")
+
+
+def _resolve_llm_options(provider: str, model: str | None) -> tuple[str, str | None]:
+    """解析本次 AI 标注实际使用的 provider/model。
+
+    调用方（前端设置面板）若显式选择了模型，直接使用；否则回退到
+    config.py 中的 style_tag_check_llm_provider / style_tag_check_llm_model
+    （可在 .env 中配置），留空 model 时再由 request_chat_completion 走通用默认
+    （DEEPSEEK_MODEL / OPENROUTER_MODEL）。
+    """
+    if model:
+        return provider, model
+    settings = get_settings()
+    default_provider = getattr(settings, "style_tag_check_llm_provider", "auto") or "auto"
+    default_model = getattr(settings, "style_tag_check_llm_model", None) or None
+    resolved_provider = provider if provider and provider != "auto" else default_provider
+    return resolved_provider, default_model
 
 
 # ─────────────────────────────────────────
@@ -192,13 +210,19 @@ def _build_ai_prompt(seq_items: list[tuple[int, str, str, str]]) -> str:
     combined = "\n\n".join(lines)
     return f"""你是双语排版标注专家。以下每条包含：带 ⟦n⟧…⟦/n⟧ 行内格式标签的原文、标签对应的样式说明、以及对应的纯译文（共 {len(seq_items)} 条，用[序号]标记）。
 
-任务：判断原文中每个 ⟦n⟧ 标签包裹的内容翻译成了译文中的哪些词语，在**纯译文文本上原样插入对应的 ⟦n⟧…⟦/n⟧ 标签**，标出这些词语。
+任务：判断原文中每个 ⟦n⟧ 标签包裹的内容翻译成了译文中的哪些词语，在**纯译文文本上原样插入对应的 ⟦n⟧…⟦/n⟧ 标签**，标出这些词语，强烈要求和原文整体效果保持一致。
 
 硬性规则（任何一条违反都会导致该条被丢弃）：
 1. 绝对不能修改、增删纯译文的任何一个字符，只能在其中插入 ⟦n⟧ 和 ⟦/n⟧ 标记本身。
-2. 每个标签 id 最多使用一次，必须成对出现（⟦n⟧ 在前，⟦/n⟧ 在后），不能嵌套或交叉。
-3. 如果某个标签对应的原文片段在译文中找不到明确对应词语（如无法翻译的符号、编号），可以不给该 id 打标签——不要求覆盖所有 id。
-4. 语序可以和原文不同（译文的词序通常与原文不同，标签跟着对应的译文词语走）。
+2. 标签格式必须严格为：
+   - 开始标签：⟦数字⟧   （左括号是 ⟦，右括号是 ⟧）
+   - 结束标签：⟦/数字⟧  （左括号是 ⟦，右括号是 ⟧）
+   禁止使用其他符号，尤其是禁止使用两个左括号（如 ⟦4⟦）。
+3. 每个标签 id 最多使用一次，必须成对出现（⟦n⟧ 在前，⟦/n⟧ 在后），强烈要求和原文整体效果保持一致；若原文是连续标签且标签之间没有漏掉字符，译文在正确的位置标记连续标签也不要漏掉字符。
+4. 如果某个标签对应的原文片段在译文中找不到明确对应词语（如无法翻译的符号、编号），可以不给该 id 打标签——不要求覆盖所有 id。
+5. 语序可以和原文不同（译文的词序通常与原文不同，标签跟着对应的译文词语走）。
+6. 您输出的 tagged_text 在移除所有标签后，必须与提供的纯译文**逐字符完全相同**（包括空格、标点）。
+8. 在插入标签时，必须保留译文原有的空格、标点等非字母数字字符的位置。标签不能放在单词内部，也不能删除或增加空格。剥离标签后，文字间的空格必须与原译文完全一致。
 
 输出 JSON 数组，长度必须与输入条数（{len(seq_items)}）相同：
 [
@@ -478,6 +502,7 @@ async def run_ai_style_tag_check_for_report(
     model: str | None = None,
 ) -> StyleTagCheckReport:
     """对报告中的（全部或指定）候选项跑 AI 标注。"""
+    provider, model = _resolve_llm_options(provider, model)
     query = db.query(StyleTagCheckReportItem).filter(
         StyleTagCheckReportItem.report_id == report.id
     )
@@ -530,6 +555,7 @@ async def aiter_style_tag_check_generation(
     """流式执行样式标记专检（扫描候选 + AI 标注），逐步 yield 进度事件。"""
     if not files:
         raise HTTPException(status_code=400, detail="请选择要检查的文件。")
+    provider, model = _resolve_llm_options(provider, model)
 
     yield {"stage": "scan", "current": 0, "total": 0}
     total_segments, drafts = _collect_style_tag_candidates(db, files)
@@ -666,6 +692,7 @@ async def rerun_style_tag_check_item(
     model: str | None = None,
 ) -> StyleTagCheckReportItem:
     """对单条重新跑 AI 标注（例如译文改动后原建议已失效）。"""
+    provider, model = _resolve_llm_options(provider, model)
     segment = _get_item_segment(db, item)
     item.target_text = segment.target_text or ""
     format_map = json.loads(item.format_map or "{}")

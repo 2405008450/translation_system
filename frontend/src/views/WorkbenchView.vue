@@ -8169,36 +8169,18 @@ onBeforeRouteLeave(async () => {
         </div>
 
         <div class="tool-group custom-style">
-          <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-bold" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
+          <div class="custom-style__grid">
+            <button class="style-item tool-button" type="button" data-testid="workbench-format-bold" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
               <span class="icon-text-area"><span class="tool-item"><Bold class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-strikethrough" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
-              <span class="icon-text-area"><span class="tool-item"><Strikethrough class="tool-label-icon" :size="15" /></span></span>
-            </button>
-            <span class="tool-line style-item tool-button is-placeholder" aria-hidden="true"><span class="icon-text-area"><span class="tool-item"></span></span></span>
-          </span>
-          <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-italic" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
+            <button class="style-item tool-button" type="button" data-testid="workbench-format-italic" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
               <span class="icon-text-area"><span class="tool-item"><Italic class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-superscript" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
-              <span class="icon-text-area"><span class="tool-item"><Superscript class="tool-label-icon" :size="15" /></span></span>
-            </button>
-            <span class="tool-line style-item tool-button is-placeholder" aria-hidden="true"><span class="icon-text-area"><span class="tool-item"></span></span></span>
-          </span>
-          <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-underline" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
+            <button class="style-item tool-button" type="button" data-testid="workbench-format-underline" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
               <span class="icon-text-area"><span class="tool-item"><Underline class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-subscript" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
-              <span class="icon-text-area"><span class="tool-item"><Subscript class="tool-label-icon" :size="15" /></span></span>
-            </button>
-            <span class="tool-line style-item tool-button is-placeholder" aria-hidden="true"><span class="icon-text-area"><span class="tool-item"></span></span></span>
-          </span>
-          <span class="tool-col align-left">
             <div class="case-menu">
-              <button class="tool-line style-item tool-button" type="button" data-testid="workbench-case-menu-button" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
+              <button class="style-item tool-button" type="button" data-testid="workbench-case-menu-button" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
                 <span class="icon-text-area has_dropdown"><span class="tool-item"><Type class="tool-label-icon" :size="15" /></span></span>
                 <span class="dropdown-link" aria-hidden="true">
                   <ChevronDown :size="10" />
@@ -8211,16 +8193,27 @@ onBeforeRouteLeave(async () => {
                 <button type="button" class="case-menu__item" data-testid="workbench-case-sentence" @mousedown.prevent @click="applyCase('sentence')">{{ t('workbench.ribbon.caseSentence') }}</button>
               </div>
             </div>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
+            <button class="style-item tool-button" type="button" data-testid="workbench-format-strikethrough" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
+              <span class="icon-text-area"><span class="tool-item"><Strikethrough class="tool-label-icon" :size="15" /></span></span>
+            </button>
+            <button class="style-item tool-button" type="button" data-testid="workbench-format-superscript" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
+              <span class="icon-text-area"><span class="tool-item"><Superscript class="tool-label-icon" :size="15" /></span></span>
+            </button>
+            <button class="style-item tool-button" type="button" data-testid="workbench-format-subscript" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
+              <span class="icon-text-area"><span class="tool-item"><Subscript class="tool-label-icon" :size="15" /></span></span>
+            </button>
+            <button class="style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
               <span class="icon-text-area"><span class="tool-item"><Pilcrow class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.formatMarksVisible.value }" title="显示/隐藏原文与译文样式预览" @click="toggleFormatMarks">
+            <button class="style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.formatMarksVisible.value }" title="显示/隐藏原文与译文样式预览" @click="toggleFormatMarks">
               <span class="icon-text-area"><span class="tool-item"><Tags class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.tagEditModeEnabled.value }" :disabled="!activeSegmentCanWrite" title="选中译文样式预览中的文字，一键加/删样式标签" @click="toggleTagEditMode">
+            <button class="style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.tagEditModeEnabled.value }" :disabled="!activeSegmentCanWrite" title="选中译文样式预览中的文字，一键加/删样式标签" @click="toggleTagEditMode">
               <span class="icon-text-area"><span class="tool-item"><TagIcon class="tool-label-icon" :size="15" /></span></span>
             </button>
-          </span>
+            <span class="style-item custom-style__placeholder" aria-hidden="true"></span>
+            <span class="style-item custom-style__placeholder" aria-hidden="true"></span>
+          </div>
         </div>
 
         <div class="tool-group">
@@ -12326,23 +12319,27 @@ onBeforeRouteLeave(async () => {
   padding-left: 5px;
 }
 
-.custom-style .tool-col {
-  width: 24px;
-}
-
-.custom-style .tool-col + .tool-col {
-  margin-left: 2px;
+.custom-style__grid {
+  display: grid;
+  grid-template-columns: repeat(4, 24px);
+  grid-auto-rows: 24px;
+  gap: 2px;
+  align-content: center;
+  justify-content: start;
 }
 
 .style-item.tool-button {
+  display: inline-flex;
   justify-content: center;
+  align-items: center;
   width: 23px;
   height: 23px;
   padding: 0;
 }
 
-/* 样式区第三行占位：保持 4 列网格对齐，仅“译文样式标记”按钮实际可见 */
-.style-item.tool-button.is-placeholder {
+.custom-style__placeholder {
+  width: 23px;
+  height: 23px;
   visibility: hidden;
   pointer-events: none;
 }
