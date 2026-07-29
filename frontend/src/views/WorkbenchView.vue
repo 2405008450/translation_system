@@ -5394,6 +5394,122 @@ const styleTagCheckButtonTitle = computed(() => {
     : '生成样式标记专检'
 })
 
+// ========== 底部 AI 能力下拉（数字专检 / 样式标记专检） ==========
+const showAiCapabilityMenu = ref(false)
+const aiCapabilityTriggerRef = ref<HTMLButtonElement | null>(null)
+const aiCapabilityMenuRef = ref<HTMLElement | null>(null)
+const aiCapabilityMenuStyle = ref<Record<string, string>>({})
+type AiCapabilityKey = 'number-check' | 'style-tag-check'
+
+const isAiCapabilityBusy = computed(() => (
+  loadingNumberCheck.value
+  || generatingNumberCheck.value
+  || loadingStyleTagCheck.value
+  || generatingStyleTagCheck.value
+))
+
+const aiCapabilityButtonTitle = computed(() => {
+  if (activeBottomTool.value === 'number-check') {
+    return numberCheckButtonTitle.value
+  }
+  if (activeBottomTool.value === 'style-tag-check') {
+    return styleTagCheckButtonTitle.value
+  }
+  return 'AI能力：数字专检 / 样式标记专检'
+})
+
+const aiCapabilityBadgeCount = computed(() => {
+  if (activeBottomTool.value === 'number-check' && numberCheckReport.value) {
+    return numberCheckReport.value.active_issue_count
+  }
+  if (activeBottomTool.value === 'style-tag-check' && styleTagCheckReport.value) {
+    return styleTagCheckReport.value.candidate_count
+  }
+  return null
+})
+
+function updateAiCapabilityMenuPosition() {
+  const trigger = aiCapabilityTriggerRef.value
+  if (!trigger) {
+    return
+  }
+
+  const rect = trigger.getBoundingClientRect()
+  const gap = 6
+  const viewportPadding = 8
+  const menuWidth = 190
+  const menuHeight = aiCapabilityMenuRef.value?.offsetHeight ?? 0
+  const maxLeft = window.innerWidth - menuWidth - viewportPadding
+  const left = Math.min(Math.max(viewportPadding, rect.left), Math.max(viewportPadding, maxLeft))
+  const top = Math.max(viewportPadding, rect.top - menuHeight - gap)
+
+  aiCapabilityMenuStyle.value = {
+    position: 'fixed',
+    top: `${Math.round(top)}px`,
+    left: `${Math.round(left)}px`,
+    zIndex: '3000',
+    minWidth: `${menuWidth}px`,
+  }
+}
+
+function handleAiCapabilityDocumentClick(event: MouseEvent) {
+  const target = event.target
+  if (!(target instanceof Node)) {
+    closeAiCapabilityMenu()
+    return
+  }
+  if (aiCapabilityTriggerRef.value?.contains(target) || aiCapabilityMenuRef.value?.contains(target)) {
+    return
+  }
+  closeAiCapabilityMenu()
+}
+
+function handleAiCapabilityDocumentKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') {
+    closeAiCapabilityMenu()
+  }
+}
+
+function removeAiCapabilityMenuListeners() {
+  document.removeEventListener('click', handleAiCapabilityDocumentClick)
+  document.removeEventListener('keydown', handleAiCapabilityDocumentKeydown)
+  window.removeEventListener('resize', closeAiCapabilityMenu)
+  window.removeEventListener('scroll', closeAiCapabilityMenu, true)
+}
+
+async function toggleAiCapabilityMenu() {
+  if (showAiCapabilityMenu.value) {
+    closeAiCapabilityMenu()
+    return
+  }
+
+  showAiCapabilityMenu.value = true
+  updateAiCapabilityMenuPosition()
+  document.addEventListener('click', handleAiCapabilityDocumentClick)
+  document.addEventListener('keydown', handleAiCapabilityDocumentKeydown)
+  window.addEventListener('resize', closeAiCapabilityMenu)
+  window.addEventListener('scroll', closeAiCapabilityMenu, true)
+  await nextTick()
+  updateAiCapabilityMenuPosition()
+}
+
+function closeAiCapabilityMenu() {
+  if (!showAiCapabilityMenu.value) {
+    return
+  }
+  showAiCapabilityMenu.value = false
+  removeAiCapabilityMenuListeners()
+}
+
+async function selectAiCapability(key: AiCapabilityKey) {
+  closeAiCapabilityMenu()
+  if (key === 'number-check') {
+    await openNumberCheck()
+  } else {
+    await openStyleTagCheck()
+  }
+}
+
 interface StyleTagCheckStatusTag {
   text: string
   tone: 'ok' | 'warn' | 'muted' | 'done'
@@ -7369,6 +7485,7 @@ function handleClickOutside(event: MouseEvent) {
   if (!target.closest('.export-dropdown')) {
     showExportMenu.value = false
   }
+
   if (
     !target.closest('.workbench-confirm-menu')
     && !target.closest('.workbench-confirm-menu__dropdown')
@@ -7786,6 +7903,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('click', handleClickOutside)
   document.removeEventListener('selectionchange', handleSelectionChange)
   document.removeEventListener('fullscreenchange', handleWorkbenchFullscreenChange)
+  removeAiCapabilityMenuListeners()
   clearExportPollTimer()
   commentStore.stopPolling()
 })
@@ -9691,47 +9809,83 @@ onBeforeRouteLeave(async () => {
                 {{ termQAReport.active_issue_count }}
               </span>
             </button>
-            <button
-              class="segment-editor-bottom-tool segment-editor-bottom-tool--qa"
-              :class="{ 'is-active': activeBottomTool === 'number-check' }"
-              type="button"
-              :title="numberCheckButtonTitle"
-              :aria-pressed="activeBottomTool === 'number-check'"
-              :disabled="loadingNumberCheck || generatingNumberCheck"
-              @click="void openNumberCheck()"
-            >
-              <Loader2 v-if="loadingNumberCheck || generatingNumberCheck" class="lucide-spin" :size="14" />
-              <Sigma v-else :size="14" />
-              <span>数字专检</span>
-              <span
-                v-if="numberCheckReport"
-                class="segment-editor-bottom-tool__badge"
-                :class="{ 'is-clean': numberCheckReport.active_issue_count === 0 }"
+            <div class="segment-editor-bottom-tool-dropdown">
+              <button
+                ref="aiCapabilityTriggerRef"
+                class="segment-editor-bottom-tool segment-editor-bottom-tool--qa segment-editor-bottom-tool--ai-capability"
+                :class="{ 'is-active': activeBottomTool === 'number-check' || activeBottomTool === 'style-tag-check' }"
+                type="button"
+                :title="aiCapabilityButtonTitle"
+                :aria-expanded="showAiCapabilityMenu"
+                aria-haspopup="menu"
+                :disabled="isAiCapabilityBusy"
+                @click.stop="void toggleAiCapabilityMenu()"
               >
-                {{ numberCheckReport.active_issue_count }}
-              </span>
-            </button>
-            <button
-              v-if="!isMergeWorkbench"
-              class="segment-editor-bottom-tool segment-editor-bottom-tool--qa"
-              :class="{ 'is-active': activeBottomTool === 'style-tag-check' }"
-              type="button"
-              :title="styleTagCheckButtonTitle"
-              :aria-pressed="activeBottomTool === 'style-tag-check'"
-              :disabled="loadingStyleTagCheck || generatingStyleTagCheck"
-              @click="void openStyleTagCheck()"
-            >
-              <Loader2 v-if="loadingStyleTagCheck || generatingStyleTagCheck" class="lucide-spin" :size="14" />
-              <Palette v-else :size="14" />
-              <span>样式标记专检</span>
-              <span
-                v-if="styleTagCheckReport"
-                class="segment-editor-bottom-tool__badge"
-                :class="{ 'is-clean': styleTagCheckReport.candidate_count === 0 }"
-              >
-                {{ styleTagCheckReport.candidate_count }}
-              </span>
-            </button>
+                <Loader2 v-if="isAiCapabilityBusy" class="lucide-spin" :size="14" />
+                <Bot v-else :size="14" />
+                <span>AI能力</span>
+                <ChevronUp v-if="showAiCapabilityMenu" :size="12" />
+                <ChevronDown v-else :size="12" />
+                <span
+                  v-if="aiCapabilityBadgeCount !== null"
+                  class="segment-editor-bottom-tool__badge"
+                  :class="{ 'is-clean': aiCapabilityBadgeCount === 0 }"
+                >
+                  {{ aiCapabilityBadgeCount }}
+                </span>
+              </button>
+              <Teleport to="body">
+                <div
+                  v-if="showAiCapabilityMenu"
+                  ref="aiCapabilityMenuRef"
+                  class="segment-editor-bottom-tool-dropdown__menu"
+                  :style="aiCapabilityMenuStyle"
+                  role="menu"
+                  aria-label="AI能力"
+                  @click.stop
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    class="segment-editor-bottom-tool-dropdown__item"
+                    :class="{ 'is-active': activeBottomTool === 'number-check' }"
+                    :disabled="loadingNumberCheck || generatingNumberCheck"
+                    @click="void selectAiCapability('number-check')"
+                  >
+                    <Loader2 v-if="loadingNumberCheck || generatingNumberCheck" class="lucide-spin" :size="14" />
+                    <Sigma v-else :size="14" />
+                    <span>数字专检</span>
+                    <span
+                      v-if="numberCheckReport"
+                      class="segment-editor-bottom-tool-dropdown__badge"
+                      :class="{ 'is-clean': numberCheckReport.active_issue_count === 0 }"
+                    >
+                      {{ numberCheckReport.active_issue_count }}
+                    </span>
+                  </button>
+                  <button
+                    v-if="!isMergeWorkbench"
+                    type="button"
+                    role="menuitem"
+                    class="segment-editor-bottom-tool-dropdown__item"
+                    :class="{ 'is-active': activeBottomTool === 'style-tag-check' }"
+                    :disabled="loadingStyleTagCheck || generatingStyleTagCheck"
+                    @click="void selectAiCapability('style-tag-check')"
+                  >
+                    <Loader2 v-if="loadingStyleTagCheck || generatingStyleTagCheck" class="lucide-spin" :size="14" />
+                    <Palette v-else :size="14" />
+                    <span>样式标记专检</span>
+                    <span
+                      v-if="styleTagCheckReport"
+                      class="segment-editor-bottom-tool-dropdown__badge"
+                      :class="{ 'is-clean': styleTagCheckReport.candidate_count === 0 }"
+                    >
+                      {{ styleTagCheckReport.candidate_count }}
+                    </span>
+                  </button>
+                </div>
+              </Teleport>
+            </div>
             <button
               v-for="tool in bottomToolButtons"
               :key="tool.key"
@@ -14685,13 +14839,110 @@ onBeforeRouteLeave(async () => {
     color 140ms ease;
 }
 
-.segment-editor-bottom-tool:first-child {
+.segment-editor-bottom-tools > .segment-editor-bottom-tool:first-child,
+.segment-editor-bottom-tools > .segment-editor-bottom-tool-dropdown:first-child .segment-editor-bottom-tool {
   border-left: 0;
   border-radius: 0;
 }
 
-.segment-editor-bottom-tool:last-child {
+.segment-editor-bottom-tools > .segment-editor-bottom-tool:last-child,
+.segment-editor-bottom-tools > .segment-editor-bottom-tool-dropdown:last-child .segment-editor-bottom-tool {
   border-radius: 0;
+}
+
+.segment-editor-bottom-tool-dropdown {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.segment-editor-bottom-tool-dropdown .segment-editor-bottom-tool {
+  height: 100%;
+}
+
+.segment-editor-bottom-tool-dropdown__menu {
+  display: grid;
+  gap: 2px;
+  max-width: calc(100vw - 16px);
+  padding: 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-soft);
+}
+
+.segment-editor-bottom-tool-dropdown__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.2;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.segment-editor-bottom-tool-dropdown__item svg {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+}
+
+.segment-editor-bottom-tool-dropdown__item span:first-of-type {
+  flex: 1 1 auto;
+}
+
+.segment-editor-bottom-tool-dropdown__item:hover:not(:disabled),
+.segment-editor-bottom-tool-dropdown__item:focus-visible {
+  background: var(--surface-muted);
+  color: var(--text-primary);
+  outline: none;
+}
+
+.segment-editor-bottom-tool-dropdown__item.is-active {
+  background: var(--surface-muted);
+  color: var(--brand-700);
+}
+
+.segment-editor-bottom-tool-dropdown__item.is-active svg {
+  color: var(--brand-700);
+}
+
+.segment-editor-bottom-tool-dropdown__item:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.segment-editor-bottom-tool-dropdown__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #fff4e5;
+  color: #9b4d07;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.segment-editor-bottom-tool-dropdown__badge.is-clean {
+  background: #e6f6ef;
+  color: #15795d;
+}
+
+.segment-editor-bottom-tool--ai-capability {
+  gap: 4px;
 }
 
 .segment-editor-bottom-tool svg {
