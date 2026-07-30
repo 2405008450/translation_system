@@ -743,6 +743,116 @@ export interface StyleTagCheckReport {
   items: StyleTagCheckReportItem[]
 }
 
+// ─── Translation Review ───────────────────────────────────
+
+export interface TranslationReviewReportItem {
+  id: string
+  report_id: string
+  file_record_id: string
+  sentence_id: string
+  file_name: string
+  file_order: number
+  display_index: number
+  category_key: string
+  category_index: number
+  category_label: string
+  rule_ref: string
+  severity: 'error' | 'warning' | 'suggestion'
+  origin: 'program' | 'ai'
+  source_text: string
+  target_text: string
+  quote: string
+  quote_start: number
+  quote_end: number
+  locate_status: 'ok' | 'normalized' | 'unlocatable' | 'ambiguous'
+  replace_anchor: string
+  suggested_value: string
+  suggested_target_text: string
+  reason: string
+  confidence: 'high' | 'medium' | 'low'
+  citations: Array<{ title?: string; url?: string; snippet?: string }>
+  apply_mode: 'anchor' | 'full' | 'manual'
+  applied: boolean
+  applied_at: string | null
+  apply_batch_id: string | null
+  status: 'open' | 'applied' | 'rejected' | 'ignored' | 'stale'
+  ignored_at: string | null
+  block_index: number
+  row_index: number | null
+  cell_index: number | null
+  created_at: string | null
+}
+
+export interface TranslationReviewAgentRun {
+  category_key: string
+  category_index: number
+  label: string
+  mode: string
+  input_segment_count: number
+  ai_input_count: number
+  program_finding_count: number
+  ai_finding_count: number
+  dropped_count: number
+  status: string
+  error_message: string
+  web_search_requests: number
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface TranslationReviewCategoryStat {
+  key: string
+  label: string
+  status: string
+  current: number
+  total: number
+  finding_count: number
+}
+
+export interface TranslationReviewProgress {
+  phase?: string
+  overall_percent: number
+  current_category?: string
+  current_file_name?: string
+  categories?: TranslationReviewCategoryStat[]
+  files?: Array<{ file_id: string; file_name: string; done_categories: number; total_categories: number; finding_count: number }>
+  updated_at?: string
+}
+
+export interface TranslationReviewReport {
+  id: string
+  project_id: string | null
+  file_record_id: string | null
+  merge_view_id: string | null
+  scope: 'file' | 'merge_view'
+  segment_scope: string
+  enabled_categories: string[]
+  file_ids: string[]
+  total_files: number
+  total_segments: number
+  checked_segments: number
+  category_counts: Record<string, number>
+  file_counts: Record<string, string>
+  issue_count: number
+  active_issue_count: number
+  applied_count: number
+  ignored_count: number
+  multi_category_segment_count: number
+  provider: string
+  model: string
+  web_verify_provider: string
+  web_search_requests: number
+  task_id: string
+  status: 'running' | 'completed' | 'partial_failed' | 'failed'
+  progress: TranslationReviewProgress
+  failed_categories: string[]
+  error_message: string
+  created_at: string | null
+  finished_at: string | null
+  items: TranslationReviewReportItem[]
+  agent_runs: TranslationReviewAgentRun[]
+}
+
 export interface ProjectSegmentSyncSummary {
   filled_count: number
   updated_count: number

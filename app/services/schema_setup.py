@@ -631,6 +631,25 @@ REQUIRED_SCHEMA = {
         "created_at",
         "updated_at",
     },
+    "translation_review_reports": {
+        "id",
+        "scope",
+        "status",
+        "created_at",
+    },
+    "translation_review_report_items": {
+        "id",
+        "report_id",
+        "category_key",
+        "file_order",
+        "sequence_index",
+    },
+    "translation_review_agent_runs": {
+        "id",
+        "report_id",
+        "category_key",
+        "status",
+    },
 }
 
 REQUIRED_INDEXES = {
@@ -749,6 +768,23 @@ REQUIRED_INDEXES = {
     },
     "pptx_layout_report_items": {
         "ix_pptx_layout_report_items_report_id",
+    },
+    "translation_review_reports": {
+        "ix_translation_review_reports_project_id",
+        "ix_translation_review_reports_file_record_id",
+        "ix_translation_review_reports_merge_view_id",
+        "ix_translation_review_reports_created_by_id",
+        "ix_translation_review_reports_task_id",
+        "ix_translation_review_reports_created_at",
+    },
+    "translation_review_report_items": {
+        "ix_translation_review_report_items_report_id",
+        "ix_translation_review_report_items_category_key",
+        "ix_translation_review_report_items_status",
+    },
+    "translation_review_agent_runs": {
+        "ix_translation_review_agent_runs_report_id",
+        "ix_translation_review_agent_runs_report_category",
     },
 }
 
@@ -3572,6 +3608,192 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 END LOOP;
             END
             $$;
+            """,
+            # ─────────────────────────────────────────────────────────────
+            # 翻译内容校对（Translation Review）— 3 张表
+            # ─────────────────────────────────────────────────────────────
+            f"""
+            CREATE TABLE IF NOT EXISTS translation_review_reports (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE,
+                merge_view_id UUID REFERENCES project_merge_views(id) ON DELETE CASCADE,
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                scope VARCHAR(20) NOT NULL DEFAULT 'file',
+                segment_scope VARCHAR(30) NOT NULL DEFAULT 'all',
+                enabled_categories TEXT NOT NULL DEFAULT '[]',
+                file_ids TEXT NOT NULL DEFAULT '[]',
+                total_files INTEGER NOT NULL DEFAULT 0,
+                total_segments INTEGER NOT NULL DEFAULT 0,
+                checked_segments INTEGER NOT NULL DEFAULT 0,
+                category_counts TEXT NOT NULL DEFAULT '{{}}',
+                file_counts TEXT NOT NULL DEFAULT '{{}}',
+                issue_count INTEGER NOT NULL DEFAULT 0,
+                active_issue_count INTEGER NOT NULL DEFAULT 0,
+                applied_count INTEGER NOT NULL DEFAULT 0,
+                ignored_count INTEGER NOT NULL DEFAULT 0,
+                multi_category_segment_count INTEGER NOT NULL DEFAULT 0,
+                provider VARCHAR(40) NOT NULL DEFAULT '',
+                model VARCHAR(200) NOT NULL DEFAULT '',
+                web_verify_provider VARCHAR(20) NOT NULL DEFAULT 'none',
+                web_search_requests INTEGER NOT NULL DEFAULT 0,
+                task_id VARCHAR(64) NOT NULL DEFAULT '',
+                status VARCHAR(20) NOT NULL DEFAULT 'running',
+                progress TEXT NOT NULL DEFAULT '{{}}',
+                failed_categories TEXT NOT NULL DEFAULT '[]',
+                error_message TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                finished_at TIMESTAMP
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS translation_review_report_items (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                report_id UUID NOT NULL REFERENCES translation_review_reports(id) ON DELETE CASCADE,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                segment_id UUID REFERENCES segments(id) ON DELETE SET NULL,
+                sentence_id VARCHAR(100) NOT NULL DEFAULT '',
+                file_name VARCHAR(255) NOT NULL DEFAULT '',
+                file_order INTEGER NOT NULL DEFAULT 0,
+                display_index INTEGER NOT NULL DEFAULT -1,
+                sequence_index INTEGER NOT NULL DEFAULT -1,
+                category_key VARCHAR(40) NOT NULL DEFAULT '',
+                category_index INTEGER NOT NULL DEFAULT 0,
+                rule_ref VARCHAR(20) NOT NULL DEFAULT '',
+                severity VARCHAR(20) NOT NULL DEFAULT 'error',
+                origin VARCHAR(10) NOT NULL DEFAULT 'ai',
+                source_text TEXT NOT NULL DEFAULT '',
+                target_text TEXT NOT NULL DEFAULT '',
+                quote TEXT NOT NULL DEFAULT '',
+                quote_start INTEGER NOT NULL DEFAULT -1,
+                quote_end INTEGER NOT NULL DEFAULT -1,
+                locate_status VARCHAR(20) NOT NULL DEFAULT 'ok',
+                replace_anchor TEXT NOT NULL DEFAULT '',
+                suggested_value TEXT NOT NULL DEFAULT '',
+                suggested_target_text TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                confidence VARCHAR(10) NOT NULL DEFAULT 'medium',
+                citations TEXT NOT NULL DEFAULT '[]',
+                apply_mode VARCHAR(10) NOT NULL DEFAULT 'manual',
+                original_target_text TEXT NOT NULL DEFAULT '',
+                applied BOOLEAN NOT NULL DEFAULT FALSE,
+                applied_at TIMESTAMP,
+                apply_batch_id UUID,
+                status VARCHAR(20) NOT NULL DEFAULT 'open',
+                ignored_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                ignored_at TIMESTAMP,
+                block_index INTEGER NOT NULL DEFAULT 0,
+                row_index INTEGER,
+                cell_index INTEGER,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS translation_review_agent_runs (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                report_id UUID NOT NULL REFERENCES translation_review_reports(id) ON DELETE CASCADE,
+                category_key VARCHAR(40) NOT NULL DEFAULT '',
+                category_index INTEGER NOT NULL DEFAULT 0,
+                mode VARCHAR(20) NOT NULL DEFAULT '',
+                input_segment_count INTEGER NOT NULL DEFAULT 0,
+                ai_input_count INTEGER NOT NULL DEFAULT 0,
+                batch_count INTEGER NOT NULL DEFAULT 0,
+                llm_request_count INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                web_search_requests INTEGER NOT NULL DEFAULT 0,
+                program_finding_count INTEGER NOT NULL DEFAULT 0,
+                ai_finding_count INTEGER NOT NULL DEFAULT 0,
+                dropped_count INTEGER NOT NULL DEFAULT 0,
+                status VARCHAR(30) NOT NULL DEFAULT 'ok',
+                error_message TEXT NOT NULL DEFAULT '',
+                provider VARCHAR(40) NOT NULL DEFAULT '',
+                model VARCHAR(200) NOT NULL DEFAULT '',
+                started_at TIMESTAMP,
+                finished_at TIMESTAMP
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_reports_project_id
+            ON translation_review_reports (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_reports_file_record_id
+            ON translation_review_reports (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_reports_merge_view_id
+            ON translation_review_reports (merge_view_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_reports_created_by_id
+            ON translation_review_reports (created_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_reports_task_id
+            ON translation_review_reports (task_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_reports_created_at
+            ON translation_review_reports (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_reports_scope_created_at
+            ON translation_review_reports (scope, created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_reports_merge_view_created_at
+            ON translation_review_reports (merge_view_id, created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_report_items_report_id
+            ON translation_review_report_items (report_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_report_items_project_id
+            ON translation_review_report_items (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_report_items_file_record_id
+            ON translation_review_report_items (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_report_items_segment_id
+            ON translation_review_report_items (segment_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_report_items_category_key
+            ON translation_review_report_items (category_key)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_report_items_status
+            ON translation_review_report_items (status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_report_items_report_sentence
+            ON translation_review_report_items (report_id, sentence_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_report_items_apply_batch_id
+            ON translation_review_report_items (apply_batch_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_report_items_sort_order
+            ON translation_review_report_items
+                (report_id, file_order, block_index, row_index, cell_index,
+                 sequence_index, sentence_id, category_index)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_agent_runs_report_id
+            ON translation_review_agent_runs (report_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_agent_runs_report_category
+            ON translation_review_agent_runs (report_id, category_key)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_agent_runs_status
+            ON translation_review_agent_runs (status)
             """,
         ]
     )

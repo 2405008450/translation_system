@@ -167,6 +167,19 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+    # ─── 翻译内容校对（Translation Review）配置 ──────────────────────
+    translation_review_max_concurrency: int = 3
+    translation_review_requests_per_minute: int = 60
+    translation_review_batch_size_default: int = 12
+    translation_review_default_segment_scope: str = "all"
+    # 联网查证：none | openrouter | custom
+    translation_review_web_search_provider: str = "none"
+    translation_review_web_search_engine: str = "auto"
+    translation_review_web_search_max_results: int = 5
+    translation_review_web_search_max_uses: int = 2
+    translation_review_web_allow_domains: list[str] = Field(default_factory=list)
+    translation_review_web_search_custom_url: str | None = None
+    translation_review_web_search_custom_api_key: str | None = None
 
 
 @lru_cache

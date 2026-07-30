@@ -428,6 +428,26 @@ from app.services.style_tag_check_service import (
 from app.services.tm_vector import sync_tm_embeddings
 from app.services.translation_memory_service import TMUpsertEntry, batch_upsert_tm_entries
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
+from app.services.docx_report_exporter import (
+    build_docx_download_response as tr_build_docx_download_response,
+    build_translation_review_docx,
+)
+from app.services.translation_review.service import (
+    apply_batch as tr_apply_batch,
+    apply_item as tr_apply_item,
+    create_review_report,
+    get_report as tr_get_report,
+    list_file_reports as tr_list_file_reports,
+    list_merge_view_reports as tr_list_merge_view_reports,
+    load_agent_runs as tr_load_agent_runs,
+    load_report_items as tr_load_report_items,
+    reject_item as tr_reject_item,
+    restore_item as tr_restore_item,
+    run_program_rules_only,
+    serialize_report as tr_serialize_report,
+    set_items_ignored as tr_set_items_ignored,
+    undo_batch as tr_undo_batch,
+)
 
 try:
     from arq import create_pool as arq_create_pool
@@ -444,6 +464,7 @@ ARQ_MAINTENANCE_QUEUE_NAME = "arq:maintenance"
 ARQ_AUTO_TM_QUEUE_NAME = "arq:auto-tm"
 ARQ_SEGMENT_SYNC_QUEUE_NAME = "arq:segment-sync"
 ARQ_PRETRANSLATION_QUEUE_NAME = "arq:pretranslation"
+ARQ_TRANSLATION_REVIEW_QUEUE_NAME = "arq:translation-review"
 ARQ_AUTO_TM_BACKGROUND_JOB_ID = "auto-tm-background"
 ARQ_AUTO_TM_REMATCH_BACKGROUND_JOB_ID = "auto-tm-rematch-background"
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -1492,6 +1513,21 @@ class PretranslationWorkerSettings:
     functions = [
         pretranslation_run_job,
     ]
+    redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
+
+
+def _build_translation_review_arq_settings():
+    """延迟导入避免循环依赖。"""
+    from app.services.translation_review.service import translation_review_job
+    return translation_review_job
+
+
+class TranslationReviewWorkerSettings:
+    """翻译内容校对 arq worker 配置。队列：arq:translation-review"""
+    queue_name = ARQ_TRANSLATION_REVIEW_QUEUE_NAME
+    keep_result = 0
+    max_jobs = 1
+    functions = [_build_translation_review_arq_settings()]
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
 
@@ -9498,6 +9534,445 @@ def apply_all_style_tag_check_report_items(
     result = serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
     result["applied_count"] = applied_count
     return result
+
+
+# ─────────────────────────────────────────────────────────────
+# 翻译内容校对（Translation Review）端点
+# ─────────────────────────────────────────────────────────────
+
+class TranslationReviewTaskRequest(BaseModel):
+    categories: list[str] | None = None
+    segment_scope: str = "all"
+    provider: str = "auto"
+    model: str = ""
+    web_verify: str = "none"
+
+
+class TranslationReviewIgnoreRequest(BaseModel):
+    item_ids: list[UUID]
+    ignored: bool
+
+
+class TranslationReviewApplyBatchRequest(BaseModel):
+    mode: str = "high_confidence"   # program | high_confidence | category | selected
+    category_key: str | None = None
+    item_ids: list[UUID] | None = None
+
+
+class TranslationReviewUndoBatchRequest(BaseModel):
+    apply_batch_id: UUID | None = None
+
+
+def _get_tr_report_or_404(db: Session, report_id: UUID) -> "TranslationReviewReport":
+    from app.models import TranslationReviewReport
+    report = db.query(TranslationReviewReport).filter(
+        TranslationReviewReport.id == report_id
+    ).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="校对报告不存在。")
+    return report
+
+
+def _get_tr_item_or_404(db: Session, item_id: UUID) -> "TranslationReviewReportItem":
+    from app.models import TranslationReviewReportItem
+    item = db.query(TranslationReviewReportItem).filter(
+        TranslationReviewReportItem.id == item_id
+    ).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="报告条目不存在。")
+    return item
+
+
+def _build_file_order_map(files: list["FileRecord"]) -> "dict[UUID, int]":
+    return {f.id: i for i, f in enumerate(files)}
+
+
+def _run_translation_review_background(
+    db: "Session",
+    report_id: "UUID",
+    files: list["FileRecord"],
+    file_order_map: "dict[UUID, int]",
+    segment_scope: str,
+    enabled_categories: list[str] | None,
+) -> None:
+    """本地后台回退（arq 未启用时）。"""
+    import asyncio as _asyncio
+    from app.models import TranslationReviewReport
+    from app.services.translation_review.orchestrator import run_full_review
+    report = db.query(TranslationReviewReport).filter(
+        TranslationReviewReport.id == report_id
+    ).first()
+    if not report:
+        return
+    _asyncio.run(run_full_review(
+        db, report, files, file_order_map,
+        segment_scope=segment_scope,
+        enabled_keys=enabled_categories,
+        provider=report.provider or "auto",
+        model=report.model or None,
+        web_verify_provider=report.web_verify_provider or "none",
+    ))
+
+
+@router.post("/file-records/{file_record_id}/translation-review-tasks")
+async def create_file_translation_review_task(
+    file_record_id: UUID,
+    payload: TranslationReviewTaskRequest | None = None,
+    background_tasks: BackgroundTasks = ...,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    body = payload or TranslationReviewTaskRequest()
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    project = _resolve_file_record_project(db, file_record)
+    files = [file_record]
+    file_order_map = _build_file_order_map(files)
+
+    report = create_review_report(
+        db,
+        project=project,
+        files=files,
+        file_order_map=file_order_map,
+        merge_view=None,
+        current_user=current_user,
+        segment_scope=body.segment_scope,
+        enabled_categories=body.categories,
+        provider=body.provider,
+        model=body.model,
+        web_verify_provider=body.web_verify,
+    )
+    db.commit()
+
+    enqueued = await _enqueue_arq_job(
+        "translation_review_job",
+        str(report.id),
+        queue_name=ARQ_TRANSLATION_REVIEW_QUEUE_NAME,
+    )
+    if not enqueued:
+        background_tasks.add_task(
+            _run_translation_review_background,
+            db, report.id, files, file_order_map,
+            body.segment_scope, body.categories,
+        )
+
+    return {"task_id": str(report.id), "report_id": str(report.id)}
+
+
+@router.get("/file-records/{file_record_id}/translation-review-reports")
+def list_file_translation_review_reports(
+    file_record_id: UUID,
+    limit: int = 1,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    reports = tr_list_file_reports(db, file_record_id, limit=limit)
+    return {
+        "items": [
+            tr_serialize_report(r, tr_load_report_items(db, r.id), tr_load_agent_runs(db, r.id))
+            for r in reports
+        ]
+    }
+
+
+@router.get("/translation-review-tasks/{task_id}")
+def get_translation_review_task(
+    task_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_tr_report_or_404(db, task_id)
+    return {
+        "status": report.status,
+        "report_id": str(report.id),
+        "progress": json.loads(report.progress or "{}"),
+        "error_message": report.error_message,
+    }
+
+
+@router.get("/translation-review-reports/{report_id}")
+def get_translation_review_report(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_tr_report_or_404(db, report_id)
+    return tr_serialize_report(
+        report,
+        tr_load_report_items(db, report_id),
+        tr_load_agent_runs(db, report_id),
+    )
+
+
+@router.post("/translation-review-report-items/{item_id}/apply")
+def apply_translation_review_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_tr_item_or_404(db, item_id)
+    result_status = tr_apply_item(db, item, current_user)
+    db.commit()
+    return {"status": result_status}
+
+
+@router.post("/translation-review-report-items/{item_id}/restore")
+def restore_translation_review_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_tr_item_or_404(db, item_id)
+    success = tr_restore_item(db, item, current_user)
+    db.commit()
+    return {"success": success}
+
+
+@router.post("/translation-review-report-items/{item_id}/reject")
+def reject_translation_review_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_tr_item_or_404(db, item_id)
+    tr_reject_item(db, item)
+    db.commit()
+    return {"status": "rejected"}
+
+
+@router.patch("/translation-review-report-items/ignore")
+def ignore_translation_review_items(
+    payload: TranslationReviewIgnoreRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not payload.item_ids:
+        raise HTTPException(status_code=400, detail="请选择要操作的条目。")
+    changed = tr_set_items_ignored(db, payload.item_ids, payload.ignored, current_user)
+    db.commit()
+    return {"changed_count": changed}
+
+
+@router.post("/translation-review-reports/{report_id}/apply-batch")
+def apply_translation_review_batch(
+    report_id: UUID,
+    payload: TranslationReviewApplyBatchRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_tr_report_or_404(db, report_id)
+    result = tr_apply_batch(
+        db,
+        report_id=report.id,
+        mode=payload.mode,
+        current_user=current_user,
+        category_key=payload.category_key,
+        item_ids=payload.item_ids,
+    )
+    return result
+
+
+@router.post("/translation-review-reports/{report_id}/undo-batch")
+def undo_translation_review_batch(
+    report_id: UUID,
+    payload: TranslationReviewUndoBatchRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_tr_report_or_404(db, report_id)
+    body = payload or TranslationReviewUndoBatchRequest()
+    result = tr_undo_batch(db, report.id, current_user, apply_batch_id=body.apply_batch_id)
+    return result
+
+
+# ─── 合并视图变体 ─────────────────────────────────────────
+
+@router.post("/merge-views/{view_id}/translation-review-tasks")
+async def create_merge_view_translation_review_task(
+    view_id: UUID,
+    payload: TranslationReviewTaskRequest | None = None,
+    background_tasks: BackgroundTasks = ...,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    body = payload or TranslationReviewTaskRequest()
+    view, project, files = _get_merge_view_context(db, view_id, current_user)
+    file_order_map = _build_file_order_map(files)
+
+    report = create_review_report(
+        db,
+        project=project,
+        files=files,
+        file_order_map=file_order_map,
+        merge_view=view,
+        current_user=current_user,
+        segment_scope=body.segment_scope,
+        enabled_categories=body.categories,
+        provider=body.provider,
+        model=body.model,
+        web_verify_provider=body.web_verify,
+    )
+    db.commit()
+
+    enqueued = await _enqueue_arq_job(
+        "translation_review_job",
+        str(report.id),
+        queue_name=ARQ_TRANSLATION_REVIEW_QUEUE_NAME,
+    )
+    if not enqueued:
+        background_tasks.add_task(
+            _run_translation_review_background,
+            db, report.id, files, file_order_map,
+            body.segment_scope, body.categories,
+        )
+
+    return {"task_id": str(report.id), "report_id": str(report.id)}
+
+
+@router.get("/merge-views/{view_id}/translation-review-reports")
+def list_merge_view_translation_review_reports(
+    view_id: UUID,
+    limit: int = 1,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    view, _project, _files = _get_merge_view_context(db, view_id, current_user)
+    reports = tr_list_merge_view_reports(db, view.id, limit=limit)
+    return {
+        "items": [
+            tr_serialize_report(r, tr_load_report_items(db, r.id), tr_load_agent_runs(db, r.id))
+            for r in reports
+        ]
+    }
+
+
+@router.get("/translation-review-reports/{report_id}/export-docx")
+def export_translation_review_report_docx(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_tr_report_or_404(db, report_id)
+    items = tr_load_report_items(db, report_id)
+    runs = tr_load_agent_runs(db, report_id)
+    report_data = tr_serialize_report(report, items, runs)
+    items_data = report_data.pop("items", [])
+    runs_data = report_data.pop("agent_runs", [])
+    docx_bytes = build_translation_review_docx(report_data, items_data, runs_data)
+    safe_name = f"review-{str(report_id)[:8]}.docx"
+    if report.scope == "file" and report.file_record_id:
+        file_record = db.query(FileRecord).filter(FileRecord.id == report.file_record_id).first()
+        if file_record and file_record.filename:
+            base = file_record.filename.rsplit(".", 1)[0] if "." in file_record.filename else file_record.filename
+            safe_name = f"{base}-校对报告.docx"
+    return tr_build_docx_download_response(safe_name, docx_bytes)
+
+
+class TranslationReviewRerunRequest(BaseModel):
+    category_keys: list[str] | None = None
+    item_ids: list[UUID] | None = None
+
+
+@router.post("/translation-review-reports/{report_id}/rerun")
+async def rerun_translation_review_report(
+    report_id: UUID,
+    payload: TranslationReviewRerunRequest | None = None,
+    background_tasks: BackgroundTasks = ...,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """重跑指定类别（或全部）。重新入队 arq 任务。"""
+    from app.models import TranslationReviewReport, TranslationReviewAgentRun
+    import json as _json
+    report = _get_tr_report_or_404(db, report_id)
+    body = payload or TranslationReviewRerunRequest()
+
+    # 更新状态为 running
+    report.status = "running"
+    report.error_message = ""
+    if body.category_keys:
+        # 只删除本次重跑的类别 items + agent_runs
+        from app.models import TranslationReviewReportItem
+        db.query(TranslationReviewAgentRun).filter(
+            TranslationReviewAgentRun.report_id == report_id,
+            TranslationReviewAgentRun.category_key.in_(body.category_keys),
+        ).delete(synchronize_session="fetch")
+        db.query(TranslationReviewReportItem).filter(
+            TranslationReviewReportItem.report_id == report_id,
+            TranslationReviewReportItem.category_key.in_(body.category_keys),
+        ).delete(synchronize_session="fetch")
+    db.commit()
+
+    files: list[FileRecord] = []
+    merge_view = None
+    if report.scope == "merge_view" and report.merge_view_id:
+        from app.models import ProjectMergeView
+        from app.services.merge_view_service import load_view_file_records
+        view = db.query(ProjectMergeView).filter(ProjectMergeView.id == report.merge_view_id).first()
+        if view:
+            merge_view = view
+            _, project, files = _get_merge_view_context(db, view.id, current_user)
+    else:
+        if report.file_record_id:
+            fr = db.query(FileRecord).filter(FileRecord.id == report.file_record_id).first()
+            files = [fr] if fr else []
+
+    file_order_map = {f.id: i for i, f in enumerate(files)}
+
+    enqueued = await _enqueue_arq_job(
+        "translation_review_job",
+        str(report_id),
+        queue_name=ARQ_TRANSLATION_REVIEW_QUEUE_NAME,
+    )
+    if not enqueued:
+        background_tasks.add_task(
+            _run_translation_review_background,
+            db, report_id, files, file_order_map,
+            report.segment_scope or "all",
+            body.category_keys,
+        )
+    return {"task_id": str(report_id), "report_id": str(report_id)}
+
+
+@router.get("/translation-review-reports/{report_id}/export-xlsx")
+def export_translation_review_report_xlsx(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_tr_report_or_404(db, report_id)
+    items = tr_load_report_items(db, report_id)
+    rows = [
+        [
+            item.sentence_id,
+            item.file_name,
+            item.category_key,
+            item.rule_ref,
+            item.severity,
+            item.origin,
+            item.source_text,
+            item.target_text,
+            item.quote,
+            item.reason,
+            item.suggested_value,
+            item.confidence,
+            item.status,
+            item.applied_at.isoformat() if item.applied_at else "",
+        ]
+        for item in items
+    ]
+    xlsx_bytes = build_tabular_xlsx(
+        sheet_title="翻译校对结果",
+        headers=["句段ID", "文件", "类别", "规则", "严重程度", "来源", "原文", "译文", "问题片段", "问题说明", "修改建议", "置信度", "状态", "应用时间"],
+        rows=rows,
+    )
+    return build_xlsx_download_response(f"review-{str(report_id)[:8]}.xlsx", xlsx_bytes)
 
 
 @router.get("/projects/{project_id}")

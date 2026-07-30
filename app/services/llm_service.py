@@ -40,6 +40,17 @@ class LLMConfigurationError(LLMServiceError):
 class LLMRequestError(LLMServiceError):
     """LLM 请求异常。"""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
 
 class LLMResponseValidationError(LLMServiceError):
     """LLM 返回内容不符合约束。"""
@@ -89,6 +100,8 @@ class LLMChatCompletionResult:
     content: str
     provider: str
     model: str
+    annotations: list[dict] = field(default_factory=list)
+    web_search_requests: int = 0
 
 
 @dataclass(frozen=True)
@@ -639,8 +652,10 @@ async def _request_translation(
     timeout_seconds: float,
     model_override: str | None = None,
     response_format: dict | None = None,
+    tools: list[dict] | None = None,
+    extra_body: dict | None = None,
 ) -> str:
-    payload = {
+    payload: dict = {
         "model": model_override or provider.model,
         "messages": messages,
         "temperature": temperature,
@@ -648,6 +663,12 @@ async def _request_translation(
     }
     if response_format:
         payload["response_format"] = response_format
+    # openrouter:web_search 是 OpenRouter 专属能力，只向 openrouter provider 发送；
+    # 向其他 provider（deepseek / openai 等）发送会导致 400 Invalid Request。
+    if tools and provider.name == "openrouter":
+        payload["tools"] = tools
+    if extra_body and provider.name == "openrouter":
+        payload.update(extra_body)
     headers = {
         "Authorization": f"Bearer {provider.api_key}",
         "Content-Type": "application/json",
@@ -688,7 +709,19 @@ async def _request_translation(
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        raise LLMRequestError(f"{provider.name} 返回错误：{exc.response.text}") from exc
+        status_code = exc.response.status_code
+        retry_after_header = exc.response.headers.get("Retry-After")
+        retry_after: float | None = None
+        if retry_after_header is not None:
+            try:
+                retry_after = float(retry_after_header)
+            except ValueError:
+                pass
+        raise LLMRequestError(
+            f"{provider.name} 返回错误：{exc.response.text}",
+            status_code=status_code,
+            retry_after=retry_after,
+        ) from exc
 
     return _extract_translation_from_payload(response.json(), provider.name)
 
@@ -702,7 +735,22 @@ async def request_chat_completion(
     temperature: float | None = None,
     settings: Settings | None = None,
     allow_fallback: bool = True,
+    tools: list[dict] | None = None,
+    extra_body: dict | None = None,
 ) -> LLMChatCompletionResult:
+    """
+    通用 chat completion 调用。
+
+    新增参数：
+    - tools: OpenAI/OpenRouter tool 列表（如 openrouter:web_search）
+    - extra_body: 额外合并进请求体的字段（如 max_tool_calls）
+
+    退避策略（改进）：
+    - 429 / 5xx: 指数退避 min(2**attempt * 1.0, 30) + jitter，Retry-After 优先；
+      同一 provider 先耗尽重试，再 fallback 到下一 provider。
+    - 其他错误: 保持原有线性退避，不改动既有行为。
+    """
+    import random as _random
     config = settings or get_settings()
     providers = validate_provider_choice(provider=provider, settings=config)
     if not allow_fallback:
@@ -725,12 +773,49 @@ async def request_chat_completion(
                         timeout_seconds=config.llm_timeout_seconds,
                         model_override=model_override,
                         response_format=response_format,
+                        tools=tools,
+                        extra_body=extra_body,
                     )
+                    # content may be a plain str or dict depending on whether tools were used
+                    if isinstance(content, dict):
+                        text_content = content.get("content") or ""
+                        annotations = content.get("annotations") or []
+                        web_requests = int(content.get("web_search_requests") or 0)
+                    else:
+                        text_content = content
+                        annotations = []
+                        web_requests = 0
                     return LLMChatCompletionResult(
-                        content=content,
+                        content=text_content,
                         provider=item.name,
                         model=model_override or item.model,
+                        annotations=annotations,
+                        web_search_requests=web_requests,
                     )
+                except LLMRequestError as exc:
+                    last_error = exc
+                    status_code = getattr(exc, "status_code", None)
+                    retry_after = getattr(exc, "retry_after", None)
+                    logger.warning(
+                        "llm chat completion failed provider=%s model=%s attempt=%s "
+                        "status_code=%s error=%s",
+                        item.name,
+                        model_override or item.model,
+                        attempt_index + 1,
+                        status_code,
+                        exc,
+                    )
+                    if attempt_index + 1 >= retry_attempts:
+                        break
+                    # 429 or 5xx → exponential backoff
+                    if status_code is not None and (status_code == 429 or status_code >= 500):
+                        if retry_after is not None:
+                            delay = min(retry_after + _random.uniform(0, 1), 60.0)
+                        else:
+                            delay = min(1.0 * (2 ** attempt_index) + _random.uniform(0, 1), 30.0)
+                    else:
+                        delay = min(0.5 * (attempt_index + 1), 2.0)
+                    await asyncio.sleep(delay)
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
                     logger.warning(
@@ -1183,7 +1268,12 @@ def _request_translation_with_urllib(
     return _extract_translation_from_payload(parsed_payload, provider.name)
 
 
-def _extract_translation_from_payload(payload: dict, provider_name: str) -> str:
+def _extract_translation_from_payload(payload: dict, provider_name: str) -> str | dict:
+    """
+    从 LLM 响应中提取翻译文本。
+    如果响应包含 tool-use 注释（如 OpenRouter web_search），
+    返回 dict{'content', 'annotations', 'web_search_requests'} 而不是纯字符串。
+    """
     choices = payload.get("choices") or []
     if not choices:
         raise LLMRequestError(f"{provider_name} 未返回可用结果。")
@@ -1193,6 +1283,17 @@ def _extract_translation_from_payload(payload: dict, provider_name: str) -> str:
     translated_text = _normalize_response_content(content)
     if not translated_text:
         raise LLMRequestError(f"{provider_name} 返回空译文。")
+
+    # 检查是否有 url_citation 注释（tool use）
+    annotations = message.get("annotations") or []
+    usage = payload.get("usage") or {}
+    web_requests = int(usage.get("web_search_requests") or 0)
+    if annotations or web_requests:
+        return {
+            "content": translated_text,
+            "annotations": annotations,
+            "web_search_requests": web_requests,
+        }
 
     return translated_text
 

@@ -76,6 +76,7 @@ import WorkbenchHistoryPanel from '../components/WorkbenchHistoryPanel.vue'
 import WorkbenchMatchPanel from '../components/WorkbenchMatchPanel.vue'
 import WorkbenchTermsPanel from '../components/WorkbenchTermsPanel.vue'
 import ReferencePanel from '../components/ReferencePanel.vue'
+import TranslationReviewPanel from '../components/TranslationReviewPanel.vue'
 import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { http } from '../api/http'
 import {
@@ -170,8 +171,8 @@ const props = defineProps<{
   mergeViewId?: string
 }>()
 
-type BottomToolKey = 'qa-result' | 'number-check' | 'style-tag-check' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
-type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result' | 'number-check' | 'style-tag-check'>
+type BottomToolKey = 'qa-result' | 'number-check' | 'style-tag-check' | 'translation-review' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
+type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result' | 'number-check' | 'style-tag-check' | 'translation-review'>
 type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes' | 'reference'
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
@@ -5399,7 +5400,7 @@ const showAiCapabilityMenu = ref(false)
 const aiCapabilityTriggerRef = ref<HTMLButtonElement | null>(null)
 const aiCapabilityMenuRef = ref<HTMLElement | null>(null)
 const aiCapabilityMenuStyle = ref<Record<string, string>>({})
-type AiCapabilityKey = 'number-check' | 'style-tag-check'
+type AiCapabilityKey = 'number-check' | 'style-tag-check' | 'translation-review'
 
 const isAiCapabilityBusy = computed(() => (
   loadingNumberCheck.value
@@ -5418,12 +5419,18 @@ const aiCapabilityButtonTitle = computed(() => {
   return 'AI能力：数字专检 / 样式标记专检'
 })
 
+// 翻译内容校对独立状态（供 badge 显示）
+const translationReviewActiveCount = ref<number | null>(null)
+
 const aiCapabilityBadgeCount = computed(() => {
   if (activeBottomTool.value === 'number-check' && numberCheckReport.value) {
     return numberCheckReport.value.active_issue_count
   }
   if (activeBottomTool.value === 'style-tag-check' && styleTagCheckReport.value) {
     return styleTagCheckReport.value.candidate_count
+  }
+  if (activeBottomTool.value === 'translation-review') {
+    return translationReviewActiveCount.value
   }
   return null
 })
@@ -5505,8 +5512,17 @@ async function selectAiCapability(key: AiCapabilityKey) {
   closeAiCapabilityMenu()
   if (key === 'number-check') {
     await openNumberCheck()
-  } else {
+  } else if (key === 'style-tag-check') {
     await openStyleTagCheck()
+  } else {
+    // translation-review
+    if (activeBottomTool.value === 'translation-review') {
+      closeBottomDrawer()
+      return
+    }
+    previewPanelRendering.value = false
+    activeBottomTool.value = 'translation-review'
+    await scrollBottomPanelIntoView()
   }
 }
 
@@ -9883,6 +9899,23 @@ onBeforeRouteLeave(async () => {
                       {{ styleTagCheckReport.candidate_count }}
                     </span>
                   </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    class="segment-editor-bottom-tool-dropdown__item"
+                    :class="{ 'is-active': activeBottomTool === 'translation-review' }"
+                    @click="void selectAiCapability('translation-review')"
+                  >
+                    <ShieldCheck :size="14" />
+                    <span>翻译内容校对</span>
+                    <span
+                      v-if="translationReviewActiveCount !== null"
+                      class="segment-editor-bottom-tool-dropdown__badge"
+                      :class="{ 'is-clean': translationReviewActiveCount === 0 }"
+                    >
+                      {{ translationReviewActiveCount }}
+                    </span>
+                  </button>
                 </div>
               </Teleport>
             </div>
@@ -9920,7 +9953,7 @@ onBeforeRouteLeave(async () => {
               :class="[
                 `workbench-bottom-drawer--${activeBottomTool}`,
                 {
-                  'is-wide': activeBottomTool === 'split-preview' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check' || activeBottomTool === 'style-tag-check',
+                  'is-wide': activeBottomTool === 'split-preview' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check' || activeBottomTool === 'style-tag-check' || activeBottomTool === 'translation-review',
                   'is-loading': bottomDrawerPreviewBusy,
                   'is-resizable': isBottomDrawerResizable,
                   'is-resizing': isBottomDrawerResizing,
@@ -10776,6 +10809,27 @@ onBeforeRouteLeave(async () => {
                   </button>
                 </div>
               </div>
+
+              <TranslationReviewPanel
+                v-else-if="activeBottomTool === 'translation-review'"
+                key="translation-review"
+                :file-record-id="isMergeWorkbench ? null : (segmentStore.fileRecord?.id ?? null)"
+                :merge-view-id="isMergeWorkbench ? (segmentStore.mergeViewId ?? props.mergeViewId ?? null) : null"
+                :is-merge-workbench="isMergeWorkbench"
+                :active-file-record-id="activeWorkbenchFileId"
+                :on-focus-sentence="(sid: string, fid?: string) => {
+                  if (fid && isMergeWorkbench) {
+                    const key = segmentStore.segments.find(s => s.sentence_id === sid && s.file_record_id === fid)
+                      ? segmentStore.segmentKeyOf(segmentStore.segments.find(s => s.sentence_id === sid && s.file_record_id === fid) as any)
+                      : sid
+                    void handlePreviewFocus(key)
+                  } else {
+                    void handlePreviewFocus(sid)
+                  }
+                }"
+                :on-active-count-change="(n: number | null) => { translationReviewActiveCount = n }"
+                class="workbench-bottom-drawer__qa"
+              />
             </section>
           </Transition>
 
