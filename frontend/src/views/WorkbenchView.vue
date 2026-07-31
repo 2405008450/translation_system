@@ -79,6 +79,7 @@ import ReferencePanel from '../components/ReferencePanel.vue'
 import TranslationReviewPanel from '../components/TranslationReviewPanel.vue'
 import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { http } from '../api/http'
+import { queryOnlineTerms, type OnlineTermSource } from '../api/onlineTerms'
 import {
   createMergeViewQAResult,
   fetchMergeViewSegmentPosition,
@@ -147,6 +148,7 @@ import type {
   TMCollection,
   TermBase,
   TermEntryRecord,
+  OnlineTermResult,
   QualityQASettingsResponse,
   WorkbenchQAResult,
   WorkbenchQAResultItem,
@@ -686,8 +688,12 @@ const pendingFormatsForEditor = computed(() => ({
   _overrideActive: richTextEditor.formatOverrideActive.value,
 }))
 
+const TERM_ENTRY_PAGE_SIZE = 100
 const termBases = ref<TermBase[]>([])
 const termEntries = ref<TermEntryRecord[]>([])
+const termEntriesTotal = ref(0)
+const loadingMoreTermEntries = ref(false)
+const hasMoreTermEntries = computed(() => termEntries.value.length < termEntriesTotal.value)
 const selectedTermBaseId = ref('')
 const loadingTermBases = ref(false)
 const loadingTermEntries = ref(false)
@@ -707,6 +713,17 @@ const addTermTargetText = ref('')
 const addTermTargetBaseId = ref('')
 const addTermFormError = ref('')
 const termsMessage = ref(t('workbench.terms.defaultMessage'))
+const onlineTermEntries = ref<OnlineTermResult[]>([])
+const addedOnlineTermKeys = ref<string[]>([])
+const onlineTermsLoading = ref(false)
+const onlineTermsError = ref('')
+const canWriteSelectedTermBase = computed(() => Boolean(
+  selectedTermBaseId.value
+  && (
+    authStore.isBusinessManager
+    || activeWorkbenchFileContext.value?.term_base_write_ids?.includes(selectedTermBaseId.value)
+  ),
+))
 
 // 参考文件匹配结果
 
@@ -2644,25 +2661,109 @@ async function loadTermBases() {
   }
 }
 
-async function loadTermEntries() {
+async function loadTermEntries(append = false) {
   if (!selectedTermBaseId.value) {
     termEntries.value = []
+    termEntriesTotal.value = 0
     return
   }
 
-  loadingTermEntries.value = true
+  if (append) {
+    if (loadingMoreTermEntries.value || !hasMoreTermEntries.value) return
+    loadingMoreTermEntries.value = true
+  } else {
+    loadingTermEntries.value = true
+  }
+
   try {
-    const { data } = await http.get<{ items: TermEntryRecord[] }>(`/term-bases/${selectedTermBaseId.value}/entries`, {
-      params: { limit: 200 },
+    const { data } = await http.get<{
+      items: TermEntryRecord[]
+      total: number
+    }>(`/term-bases/${selectedTermBaseId.value}/entries`, {
+      params: {
+        skip: append ? termEntries.value.length : 0,
+        limit: TERM_ENTRY_PAGE_SIZE,
+      },
     })
-    termEntries.value = data.items
+    termEntries.value = append ? [...termEntries.value, ...data.items] : data.items
+    termEntriesTotal.value = Number(data.total || 0)
     window.localStorage.setItem(getTermBaseStorageKey(), selectedTermBaseId.value)
-    termsMessage.value = t('workbench.terms.loadedEntries', { count: data.items.length })
+    termsMessage.value = t('workbench.terms.loadedEntries', { count: termEntries.value.length })
   } catch (error) {
     termsMessage.value = getErrorMessage(error, t('workbench.errors.termEntriesLoad'))
   } finally {
-    loadingTermEntries.value = false
+    if (append) {
+      loadingMoreTermEntries.value = false
+    } else {
+      loadingTermEntries.value = false
+    }
   }
+}
+
+function onlineTermKey(sourceText: string, targetText: string) {
+  return `${sourceText}\u0000${targetText}`.toLocaleLowerCase()
+}
+
+async function handleOnlineTermQuery(request: { query: string; sources: OnlineTermSource[] }) {
+  if (!selectedTermBaseId.value || !request.query.trim()) return
+  onlineTermsLoading.value = true
+  onlineTermsError.value = ''
+  onlineTermEntries.value = []
+  addedOnlineTermKeys.value = []
+  try {
+    const result = await queryOnlineTerms(selectedTermBaseId.value, request.query, request.sources)
+    onlineTermEntries.value = result.items
+  } catch (error) {
+    onlineTermsError.value = getErrorMessage(error, t('workbench.errors.onlineTermsQuery'))
+  } finally {
+    onlineTermsLoading.value = false
+  }
+}
+
+async function handleAddOnlineTerm(entry: OnlineTermResult) {
+  if (!selectedTermBaseId.value || !canWriteSelectedTermBase.value || !activeWorkbenchFileId.value) return
+  try {
+    await http.post(`/term-bases/${selectedTermBaseId.value}/entries`, {
+      source_text: entry.source_text,
+      target_text: entry.target_text,
+      file_record_id: activeWorkbenchFileId.value,
+      metadata: {
+        origin: 'online',
+        source_name: entry.source_name,
+        source_url: entry.source_url,
+        confidence: entry.confidence,
+        note: entry.note,
+      },
+    })
+    addedOnlineTermKeys.value = [
+      ...new Set([...addedOnlineTermKeys.value, onlineTermKey(entry.source_text, entry.target_text)]),
+    ]
+    await loadTermEntries()
+    toast.success(t('workbench.terms.onlineAdded'))
+  } catch (error) {
+    toast.error(getErrorMessage(error, t('workbench.errors.onlineTermAdd')))
+  }
+}
+
+async function handleRevokeOnlineTerm(entryId: string) {
+  const entry = termEntries.value.find((item) => item.id === entryId)
+  try {
+    await http.delete(`/term-entries/${entryId}`)
+    if (entry) {
+      const key = onlineTermKey(entry.source_text, entry.target_text)
+      addedOnlineTermKeys.value = addedOnlineTermKeys.value.filter((item) => item !== key)
+    }
+    await loadTermEntries()
+    toast.success(t('workbench.terms.onlineRevoked'))
+  } catch (error) {
+    toast.error(getErrorMessage(error, t('workbench.errors.onlineTermRevoke')))
+  }
+}
+
+function resetOnlineTermResults() {
+  onlineTermEntries.value = []
+  addedOnlineTermKeys.value = []
+  onlineTermsError.value = ''
 }
 
 function resetResourceSearchResults(message = '请输入关键词，搜索当前文件绑定的记忆库和术语库。') {
@@ -7809,11 +7910,16 @@ watch(() => segmentStore.activeFileRecordId, () => {
 })
 
 watch(selectedTermBaseId, () => {
+  resetOnlineTermResults()
   if (!selectedTermBaseId.value) {
     termEntries.value = []
     return
   }
   void loadTermEntries()
+})
+
+watch(activeSegmentSourceText, () => {
+  resetOnlineTermResults()
 })
 
 watch(
@@ -10817,6 +10923,7 @@ onBeforeRouteLeave(async () => {
                 :merge-view-id="isMergeWorkbench ? (segmentStore.mergeViewId ?? props.mergeViewId ?? null) : null"
                 :is-merge-workbench="isMergeWorkbench"
                 :active-file-record-id="activeWorkbenchFileId"
+                :project-id="activeWorkbenchProjectId"
                 :on-focus-sentence="(sid: string, fid?: string) => {
                   if (fid && isMergeWorkbench) {
                     const key = segmentStore.segments.find(s => s.sentence_id === sid && s.file_record_id === fid)
@@ -11146,7 +11253,19 @@ onBeforeRouteLeave(async () => {
             :active-source-text="activeSegmentSourceText"
             :loading-bases="loadingTermBases"
             :loading-entries="loadingTermEntries"
+            :local-total="termEntriesTotal"
+            :loading-more-local="loadingMoreTermEntries"
+            :has-more-local="hasMoreTermEntries"
             :message="termsMessage"
+            :online-entries="onlineTermEntries"
+            :added-online-term-keys="addedOnlineTermKeys"
+            :online-loading="onlineTermsLoading"
+            :online-error="onlineTermsError"
+            :can-write-selected-term-base="canWriteSelectedTermBase"
+            @query-online="handleOnlineTermQuery"
+            @add-online-term="handleAddOnlineTerm"
+            @revoke-online-term="handleRevokeOnlineTerm"
+            @load-more-local="() => void loadTermEntries(true)"
           />
           <section
             v-else-if="activeSideTool === 'resource-search'"

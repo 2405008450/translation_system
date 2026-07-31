@@ -148,6 +148,8 @@ REQUIRED_SCHEMA = {
         "translation_guidelines",
         "quality_qa_settings",
         "auto_tm_enabled",
+        "translation_rules",
+        "translation_rules_filename",
         "created_at",
         "updated_at",
     },
@@ -1608,6 +1610,18 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS projects
             ADD COLUMN IF NOT EXISTS quality_qa_settings TEXT NOT NULL DEFAULT '{}'
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS translation_rules TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS translation_rules_filename VARCHAR(255) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS translation_rules_updated_at TIMESTAMP
             """,
             """
             ALTER TABLE IF EXISTS projects

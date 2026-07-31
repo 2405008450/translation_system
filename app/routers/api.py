@@ -436,6 +436,8 @@ from app.services.translation_review.service import (
     apply_batch as tr_apply_batch,
     apply_item as tr_apply_item,
     create_review_report,
+    extract_text_from_upload,
+    get_project_rules,
     get_report as tr_get_report,
     list_file_reports as tr_list_file_reports,
     list_merge_view_reports as tr_list_merge_view_reports,
@@ -443,10 +445,10 @@ from app.services.translation_review.service import (
     load_report_items as tr_load_report_items,
     reject_item as tr_reject_item,
     restore_item as tr_restore_item,
-    run_program_rules_only,
     serialize_report as tr_serialize_report,
     set_items_ignored as tr_set_items_ignored,
     undo_batch as tr_undo_batch,
+    upload_project_rules,
 )
 
 try:
@@ -9541,11 +9543,9 @@ def apply_all_style_tag_check_report_items(
 # ─────────────────────────────────────────────────────────────
 
 class TranslationReviewTaskRequest(BaseModel):
-    categories: list[str] | None = None
     segment_scope: str = "all"
     provider: str = "auto"
     model: str = ""
-    web_verify: str = "none"
 
 
 class TranslationReviewIgnoreRequest(BaseModel):
@@ -9593,25 +9593,94 @@ def _run_translation_review_background(
     files: list["FileRecord"],
     file_order_map: "dict[UUID, int]",
     segment_scope: str,
-    enabled_categories: list[str] | None,
+    rules_text: str,
+    report_provider: str,
+    report_model: str,
 ) -> None:
     """本地后台回退（arq 未启用时）。"""
     import asyncio as _asyncio
     from app.models import TranslationReviewReport
-    from app.services.translation_review.orchestrator import run_full_review
+    from app.services.translation_review.service import run_review_with_rules
     report = db.query(TranslationReviewReport).filter(
         TranslationReviewReport.id == report_id
     ).first()
     if not report:
         return
-    _asyncio.run(run_full_review(
-        db, report, files, file_order_map,
+    _asyncio.run(run_review_with_rules(
+        db, report, files, file_order_map, rules_text,
         segment_scope=segment_scope,
-        enabled_keys=enabled_categories,
-        provider=report.provider or "auto",
-        model=report.model or None,
-        web_verify_provider=report.web_verify_provider or "none",
+        provider=report_provider or "auto",
+        model=report_model or None,
     ))
+
+
+@router.post("/projects/{project_id}/translation-rules")
+async def upload_translation_rules(
+    project_id: UUID,
+    file: UploadFile,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """上传项目翻译规则文件（.docx / .txt / .md），提取文本后存入项目。"""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    _require_project_read_access(project, current_user, db)
+
+    raw_bytes = await file.read()
+    if len(raw_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="文件过大，请上传 5MB 以内的规则文件。")
+
+    rules_text = extract_text_from_upload(file.filename or "", raw_bytes)
+    if not rules_text.strip():
+        raise HTTPException(status_code=400, detail="无法从文件中提取文本内容。")
+
+    updated = upload_project_rules(db, project_id, rules_text, file.filename or "")
+    return {
+        "project_id": str(project_id),
+        "filename": updated.translation_rules_filename,
+        "char_count": len(rules_text),
+        "updated_at": updated.translation_rules_updated_at.isoformat()
+                      if updated.translation_rules_updated_at else None,
+    }
+
+
+@router.get("/projects/{project_id}/translation-rules")
+def get_translation_rules(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """读取项目翻译规则信息。"""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    _require_project_read_access(project, current_user, db)
+    result = get_project_rules(db, project_id)
+    result["char_count"] = len(result.get("rules", ""))
+    result["project_id"] = str(project_id)
+    # 不把全文返回给前端（可能很长），只返回摘要
+    result["preview"] = (result.get("rules") or "")[:200]
+    del result["rules"]
+    return result
+
+
+@router.delete("/projects/{project_id}/translation-rules")
+def delete_translation_rules(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """清除项目翻译规则。"""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    _require_project_read_access(project, current_user, db)
+    project.translation_rules = ""
+    project.translation_rules_filename = ""
+    project.translation_rules_updated_at = None
+    db.commit()
+    return {"deleted": True}
 
 
 @router.post("/file-records/{file_record_id}/translation-review-tasks")
@@ -9628,6 +9697,10 @@ async def create_file_translation_review_task(
         raise HTTPException(status_code=404, detail="任务不存在。")
     _require_file_record_read_access(file_record, current_user)
     project = _resolve_file_record_project(db, file_record)
+    # 从项目读取规则文本
+    rules_text = (project.translation_rules or "") if project else ""
+    if not rules_text.strip():
+        raise HTTPException(status_code=400, detail="当前项目尚未上传翻译规则文件，请先在项目设置中上传后再开始校对。")
     files = [file_record]
     file_order_map = _build_file_order_map(files)
 
@@ -9639,10 +9712,8 @@ async def create_file_translation_review_task(
         merge_view=None,
         current_user=current_user,
         segment_scope=body.segment_scope,
-        enabled_categories=body.categories,
         provider=body.provider,
         model=body.model,
-        web_verify_provider=body.web_verify,
     )
     db.commit()
 
@@ -9655,7 +9726,8 @@ async def create_file_translation_review_task(
         background_tasks.add_task(
             _run_translation_review_background,
             db, report.id, files, file_order_map,
-            body.segment_scope, body.categories,
+            body.segment_scope, rules_text,
+            report.provider, report.model,
         )
 
     return {"task_id": str(report.id), "report_id": str(report.id)}
@@ -9803,6 +9875,9 @@ async def create_merge_view_translation_review_task(
 ):
     body = payload or TranslationReviewTaskRequest()
     view, project, files = _get_merge_view_context(db, view_id, current_user)
+    rules_text = (project.translation_rules or "") if project else ""
+    if not rules_text.strip():
+        raise HTTPException(status_code=400, detail="当前项目尚未上传翻译规则文件，请先在项目设置中上传后再开始校对。")
     file_order_map = _build_file_order_map(files)
 
     report = create_review_report(
@@ -9813,10 +9888,8 @@ async def create_merge_view_translation_review_task(
         merge_view=view,
         current_user=current_user,
         segment_scope=body.segment_scope,
-        enabled_categories=body.categories,
         provider=body.provider,
         model=body.model,
-        web_verify_provider=body.web_verify,
     )
     db.commit()
 
@@ -9829,7 +9902,8 @@ async def create_merge_view_translation_review_task(
         background_tasks.add_task(
             _run_translation_review_background,
             db, report.id, files, file_order_map,
-            body.segment_scope, body.categories,
+            body.segment_scope, rules_text,
+            report.provider, report.model,
         )
 
     return {"task_id": str(report.id), "report_id": str(report.id)}
@@ -9887,42 +9961,32 @@ async def rerun_translation_review_report(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """重跑指定类别（或全部）。重新入队 arq 任务。"""
-    from app.models import TranslationReviewReport, TranslationReviewAgentRun
-    import json as _json
+    """全量重跑（清空旧 items 后重新检查）。"""
+    from app.models import TranslationReviewReport, TranslationReviewReportItem
     report = _get_tr_report_or_404(db, report_id)
-    body = payload or TranslationReviewRerunRequest()
 
-    # 更新状态为 running
+    # 清空旧结果
     report.status = "running"
     report.error_message = ""
-    if body.category_keys:
-        # 只删除本次重跑的类别 items + agent_runs
-        from app.models import TranslationReviewReportItem
-        db.query(TranslationReviewAgentRun).filter(
-            TranslationReviewAgentRun.report_id == report_id,
-            TranslationReviewAgentRun.category_key.in_(body.category_keys),
-        ).delete(synchronize_session="fetch")
-        db.query(TranslationReviewReportItem).filter(
-            TranslationReviewReportItem.report_id == report_id,
-            TranslationReviewReportItem.category_key.in_(body.category_keys),
-        ).delete(synchronize_session="fetch")
+    db.query(TranslationReviewReportItem).filter(
+        TranslationReviewReportItem.report_id == report_id
+    ).delete(synchronize_session="fetch")
     db.commit()
 
     files: list[FileRecord] = []
-    merge_view = None
     if report.scope == "merge_view" and report.merge_view_id:
         from app.models import ProjectMergeView
         from app.services.merge_view_service import load_view_file_records
         view = db.query(ProjectMergeView).filter(ProjectMergeView.id == report.merge_view_id).first()
         if view:
-            merge_view = view
             _, project, files = _get_merge_view_context(db, view.id, current_user)
     else:
         if report.file_record_id:
             fr = db.query(FileRecord).filter(FileRecord.id == report.file_record_id).first()
             files = [fr] if fr else []
 
+    project = _resolve_file_record_project(db, files[0]) if files else None
+    rules_text = (project.translation_rules or "") if project else ""
     file_order_map = {f.id: i for i, f in enumerate(files)}
 
     enqueued = await _enqueue_arq_job(
@@ -9935,7 +9999,9 @@ async def rerun_translation_review_report(
             _run_translation_review_background,
             db, report_id, files, file_order_map,
             report.segment_scope or "all",
-            body.category_keys,
+            rules_text,
+            report.provider or "auto",
+            report.model or "",
         )
     return {"task_id": str(report_id), "report_id": str(report_id)}
 

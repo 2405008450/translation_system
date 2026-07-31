@@ -1332,6 +1332,14 @@ export interface TMEntryRecord {
   updated_at: string
 }
 
+export interface TermEntryMetadata {
+  origin?: 'online' | string
+  source_name?: string
+  source_url?: string
+  confidence?: number
+  note?: string
+}
+
 export interface TermEntryRecord {
   id: string
   term_base_id: string
@@ -1345,6 +1353,16 @@ export interface TermEntryRecord {
   last_modified_by_name?: string | null
   created_at: string
   updated_at: string
+  metadata?: TermEntryMetadata | null
+}
+
+export interface OnlineTermResult {
+  source_text: string
+  target_text: string
+  source_name: string
+  source_url: string
+  confidence: number
+  note: string
 }
 
 export interface GlossaryEntryRecord {

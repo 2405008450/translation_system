@@ -56,6 +56,16 @@ class Project(Base):
     auto_tm_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("true")
     )
+    # 项目级翻译校对规则（从上传文件提取的纯文本）
+    translation_rules: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=text("''")
+    )
+    translation_rules_filename: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default=text("''")
+    )
+    translation_rules_updated_at: Mapped[DateTime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )

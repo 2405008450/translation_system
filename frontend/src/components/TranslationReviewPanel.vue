@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  Bot, Download, Layers, List, Loader2, RotateCcw, Settings, X,
+  AlertCircle, Bot, Download, Layers, List, Loader2, RotateCcw, Settings, Upload,
 } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, ref } from 'vue'
 import Modal from './base/Modal.vue'
@@ -9,9 +9,10 @@ import {
   createFileTranslationReviewTask, createMergeViewTranslationReviewTask,
   fetchFileTranslationReviewReport, fetchMergeViewTranslationReviewReport,
   fetchTranslationReviewReport, fetchTranslationReviewTask,
-  rejectTranslationReviewItem, rerunTranslationReview, restoreTranslationReviewItem,
+  fetchTranslationRulesInfo, uploadTranslationRules, deleteTranslationRules,
+  rerunTranslationReview, restoreTranslationReviewItem,
   setTranslationReviewItemsIgnored, undoTranslationReviewBatch,
-  type TranslationReviewTaskOptions,
+  type TranslationReviewTaskOptions, type TranslationRulesInfo,
 } from '../api/translationReview'
 import type { TranslationReviewReport, TranslationReviewReportItem } from '../types/api'
 import { llmModelOptions } from '../constants/llm'
@@ -23,6 +24,7 @@ const props = defineProps<{
   fileRecordId: string | null
   mergeViewId: string | null
   isMergeWorkbench: boolean
+  projectId: string | null
   onFocusSentence: (sentenceId: string, fileRecordId?: string) => void
   onActiveCountChange?: (count: number | null) => void
 }>()
@@ -35,13 +37,17 @@ const loading = ref(false)
 const generating = ref(false)
 let pollTimer: ReturnType<typeof setTimeout> | null = null
 
+// ─── Rules file state ─────────────────────────────────────
+const rulesInfo = ref<TranslationRulesInfo | null>(null)
+const loadingRules = ref(false)
+const uploadingRules = ref(false)
+const rulesFileInput = ref<HTMLInputElement | null>(null)
+
 // ─── Settings modal ───────────────────────────────────────
 const showSettingsModal = ref(false)
-const settingsCategories = ref<string[]>([])
 const settingsSegmentScope = ref('all')
 const settingsProvider = ref('auto')
 const settingsModel = ref('')
-const settingsWebVerify = ref('none')
 
 // ─── Filter state ─────────────────────────────────────────
 type FilterStatus = 'all' | 'open' | 'applied' | 'ignored' | 'rejected' | 'stale'
@@ -52,22 +58,9 @@ const viewMode = ref<'list' | 'grouped'>('list')
 
 // ─── Action state ─────────────────────────────────────────
 const busyItemId = ref<string | null>(null)
+const activeItemId = ref<string | null>(null)
 const batchBusy = ref(false)
 const exportingDocx = ref(false)
-
-// ─── Category metadata ────────────────────────────────────
-const ALL_CATEGORIES = [
-  { key: 'tense', label: '时态' },
-  { key: 'symbols', label: '英文符号' },
-  { key: 'casing', label: '大小写' },
-  { key: 'number_format', label: '数字格式' },
-  { key: 'proper_noun', label: '专有名词' },
-  { key: 'fixed_syntax', label: '固定句法' },
-  { key: 'noun_merge', label: '名词合并' },
-  { key: 'omission', label: '避免漏译' },
-  { key: 'comprehension', label: '原文理解' },
-  { key: 'syntax_polish', label: '句法优化' },
-]
 
 const SCOPE_OPTIONS = [
   { value: 'all', label: '全部句段' },
@@ -76,22 +69,18 @@ const SCOPE_OPTIONS = [
   { value: 'confirmed_only', label: '仅已确认' },
 ]
 
-const WEB_VERIFY_OPTIONS = [
-  { value: 'none', label: '关闭' },
-  { value: 'openrouter', label: 'OpenRouter 联网（需 OpenRouter 模型）' },
-]
-
 // ─── Computed ─────────────────────────────────────────────
 const isRunning = computed(() => report.value?.status === 'running')
+
+const hasRules = computed(() => (rulesInfo.value?.char_count ?? 0) > 0)
 
 const overallProgress = computed(() =>
   isRunning.value ? (report.value?.progress?.overall_percent ?? 0) : 100
 )
 
-const currentCategoryLabel = computed(() => {
+const progressFileLabel = computed(() => {
   if (!isRunning.value) return ''
-  const key = report.value?.progress?.current_category
-  return ALL_CATEGORIES.find(c => c.key === key)?.label ?? key ?? ''
+  return report.value?.progress?.current_file_name ?? ''
 })
 
 const filteredItems = computed((): TranslationReviewReportItem[] => {
@@ -117,15 +106,13 @@ const groupedItems = computed(() => {
   return [...groups.values()]
 })
 
+// categoryStats: derived from LLM-returned categories (not hardcoded)
 const categoryStats = computed(() => {
   const counts = (report.value?.category_counts ?? {}) as Record<string, number>
-  return ALL_CATEGORIES.map(c => ({
-    ...c,
-    count: counts[c.key] ?? 0,
-    agentStatus: report.value?.agent_runs?.find(r => r.category_key === c.key)?.status ?? 'pending',
-  }))
+  return Object.entries(counts)
+    .sort(([, a], [, b]) => b - a)
+    .map(([key, count]) => ({ key, label: key, count }))
 })
-
 const mergeViewFiles = computed(() => {
   if (!props.isMergeWorkbench || !report.value) return []
   const fileIds: string[] = report.value.file_ids ?? []
@@ -136,10 +123,6 @@ const mergeViewFiles = computed(() => {
     count: Number(fileCounts[fid] ?? 0),
   }))
 })
-
-const programBatchCount = computed(() =>
-  (report.value?.items ?? []).filter(i => i.origin === 'program' && i.status === 'open' && i.apply_mode !== 'manual').length
-)
 
 const highConfBatchCount = computed(() =>
   (report.value?.items ?? []).filter(i =>
@@ -163,6 +146,14 @@ const reportMetaText = computed(() => {
 async function loadExistingReport() {
   loading.value = true
   try {
+    // Load rules info in parallel
+    if (props.projectId) {
+      loadingRules.value = true
+      fetchTranslationRulesInfo(props.projectId)
+        .then(info => { rulesInfo.value = info })
+        .catch(() => {})
+        .finally(() => { loadingRules.value = false })
+    }
     let fetched: TranslationReviewReport | null = null
     if (props.isMergeWorkbench && props.mergeViewId) {
       fetched = await fetchMergeViewTranslationReviewReport(props.mergeViewId)
@@ -182,11 +173,9 @@ async function startGeneration() {
   report.value = null
   showSettingsModal.value = false
   const options: TranslationReviewTaskOptions = {
-    categories: settingsCategories.value.length < ALL_CATEGORIES.length ? settingsCategories.value : undefined,
     segmentScope: settingsSegmentScope.value,
     provider: settingsProvider.value,
     model: settingsModel.value || undefined,
-    webVerify: settingsWebVerify.value,
   }
   try {
     let result: { task_id: string; report_id: string }
@@ -252,31 +241,12 @@ async function handleRestoreItem(item: TranslationReviewReportItem) {
   finally { busyItemId.value = null }
 }
 
-async function handleRejectItem(item: TranslationReviewReportItem) {
-  if (busyItemId.value) return
-  busyItemId.value = item.id
-  try { await rejectTranslationReviewItem(item.id); await refreshReport() }
-  catch (e) { toast.error({ title: '操作失败', message: String(e) }) }
-  finally { busyItemId.value = null }
-}
-
 async function handleIgnoreItem(item: TranslationReviewReportItem, ignored: boolean) {
   if (busyItemId.value) return
   busyItemId.value = item.id
   try { await setTranslationReviewItemsIgnored([item.id], ignored); await refreshReport() }
   catch (e) { toast.error({ title: '操作失败', message: String(e) }) }
   finally { busyItemId.value = null }
-}
-
-async function handleApplyProgramBatch() {
-  if (batchBusy.value || !report.value) return
-  batchBusy.value = true
-  try {
-    const res = await applyTranslationReviewBatch(report.value.id, { mode: 'program' })
-    await refreshReport()
-    toast.success(`已应用 ${res.applied_count} 条程序检查修改${res.stale_count ? `，${res.stale_count} 条需重查` : ''}`)
-  } catch (e) { toast.error({ title: '批量失败', message: String(e) }) }
-  finally { batchBusy.value = false }
 }
 
 async function handleApplyHighConfBatch() {
@@ -311,6 +281,31 @@ async function handleExportDocx() {
   finally { exportingDocx.value = false }
 }
 
+function triggerRulesUpload() {
+  rulesFileInput.value?.click()
+}
+
+async function handleRulesFileChange(event: Event) {
+  const file = (event.target as HTMLInputElement).files?.[0]
+  ;(event.target as HTMLInputElement).value = ''
+  if (!file || !props.projectId) return
+  uploadingRules.value = true
+  try {
+    rulesInfo.value = await uploadTranslationRules(props.projectId, file)
+    toast.success(`规则文件「${file.name}」上传成功，共 ${rulesInfo.value.char_count} 个字符。`)
+  } catch (e) { toast.error({ title: '上传失败', message: String(e) }) }
+  finally { uploadingRules.value = false }
+}
+
+async function handleDeleteRules() {
+  if (!props.projectId) return
+  try {
+    await deleteTranslationRules(props.projectId)
+    rulesInfo.value = null
+    toast.success('已清除规则文件。')
+  } catch (e) { toast.error({ title: '清除失败', message: String(e) }) }
+}
+
 async function refreshReport() {
   if (!report.value) return
   try {
@@ -320,6 +315,7 @@ async function refreshReport() {
 }
 
 function jumpToSegment(item: TranslationReviewReportItem) {
+  activeItemId.value = item.id
   props.onFocusSentence(item.sentence_id, item.file_record_id)
 }
 
@@ -405,7 +401,6 @@ function segLabel(item: TranslationReviewReportItem) {
 
 // Init
 loadExistingReport()
-settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
 </script>
 
 <template>
@@ -414,9 +409,15 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
     <div class="workbench-bottom-drawer__header workbench-bottom-drawer__header--qa">
       <div class="workbench-bottom-drawer__header-lead">
         <div class="section-title section-title--tight">翻译内容校对</div>
-        <p class="panel-subtitle">按广东地方志翻译规则检查时态、符号、大小写、数字、专有名词等 10 个类别。</p>
+        <p class="panel-subtitle">基于项目规则文件，由 AI 逐批检查译文并自动归类问题。</p>
+        <div v-if="rulesInfo && rulesInfo.char_count > 0" class="tr-panel__rules-line">
+          <span class="tr-panel__rules-tag">📄 {{ rulesInfo.filename || '已上传' }} · {{ rulesInfo.char_count.toLocaleString() }} 字符</span>
+        </div>
+        <div v-else-if="!loadingRules" class="tr-panel__rules-line">
+          <span class="tr-panel__rules-tag tr-panel__rules-tag--warn">⚠ 未上传规则文件</span>
+        </div>
       </div>
-
+  
       <!-- Summary stats -->
       <div v-if="report" class="term-qa-dialog__summary">
         <span class="term-qa-stat">
@@ -429,7 +430,7 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
         </span>
         <span class="term-qa-dialog__meta">{{ reportMetaText }}</span>
       </div>
-
+  
       <!-- Actions — 与数字专检完全相同的一行布局 -->
       <div class="term-qa-dialog__actions">
         <!-- 设置 -->
@@ -442,7 +443,7 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
           <Settings :size="14" />
           设置
         </button>
-
+  
         <!-- 类别筛选 select（与数字专检筛选 select 完全一致） -->
         <select
           v-if="report"
@@ -455,7 +456,7 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
             {{ cat.label }}{{ cat.count > 0 ? ` (${cat.count})` : '' }}
           </option>
         </select>
-
+  
         <!-- 状态筛选 select -->
         <select
           v-if="report"
@@ -470,7 +471,7 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
           <option value="rejected">已拒绝</option>
           <option value="stale">需重查</option>
         </select>
-
+  
         <!-- 文件筛选（仅合并视图） -->
         <select
           v-if="report && isMergeWorkbench && mergeViewFiles.length > 1"
@@ -483,7 +484,7 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
             {{ f.name }}{{ f.count > 0 ? ` (${f.count})` : '' }}
           </option>
         </select>
-
+  
         <!-- 视图切换 -->
         <div v-if="report" class="tr-panel__view-toggle" role="group" aria-label="显示方式">
           <button class="tr-panel__view-btn" :class="{ 'is-active': viewMode === 'list' }" type="button" title="按问题列表" @click="viewMode = 'list'">
@@ -493,20 +494,8 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
             <Layers :size="13" />
           </button>
         </div>
-
-        <!-- 应用程序项 -->
-        <button
-          v-if="report && !isRunning"
-          class="button button--ghost term-qa-dialog__action-button"
-          type="button"
-          :disabled="programBatchCount === 0 || batchBusy"
-          title="应用所有程序检查项（确定性规则，最安全）"
-          @click="handleApplyProgramBatch"
-        >
-          <Loader2 v-if="batchBusy" class="lucide-spin" :size="14" />
-          应用程序项{{ programBatchCount > 0 ? ` ${programBatchCount}` : '' }}
-        </button>
-
+  
+  
         <!-- 高置信度批量 -->
         <button
           v-if="report && !isRunning"
@@ -518,7 +507,7 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
         >
           高置信度{{ highConfBatchCount > 0 ? ` ${highConfBatchCount}` : '' }}
         </button>
-
+  
         <!-- 撤销批量 -->
         <button
           v-if="report && !isRunning"
@@ -531,7 +520,7 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
           <RotateCcw :size="14" />
           撤销批量
         </button>
-
+  
         <!-- 导出 Word -->
         <button
           v-if="report && !isRunning"
@@ -545,7 +534,7 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
           <Download v-else :size="14" />
           导出
         </button>
-
+  
         <!-- 重新检查 / 开始检查 -->
         <button
           class="button button--ghost term-qa-dialog__action-button"
@@ -559,12 +548,12 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
         </button>
       </div>
     </div>
-
-    <!-- Progress bar (generating) — mirrors number-check progress -->
+  
+    <!-- Progress bar (generating) -->
     <div v-if="(isRunning || generating) && report" class="number-check__progress">
       <div class="number-check__progress-head">
         <span class="number-check__progress-text">
-          正在检查{{ currentCategoryLabel ? `：${currentCategoryLabel}` : '' }}
+          正在检查{{ progressFileLabel ? `：${progressFileLabel}` : '' }}（每批 50 条句段）
         </span>
         <span class="number-check__progress-pct">{{ overallProgress }}%</span>
       </div>
@@ -572,7 +561,7 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
         <div class="number-check__progress-fill" :style="{ width: `${overallProgress}%` }" />
       </div>
     </div>
-
+  
     <!-- ── Loading / empty ── -->
     <div v-if="loading" class="empty-state">
       <Loader2 class="lucide-spin" :size="28" />正在加载翻译校对结果
@@ -586,7 +575,7 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
         <Bot :size="14" />开始检查
       </button>
     </div>
-
+  
     <!-- ── List view (mirrors number-check table layout) ── -->
     <div v-else-if="viewMode === 'list'" class="term-qa-dialog__table-wrap">
       <div v-if="filteredItems.length === 0" class="empty-state">当前筛选条件下无结果。</div>
@@ -609,7 +598,10 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
             v-for="item in filteredItems"
             :key="item.id"
             class="term-qa-dialog__row"
-            :class="{ 'is-ignored': item.status === 'ignored' || item.status === 'rejected' }"
+            :class="{
+              'is-current': activeItemId === item.id,
+              'is-ignored': item.status === 'ignored' || item.status === 'rejected',
+            }"
             tabindex="0"
             @click="jumpToSegment(item)"
             @keydown.enter.prevent="jumpToSegment(item)"
@@ -668,13 +660,6 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
                   @click="handleRestoreItem(item)"
                 >恢复</button>
                 <button
-                  v-if="item.status === 'open'"
-                  class="button button--ghost term-qa-dialog__inline-action number-check__action"
-                  type="button"
-                  :disabled="busyItemId === item.id"
-                  @click="handleRejectItem(item)"
-                >拒绝</button>
-                <button
                   class="button button--ghost term-qa-dialog__inline-action number-check__action"
                   type="button"
                   :disabled="busyItemId === item.id"
@@ -686,7 +671,7 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
         </tbody>
       </table>
     </div>
-
+  
     <!-- ── Grouped view ── -->
     <div v-else-if="viewMode === 'grouped'" class="term-qa-dialog__table-wrap">
       <div v-if="!groupedItems || groupedItems.length === 0" class="empty-state">当前筛选条件下无结果。</div>
@@ -698,6 +683,7 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
         >
           <div
             class="tr-panel__group-header term-qa-dialog__row"
+            :class="{ 'is-current': group.items.some(item => activeItemId === item.id) }"
             tabindex="0"
             @click="jumpToSegment(group.items[0])"
             @keydown.enter.prevent="jumpToSegment(group.items[0])"
@@ -726,7 +712,6 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
             <div class="term-qa-dialog__inline-actions number-check__actions" @click.stop>
               <button v-if="item.status === 'open' && canApply(item)" class="button button--ghost term-qa-dialog__inline-action number-check__action" type="button" :disabled="busyItemId === item.id" @click="handleApplyItem(item)">应用</button>
               <button v-if="item.status === 'applied'" class="button button--ghost term-qa-dialog__inline-action number-check__action" type="button" @click="handleRestoreItem(item)">恢复</button>
-              <button v-if="item.status === 'open'" class="button button--ghost term-qa-dialog__inline-action number-check__action" type="button" @click="handleRejectItem(item)">拒绝</button>
               <button class="button button--ghost term-qa-dialog__inline-action number-check__action" type="button" @click="handleIgnoreItem(item, item.status !== 'ignored')">{{ item.status === 'ignored' ? '恢复' : '忽略' }}</button>
             </div>
           </div>
@@ -734,8 +719,8 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
       </div>
     </div>
   </div>
-
-  <!-- ── Settings Modal (mirrors showNumberCheckSettings modal) ── -->
+  
+  <!-- Settings Modal -->
   <Modal
     :open="showSettingsModal"
     title="翻译内容校对设置"
@@ -743,6 +728,43 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
     @close="showSettingsModal = false"
   >
     <div class="number-check__settings-dialog">
+      <!-- 规则文件管理 -->
+      <div class="number-check__settings-group">
+        <div class="number-check__settings-label">翻译规则文件（项目级）</div>
+        <div v-if="rulesInfo && rulesInfo.char_count > 0" class="tr-panel__rules-info">
+          <span class="tr-panel__rules-filename">📄 {{ rulesInfo.filename || '已上传' }}</span>
+          <span class="hint-text">{{ rulesInfo.char_count }} 字符 · {{ rulesInfo.updated_at?.slice(0, 10) ?? '' }}</span>
+          <span v-if="rulesInfo.preview" class="tr-panel__rules-preview hint-text">{{ rulesInfo.preview }}…</span>
+        </div>
+        <div v-else class="hint-text" style="color:#b45309">⚠ 当前项目尚未上传翻译规则文件，无法开始校对。</div>
+        <div class="tr-panel__rules-actions">
+          <button
+            class="button button--ghost term-qa-dialog__action-button"
+            type="button"
+            :disabled="uploadingRules || !projectId"
+            @click="triggerRulesUpload"
+          >
+            <Loader2 v-if="uploadingRules" class="lucide-spin" :size="14" />
+            <Upload v-else :size="14" />
+            {{ rulesInfo?.char_count ? '更换规则文件' : '上传规则文件' }}
+          </button>
+          <button
+            v-if="rulesInfo?.char_count"
+            class="button button--ghost term-qa-dialog__action-button"
+            type="button"
+            @click="handleDeleteRules"
+          >清除</button>
+        </div>
+        <p class="hint-text">支持 .docx / .txt / .md 格式，文件内容为翻译规则说明，将整体喂给 AI 作为检查依据。</p>
+        <input
+          ref="rulesFileInput"
+          type="file"
+          accept=".docx,.txt,.md,.markdown"
+          style="display:none"
+          @change="handleRulesFileChange"
+        />
+      </div>
+      <!-- 检查范围 -->
       <div class="number-check__settings-group">
         <div class="number-check__settings-label">检查范围</div>
         <label v-for="o in SCOPE_OPTIONS" :key="o.value" class="number-check__settings-option">
@@ -750,6 +772,7 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
           {{ o.label }}
         </label>
       </div>
+      <!-- AI 模型 -->
       <div class="number-check__settings-group">
         <div class="number-check__settings-label">AI 模型</div>
         <select class="term-qa-dialog__filter-select" v-model="settingsModel">
@@ -757,34 +780,265 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
           <option v-for="m in llmModelOptions" :key="m.id" :value="m.id">{{ m.name }}</option>
         </select>
       </div>
-      <div class="number-check__settings-group">
-        <div class="number-check__settings-label">联网查证</div>
-        <label v-for="o in WEB_VERIFY_OPTIONS" :key="o.value" class="number-check__settings-option">
-          <input type="radio" :value="o.value" v-model="settingsWebVerify" />
-          {{ o.label }}
-        </label>
-        <p v-if="settingsWebVerify === 'openrouter'" class="hint-text" style="margin-top:4px">
-          联网查证仅对「专有名词」类别生效，会产生额外搜索费用，需使用 OpenRouter 模型。
-        </p>
-      </div>
-      <div class="number-check__settings-group">
-        <div class="number-check__settings-label">启用类别</div>
-        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:6px 12px">
-          <label v-for="c in ALL_CATEGORIES" :key="c.key" class="number-check__settings-option">
-            <input type="checkbox" :value="c.key" v-model="settingsCategories" />
-            {{ c.label }}
-          </label>
-        </div>
-      </div>
-      <p class="hint-text">设置在下次「开始检查 / 重新检查」时生效。</p>
-    </div>
-    <template #footer>
-      <button class="button button--primary" type="button" @click="showSettingsModal = false">完成</button>
-    </template>
-  </Modal>
+      <p class="hint-text">每批 50 条句段发送一次 AI 请求；规则文件越长每次消耗 token 越多，建议控制在 2 万字符以内。</p>
+  </div>
+      <template #footer>
+        <button class="button button--primary" type="button" @click="showSettingsModal = false">完成</button>
+      </template>
+    </Modal>
+
 </template>
 
 <style scoped>
+/* Header single-row layout matching number-check */
+.workbench-bottom-drawer__header--qa {
+  flex-wrap: nowrap !important;
+  align-items: flex-start;
+  gap: 10px;
+  padding-right: 34px;
+}
+
+.workbench-bottom-drawer__header--qa .workbench-bottom-drawer__header-lead {
+  flex: 0 0 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.workbench-bottom-drawer__header--qa .panel-subtitle {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 300px;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-dialog__summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  align-self: center;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-dialog__actions {
+  flex: 0 0 auto;
+  margin-left: auto;
+  align-self: center;
+  flex-wrap: nowrap;
+}
+
+/* Compact action buttons matching number-check size */
+.term-qa-dialog__actions .term-qa-dialog__action-button {
+  min-height: 26px;
+  padding: 3px 7px;
+  font-size: 12px;
+}
+
+.term-qa-dialog__actions .term-qa-dialog__filter-select {
+  min-height: 26px;
+  padding: 2px 7px;
+  font-size: 12px;
+}
+
+/* Rules line in header-lead */
+.tr-panel__rules-line {
+  margin-top: 1px;
+}
+
+.tr-panel__rules-line .tr-panel__rules-tag {
+  margin-left: 0;
+}
+
+/* Header: vertical introduction, centered summary, top-right actions */
+.workbench-bottom-drawer__header.workbench-bottom-drawer__header--qa {
+  display: grid !important;
+  grid-template-columns: minmax(240px, 1fr) auto auto;
+  align-items: start;
+  column-gap: 10px;
+  flex-wrap: nowrap !important;
+}
+
+.workbench-bottom-drawer__header--qa > .workbench-bottom-drawer__header-lead {
+  grid-column: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.workbench-bottom-drawer__header--qa .panel-subtitle {
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-muted, #64748b);
+  font-size: 12px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tr-panel__rules-line {
+  min-width: 0;
+  overflow: hidden;
+  line-height: 1.25;
+}
+
+.tr-panel__rules-line .tr-panel__rules-tag {
+  margin-left: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workbench-bottom-drawer__header--qa > .term-qa-dialog__summary {
+  grid-column: 2;
+  align-self: center;
+  min-width: 0;
+  flex-wrap: nowrap;
+}
+
+.workbench-bottom-drawer__header--qa > .term-qa-dialog__actions {
+  grid-column: 3;
+  justify-self: end;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  margin-left: 0;
+  flex-wrap: nowrap !important;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.workbench-bottom-drawer__header--qa > .term-qa-dialog__actions::-webkit-scrollbar {
+  display: none;
+}
+
+/* Summary stats match the number-check header. */
+.workbench-bottom-drawer__header--qa .term-qa-dialog__summary {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: nowrap;
+  color: var(--text-muted, #64748b);
+  font-size: 12px;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-height: 22px;
+  padding: 1px 6px;
+  border: 1px solid #d7e7e3;
+  border-radius: 4px;
+  background: #f3faf8;
+  white-space: nowrap;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-stat.is-muted {
+  border-color: var(--border-color, #dbe3ea);
+  background: var(--surface-muted, #f8fafc);
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-stat__value {
+  font-size: 13px;
+  font-weight: 700;
+  font-style: normal;
+  color: #b4530f;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-stat.is-muted .term-qa-stat__value {
+  color: #2f4a53;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-stat__label {
+  color: var(--text-muted, #64748b);
+  font-size: 11px;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-dialog__meta {
+  min-width: 0;
+  color: #8694a0;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Compact controls match the number-check toolbar. */
+.workbench-bottom-drawer__header--qa .term-qa-dialog__action-button,
+.workbench-bottom-drawer__header--qa .term-qa-dialog__filter-select {
+  min-height: 26px;
+  height: 26px;
+  padding: 3px 7px;
+  border: 1px solid #c5d6de;
+  border-radius: 4px;
+  background: #fff;
+  color: #2b3a40;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-dialog__action-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  box-shadow: none;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-dialog__action-button:hover:not(:disabled),
+.workbench-bottom-drawer__header--qa .term-qa-dialog__filter-select:hover:not(:disabled) {
+  border-color: #8db9c4;
+  background: #edf8f6;
+  color: #0b6658;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-dialog__action-button:focus-visible,
+.workbench-bottom-drawer__header--qa .term-qa-dialog__filter-select:focus-visible {
+  outline: 2px solid rgba(13, 122, 104, 0.2);
+  outline-offset: 1px;
+}
+
+/* Keep the list table grid visible, matching number-check. */
+.term-qa-dialog__table-wrap {
+  border: 1px solid #dce5ea;
+  border-radius: 4px;
+  background: #fff;
+}
+
+.term-qa-dialog__table.number-check__table {
+  width: 100%;
+  border: 1px solid #dce5ea;
+  border-collapse: collapse;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.term-qa-dialog__table.number-check__table th,
+.term-qa-dialog__table.number-check__table td {
+  border: 1px solid #dce5ea !important;
+  padding: 6px 8px;
+  vertical-align: top;
+}
+
+.term-qa-dialog__table.number-check__table thead th {
+  background: #f3f7f9;
+  color: #50636b;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.term-qa-dialog__table.number-check__table .term-qa-dialog__row:hover,
+.term-qa-dialog__table.number-check__table .term-qa-dialog__row:focus-visible,
+.term-qa-dialog__table.number-check__table .term-qa-dialog__row.is-current,
+.tr-panel__group-header.is-current {
+  background: #e4f3ff;
+  outline: none;
+  box-shadow: inset 3px 0 0 #2a7fb8;
+}
+
 /* View toggle */
 .tr-panel__view-toggle {
   display: inline-flex;
@@ -870,7 +1124,52 @@ settingsCategories.value = ALL_CATEGORIES.map(c => c.key)
   border-top: 1px dashed var(--line-soft);
 }
 
-/* Severity tags (reuse number-check colors) */
+/* Rules file info in settings */
+.tr-panel__rules-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: #e9f5f0;
+  color: #0a6b55;
+  font-size: 11px;
+  margin-left: 6px;
+}
+
+.tr-panel__rules-tag--warn {
+  background: #fff8e1;
+  color: #b45309;
+}
+
+.tr-panel__rules-info {
+  display: grid;
+  gap: 3px;
+  padding: 6px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  background: var(--surface-muted);
+  margin-bottom: 6px;
+}
+
+.tr-panel__rules-filename {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.tr-panel__rules-preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+  font-size: 11px;
+}
+
+.tr-panel__rules-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
 .number-check__status-tag.is-error    { background: #fdecec; color: #c0392b; }
 .number-check__status-tag.is-warning  { background: #fff8e1; color: #b45309; }
 .number-check__status-tag.is-suggestion { background: #e8f0fe; color: #1a5fb4; }

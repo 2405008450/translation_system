@@ -2,15 +2,21 @@ import { http } from './http'
 import type { TranslationReviewReport } from '../types/api'
 
 export interface TranslationReviewTaskOptions {
-  categories?: string[]
   segmentScope?: string
   provider?: string
   model?: string
-  webVerify?: string
+}
+
+export interface TranslationRulesInfo {
+  project_id: string
+  filename: string
+  char_count: number
+  preview: string
+  updated_at: string | null
 }
 
 export interface ApplyBatchOptions {
-  mode: 'program' | 'high_confidence' | 'category' | 'selected'
+  mode: 'high_confidence' | 'category' | 'selected'
   categoryKey?: string
   itemIds?: string[]
 }
@@ -28,12 +34,37 @@ export interface UndoBatchResult {
 
 function buildTaskBody(options: TranslationReviewTaskOptions = {}) {
   return {
-    categories: options.categories ?? null,
     segment_scope: options.segmentScope ?? 'all',
     provider: options.provider ?? 'auto',
     model: options.model ?? '',
-    web_verify: options.webVerify ?? 'none',
   }
+}
+
+// ─── 规则文件管理 ─────────────────────────────────────────
+
+export async function uploadTranslationRules(projectId: string, file: File) {
+  const form = new FormData()
+  form.append('file', file)
+  const { data } = await http.post<TranslationRulesInfo>(
+    `/projects/${projectId}/translation-rules`,
+    form,
+    { headers: { 'Content-Type': 'multipart/form-data' } },
+  )
+  return data
+}
+
+export async function fetchTranslationRulesInfo(projectId: string) {
+  const { data } = await http.get<TranslationRulesInfo>(
+    `/projects/${projectId}/translation-rules`,
+  )
+  return data
+}
+
+export async function deleteTranslationRules(projectId: string) {
+  const { data } = await http.delete<{ deleted: boolean }>(
+    `/projects/${projectId}/translation-rules`,
+  )
+  return data
 }
 
 // ─── 任务创建 + 进度轮询 ─────────────────────────────────
@@ -154,15 +185,10 @@ export async function undoTranslationReviewBatch(
   return data
 }
 
-// ─── 重跑 ────────────────────────────────────────────────
-
-export async function rerunTranslationReview(
-  reportId: string,
-  categoryKeys?: string[],
-) {
+export async function rerunTranslationReview(reportId: string) {
   const { data } = await http.post<{ task_id: string; report_id: string }>(
     `/translation-review-reports/${reportId}/rerun`,
-    categoryKeys?.length ? { category_keys: categoryKeys } : {},
+    {},
   )
   return data
 }

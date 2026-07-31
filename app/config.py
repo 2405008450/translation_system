@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model: str = "google/gemini-3-flash-preview"
+    online_term_search_engine: str = "auto"
+    online_term_search_model: str | None = None
+    online_term_search_max_results: int = 5
+    online_term_search_max_uses: int = 2
     llm_timeout_seconds: float = 60.0
     llm_stall_timeout_seconds: float = 120.0
     llm_max_concurrency: int = 5
