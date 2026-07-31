@@ -882,6 +882,7 @@ const exportProgress = ref(0)
 const exportMessage = ref('')
 let exportPollTimer: number | null = null
 const groupedExportOptions = computed(() => groupExportOptions(exportOptions.value))
+type WordExportMode = 'standard' | 'revision'
 
 // 导出样式设置（仅对 DOCX 生效）
 const EXPORT_STYLE_SETTINGS_STORAGE_KEY = 'workbench.exportStyleSettings'
@@ -952,6 +953,37 @@ const isOfficeFormat = computed(() => {
   const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase()
   return ['.doc', '.docx', '.xlsx', '.pptx', '.pdf'].includes(ext)
 })
+
+const isWordFormat = computed(() => {
+  const filename = segmentStore.fileRecord?.filename || ''
+  const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase()
+  return ['.doc', '.docx'].includes(ext)
+})
+
+function isWordTargetExportOption(option: FileExportOption) {
+  return option.id === 'original' && isWordFormat.value
+}
+
+function getWorkbenchExportOptionName(option: FileExportOption, mode: WordExportMode = 'standard') {
+  if (!isWordTargetExportOption(option)) {
+    return option.name
+  }
+  return mode === 'revision'
+    ? t('workbench.exportModes.revisionName')
+    : t('workbench.exportModes.standardName')
+}
+
+function getWorkbenchExportOptionDescription(option: FileExportOption, mode: WordExportMode = 'standard') {
+  if (!isWordTargetExportOption(option)) {
+    return option.description
+  }
+  if (mode === 'revision' && segmentStore.pendingRevisionCount === 0) {
+    return t('workbench.exportModes.revisionUnavailable')
+  }
+  return mode === 'revision'
+    ? t('workbench.exportModes.revisionDescription')
+    : t('workbench.exportModes.standardDescription')
+}
 
 function resolveItemHeight() {
   const stableGrid = Boolean(props.standalone)
@@ -6770,14 +6802,20 @@ async function waitForFileExportTask(task: FileExportTask) {
   }
 }
 
-async function exportWithTypeForFile(exportType: string, fileRecordId?: string | null) {
+async function exportWithTypeForFile(
+  exportType: string,
+  fileRecordId?: string | null,
+  wordExportMode: WordExportMode = 'standard',
+) {
   const targetFileRecordId = fileRecordId || segmentStore.fileRecord?.id || ''
   if (!targetFileRecordId || exporting.value) return
 
   pageError.value = ''
   exporting.value = true
   exportProgress.value = 0
-  exportMessage.value = '导出任务提交中。'
+  exportMessage.value = wordExportMode === 'revision'
+    ? t('workbench.exportModes.revisionSubmitting')
+    : t('workbench.exportModes.standardSubmitting')
   showExportMenu.value = false
 
   try {
@@ -6789,7 +6827,7 @@ async function exportWithTypeForFile(exportType: string, fileRecordId?: string |
     const stylePayload = exportStyleSettings.value.enabled ? exportStyleSettings.value : null
     const includeRevisionMarks = (
       exportType === 'original'
-      && segmentStore.revisionTrackingEnabled
+      && wordExportMode === 'revision'
     )
     const exportPayload = (
       stylePayload || includeRevisionMarks
@@ -6813,7 +6851,11 @@ async function exportWithTypeForFile(exportType: string, fileRecordId?: string |
     // 从响应头获取文件名
     const resolvedFilename = resolveDownloadFilename(response.headers['content-disposition'], `export.${exportType}`)
     downloadBlob(response.data, resolvedFilename)
-    toast.success('导出完成，文件已开始下载。')
+    toast.success(
+      wordExportMode === 'revision'
+        ? t('workbench.exportModes.revisionSuccess')
+        : t('workbench.exportModes.standardSuccess'),
+    )
   } catch (error) {
     if (axios.isAxiosError(error)) {
       pageError.value = String(error.response?.data?.detail || '导出失败。')
@@ -6828,8 +6870,18 @@ async function exportWithTypeForFile(exportType: string, fileRecordId?: string |
   }
 }
 
-async function exportWithType(exportType: string) {
-  await exportWithTypeForFile(exportType, segmentStore.fileRecord?.id)
+async function exportWithType(exportType: string, wordExportMode: WordExportMode = 'standard') {
+  if (wordExportMode === 'revision') {
+    const confirmed = await confirm({
+      title: t('workbench.exportModes.revisionConfirmTitle'),
+      message: t('workbench.exportModes.revisionConfirmMessage'),
+      confirmText: t('workbench.exportModes.revisionConfirmAction'),
+    })
+    if (!confirmed) {
+      return
+    }
+  }
+  await exportWithTypeForFile(exportType, segmentStore.fileRecord?.id, wordExportMode)
 }
 
 // 点击外部关闭导出菜单
@@ -7339,25 +7391,48 @@ onBeforeRouteLeave(async () => {
                   class="export-dropdown__group"
                 >
                   <div class="export-dropdown__group-title">{{ group.label }}</div>
-                  <button
-                    v-for="option in group.options"
-                    :key="option.id"
-                    type="button"
-                    class="export-dropdown__item"
-                    :disabled="exporting"
-                    @click="exportWithType(option.id)"
-                  >
-                    <span class="export-dropdown__item-head">
-                      <span class="export-dropdown__item-name">{{ option.name }}</span>
-                      <span
-                        v-if="getExportOptionExtensionLabel(option)"
-                        class="export-dropdown__item-ext"
-                      >
-                        {{ getExportOptionExtensionLabel(option) }}
+                  <template v-for="option in group.options" :key="option.id">
+                    <button
+                      type="button"
+                      class="export-dropdown__item"
+                      :disabled="exporting"
+                      @click="exportWithType(option.id, 'standard')"
+                    >
+                      <span class="export-dropdown__item-head">
+                        <span class="export-dropdown__item-name">
+                          {{ getWorkbenchExportOptionName(option, 'standard') }}
+                        </span>
+                        <span
+                          v-if="getExportOptionExtensionLabel(option)"
+                          class="export-dropdown__item-ext"
+                        >
+                          {{ getExportOptionExtensionLabel(option) }}
+                        </span>
                       </span>
-                    </span>
-                    <span class="export-dropdown__item-desc">{{ option.description }}</span>
-                  </button>
+                      <span class="export-dropdown__item-desc">
+                        {{ getWorkbenchExportOptionDescription(option, 'standard') }}
+                      </span>
+                    </button>
+                    <button
+                      v-if="isWordTargetExportOption(option)"
+                      type="button"
+                      class="export-dropdown__item export-dropdown__item--revision"
+                      :disabled="exporting || segmentStore.pendingRevisionCount === 0"
+                      @click="exportWithType(option.id, 'revision')"
+                    >
+                      <span class="export-dropdown__item-head">
+                        <span class="export-dropdown__item-name">
+                          {{ getWorkbenchExportOptionName(option, 'revision') }}
+                        </span>
+                        <span class="export-dropdown__item-ext export-dropdown__item-ext--warning">
+                          {{ t('workbench.exportModes.experimentalBadge') }}
+                        </span>
+                      </span>
+                      <span class="export-dropdown__item-desc">
+                        {{ getWorkbenchExportOptionDescription(option, 'revision') }}
+                      </span>
+                    </button>
+                  </template>
                 </div>
               </template>
             </div>
@@ -8200,25 +8275,48 @@ onBeforeRouteLeave(async () => {
                   class="export-dropdown__group"
                 >
                   <div class="export-dropdown__group-title">{{ group.label }}</div>
-                  <button
-                    v-for="option in group.options"
-                    :key="option.id"
-                    type="button"
-                    class="export-dropdown__item"
-                    :disabled="exporting"
-                    @click="exportWithType(option.id)"
-                  >
-                    <span class="export-dropdown__item-head">
-                      <span class="export-dropdown__item-name">{{ option.name }}</span>
-                      <span
-                        v-if="getExportOptionExtensionLabel(option)"
-                        class="export-dropdown__item-ext"
-                      >
-                        {{ getExportOptionExtensionLabel(option) }}
+                  <template v-for="option in group.options" :key="option.id">
+                    <button
+                      type="button"
+                      class="export-dropdown__item"
+                      :disabled="exporting"
+                      @click="exportWithType(option.id, 'standard')"
+                    >
+                      <span class="export-dropdown__item-head">
+                        <span class="export-dropdown__item-name">
+                          {{ getWorkbenchExportOptionName(option, 'standard') }}
+                        </span>
+                        <span
+                          v-if="getExportOptionExtensionLabel(option)"
+                          class="export-dropdown__item-ext"
+                        >
+                          {{ getExportOptionExtensionLabel(option) }}
+                        </span>
                       </span>
-                    </span>
-                    <span class="export-dropdown__item-desc">{{ option.description }}</span>
-                  </button>
+                      <span class="export-dropdown__item-desc">
+                        {{ getWorkbenchExportOptionDescription(option, 'standard') }}
+                      </span>
+                    </button>
+                    <button
+                      v-if="isWordTargetExportOption(option)"
+                      type="button"
+                      class="export-dropdown__item export-dropdown__item--revision"
+                      :disabled="exporting || segmentStore.pendingRevisionCount === 0"
+                      @click="exportWithType(option.id, 'revision')"
+                    >
+                      <span class="export-dropdown__item-head">
+                        <span class="export-dropdown__item-name">
+                          {{ getWorkbenchExportOptionName(option, 'revision') }}
+                        </span>
+                        <span class="export-dropdown__item-ext export-dropdown__item-ext--warning">
+                          {{ t('workbench.exportModes.experimentalBadge') }}
+                        </span>
+                      </span>
+                      <span class="export-dropdown__item-desc">
+                        {{ getWorkbenchExportOptionDescription(option, 'revision') }}
+                      </span>
+                    </button>
+                  </template>
                 </div>
               </template>
             </div>
@@ -15697,6 +15795,16 @@ onBeforeRouteLeave(async () => {
   background: rgba(13, 122, 104, 0.08);
 }
 
+.export-dropdown__item--revision {
+  margin-top: 2px;
+  border: 1px solid #f2d3a2;
+  background: #fffaf2;
+}
+
+.export-dropdown__item--revision:hover {
+  background: #fff3df;
+}
+
 .export-dropdown__item:disabled {
   opacity: 0.5;
   cursor: not-allowed;
@@ -15728,6 +15836,12 @@ onBeforeRouteLeave(async () => {
   color: #4d5c65;
   font-size: 10px;
   font-weight: 700;
+}
+
+.export-dropdown__item-ext--warning {
+  border-color: #e8b665;
+  background: #fff0d5;
+  color: #8a4f00;
 }
 
 .export-dropdown__item-desc {

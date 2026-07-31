@@ -155,6 +155,21 @@ const overrides = {
     kicker: 'Smart Operations Platform',
   },
   workbench: {
+    exportModes: {
+      standardName: 'Target File (Stable, Recommended)',
+      standardDescription: 'Exports the current translation without Word revision marks. Recommended for delivery.',
+      revisionName: 'Target File (With Revision Marks)',
+      revisionDescription: 'Experimental: preserves pending revision marks. Characters may be missing; also export a stable backup.',
+      revisionUnavailable: 'There are no pending revisions to include.',
+      experimentalBadge: 'Experimental',
+      revisionConfirmTitle: 'Export with revision marks?',
+      revisionConfirmMessage: 'This mode is still being improved and the exported Word file may have missing characters. Export a stable backup before continuing.',
+      revisionConfirmAction: 'Export Revision Version',
+      standardSubmitting: 'Submitting stable export task.',
+      revisionSubmitting: 'Submitting revision-mark export task.',
+      standardSuccess: 'Stable export completed. The download has started.',
+      revisionSuccess: 'Revision-mark export completed. Please verify that the content is complete.',
+    },
     statusSummary: {
       projectSync: 'Project sync',
     },
