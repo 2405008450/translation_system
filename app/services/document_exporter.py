@@ -3212,15 +3212,30 @@ def _queue_structural_word_text_range_edit(
 def _remove_structural_line_break_tokens(tokens: list[TextToken]) -> None:
     removed: set[tuple[int, int]] = set()
     for token in tokens:
-        parent = token.container_element
-        anchor = token.anchor_element
-        if parent is None or anchor is None:
+        run = token.run_element
+        line_break = token.element
+        if run is None or line_break is None:
             continue
-        key = (id(parent), id(anchor))
+
+        # 换行符可能和后续文本共用同一个 w:r。这里只能删除 w:br/w:cr
+        # 本身；如果删除作为锚点的整个 w:r，后续句段仍引用该 run 时会在
+        # 格式化译文插入阶段触发 “Element ... is not in list”。
+        line_break_parent = next(
+            (
+                candidate
+                for candidate in run.iter()
+                if any(child is line_break for child in list(candidate))
+            ),
+            None,
+        )
+        if line_break_parent is None:
+            continue
+
+        key = (id(line_break_parent), id(line_break))
         if key in removed:
             continue
         try:
-            parent.remove(anchor)
+            line_break_parent.remove(line_break)
         except ValueError:
             continue
         removed.add(key)

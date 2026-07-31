@@ -57,3 +57,4 @@ TMX下载/
 /term_*.json
 /term_*.jsonl
 outputs/
+.codex
