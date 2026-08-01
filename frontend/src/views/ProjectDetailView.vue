@@ -795,6 +795,7 @@ const showProjectExportMenu = ref(false)
 const loadingProjectExportOptions = ref(false)
 const projectExportOptions = ref<FileExportOption[]>([])
 const groupedProjectExportOptions = computed(() => groupExportOptions(projectExportOptions.value))
+type WordExportMode = 'standard' | 'revision'
 let exportPollTimer: number | null = null
 let activePretranslationPollTimer: number | null = null
 const ACTIVE_PRETRANSLATION_STATUSES = new Set(['queued', 'running', 'canceling'])
@@ -1061,6 +1062,10 @@ const fileSelectionRangeHint = computed(() => (
 ))
 const selectedProjectFiles = computed(() => (
   tableRows.value.filter((row) => selectedFileIds.value.has(row.id))
+))
+const selectedProjectFilesAreWord = computed(() => (
+  selectedProjectFiles.value.length > 0
+  && selectedProjectFiles.value.every((row) => isWordProjectFile(row))
 ))
 const hasSelectedLockedFile = computed(() => selectedProjectFiles.value.some((row) => row.is_edit_locked))
 const hasSelectedNonWritableFile = computed(() => selectedProjectFiles.value.some((row) => !row.can_write))
@@ -1347,6 +1352,41 @@ const projectExportButtonTitle = computed(() => {
   }
   return ''
 })
+
+function isWordProjectFile(row: ProjectRow | null) {
+  const filename = String(row?.filename || '').toLowerCase()
+  return filename.endsWith('.doc') || filename.endsWith('.docx')
+}
+
+function isSelectedWordTargetExportOption(option: FileExportOption) {
+  return option.id === 'original' && selectedProjectFilesAreWord.value
+}
+
+function getProjectExportOptionName(option: FileExportOption, mode: WordExportMode = 'standard') {
+  if (!isSelectedWordTargetExportOption(option)) {
+    return option.name
+  }
+  return mode === 'revision'
+    ? t('workbench.exportModes.revisionName')
+    : t('workbench.exportModes.standardName')
+}
+
+function getProjectExportOptionDescription(option: FileExportOption, mode: WordExportMode = 'standard') {
+  if (!isSelectedWordTargetExportOption(option)) {
+    return option.description
+  }
+  return mode === 'revision'
+    ? t('workbench.exportModes.revisionDescription')
+    : t('workbench.exportModes.standardDescription')
+}
+
+async function confirmRevisionMarkedExport() {
+  return confirm({
+    title: t('workbench.exportModes.revisionConfirmTitle'),
+    message: t('workbench.exportModes.revisionConfirmMessage'),
+    confirmText: t('workbench.exportModes.revisionConfirmAction'),
+  })
+}
 
 const columns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('projectDetail.files.columns.details'), width: '300px', sortable: true },
@@ -4986,12 +5026,21 @@ async function toggleProjectExportMenu() {
   showProjectExportMenu.value = true
 }
 
-async function downloadProjectFileExport(row: ProjectRow, exportType: string) {
+async function downloadProjectFileExport(
+  row: ProjectRow,
+  exportType: string,
+  wordExportMode: WordExportMode = 'standard',
+) {
   const rowId = String(row.id)
   const filename = String(row.filename || 'export')
+  const exportPayload = (
+    exportType === 'original' && wordExportMode === 'revision'
+      ? { include_revision_marks: true }
+      : null
+  )
   const { data: task } = await http.post<FileExportTask>(
     `/file-records/${rowId}/exports`,
-    null,
+    exportPayload,
     { params: { type: exportType } },
   )
   const completedTask = await waitForFileExportTask(task)
@@ -5026,8 +5075,15 @@ async function downloadProjectFileZipExport(rows: ProjectRow[]) {
   downloadBlob(response.data, downloadName)
 }
 
-async function exportProjectFile(row: ProjectRow, exportType = 'original') {
+async function exportProjectFile(
+  row: ProjectRow,
+  exportType = 'original',
+  wordExportMode: WordExportMode = 'standard',
+) {
   if (exportingFileId.value) {
+    return
+  }
+  if (wordExportMode === 'revision' && !(await confirmRevisionMarkedExport())) {
     return
   }
 
@@ -5037,11 +5093,17 @@ async function exportProjectFile(row: ProjectRow, exportType = 'original') {
   exportingFileId.value = String(row.id)
   exportingFileType.value = exportType
   exportFileProgress.value = 0
-  exportFileMessage.value = '导出任务提交中。'
+  exportFileMessage.value = wordExportMode === 'revision'
+    ? t('workbench.exportModes.revisionSubmitting')
+    : t('workbench.exportModes.standardSubmitting')
 
   try {
-    await downloadProjectFileExport(row, exportType)
-    toast.success(getProjectFileExportSuccessMessage(exportType, 1))
+    await downloadProjectFileExport(row, exportType, wordExportMode)
+    toast.success(
+      wordExportMode === 'revision'
+        ? t('workbench.exportModes.revisionSuccess')
+        : getProjectFileExportSuccessMessage(exportType, 1),
+    )
   } catch (error) {
     pageError.value = getErrorMessage(
       error,
@@ -5084,8 +5146,14 @@ async function exportSelectedProjectFilesAsZip() {
   }
 }
 
-async function exportSelectedProjectFiles(exportType: string) {
+async function exportSelectedProjectFiles(
+  exportType: string,
+  wordExportMode: WordExportMode = 'standard',
+) {
   if (selectedProjectFiles.value.length === 0 || exportingFileId.value) {
+    return
+  }
+  if (wordExportMode === 'revision' && !(await confirmRevisionMarkedExport())) {
     return
   }
 
@@ -5100,10 +5168,16 @@ async function exportSelectedProjectFiles(exportType: string) {
       exportingFileId.value = String(current.id)
       exportingFileType.value = exportType
       exportFileProgress.value = 0
-      exportFileMessage.value = `导出 ${index + 1}/${rows.length} 提交中。`
-      await downloadProjectFileExport(current, exportType)
+      exportFileMessage.value = wordExportMode === 'revision'
+        ? `修订痕迹版 ${index + 1}/${rows.length} 提交中。`
+        : `稳定版 ${index + 1}/${rows.length} 提交中。`
+      await downloadProjectFileExport(current, exportType, wordExportMode)
     }
-    toast.success(getProjectFileExportSuccessMessage(exportType, rows.length))
+    toast.success(
+      wordExportMode === 'revision'
+        ? t('workbench.exportModes.revisionSuccess')
+        : getProjectFileExportSuccessMessage(exportType, rows.length),
+    )
   } catch (error) {
     pageError.value = getErrorMessage(
       error,
@@ -7316,25 +7390,48 @@ onBeforeUnmount(() => {
                         class="pd-export-menu__group"
                       >
                         <div class="pd-export-menu__group-title">{{ group.label }}</div>
-                        <button
-                          v-for="option in group.options"
-                          :key="option.id"
-                          class="pd-export-menu__item"
-                          type="button"
-                          :disabled="Boolean(exportingFileId)"
-                          @click="exportSelectedProjectFiles(option.id)"
-                        >
-                          <span class="pd-export-menu__item-head">
-                            <span class="pd-export-menu__item-name">{{ option.name }}</span>
-                            <span
-                              v-if="getExportOptionExtensionLabel(option)"
-                              class="pd-export-menu__item-ext"
-                            >
-                              {{ getExportOptionExtensionLabel(option) }}
+                        <template v-for="option in group.options" :key="option.id">
+                          <button
+                            class="pd-export-menu__item"
+                            type="button"
+                            :disabled="Boolean(exportingFileId)"
+                            @click="exportSelectedProjectFiles(option.id, 'standard')"
+                          >
+                            <span class="pd-export-menu__item-head">
+                              <span class="pd-export-menu__item-name">
+                                {{ getProjectExportOptionName(option, 'standard') }}
+                              </span>
+                              <span
+                                v-if="getExportOptionExtensionLabel(option)"
+                                class="pd-export-menu__item-ext"
+                              >
+                                {{ getExportOptionExtensionLabel(option) }}
+                              </span>
                             </span>
-                          </span>
-                          <span class="pd-export-menu__item-desc">{{ option.description }}</span>
-                        </button>
+                            <span class="pd-export-menu__item-desc">
+                              {{ getProjectExportOptionDescription(option, 'standard') }}
+                            </span>
+                          </button>
+                          <button
+                            v-if="isSelectedWordTargetExportOption(option)"
+                            class="pd-export-menu__item pd-export-menu__item--revision"
+                            type="button"
+                            :disabled="Boolean(exportingFileId)"
+                            @click="exportSelectedProjectFiles(option.id, 'revision')"
+                          >
+                            <span class="pd-export-menu__item-head">
+                              <span class="pd-export-menu__item-name">
+                                {{ getProjectExportOptionName(option, 'revision') }}
+                              </span>
+                              <span class="pd-export-menu__item-ext pd-export-menu__item-ext--warning">
+                                {{ t('workbench.exportModes.experimentalBadge') }}
+                              </span>
+                            </span>
+                            <span class="pd-export-menu__item-desc">
+                              {{ getProjectExportOptionDescription(option, 'revision') }}
+                            </span>
+                          </button>
+                        </template>
                       </div>
                       <button
                         v-if="canExportSelectedProjectFilesAsZip"
@@ -7966,9 +8063,23 @@ onBeforeUnmount(() => {
           type="button"
           :disabled="!actionMenuRow.has_source_document || Boolean(exportingFileId)"
           :title="isProjectFileExporting(actionMenuRow, 'original') ? exportFileMessage : (!actionMenuRow.has_source_document ? t('projectDetail.common.uploadRequired') : undefined)"
-          @click="exportProjectFile(actionMenuRow, 'original')"
+          @click="exportProjectFile(actionMenuRow, 'original', 'standard')"
         >
-          {{ getProjectFileExportLabel(actionMenuRow, 'original') }}
+          {{
+            isWordProjectFile(actionMenuRow)
+              ? t('workbench.exportModes.standardName')
+              : getProjectFileExportLabel(actionMenuRow, 'original')
+          }}
+        </button>
+        <button
+          v-if="isWordProjectFile(actionMenuRow)"
+          type="button"
+          class="is-warning"
+          :disabled="!actionMenuRow.has_source_document || Boolean(exportingFileId)"
+          :title="t('workbench.exportModes.revisionDescription')"
+          @click="exportProjectFile(actionMenuRow, 'original', 'revision')"
+        >
+          {{ t('workbench.exportModes.revisionName') }} · {{ t('workbench.exportModes.experimentalBadge') }}
         </button>
         <button
           type="button"
@@ -10000,6 +10111,16 @@ onBeforeUnmount(() => {
   background: var(--surface-muted);
 }
 
+.pd-export-menu__item--revision {
+  margin-top: 2px;
+  border: 1px solid #f2d3a2;
+  background: #fffaf2;
+}
+
+.pd-export-menu__item--revision:hover:not(:disabled) {
+  background: #fff3df;
+}
+
 .pd-export-menu__item:disabled {
   color: var(--text-muted);
   cursor: not-allowed;
@@ -10029,6 +10150,12 @@ onBeforeUnmount(() => {
   color: var(--text-secondary);
   font-size: 10px;
   font-weight: 700;
+}
+
+.pd-export-menu__item-ext--warning {
+  border-color: #e8b665;
+  background: #fff0d5;
+  color: #8a4f00;
 }
 
 .pd-export-menu__item-desc {

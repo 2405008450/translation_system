@@ -21,6 +21,13 @@ LEXICON_COLUMNS = (
     "notes",
 )
 
+CATEGORY_BY_SHEET_NAME = {
+    "名词": "noun",
+    "动词": "verb",
+    "形容词": "adjective",
+    "副词": "adverb",
+}
+
 
 @dataclass
 class LexiconRow:
@@ -43,8 +50,72 @@ def _form_name(header: str, fallback: str) -> str:
     return normalized or fallback
 
 
-def read_excel_rows(path: Path) -> list[LexiconRow]:
+def _merge_row(merged: dict[tuple[str, str], LexiconRow], row: LexiconRow) -> None:
+    key = (row.british.casefold(), row.american.casefold())
+    item = merged.setdefault(
+        key,
+        LexiconRow(british=row.british, american=row.american),
+    )
+    item.categories.update(row.categories)
+    item.forms.update(row.forms)
+    item.source_refs.update(row.source_refs)
+
+
+def read_csv_rows(path: Path) -> list[LexiconRow]:
+    """读取已有运行时词库，用于增量合并；启用状态和冲突备注会重新计算。"""
+    rows: list[LexiconRow] = []
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if tuple(reader.fieldnames or ()) != LEXICON_COLUMNS:
+            raise ValueError(f"已有词库列结构不符合要求：{path}")
+        for row_number, values in enumerate(reader, start=2):
+            british = _clean(values.get("british"))
+            american = _clean(values.get("american"))
+            if not british or not american or british.casefold() == american.casefold():
+                raise ValueError(f"已有词库第 {row_number} 行包含无效词对")
+            rows.append(
+                LexiconRow(
+                    british=british,
+                    american=american,
+                    categories=set(filter(None, _clean(values.get("category")).split("|"))),
+                    forms=set(filter(None, _clean(values.get("form")).split("|"))),
+                    source_refs=set(filter(None, _clean(values.get("source_refs")).split("|"))),
+                )
+            )
+    return rows
+
+
+def _detect_column_pairs(headers: list[str], worksheet_title: str) -> list[tuple[int, int, str]]:
+    category = CATEGORY_BY_SHEET_NAME.get(worksheet_title)
+    if category is None:
+        return []
+
+    british_columns = [index for index, header in enumerate(headers) if header.startswith("英式")]
+    american_columns = [index for index, header in enumerate(headers) if header.startswith("美式")]
+    if not british_columns or len(british_columns) != len(american_columns):
+        raise ValueError(f"工作表“{worksheet_title}”的英式/美式列无法配对")
+
+    column_pairs: list[tuple[int, int, str]] = []
+    for pair_index, (british_column, american_column) in enumerate(
+        zip(british_columns, american_columns),
+        start=1,
+    ):
+        british_form = _form_name(headers[british_column], "基本形式")
+        american_form = _form_name(headers[american_column], "基本形式")
+        if british_form != american_form:
+            raise ValueError(
+                f"工作表“{worksheet_title}”第 {pair_index} 组英式/美式词形不一致："
+                f"{headers[british_column]!r} / {headers[american_column]!r}"
+            )
+        column_pairs.append((british_column, american_column, british_form))
+    return column_pairs
+
+
+def read_excel_rows(path: Path, base_rows: list[LexiconRow] | None = None) -> list[LexiconRow]:
     merged: dict[tuple[str, str], LexiconRow] = {}
+    for row in base_rows or ():
+        _merge_row(merged, row)
+
     workbook = load_workbook(path, read_only=True, data_only=True)
     try:
         for worksheet in workbook.worksheets:
@@ -53,29 +124,8 @@ def read_excel_rows(path: Path) -> list[LexiconRow]:
                 (),
             )
             headers = [_clean(value) for value in header_values]
-            column_pairs: list[tuple[int, int, str]] = []
-            category = ""
-            if (
-                len(headers) >= 10
-                and headers[0].startswith("英式")
-                and headers[5].startswith("美式")
-            ):
-                category = "verb"
-                column_pairs = [
-                    (index, index + 5, _form_name(headers[index], f"form_{index + 1}"))
-                    for index in range(5)
-                ]
-            elif (
-                len(headers) >= 4
-                and headers[0].startswith("英式")
-                and headers[2].startswith("美式")
-            ):
-                category = "noun"
-                column_pairs = [
-                    (0, 2, _form_name(headers[0], "singular")),
-                    (1, 3, _form_name(headers[1], "plural")),
-                ]
-
+            category = CATEGORY_BY_SHEET_NAME.get(worksheet.title)
+            column_pairs = _detect_column_pairs(headers, worksheet.title)
             if not column_pairs:
                 continue
 
@@ -91,13 +141,18 @@ def read_excel_rows(path: Path) -> list[LexiconRow]:
                     if not british or not american or british.casefold() == american.casefold():
                         continue
 
-                    key = (british.casefold(), american.casefold())
-                    item = merged.setdefault(key, LexiconRow(british=british, american=american))
-                    item.categories.add(category)
-                    item.forms.add(form_name)
-                    item.source_refs.add(
-                        f"{worksheet.title}!{get_column_letter(british_column + 1)}{row_number}:"
-                        f"{get_column_letter(american_column + 1)}{row_number}"
+                    _merge_row(
+                        merged,
+                        LexiconRow(
+                            british=british,
+                            american=american,
+                            categories={category} if category else set(),
+                            forms={form_name},
+                            source_refs={
+                                f"{worksheet.title}!{get_column_letter(british_column + 1)}{row_number}:"
+                                f"{get_column_letter(american_column + 1)}{row_number}"
+                            },
+                        ),
                     )
     finally:
         workbook.close()
@@ -208,12 +263,20 @@ def parse_args() -> argparse.Namespace:
         default=Path("app/resources/english_variant_lexicon.csv"),
         help="输出 CSV 路径",
     )
+    parser.add_argument(
+        "--merge-existing",
+        type=Path,
+        help="可选：先载入已有 CSV，再将工作簿内容合并进去",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    rows = read_excel_rows(args.input.expanduser().resolve())
+    base_rows = None
+    if args.merge_existing is not None:
+        base_rows = read_csv_rows(args.merge_existing.expanduser().resolve())
+    rows = read_excel_rows(args.input.expanduser().resolve(), base_rows=base_rows)
     validate_rows(rows)
     output_path = args.output.expanduser().resolve()
     write_csv(rows, output_path)
