@@ -153,6 +153,7 @@ async def _call_llm(candidates: List[BlockNode]) -> dict[str, bool]:
     ]
     settings = get_settings()
     model_override = getattr(settings, "dwg_llm_verify_model", "") or None
+    provider = getattr(settings, "dwg_llm_verify_provider", "openrouter") or "openrouter"
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -160,10 +161,11 @@ async def _call_llm(candidates: List[BlockNode]) -> dict[str, bool]:
     try:
         result = await request_chat_completion(
             messages=messages,
+            provider=provider,
             model_override=model_override,
-            response_format={"type": "json_object"} if model_override else None,
             temperature=0.0,
             settings=settings,
+            allow_fallback=False,
         )
     except LLMServiceError as exc:
         logger.warning("L5-LLM 二次校验失败(服务异常)：%s", exc)

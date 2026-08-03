@@ -20,6 +20,7 @@ TRAILING_CLOSERS = '"\'\"\'》】）)]」』'
 NUMBER_PREFIX_PATTERN = re.compile(
     r'^(\d+|[a-zA-Z]|[ivxIVX]+)\.\s*$'
 )
+SECTION_PREFIX_PATTERN = re.compile(r'^\d+(?:\.\d+)+\.?\s*$')
 
 # 常见英文缩写（不应在其后分句）
 COMMON_ABBREVIATIONS = {
@@ -58,59 +59,77 @@ class SegmentExtractor:
         return segments
 
     def _extract_from_node(self, node: BlockNode, path: str) -> List[Segment]:
-        """从单个节点提取 Segment
-        
-        Args:
-            node: 块级节点
-            path: 节点在 AST 中的路径
-            
-        Returns:
-            List[Segment]: 从该节点提取的 Segment 列表
-        """
+        """从单个节点提取 Segment。"""
         segments: List[Segment] = []
-        
-        # 如果节点有文本内容，提取句子
+
         if node.text_content:
             text = node.text_content.strip()
             if text:
-                # 检查是否是 CAD 实体
                 entity_type = node.metadata.get("entity_type", "")
                 is_cad_entity = entity_type in (
-                    "TEXT", "MTEXT", "ATTRIB", "ATTDEF", "DIMENSION", 
-                    "MULTILEADER", "ACAD_TABLE", "MERGED_TEXT"
+                    "TEXT", "MTEXT", "ATTRIB", "ATTDEF", "DIMENSION",
+                    "MULTILEADER", "ACAD_TABLE", "MERGED_TEXT",
                 )
-                
-                if is_cad_entity:
-                    # CAD 实体：整体作为一个句段，不自动分割
-                    # 用户可以在工作台手动分割或合并
-                    segment = self._create_segment(
-                        source_text=self._normalize_text(text),
-                        display_text=text,
-                        block_path=path,
-                        metadata=node.metadata,
-                    )
-                    segments.append(segment)
+                sentences = (
+                    self._split_cad_sentences(text)
+                    if is_cad_entity
+                    else self._split_sentences(text)
+                )
+
+                if is_cad_entity and len(sentences) > 1:
+                    parent_source = self._normalize_text(text)
+                    group_id = ":".join((
+                        path,
+                        str(node.metadata.get("scope", "")),
+                        str(node.metadata.get("handle", "")),
+                        str(node.metadata.get("sentence_id", "")),
+                    ))
+                    joiner = "\n" if "\n" in text else " "
+                    for sentence_index, (sentence_text, display_text) in enumerate(sentences):
+                        metadata = dict(node.metadata)
+                        metadata.update({
+                            "cad_sentence_split": True,
+                            "cad_sentence_group_id": group_id,
+                            "cad_sentence_index": sentence_index,
+                            "cad_sentence_count": len(sentences),
+                            "cad_sentence_joiner": joiner,
+                            "cad_parent_source_text": parent_source,
+                            "cad_parent_display_text": text,
+                        })
+                        segments.append(self._create_segment(
+                            source_text=sentence_text,
+                            display_text=display_text,
+                            block_path=path,
+                            metadata=metadata,
+                        ))
                 else:
-                    # 其他格式：按句子分割
-                    sentences = self._split_sentences(text)
                     for sentence_text, display_text in sentences:
-                        if sentence_text:  # 跳过空句子
-                            segment = self._create_segment(
+                        if sentence_text:
+                            segments.append(self._create_segment(
                                 source_text=sentence_text,
                                 display_text=display_text,
                                 block_path=path,
-                                metadata=node.metadata,
-                            )
-                            segments.append(segment)
-        
-        # 递归处理子节点
+                                metadata=dict(node.metadata),
+                            ))
+
         if node.children:
             for idx, child in enumerate(node.children):
                 child_path = f"{path}.children.{idx}"
-                child_segments = self._extract_from_node(child, child_path)
-                segments.extend(child_segments)
-        
+                segments.extend(self._extract_from_node(child, child_path))
+
         return segments
+
+    def _split_cad_sentences(self, text: str) -> List[Tuple[str, str]]:
+        """按句末标点拆分 CAD 文本，并识别换行后的编号条目。"""
+        parts = re.split(
+            r"\r?\n+(?=\s*\d+(?:\.\d+)+(?:\.?\s|$))",
+            text,
+        )
+        sentences: List[Tuple[str, str]] = []
+        for part in parts:
+            if part.strip():
+                sentences.extend(self._split_sentences(part))
+        return sentences
 
     def _split_sentences(self, text: str) -> List[Tuple[str, str]]:
         """将文本分割为句子
@@ -140,7 +159,7 @@ class SegmentExtractor:
                 # 英文句号需要特殊处理
                 # 检查是否是序号后的点（如 "1." "a." "i."）
                 prefix = text[start:i+1].strip()
-                if NUMBER_PREFIX_PATTERN.match(prefix):
+                if NUMBER_PREFIX_PATTERN.match(prefix) or SECTION_PREFIX_PATTERN.match(prefix):
                     # 这是序号，不分割
                     is_sentence_end = False
                 else:

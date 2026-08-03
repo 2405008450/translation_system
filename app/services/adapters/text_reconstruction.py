@@ -110,6 +110,137 @@ class BarrierIndex:
                     return ln
         return None
 
+    def enclosing_cell(
+        self,
+        scope: str,
+        x: float,
+        y: float,
+        height: float = 0.0,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """返回包围文本锚点的最近闭合线框 (left, right, bottom, top)。"""
+        if not self._sorted:
+            self.finalize()
+
+        center_y = y + max(height, 0.0) * 0.5
+        verticals = [
+            line for line in self._v.get(scope, [])
+            if line.range_min <= center_y <= line.range_max
+        ]
+        lefts = [line.pos for line in verticals if line.pos < x]
+        rights = [line.pos for line in verticals if line.pos > x]
+        if not lefts or not rights:
+            return None
+        left, right = max(lefts), min(rights)
+
+        horizontals = [
+            line for line in self._h.get(scope, [])
+            if line.range_min <= x <= line.range_max
+        ]
+        bottoms = [line.pos for line in horizontals if line.pos < center_y]
+        tops = [line.pos for line in horizontals if line.pos > center_y]
+        if not bottoms or not tops:
+            return None
+        bottom, top = max(bottoms), min(tops)
+
+        if right <= left or top <= bottom:
+            return None
+        return (left, right, bottom, top)
+    def enclosing_cell(
+        self,
+        scope: str,
+        x: float,
+        y: float,
+        height: float = 0.0,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """返回包围文本锚点的最近闭合线框 (left, right, bottom, top)。"""
+        if not self._sorted:
+            self.finalize()
+
+        center_y = y + max(height, 0.0) * 0.5
+        verticals = [
+            line for line in self._v.get(scope, [])
+            if line.range_min <= center_y <= line.range_max
+        ]
+        lefts = [line for line in verticals if line.pos < x]
+        rights = [line for line in verticals if line.pos > x]
+        if not lefts or not rights:
+            return None
+        left = max(lefts, key=lambda line: line.pos)
+        right = min(rights, key=lambda line: line.pos)
+
+        horizontals = [
+            line for line in self._h.get(scope, [])
+            if line.range_min <= x <= line.range_max
+        ]
+        bottoms = [line for line in horizontals if line.pos < center_y]
+        tops = [line for line in horizontals if line.pos > center_y]
+        if not bottoms or not tops:
+            return None
+        bottom = max(bottoms, key=lambda line: line.pos)
+        top = min(tops, key=lambda line: line.pos)
+
+        # 四条边必须覆盖彼此的交点，避免把零散引线误判成表格单元格。
+        tolerance = max(height * 0.5, 1e-6)
+        if (
+            left.range_min > bottom.pos + tolerance
+            or left.range_max < top.pos - tolerance
+            or right.range_min > bottom.pos + tolerance
+            or right.range_max < top.pos - tolerance
+            or bottom.range_min > left.pos + tolerance
+            or bottom.range_max < right.pos - tolerance
+            or top.range_min > left.pos + tolerance
+            or top.range_max < right.pos - tolerance
+        ):
+            return None
+        if right.pos <= left.pos or top.pos <= bottom.pos:
+            return None
+        return (left.pos, right.pos, bottom.pos, top.pos)
+
+    def is_grid_cell(
+        self,
+        scope: str,
+        cell: Tuple[float, float, float, float],
+        *,
+        tolerance: float = 1e-6,
+    ) -> bool:
+        """判断闭合框是否属于多格表格，而不是孤立的说明/引线框。
+
+        单独一个矩形没有足够信息证明它是表格。真实网格中的单元格至少会在
+        水平方向共享上下两条边，或在垂直方向共享左右两条边；共享边既可能是
+        一条贯穿多格的长线，也可能由相邻小矩形的共线线段拼接而成。
+        """
+        if not self._sorted:
+            self.finalize()
+
+        left, right, bottom, top = cell
+        tol = max(float(tolerance), 1e-6)
+
+        def horizontal_continues(y_pos: float) -> bool:
+            for line in self._h.get(scope, []):
+                if abs(line.pos - y_pos) > tol:
+                    continue
+                # 与当前边至少接触；同时向左或向右越出当前单元格。
+                touches = line.range_max >= left - tol and line.range_min <= right + tol
+                extends = line.range_min < left - tol or line.range_max > right + tol
+                if touches and extends:
+                    return True
+            return False
+
+        def vertical_continues(x_pos: float) -> bool:
+            for line in self._v.get(scope, []):
+                if abs(line.pos - x_pos) > tol:
+                    continue
+                # 与当前边至少接触；同时向下或向上越出当前单元格。
+                touches = line.range_max >= bottom - tol and line.range_min <= top + tol
+                extends = line.range_min < bottom - tol or line.range_max > top + tol
+                if touches and extends:
+                    return True
+            return False
+
+        horizontal_grid = horizontal_continues(bottom) and horizontal_continues(top)
+        vertical_grid = vertical_continues(left) and vertical_continues(right)
+        return horizontal_grid or vertical_grid
+
 
 class EntityPriority(Enum):
     """实体优先级：MTEXT > ATTRIB > TEXT"""
@@ -141,6 +272,9 @@ class TextEntity:
     tag: str = ""           # ATTRIB/ATTDEF 的 tag
     insert_handle: str = "" # 所属 INSERT 的 handle（区分同 BLOCK 的多次实例化）
     bbox_source: str = ""   # "ezdxf" | "align" | "estimate"，仅用于调试
+    color: int = 256          # DXF ACI；256=BYLAYER，0=BYBLOCK
+    true_color: Optional[int] = None
+    transparency: Optional[int] = None
     
     @property
     def priority(self) -> int:
@@ -299,14 +433,49 @@ class TextFlowGraph:
         
         方案2 语义分割：如果前一个文本以句号结尾，且后一个文本以大写/中文开头，不合并
         """
-        # 不同图层不合并
-        if e1.layer != e2.layer:
-            self._reject("layer")
+        # 同一 MTEXT 拆出的多段禁止互相合并：它们由 dxf_adapter 用 "<handle>#p<idx>"
+        # 命名的伪 handle 拆开，代表 "\P" 分隔的独立段落，视觉上就应该保持独立。
+        h1_root = e1.handle.split("#p", 1)[0] if "#p" in e1.handle else e1.handle
+        h2_root = e2.handle.split("#p", 1)[0] if "#p" in e2.handle else e2.handle
+        if "#p" in e1.handle and "#p" in e2.handle and h1_root == h2_root:
+            self._reject("mtext_split_siblings")
             return None
+
+        # 同行左侧的纯多级序号（如 1.3.1）与右侧正文属于同一条目。
+        # 统一在这里识别该关系，供跨图层、字高和水平间距规则复用，避免各处
+        # 的阈值不一致导致“已经识别为编号，却仍被普通文本门槛拆开”。
+        avg_height = max((e1.height + e2.height) / 2.0, 1e-6)
+        same_row = abs(e1.y - e2.y) <= avg_height * self.y_threshold_factor
+        horizontal_left, horizontal_right = (
+            (e1, e2) if e1.x <= e2.x else (e2, e1)
+        )
+        number_to_text_gap = horizontal_right.x - horizontal_left.right_edge
+        is_numbered_item_pair = (
+            same_row
+            and self._is_hierarchical_number_only(horizontal_left.text)
+            and not self._is_hierarchical_number_only(horizontal_right.text)
+            and -avg_height <= number_to_text_gap <= avg_height * 20
+        )
+
+        # 不同图层默认不合并；唯一例外是同行左侧的多级序号与其正文。
+        # CAD 图纸常把序号和正文放在不同图层。
+        if e1.layer != e2.layer:
+            if not is_numbered_item_pair:
+                self._reject("layer")
+                return None
 
         # 不同 scope 不合并
         if e1.scope != e2.scope:
             self._reject("scope")
+            return None
+
+        # 两个都以冒号结尾的短标签通常分列指向不同图形，例如“平面：/系统：”。
+        # 即使 LLM 不可用，几何回退也不能把它们拼成一个标签。
+        if (
+            (e1.text or "").rstrip().endswith((":", "："))
+            and (e2.text or "").rstrip().endswith((":", "："))
+        ):
+            self._reject("independent_colon_labels")
             return None
 
         # L3：bbox IoU 重叠分离
@@ -335,7 +504,9 @@ class TextFlowGraph:
 
             if e1.height > 0 and e2.height > 0:
                 h_ratio = abs(e1.height - e2.height) / max(e1.height, e2.height)
-                if h_ratio > self.height_ratio_tolerance:
+                # 编号常被单独设成大号字，正文则沿用说明文字字号；这仍是同一
+                # 条目的视觉结构。仅该明确关系跳过字高硬断，普通标题/引注不放宽。
+                if h_ratio > self.height_ratio_tolerance and not is_numbered_item_pair:
                     self._reject("height")
                     logger.debug(
                         "L4 拒绝(height差异 %.1f%%>%.0f%%) %s(%r,h=%.3f) vs %s(%r,h=%.3f)",
@@ -393,6 +564,25 @@ class TextFlowGraph:
             self._reject("y_gap_too_large")
             return None
 
+        if is_next_line:
+            upper_entity = e1 if e1.y >= e2.y else e2
+            lower_entity = e2 if upper_entity is e1 else e1
+            lower_text = (lower_entity.text or "").strip()
+            # 短冒号标签换行出现时通常是新标题/表名，不是上段正文的续行。
+            # 将它硬断开，避免 LLM 分组回退后再次把“套管尺寸表：”并入正文。
+            if len(lower_text) <= 32 and lower_text.endswith((":", "：")):
+                self._reject("standalone_colon_label_new_row")
+                return None
+
+        # 标准/规范目录按行排版：同行的“《名称》+ GB/CJJ 编号”可以合并，
+        # 但任何目录片段都禁止跨行连接，避免多个标准被串成一个句段。
+        if is_next_line and (
+            self._is_standard_list_fragment(e1.text)
+            or self._is_standard_list_fragment(e2.text)
+        ):
+            self._reject("standard_list_new_row")
+            return None
+
         # L2 网格线阻挡：真表格的相邻单元格会被横线/竖线隔开
         if self.barriers is not None:
             if is_next_line:
@@ -419,11 +609,25 @@ class TextFlowGraph:
         # L5 语义关系分类：hard_break 直接拒；soft_continue 后面加分
         semantic_bonus = 0.0
         if self.enable_semantic_break:
-            left_entity = e1 if e1.x <= e2.x else e2
-            right_entity = e2 if e1.x <= e2.x else e1
-            relation = self._classify_semantic_relation(
-                left_entity.text, right_entity.text,
-            )
+            if is_same_line:
+                horizontal_left = e1 if e1.x <= e2.x else e2
+                horizontal_right = e2 if horizontal_left is e1 else e1
+                # “1.3.1 + 同行正文”属于同一条目录项，序号本身不能触发
+                # 标题硬断；多行边界仍由后续行首序号和标准目录规则控制。
+                if self._is_hierarchical_number_only(horizontal_left.text):
+                    relation = self.SEMANTIC_SOFT_CONTINUE
+                else:
+                    relation = self._classify_semantic_relation(
+                        horizontal_left.text, horizontal_right.text,
+                    )
+            else:
+                # 换行关系必须按阅读顺序（上行 → 下行）判断；按 X 排序会把
+                # 下一行左侧标题误当成前文，导致标准清单整段串联。
+                upper_entity = e1 if e1.y >= e2.y else e2
+                lower_entity = e2 if upper_entity is e1 else e1
+                relation = self._classify_semantic_relation(
+                    upper_entity.text, lower_entity.text,
+                )
             if relation == self.SEMANTIC_HARD_BREAK:
                 self._reject("semantic_break")
                 return None
@@ -435,7 +639,11 @@ class TextFlowGraph:
             e1, e2 = e2, e1
 
         x_gap = e2.x - e1.right_edge
-        x_threshold = avg_height * self.x_gap_threshold_factor
+        # 普通同行文本保持 3 倍字高限制；明确的“多级编号 + 正文”与前面的
+        # 分桶候选规则一致，允许到 20 倍平均字高。评分也必须使用同一阈值，
+        # 否则只跳过硬拒绝仍会因 x_score 变成负数而丢边。
+        x_threshold_factor = 20.0 if is_numbered_item_pair else self.x_gap_threshold_factor
+        x_threshold = avg_height * x_threshold_factor
 
         if is_same_line:
             # 允许 estimate_text_width 高估导致的"虚假重叠"：
@@ -444,8 +652,14 @@ class TextFlowGraph:
             shorter = min(e1.width, e2.width) if e1.width > 0 and e2.width > 0 else avg_height
             allowed_overlap = max(avg_height * 2.0, shorter * 0.6)
             if x_gap < -allowed_overlap:
-                self._reject("x_overlap_too_deep")
-                return None
+                # 标准目录里名称和 GB/CJJ 编号常因 CAD 字宽估算偏大而出现
+                # “虚假深重叠”；只要两者同行且都是目录片段，就仍视为一行。
+                if not (
+                    self._is_standard_list_fragment(e1.text)
+                    and self._is_standard_list_fragment(e2.text)
+                ):
+                    self._reject("x_overlap_too_deep")
+                    return None
             if x_gap > x_threshold:
                 self._reject("x_gap_too_large")
                 return None
@@ -503,7 +717,8 @@ class TextFlowGraph:
     )
     _TITLE_PATTERN = re.compile(
         r'^('
-        r'\d+[.、)\s]|'                              # 1. 2、3)
+        r'\d+(?:\.\d+)+(?=$|\s|[、)])|'              # 1.3、1.3.14（排除 2.5in）
+        r'\d+(?:\.(?!\d)|[、)\s])|'                 # 1. 2、3)，但 2.5in 不是编号
         r'[一二三四五六七八九十]+[、.\s]|'          # 一、二.
         r'第[一二三四五六七八九十\d]+[章节条款项]?|'   # 第一章、第2节
         r'[①②③④⑤⑥⑦⑧⑨⑩]|'                       # ①②③
@@ -513,6 +728,24 @@ class TextFlowGraph:
         re.IGNORECASE,
     )
 
+    _HIERARCHICAL_NUMBER_ONLY = re.compile(r'^\d+(?:\.\d+)+[.)、]?$')
+
+    @classmethod
+    def _is_hierarchical_number_only(cls, text: str) -> bool:
+        return bool(cls._HIERARCHICAL_NUMBER_ONLY.fullmatch((text or "").strip()))
+
+    # 前缀本身（CJJ/T 后跟空格/破折号/换行）也算标准片段。
+    # CAD 里"标准名+编号"常被拆成"《...》 + CJJ/T + 98-2014"多段，
+    # 只要不是被字母延续（GBK、CJK 等），就视为清单片段。
+    _STANDARD_LIST_FRAGMENT = re.compile(
+        r'^(?:《|(?:GB|GB/T|CJJ|CJJ/T|CJ|CJ/T|JGJ|JGJ/T|CECS|ISO|IEC)(?![A-Za-z]))',
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _is_standard_list_fragment(cls, text: str) -> bool:
+        return bool(cls._STANDARD_LIST_FRAGMENT.match((text or "").strip()))
+
     def _classify_semantic_relation(self, prev_text: str, curr_text: str) -> str:
         """返回三态之一：hard_break / soft_continue / neutral"""
         prev_text = (prev_text or "").strip()
@@ -521,6 +754,13 @@ class TextFlowGraph:
             return self.SEMANTIC_NEUTRAL
 
         # ---- 硬断规则 ----
+        # 标准/规范清单通常每行以《名称》开头，下一行出现新的书名号即为新条目。
+        if curr_text.startswith("《"):
+            logger.debug(
+                "L5 硬断(新标准条目) %r → %r", prev_text[:20], curr_text[:20],
+            )
+            return self.SEMANTIC_HARD_BREAK
+
         # 后文以标题/序号开头
         if self._TITLE_PATTERN.match(curr_text):
             logger.debug(
@@ -554,6 +794,14 @@ class TextFlowGraph:
             if first_char in "、," or self._TITLE_PATTERN.match(curr_text):
                 logger.debug(
                     "L5 硬断(冒号引出列表) %r → %r",
+                    prev_text[:20], curr_text[:20],
+                )
+                return self.SEMANTIC_HARD_BREAK
+            # 前文本身就是"章节标题"（以序号开头 + 以冒号结束），
+            # 与后文正文永远不属于同一句，避免"五、维修原则："被并入下一段 MTEXT。
+            if self._TITLE_PATTERN.match(prev_text):
+                logger.debug(
+                    "L5 硬断(标题冒号) %r → %r",
                     prev_text[:20], curr_text[:20],
                 )
                 return self.SEMANTIC_HARD_BREAK
@@ -786,6 +1034,12 @@ class TextFlowGraph:
             ea = self.nodes[ha]
             for hb in members_b:
                 eb = self.nodes[hb]
+                avg_height = max((ea.height + eb.height) / 2.0, 1e-6)
+                same_row = abs(ea.y - eb.y) <= avg_height * self.y_threshold_factor
+                horizontal_left = ea if ea.x <= eb.x else eb
+                # 同行左侧多级序号只标识本行，不应在簇级复核时被当成标题边界。
+                if same_row and self._is_hierarchical_number_only(horizontal_left.text):
+                    continue
                 # 决定阅读顺序：先按 y（大在前），再按 x
                 if (ea.y, -ea.x) > (eb.y, -eb.x):
                     prev, curr = ea, eb
@@ -873,43 +1127,96 @@ class TextReconstructor:
     def reconstruct(
         self,
         entities: List[TextEntity],
+        *,
+        enable_llm_layout: bool = True,
     ) -> List[Sentence]:
-        """重建句子
-
-        Args:
-            entities: 文本实体列表
-
-        Returns:
-            重建后的句子列表
-        """
-        # 汇总所有分组内的拒绝原因，供上层诊断
+        """使用可选的 LLM 合法分组直出逻辑块，其余实体回退到几何重建。"""
         self.last_reject_stats: Dict[str, int] = {}
         if not entities:
             return []
 
-        # 按 scope 和 layer 分组
-        groups = self._group_by_context(entities)
+        llm_groups: Dict[str, str] = {}
+        if enable_llm_layout:
+            try:
+                from app.services.adapters.dwg_llm_layout import layout_group_entities
+
+                llm_groups = layout_group_entities(entities, self.barrier_index)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("L6-LLM 版面分析异常，回退到几何分桶：%s", exc)
 
         sentences: List[Sentence] = []
+        covered_handles: Set[str] = set()
+        if llm_groups:
+            nodes = {entity.handle: entity for entity in entities}
+            grouped_handles: Dict[str, List[str]] = {}
+            for entity in entities:
+                group_id = llm_groups.get(entity.handle)
+                if group_id:
+                    grouped_handles.setdefault(group_id, []).append(entity.handle)
 
-        for (scope, layer), group_entities in groups.items():
-            group_sentences = self._reconstruct_group(group_entities, scope)
-            sentences.extend(group_sentences)
+            for handles in grouped_handles.values():
+                unique_handles = list(dict.fromkeys(handles))
+                if any(handle in covered_handles for handle in unique_handles):
+                    logger.warning("忽略存在重复 handle 的 LLM 分组：%s", unique_handles)
+                    continue
+                sentence = self._path_to_sentence(unique_handles, nodes, 0.85)
+                if sentence is not None:
+                    sentences.append(sentence)
+                    covered_handles.update(unique_handles)
+
+        remaining = [
+            entity for entity in entities if entity.handle not in covered_handles
+        ]
+        for group_entities in self._group_by_context(remaining).values():
+            scope = group_entities[0].scope if group_entities else ""
+            sentences.extend(self._reconstruct_group(group_entities, scope))
 
         return sentences
+
+
+    def _group_by_llm(
+        self,
+        entities: List[TextEntity],
+        llm_groups: Dict[str, str],
+    ) -> Dict[Tuple[str, str], List[TextEntity]]:
+        """按 LLM 分组 id 组织；未被 LLM 覆盖的实体回退到 scope+layer 分桶。"""
+        groups: Dict[Tuple[str, str], List[TextEntity]] = {}
+        for entity in entities:
+            gid = llm_groups.get(entity.handle)
+            if gid:
+                key = (f"llm:{gid}", entity.layer)
+            else:
+                key = (entity.scope, entity.layer)
+            groups.setdefault(key, []).append(entity)
+        return groups
     
     def _group_by_context(
         self, entities: List[TextEntity]
     ) -> Dict[Tuple[str, str], List[TextEntity]]:
-        """按 scope 和 layer 分组"""
+        """按 scope/layer 分组；多级序号归入同行正文图层。"""
         groups: Dict[Tuple[str, str], List[TextEntity]] = {}
-        
+
         for entity in entities:
-            key = (entity.scope, entity.layer)
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(entity)
-        
+            layer = entity.layer
+            if TextFlowGraph._is_hierarchical_number_only(entity.text):
+                candidates = []
+                for other in entities:
+                    if other is entity or other.scope != entity.scope:
+                        continue
+                    if TextFlowGraph._is_hierarchical_number_only(other.text):
+                        continue
+                    avg_height = max((entity.height + other.height) / 2.0, 1e-6)
+                    if abs(entity.y - other.y) > avg_height * self.y_threshold_factor:
+                        continue
+                    x_gap = other.x - entity.right_edge
+                    if x_gap < -avg_height or x_gap > avg_height * 20:
+                        continue
+                    candidates.append((abs(x_gap), other.x, other))
+                if candidates:
+                    layer = min(candidates, key=lambda item: (item[0], item[1]))[2].layer
+
+            groups.setdefault((entity.scope, layer), []).append(entity)
+
         return groups
     
     def _reconstruct_group(

@@ -37,6 +37,7 @@ const optionDefaults: DocumentParseOptions = {
   translate_code_blocks: true,
   extract_links: false,
   skip_non_translatable: true,
+  enable_spatial_merge: false,
   xml_inline_elements_no_split: true,
   custom_parse_config: false,
   translate_idml_comments: false,

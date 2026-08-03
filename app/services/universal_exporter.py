@@ -397,12 +397,13 @@ def _extract_merged_text_info(segments: List, translations: Dict[str, str]) -> L
             continue
             
         is_merged = metadata.get('is_merged', False)
+        is_table_cell = metadata.get('cad_table_cell', False)
         merged_handles = metadata.get('merged_handles', [])
         
         if is_merged:
             segments_with_is_merged += 1
         
-        if not is_merged or len(merged_handles) <= 1:
+        if (not is_merged and not is_table_cell) or not merged_handles:
             continue
         
         # 如果没有译文，尝试从 translations 中查找
@@ -420,6 +421,16 @@ def _extract_merged_text_info(segments: List, translations: Dict[str, str]) -> L
             'primary_x': metadata.get('primary_x', 0),
             'primary_y': metadata.get('primary_y', 0),
             'primary_height': metadata.get('primary_height', 2.5),
+            'primary_style': metadata.get('primary_style', ''),
+            'primary_color': metadata.get('primary_color', 256),
+            'primary_true_color': metadata.get('primary_true_color'),
+            'primary_transparency': metadata.get('primary_transparency'),
+            'group_x': metadata.get('group_x', metadata.get('primary_x', 0)),
+            'group_y_top': metadata.get('group_y_top', metadata.get('primary_y', 0)),
+            'group_width': metadata.get('group_width', 0),
+            'group_height': metadata.get('group_height', 0),
+            'cad_table_cell': metadata.get('cad_table_cell', False),
+            'scope': metadata.get('scope', ''),
             'layer': metadata.get('layer', '0'),
         }
         merged_info_list.append(merged_info)

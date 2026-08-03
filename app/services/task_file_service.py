@@ -396,6 +396,12 @@ _UPLOAD_CAPABILITY_SPECS = (
                 "label": "非译元素(数字和符号)",
                 "default": True,
             },
+            {
+                "id": "enable_spatial_merge",
+                "label": "复杂图纸（合并碎片文本）",
+                "default": False,
+                "description": "复杂说明文字被拆成多个实体时开启；简单图纸请保持关闭。",
+            },
         ),
     },
     {
@@ -412,6 +418,12 @@ _UPLOAD_CAPABILITY_SPECS = (
                 "id": "skip_non_translatable",
                 "label": "非译元素(数字和符号)",
                 "default": True,
+            },
+            {
+                "id": "enable_spatial_merge",
+                "label": "复杂图纸（合并碎片文本）",
+                "default": False,
+                "description": "复杂说明文字被拆成多个实体时开启；简单图纸请保持关闭。",
             },
         ),
     },
@@ -924,7 +936,15 @@ def build_export_segments_from_source(
     registry = ensure_default_adapters_registered()
     adapter = registry.get_adapter(filename)
     document_parse_options = normalize_document_parse_options(document_parse_options)
-    parse_result = adapter.parse_with_options(raw_bytes, filename=filename, options=document_parse_options)
+
+    # CAD 导出只需重新定位原文件实体。版面分组结果已保存在数据库的
+    # segment_metadata 中，禁止在导出阶段再次请求 LLM。
+    extension = (filename or "").lower().rsplit(".", 1)[-1] if filename else ""
+    is_cad_file = extension in ("dwg", "dxf")
+    parse_options = dict(document_parse_options)
+    if is_cad_file:
+        parse_options["enable_llm_layout"] = False
+    parse_result = adapter.parse_with_options(raw_bytes, filename=filename, options=parse_options)
     
     # 按 segment_id 建立数据库句段索引
     translated_segments = {
@@ -933,8 +953,6 @@ def build_export_segments_from_source(
     }
 
     # 对于 CAD 文件，额外按 handle 建立索引（因为合并后 segment_id 会变）
-    extension = (filename or "").lower().rsplit(".", 1)[-1] if filename else ""
-    is_cad_file = extension in ("dwg", "dxf")
 
     handle_to_db_segment: dict[str, Any] = {}
     merged_handles_set: set[str] = set()  # 所有被合并的 handles（用于清空）

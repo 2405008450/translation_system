@@ -95,11 +95,60 @@ def clean_mtext(text: str) -> str:
     return text
 
 
+def _mtext_paragraph_heights(raw: str, nominal_height: float) -> List[float]:
+    """返回每个 MTEXT 段落的有效字高，包含 ``\\H...;`` 格式缩放。"""
+    fallback = max(float(nominal_height or 0), 1e-6)
+    if not raw:
+        return [fallback]
+    try:
+        from ezdxf.tools.text import MTextContext, MTextParser, TokenType
+
+        context = MTextContext()
+        context.cap_height = fallback
+        heights = [fallback]
+        paragraph_index = 0
+        for token in MTextParser(raw, context):
+            token_height = max(float(token.ctx.cap_height or fallback), 1e-6)
+            heights[paragraph_index] = max(heights[paragraph_index], token_height)
+            if token.type == TokenType.NEW_PARAGRAPH:
+                paragraph_index += 1
+                heights.append(token_height)
+        return heights
+    except Exception:  # noqa: BLE001 - 格式异常时退回标称字高
+        return [fallback] * max(len(clean_mtext(raw).split("\n")), 1)
+
+
+# 标准年份后缀：CAD 里"标准名 + CJJ/T + 98-2014" 常被拆成独立 TEXT，
+# 单独看是纯数字-年份，既过不了"可译"也会被"尺寸式"拦下，
+# 但它是标准编号的一部分，必须放行给合并逻辑再判断。
+_STANDARD_YEAR_SUFFIX_RE = re.compile(r"^\d{1,4}-\d{4}[A-Za-z]?$")
+# 括号年份碎片：'(2018' / '2018)' / '(2018)' / '（2018）' / 纯 '2018'。
+# 属于 "GB50016-2014 (2018年版）" 这类被拆散的续写片段，必须放行。
+# 纯 4 位年份限定 19xx/20xx，避免把 "1234" 这类无关数字误当年份。
+_YEAR_FRAGMENT_RE = re.compile(r"^[()（）]?\s*(?:19|20)\d{2}\s*[()（）]?$")
+# 单独的开/闭括号（半/全角）：CAD 常见的"(" / "（" 单字实体，合并层放行后
+# 由几何位置决定要不要拼进相邻文本。
+_LONE_BRACKET_RE = re.compile(r"^[()（）\[\]【】《》〈〉『』]+$")
+
+
 def is_translatable_text(text: str) -> bool:
     """判断 DXF 文本是否包含可翻译字符（含 CJK 范围）。"""
     if not text:
         return False
-    return bool(re.search(r"[A-Za-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", text))
+    if re.search(r"[A-Za-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", text):
+        return True
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # 白名单：标准年份后缀 & 括号年份碎片，让它们进入合并候选，
+    # 由合并层与前后文的字母/CJK 段一起拼回原句。
+    if _STANDARD_YEAR_SUFFIX_RE.match(stripped):
+        return True
+    if _YEAR_FRAGMENT_RE.match(stripped):
+        return True
+    if _LONE_BRACKET_RE.match(stripped):
+        return True
+    return False
 
 
 # 纯尺寸/坐标式表达（4-100×100, +0.80, R12.5 等），DWG 路径下应跳过避免乱译
@@ -111,6 +160,12 @@ def _is_dimension_like(text: str) -> bool:
         return False
     stripped = text.strip()
     if not stripped:
+        return False
+    # 白名单：形如 "98-2014" / "155-2011" 的年份编号片段先放行
+    if _STANDARD_YEAR_SUFFIX_RE.match(stripped):
+        return False
+    # 白名单：'2018' / '(2018' / '2018)' 这类年份碎片是标准名的续写
+    if _YEAR_FRAGMENT_RE.match(stripped):
         return False
     return bool(_DIMENSION_LIKE_RE.match(stripped))
 
@@ -150,20 +205,16 @@ class DxfAdapter(FormatAdapter):
     ) -> ParseResult:
         self.validate_file_size(raw_bytes, filename)
         opts = options or {}
-        # 上游 document_parse_options 目前不会带 enable_spatial_merge 键，
-        # 因此 .dxf 文件即便 settings 里开了 dwg_enable_spatial_merge 也不会生效。
-        # 显式退回 settings，让 .dxf 和 .dwg 走同一套开关。
-        settings = get_settings()
-        default_spatial_merge = getattr(settings, "dwg_enable_spatial_merge", False)
-        default_skip_dim_like = getattr(settings, "dwg_skip_dimension_like", False)
-        default_extra = getattr(settings, "dwg_handle_extra_entities", False)
         return self._parse_with_options(
             raw_bytes,
             skip_non_translatable=bool(opts.get("skip_non_translatable", True)),
             filename=filename,
-            extract_extra_entities=bool(opts.get("extract_extra_entities", default_extra)),
-            skip_dimension_like=bool(opts.get("skip_dimension_like", default_skip_dim_like)),
-            enable_spatial_merge=bool(opts.get("enable_spatial_merge", default_spatial_merge)),
+            extract_extra_entities=bool(opts.get("extract_extra_entities", False)),
+            skip_dimension_like=bool(opts.get("skip_dimension_like", False)),
+            # 上传未勾选时必须明确走 9d41142 的单实体解析分支，
+            # 不再被全局 DWG_ENABLE_SPATIAL_MERGE 覆盖。
+            enable_spatial_merge=bool(opts.get("enable_spatial_merge", False)),
+            enable_llm_layout=bool(opts.get("enable_llm_layout", True)),
         )
 
     def _parse_with_options(
@@ -176,6 +227,7 @@ class DxfAdapter(FormatAdapter):
         skip_dimension_like: bool = False,
         collect_audit: bool = False,
         enable_spatial_merge: bool = False,
+        enable_llm_layout: bool = True,
     ) -> ParseResult:
         if not raw_bytes:
             return ParseResult(
@@ -199,6 +251,7 @@ class DxfAdapter(FormatAdapter):
                 doc,
                 skip_non_translatable=skip_non_translatable,
                 skip_dimension_like=skip_dimension_like,
+                enable_llm_layout=enable_llm_layout,
                 audit=audit,
             )
         else:
@@ -416,6 +469,7 @@ class DxfAdapter(FormatAdapter):
         *,
         skip_non_translatable: bool,
         skip_dimension_like: bool = False,
+        enable_llm_layout: bool = True,
         audit: Optional[List[dict]] = None,
     ) -> List[BlockNode]:
         """收集文本节点并进行语义重建
@@ -439,6 +493,12 @@ class DxfAdapter(FormatAdapter):
         barrier_stats = {"lines": 0, "hlines": 0, "vlines": 0}
 
         def _accept_entity(text_entity: Optional[TextEntity]) -> bool:
+            """前置过滤：只让可译文本或"明确白名单"碎片进入合并池。
+
+            白名单包含标准年份后缀（98-2014）、括号年份（(2018/2018)）等
+            被 CAD 拆散但语义上属于前文续写的固定形态。全量放行会带来大量
+            无意义碎片，改变图连通结构，导致标题跨行错并入正文，故收敛。
+            """
             if text_entity is None:
                 return False
             if skip_non_translatable and not is_translatable_text(text_entity.text):
@@ -497,11 +557,15 @@ class DxfAdapter(FormatAdapter):
                     pts = [(float(start[0]), float(start[1])), (float(end[0]), float(end[1]))]
                 elif dxftype == "LWPOLYLINE":
                     pts = [(float(p[0]), float(p[1])) for p in entity.get_points("xy")]
+                    if getattr(entity, "closed", False) and len(pts) > 2:
+                        pts.append(pts[0])
                 elif dxftype == "POLYLINE":
                     pts = []
                     for v in entity.vertices:
                         loc = v.dxf.location
                         pts.append((float(loc[0]), float(loc[1])))
+                    if getattr(entity, "is_closed", False) and len(pts) > 2:
+                        pts.append(pts[0])
                 else:
                     return
             except Exception:  # noqa: BLE001
@@ -617,6 +681,23 @@ class DxfAdapter(FormatAdapter):
 
             # TEXT / MTEXT / 独立 ATTRIB / ATTDEF
             if dxftype in ("TEXT", "MTEXT", "ATTRIB", "ATTDEF"):
+                # MTEXT 多段 (\P) 拆分：一个 MTEXT 内含 "9.1 ...\n9.2 ...\n9.3 ..." 时，
+                # 若不拆开，翻译后整段行数变化会覆盖相邻表格/图形。
+                # 每段各自作为独立 TextEntity 参与合并流程，y 按顺序递减一个行高。
+                if dxftype == "MTEXT":
+                    split_entities = self._split_mtext_paragraphs(
+                        entity,
+                        scope,
+                        transform=transform,
+                        insert_handle=insert_handle,
+                        block_name=block_name,
+                    )
+                    if split_entities:
+                        for te in split_entities:
+                            if _accept_entity(te):
+                                all_entities.append(te)
+                        return
+
                 text_entity = self._extract_text_entity(
                     entity,
                     scope,
@@ -680,6 +761,39 @@ class DxfAdapter(FormatAdapter):
             iou_split_threshold=iou_thr,
         )
 
+        # 闭合线框内的文本按单元格归组。普通语义重建会把编号条目视为独立句，
+        # 但 CAD 表格导出需要一个 MTEXT 承载整格内容，才能按格宽自动折行。
+        cell_by_entity_id: dict[int, tuple[float, float, float, float]] = {}
+        cell_groups: dict[tuple, List[TextEntity]] = {}
+        non_cell_entities: List[TextEntity] = []
+        for text_entity in all_entities:
+            cell = barrier_index.enclosing_cell(
+                text_entity.scope,
+                text_entity.x,
+                text_entity.y,
+                text_entity.height,
+            )
+            if cell is None:
+                non_cell_entities.append(text_entity)
+                continue
+            left, right, bottom, top = cell
+            # 排除整张图框、房间轮廓等大闭合区域，只把接近表格行高的线框当候选。
+            char_height = max(text_entity.height, 1e-6)
+            if right - left > char_height * 300 or top - bottom > char_height * 50:
+                non_cell_entities.append(text_entity)
+                continue
+            # 闭合矩形也可能是带引线的说明框。只有边界与相邻行/列连续、
+            # 确实形成多格网格时，才按表格单元格归组并在导出时居中。
+            if not barrier_index.is_grid_cell(
+                text_entity.scope,
+                cell,
+                tolerance=char_height * 0.1,
+            ):
+                non_cell_entities.append(text_entity)
+                continue
+            cell_by_entity_id[id(text_entity)] = cell
+            cell_groups.setdefault((text_entity.scope, *cell), []).append(text_entity)
+
         # 诊断：按 (scope, layer) 分桶后每桶大小分布——桶太碎（大量 1 元素桶）
         # 就说明 scope/layer 天然把同一段拆开了，几何阈值再宽也合不了。
         from collections import Counter
@@ -694,7 +808,34 @@ class DxfAdapter(FormatAdapter):
             [(f"{s[:30]}|{l}", n) for (s, l), n in top_buckets],
         )
 
-        sentences = reconstructor.reconstruct(all_entities)
+        sentences = reconstructor.reconstruct(
+            non_cell_entities,
+            enable_llm_layout=enable_llm_layout,
+        )
+        for group_entities in cell_groups.values():
+            handles = [entity.handle for entity in group_entities]
+            nodes_by_handle = {entity.handle: entity for entity in group_entities}
+            sentence = reconstructor._path_to_sentence(handles, nodes_by_handle, 1.0)
+            if sentence is None:
+                continue
+
+            # 单元格内按视觉行保留换行；同一行的碎片仍按原间距规则拼接。
+            line_groups: List[List[TextEntity]] = []
+            for entity in sentence.entities:
+                if not line_groups:
+                    line_groups.append([entity])
+                    continue
+                current_line = line_groups[-1]
+                avg_height = sum(item.height for item in current_line) / len(current_line)
+                if abs(entity.y - current_line[0].y) <= max(avg_height, entity.height) * 0.8:
+                    current_line.append(entity)
+                else:
+                    line_groups.append([entity])
+            sentence.text = "\n".join(
+                reconstructor._merge_texts(sorted(line, key=lambda item: item.x))
+                for line in line_groups
+            )
+            sentences.append(sentence)
 
         # 诊断：合并前后对比
         merged_groups = sum(1 for s in sentences if len(s.entities) > 1)
@@ -814,11 +955,57 @@ class DxfAdapter(FormatAdapter):
         # Step 3: 将句子转换为 BlockNode
         nodes: List[BlockNode] = []
         merged_count = 0
-        
+        post_filter_stats = {"non_translatable": 0, "dimension_like": 0}
+
         for sentence in sentences:
-            if not sentence.text.strip():
+            merged_text = (sentence.text or "").strip()
+            if not merged_text:
                 continue
-            
+
+            # 合并后过滤：整句仍然不含可译字符 / 整句仍是尺寸式，才丢弃。
+            # 与前置放行策略配套，保证 "98-2014" 单条不被独立丢弃，
+            # 而 "1234-5678" 这种纯尺寸单条会在此处被剔除。
+            if skip_non_translatable and not is_translatable_text(merged_text):
+                post_filter_stats["non_translatable"] += 1
+                logger.debug(
+                    "DXF 跳过(合并后非可译) sid=%s text=%r",
+                    sentence.sentence_id, merged_text[:80],
+                )
+                if audit is not None:
+                    primary = sentence.primary_entity
+                    audit.append({
+                        "handle": primary.handle if primary else "",
+                        "entity_type": primary.entity_type if primary else "",
+                        "layer": sentence.layer,
+                        "scope": primary.scope if primary else "",
+                        "text": merged_text,
+                        "has_chinese": False,
+                        "status": "skipped",
+                        "reason": "post_merge_non_translatable",
+                        "sentence_id": sentence.sentence_id,
+                    })
+                continue
+            if skip_dimension_like and _is_dimension_like(merged_text):
+                post_filter_stats["dimension_like"] += 1
+                logger.debug(
+                    "DXF 跳过(合并后尺寸式) sid=%s text=%r",
+                    sentence.sentence_id, merged_text[:80],
+                )
+                if audit is not None:
+                    primary = sentence.primary_entity
+                    audit.append({
+                        "handle": primary.handle if primary else "",
+                        "entity_type": primary.entity_type if primary else "",
+                        "layer": sentence.layer,
+                        "scope": primary.scope if primary else "",
+                        "text": merged_text,
+                        "has_chinese": False,
+                        "status": "skipped",
+                        "reason": "post_merge_dimension_like",
+                        "sentence_id": sentence.sentence_id,
+                    })
+                continue
+
             is_merged = sentence.is_merged
             if is_merged:
                 merged_count += 1
@@ -826,24 +1013,81 @@ class DxfAdapter(FormatAdapter):
             # 构建 metadata
             handles = sentence.handles
             primary = sentence.primary_entity
-            
+
+            def _root_handle(h: str) -> str:
+                # 拆段 MTEXT 的伪 handle "<hex>#p<idx>" 还原到原 handle
+                return h.split("#p", 1)[0] if "#p" in h else h
+
+            root_primary = _root_handle(primary.handle) if primary else (
+                _root_handle(handles[0]) if handles else ""
+            )
+            root_handles = [_root_handle(h) for h in handles]
+
             metadata = {
                 "entity_type": "MERGED_TEXT" if is_merged else (primary.entity_type if primary else "TEXT"),
-                "handle": primary.handle if primary else (handles[0] if handles else ""),
+                "handle": root_primary,
                 "layer": sentence.layer,
                 "scope": primary.scope if primary else "",
                 "is_merged": is_merged,
-                "merged_handles": handles,
+                "merged_handles": root_handles,
                 "merged_count": len(handles),
                 "sentence_id": sentence.sentence_id,
                 # L1/L5：合并信心分数，供前端 mini-map / 灰度提示
                 "merge_confidence": round(float(sentence.merge_confidence), 3),
             }
+
+            # MTEXT 拆段标记：若本 sentence 全部实体都是同一原 MTEXT 的拆段，
+            # 导出时要在原 y 位置创建独立小 MTEXT，避免各段 y 相对偏移随译文膨胀。
+            split_handles = [h for h in handles if "#p" in h]
+            if split_handles and len(split_handles) == len(handles):
+                parent_roots = {h.split("#p", 1)[0] for h in split_handles}
+                if len(parent_roots) == 1:
+                    parent_handle = parent_roots.pop()
+                    metadata["mtext_split_parent"] = parent_handle
+                    metadata["mtext_split_layout_version"] = 3
+                    metadata["mtext_split_indices"] = sorted(
+                        int(h.split("#p", 1)[1]) for h in split_handles
+                    )
+                    # 高度预算：本段 y 到"下一段起始 y"的距离，导出时用它决定
+                    # 译文过长是否需要缩字号，避免翻译后向下延伸砸到图表/表格。
+                    parent_next_y = self._mtext_split_next_y.get(
+                        parent_handle, {}
+                    ).get(min(metadata["mtext_split_indices"]))
+                    if parent_next_y is not None and primary is not None:
+                        budget = float(primary.y) - float(parent_next_y)
+                        if budget > 0:
+                            metadata["mtext_split_y_budget"] = budget
             
             if primary:
                 metadata["primary_x"] = primary.x
                 metadata["primary_y"] = primary.y
                 metadata["primary_height"] = primary.height
+                metadata["primary_style"] = primary.style
+                metadata["primary_color"] = primary.color
+                metadata["primary_true_color"] = primary.true_color
+                metadata["primary_transparency"] = primary.transparency
+
+            if sentence.entities:
+                metadata["group_x"] = min(e.x for e in sentence.entities)
+                metadata["group_y_top"] = max(e.y + e.height for e in sentence.entities)
+                metadata["group_width"] = max(e.right_edge for e in sentence.entities) - metadata["group_x"]
+                metadata["group_height"] = metadata["group_y_top"] - min(e.y for e in sentence.entities)
+
+            cell = cell_by_entity_id.get(id(primary)) if primary is not None else None
+            if cell is not None:
+                left, right, bottom, top = cell
+                cell_width = max(right - left, 1e-6)
+                cell_height = max(top - bottom, 1e-6)
+                padding = min(
+                    max(primary.height * 0.5, 1e-6),
+                    cell_width * 0.1,
+                    cell_height * 0.1,
+                )
+                metadata["cad_table_cell"] = True
+                metadata["group_x"] = left + padding
+                metadata["group_y_top"] = top - padding
+                metadata["group_width"] = max(cell_width - padding * 2, 1e-6)
+                metadata["group_height"] = max(cell_height - padding * 2, 1e-6)
             
             # 保存原始实体信息（供导出时精确回写）
             metadata["original_entities"] = json.dumps([
@@ -882,11 +1126,14 @@ class DxfAdapter(FormatAdapter):
         
         logger.info(
             "DXF 语义重建完成：%d 个原始实体 → %d 个句子（其中 %d 个合并组），"
-            "另有 %d 个独立节点（DIMENSION/MULTILEADER/ACAD_TABLE）",
+            "另有 %d 个独立节点（DIMENSION/MULTILEADER/ACAD_TABLE）；"
+            "合并后兜底过滤：非可译=%d，尺寸式=%d",
             len(all_entities),
             len(nodes),
             merged_count,
             len(standalone_nodes),
+            post_filter_stats["non_translatable"],
+            post_filter_stats["dimension_like"],
         )
 
         # 独立节点（DIMENSION / MULTILEADER / ACAD_TABLE）不参与合并，直接追加
@@ -914,6 +1161,124 @@ class DxfAdapter(FormatAdapter):
 
         return nodes + standalone_nodes
 
+    def _split_mtext_paragraphs(
+            self,
+            entity,
+            scope: str,
+            *,
+            transform=None,
+            insert_handle: str = "",
+            block_name: str = "",
+        ) -> Optional[List["TextEntity"]]:
+            """按 \\P 拆分带大段视觉空白的 MTEXT，并保留原始纵向布局。"""
+            if not hasattr(self, "_mtext_split_next_y"):
+                self._mtext_split_next_y = {}
+            raw = entity.text or ""
+            if not raw:
+                return None
+            cleaned = clean_mtext(raw)
+            parts = [p.strip() for p in cleaned.split("\n")]
+            if len([p for p in parts if p]) <= 1:
+                return None
+
+            max_gap = 0
+            current_gap = 0
+            for part in parts:
+                if part:
+                    current_gap = 0
+                else:
+                    current_gap += 1
+                    max_gap = max(max_gap, current_gap)
+            if max_gap < 2:
+                return None
+
+            base = self._extract_text_entity(
+                entity,
+                scope,
+                transform=transform,
+                insert_handle=insert_handle,
+                block_name=block_name,
+            )
+            if base is None:
+                return None
+
+            # MTEXT 可用 \\H...; 覆盖实体标称字高；2C9A 使用 \\H1.1666x，
+            # 忽略该倍率会把图表预留空段压缩，导致 9.2 提前落到图形上方。
+            nominal_height = base.height if base.height > 0 else 2.5
+            local_nominal_height = float(
+                getattr(entity.dxf, "char_height", nominal_height) or nominal_height
+            )
+            local_heights = _mtext_paragraph_heights(raw, local_nominal_height)
+            height_scale = nominal_height / max(local_nominal_height, 1e-6)
+            paragraph_heights = [height * height_scale for height in local_heights]
+            first_height = paragraph_heights[0] if paragraph_heights else nominal_height
+            spacing_factor = float(
+                getattr(entity.dxf, "line_spacing_factor", 1.0) or 1.0
+            )
+            available_width = base.width if base.width > 0 else first_height * 30
+
+            # _extract_text_entity 按标称字高换算 top/middle attachment；这里补上
+            # 内嵌有效字高产生的差值，使首段顶部仍与原 MTEXT insert 对齐。
+            attachment = int(getattr(entity.dxf, "attachment_point", 1) or 1)
+            if attachment in (1, 2, 3):
+                cursor_y = base.y - (first_height - nominal_height)
+            elif attachment in (4, 5, 6):
+                cursor_y = base.y - (first_height - nominal_height) / 2.0
+            else:
+                cursor_y = base.y
+
+            entities: List[TextEntity] = []
+            budget_boundary_by_idx: Dict[int, float] = {}
+            for idx, part in enumerate(parts):
+                effective_height = (
+                    paragraph_heights[idx]
+                    if idx < len(paragraph_heights)
+                    else first_height
+                )
+                line_h = effective_height * (5.0 / 3.0) * spacing_factor
+                if not part:
+                    cursor_y -= line_h
+                    continue
+
+                para_y = cursor_y
+                entities.append(TextEntity(
+                    handle=f"{base.handle}#p{idx}",
+                    entity_type="MTEXT",
+                    layer=base.layer,
+                    text=part,
+                    x=base.x,
+                    y=para_y,
+                    height=effective_height,
+                    width=base.width,
+                    rotation=base.rotation,
+                    style=base.style,
+                    scope=base.scope,
+                    block_name=base.block_name,
+                    tag=base.tag,
+                    insert_handle=base.insert_handle,
+                    bbox_source=f"{base.bbox_source}+split",
+                    color=base.color,
+                    true_color=base.true_color,
+                    transparency=base.transparency,
+                ))
+
+                # 显式 \P 之外，MTEXT 还会按 box width 自动折行。后续段落必须从
+                # 原段实际占用行数之后开始，否则 9.2/9.3 会落在同一行并相互覆盖。
+                source_width = estimate_text_width(part, effective_height)
+                source_lines = max(1, math.ceil(source_width / max(available_width, 1e-6)))
+                occupied_height = source_lines * line_h
+                cursor_y -= occupied_height
+
+                # 预算只覆盖本段原本占用的文本槽，不把连续空行（图表预留区）
+                # 算进去，避免英文译文扩张后覆盖中间的表格和示意图。
+                budget_boundary_by_idx[idx] = para_y - occupied_height
+
+            self._mtext_split_next_y[base.handle] = {
+                idx: boundary for idx, boundary in budget_boundary_by_idx.items()
+            }
+            return entities
+
+
     def _extract_text_entity(
         self,
         entity,
@@ -940,6 +1305,12 @@ class DxfAdapter(FormatAdapter):
         handle = getattr(entity.dxf, "handle", "")
         layer = getattr(entity.dxf, "layer", "0")
         style = getattr(entity.dxf, "style", "") or ""
+        raw_color = getattr(entity.dxf, "color", 256)
+        color = int(raw_color) if raw_color is not None else 256
+        raw_true_color = getattr(entity.dxf, "true_color", None)
+        true_color = int(raw_true_color) if raw_true_color is not None else None
+        raw_transparency = getattr(entity.dxf, "transparency", None)
+        transparency = int(raw_transparency) if raw_transparency is not None else None
 
         if dxftype == "TEXT":
             text = getattr(entity.dxf, "text", "") or ""
@@ -1000,6 +1371,9 @@ class DxfAdapter(FormatAdapter):
             tag=tag,
             insert_handle=insert_handle,
             bbox_source=bbox_source,
+            color=color,
+            true_color=true_color,
+            transparency=transparency,
         )
 
     # ------------------------------------------------------------------

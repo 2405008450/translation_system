@@ -93,6 +93,7 @@ DEFAULT_DOCUMENT_PARSE_OPTIONS = {
     "translate_code_blocks": True,
     "extract_links": False,
     "skip_non_translatable": True,
+    "enable_spatial_merge": False,
     "xml_inline_elements_no_split": True,
     "custom_parse_config": False,
     "translate_idml_comments": False,

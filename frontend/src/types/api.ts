@@ -229,6 +229,7 @@ export interface DocumentParseOptions {
   translate_code_blocks: boolean
   extract_links: boolean
   skip_non_translatable: boolean
+  enable_spatial_merge: boolean
   xml_inline_elements_no_split: boolean
   custom_parse_config: boolean
   translate_idml_comments: boolean
