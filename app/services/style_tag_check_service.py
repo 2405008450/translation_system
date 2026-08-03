@@ -25,6 +25,7 @@ import json
 import logging
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -47,6 +48,8 @@ from app.services.adapters.pptx_inline_tags import (
     validate_tagged_text_structure,
 )
 from app.services.file_record_service import (
+    backfill_file_record_pptx_layout,
+    backfill_file_record_source_html,
     list_segments_for_file_record,
     set_segment_target_layout_text,
 )
@@ -75,6 +78,20 @@ _ERROR_TEXT_MISMATCH = "text_mismatch"
 _ERROR_STRUCTURE = "invalid_structure"
 
 _MARKER_RE = re.compile(r"⟦\s*/?\s*\d+\s*⟧")
+STYLE_TAG_CHECK_SUPPORTED_EXTENSIONS = {".docx", ".pptx"}
+
+
+def _filter_style_tag_check_files(files: list[FileRecord], scope: str) -> list[FileRecord]:
+    if scope != "merge_view":
+        return files
+    supported = [
+        file_record
+        for file_record in files
+        if Path(file_record.filename or "").suffix.lower() in STYLE_TAG_CHECK_SUPPORTED_EXTENSIONS
+    ]
+    if not supported:
+        raise HTTPException(status_code=400, detail="当前合并视图没有支持样式专检的 DOCX 或 PPTX 文件。")
+    return supported
 
 
 def _resolve_llm_options(provider: str, model: str | None) -> tuple[str, str | None]:
@@ -143,6 +160,11 @@ def _collect_style_tag_candidates(
     total_segments = 0
     drafts: list[dict[str, Any]] = []
     for file_record in files:
+        extension = Path(file_record.filename or "").suffix.lower()
+        if extension == ".docx":
+            backfill_file_record_source_html(db, file_record)
+        elif extension == ".pptx":
+            backfill_file_record_pptx_layout(db, file_record)
         segments = list_segments_for_file_record(db, file_record.id)
         total_segments += len(segments)
         for segment in segments:
@@ -406,6 +428,7 @@ def _persist_style_tag_check_report(
     files: list[FileRecord],
     current_user: User | None,
     scope: str,
+    merge_view_id: UUID | None = None,
     total_segments: int,
     drafts: list[dict[str, Any]],
 ) -> StyleTagCheckReport:
@@ -413,6 +436,7 @@ def _persist_style_tag_check_report(
     report = StyleTagCheckReport(
         project_id=project.id if project else None,
         file_record_id=files[0].id if scope == "file" and len(files) == 1 else None,
+        merge_view_id=merge_view_id,
         created_by_id=getattr(current_user, "id", None),
         scope=scope,
         file_ids=json.dumps([str(file_id) for file_id in file_ids]),
@@ -477,10 +501,12 @@ def create_style_tag_check_report(
     files: list[FileRecord],
     current_user: User | None,
     scope: str,
+    merge_view_id: UUID | None = None,
 ) -> StyleTagCheckReport:
     """扫描候选并落库（不含 AI 标注）。"""
     if not files:
         raise HTTPException(status_code=400, detail="请选择要检查的文件。")
+    files = _filter_style_tag_check_files(files, scope)
     total_segments, drafts = _collect_style_tag_candidates(db, files)
     return _persist_style_tag_check_report(
         db,
@@ -488,6 +514,7 @@ def create_style_tag_check_report(
         files=files,
         current_user=current_user,
         scope=scope,
+        merge_view_id=merge_view_id,
         total_segments=total_segments,
         drafts=drafts,
     )
@@ -813,6 +840,7 @@ def serialize_style_tag_check_report(
         "id": str(report.id),
         "project_id": str(report.project_id) if report.project_id else None,
         "file_record_id": str(report.file_record_id) if report.file_record_id else None,
+        "merge_view_id": str(report.merge_view_id) if report.merge_view_id else None,
         "scope": report.scope,
         "file_ids": _load_ids(report.file_ids),
         "total_files": report.total_files,

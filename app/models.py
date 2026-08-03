@@ -1363,6 +1363,7 @@ class StyleTagCheckReport(Base):
     __table_args__ = (
         Index("ix_style_tag_check_reports_project_id", "project_id"),
         Index("ix_style_tag_check_reports_file_record_id", "file_record_id"),
+        Index("ix_style_tag_check_reports_merge_view_id", "merge_view_id"),
         Index("ix_style_tag_check_reports_created_by_id", "created_by_id"),
         Index("ix_style_tag_check_reports_created_at", "created_at"),
     )
@@ -1381,6 +1382,11 @@ class StyleTagCheckReport(Base):
     file_record_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    merge_view_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("project_merge_views.id", ondelete="CASCADE"),
         nullable=True,
     )
     created_by_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -1409,6 +1415,7 @@ class StyleTagCheckReport(Base):
         back_populates="report",
         cascade="all, delete-orphan",
     )
+
 
 
 class StyleTagCheckReportItem(Base):

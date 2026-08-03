@@ -99,7 +99,9 @@ import {
   applyAllStyleTagCheckItems,
   applyStyleTagCheckItem,
   createFileStyleTagCheckReport,
+  createMergeViewStyleTagCheckReport,
   fetchFileStyleTagCheckReport,
+  fetchMergeViewStyleTagCheckReport,
   recheckStyleTagCheckReport,
   rejectStyleTagCheckItem,
   rerunStyleTagCheckItem,
@@ -5477,19 +5479,33 @@ const styleTagCheckMetaText = computed(() => {
   ].filter(Boolean).join(' · ')
 })
 
+const styleTagCheckSupportedExtensions = new Set(['.docx', '.pptx'])
+const styleTagCheckMergeViewId = computed(() => segmentStore.mergeViewId || props.mergeViewId || '')
+const styleTagCheckMergeFiles = computed(() => (
+  segmentStore.mergeViewDetail?.files.filter((file) => {
+    const filename = file.filename.toLowerCase()
+    return [...styleTagCheckSupportedExtensions].some((extension) => filename.endsWith(extension))
+  }) ?? []
+))
+const styleTagCheckUnsupportedMergeFiles = computed(() => (
+  segmentStore.mergeViewDetail?.files.filter((file) => !styleTagCheckMergeFiles.value.some((supported) => supported.id === file.id)) ?? []
+))
+const styleTagCheckMergeFileNames = computed(() => styleTagCheckMergeFiles.value.map((file) => file.filename).join('、'))
+const styleTagCheckUnsupportedMergeFileNames = computed(() => styleTagCheckUnsupportedMergeFiles.value.map((file) => file.filename).join('、'))
+
 const canRunStyleTagCheck = computed(() => {
   if (generatingStyleTagCheck.value) {
     return false
   }
   if (isMergeWorkbench.value) {
-    return false
+    return Boolean(styleTagCheckMergeViewId.value && styleTagCheckMergeFiles.value.length > 0)
   }
   return Boolean(segmentStore.fileRecord)
 })
 
 const styleTagCheckButtonTitle = computed(() => {
-  if (isMergeWorkbench.value) {
-    return '样式标记专检暂不支持合并工作台'
+  if (isMergeWorkbench.value && styleTagCheckMergeFiles.value.length === 0) {
+    return '当前合并视图没有 DOCX 或 PPTX 文件，无法进行样式专检'
   }
   return styleTagCheckReport.value
     ? `样式标记专检：${styleTagCheckReport.value.candidate_count} 处候选`
@@ -5733,12 +5749,18 @@ function toggleAllStyleTagCheckItems(selected: boolean) {
 }
 
 async function loadStyleTagCheckReport() {
-  if (!segmentStore.fileRecord) {
+  const mergeViewId = styleTagCheckMergeViewId.value
+  if (isMergeWorkbench.value && !mergeViewId) {
+    return
+  }
+  if (!isMergeWorkbench.value && !segmentStore.fileRecord) {
     return
   }
   loadingStyleTagCheck.value = true
   try {
-    const report = await fetchFileStyleTagCheckReport(segmentStore.fileRecord.id)
+    const report = isMergeWorkbench.value
+      ? await fetchMergeViewStyleTagCheckReport(mergeViewId)
+      : await fetchFileStyleTagCheckReport(segmentStore.fileRecord!.id)
     setCurrentStyleTagCheckReport(report)
   } catch (error) {
     // 尚无报告时忽略错误
@@ -5776,7 +5798,11 @@ function resolveStyleTagCheckGenerateOptions() {
 }
 
 async function generateStyleTagCheckReport() {
-  if (generatingStyleTagCheck.value || !canRunStyleTagCheck.value || !segmentStore.fileRecord) {
+  if (generatingStyleTagCheck.value || !canRunStyleTagCheck.value) {
+    return
+  }
+  const mergeViewId = styleTagCheckMergeViewId.value
+  if (!isMergeWorkbench.value && !segmentStore.fileRecord) {
     return
   }
   generatingStyleTagCheck.value = true
@@ -5784,7 +5810,9 @@ async function generateStyleTagCheckReport() {
   await scrollBottomPanelIntoView()
   try {
     const options = resolveStyleTagCheckGenerateOptions()
-    const report = await createFileStyleTagCheckReport(segmentStore.fileRecord.id, options)
+    const report = isMergeWorkbench.value
+      ? await createMergeViewStyleTagCheckReport(mergeViewId, options)
+      : await createFileStyleTagCheckReport(segmentStore.fileRecord!.id, options)
     setCurrentStyleTagCheckReport(report)
     toast.show({
       title: '样式标记专检完成',
@@ -7421,6 +7449,61 @@ function openFocusWorkbench() {
 
 async function loadAllSegments() {
   toast.info('大文档模式已启用分页加载，请使用分页控件切换句段。')
+}
+
+async function focusTranslationReviewSentence(sentenceId: string, fileRecordId?: string) {
+  const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+  const isMergeMode = Boolean(isMergeWorkbench.value && mergeViewId)
+  const fileRecord = segmentStore.fileRecord
+  if (!isMergeMode && !fileRecord) {
+    return
+  }
+  if (isMergeMode && !fileRecordId) {
+    toast.warn('无法确定问题所属文件。')
+    return
+  }
+
+  const targetKey = isMergeMode
+    ? segmentStore.segmentKeyOf({ sentence_id: sentenceId, file_record_id: fileRecordId } as Segment)
+    : sentenceId
+  const currentPageIndex = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === targetKey)
+  if (currentPageIndex >= 0) {
+    await focusEditorSegmentAtIndex(currentPageIndex, { caretAtEnd: true })
+    return
+  }
+
+  try {
+    const synced = await syncPendingWorkbenchEdits()
+    if (!synced) {
+      return
+    }
+
+    let data: SegmentPositionResponse
+    if (isMergeMode) {
+      data = await fetchMergeViewSegmentPosition(mergeViewId, fileRecordId!, sentenceId, {
+        pageSize: segmentStore.pageSize,
+      })
+    } else {
+      data = (await http.get<SegmentPositionResponse>(
+        `/file-records/${fileRecord!.id}/segments/${encodeURIComponent(sentenceId)}/position`,
+        { params: { page_size: segmentStore.pageSize } },
+      )).data
+    }
+
+    await clearSegmentFiltersForTermQANavigation()
+    await refreshSegmentPage(data.page, data.page_size)
+    const targetIndex = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === targetKey)
+    if (targetIndex === -1) {
+      toast.warn('已切换到目标页，但未找到对应句段。')
+      return
+    }
+    await focusEditorSegmentAtIndex(targetIndex, { caretAtEnd: true })
+  } catch (error) {
+    toast.error({
+      title: '跳转翻译校对句段失败',
+      message: getErrorMessage(error, '无法定位报告中的句段。'),
+    })
+  }
 }
 
 async function handlePreviewFocus(sentenceId: string) {
@@ -9956,7 +10039,7 @@ onBeforeRouteLeave(async () => {
                   {{ aiCapabilityBadgeCount }}
                 </span>
               </button>
-              <Teleport to="body">
+              <Teleport :to="isWorkbenchFullscreen && workbenchPageRef ? workbenchPageRef : 'body'">
                 <div
                   v-if="showAiCapabilityMenu"
                   ref="aiCapabilityMenuRef"
@@ -9986,7 +10069,6 @@ onBeforeRouteLeave(async () => {
                     </span>
                   </button>
                   <button
-                    v-if="!isMergeWorkbench"
                     type="button"
                     role="menuitem"
                     class="segment-editor-bottom-tool-dropdown__item"
@@ -10085,7 +10167,7 @@ onBeforeRouteLeave(async () => {
               />
 
               <button
-                v-if="activeBottomTool === 'history' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check' || activeBottomTool === 'style-tag-check'"
+                v-if="activeBottomTool === 'history' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check' || activeBottomTool === 'style-tag-check' || activeBottomTool === 'translation-review'"
                 class="workbench-bottom-drawer__close"
                 type="button"
                 title="关闭"
@@ -10692,6 +10774,14 @@ onBeforeRouteLeave(async () => {
                   <div class="workbench-bottom-drawer__header-lead">
                     <div class="section-title section-title--tight">样式标记专检</div>
                     <p class="panel-subtitle">根据原文样式为多样式句段的译文补全样式，不改动译文本身。</p>
+                    <template v-if="isMergeWorkbench">
+                      <p v-if="styleTagCheckMergeFileNames" class="panel-subtitle">
+                        支持检查：{{ styleTagCheckMergeFileNames }}
+                      </p>
+                      <p v-if="styleTagCheckUnsupportedMergeFileNames" class="panel-subtitle">
+                        不支持样式专检：{{ styleTagCheckUnsupportedMergeFileNames }}
+                      </p>
+                    </template>
                   </div>
 
                   <div v-if="styleTagCheckReport" class="term-qa-dialog__summary">
@@ -10922,17 +11012,10 @@ onBeforeRouteLeave(async () => {
                 :file-record-id="isMergeWorkbench ? null : (segmentStore.fileRecord?.id ?? null)"
                 :merge-view-id="isMergeWorkbench ? (segmentStore.mergeViewId ?? props.mergeViewId ?? null) : null"
                 :is-merge-workbench="isMergeWorkbench"
-                :active-file-record-id="activeWorkbenchFileId"
+                :merge-view-files="isMergeWorkbench ? (segmentStore.mergeViewDetail?.files ?? []) : []"
                 :project-id="activeWorkbenchProjectId"
                 :on-focus-sentence="(sid: string, fid?: string) => {
-                  if (fid && isMergeWorkbench) {
-                    const key = segmentStore.segments.find(s => s.sentence_id === sid && s.file_record_id === fid)
-                      ? segmentStore.segmentKeyOf(segmentStore.segments.find(s => s.sentence_id === sid && s.file_record_id === fid) as any)
-                      : sid
-                    void handlePreviewFocus(key)
-                  } else {
-                    void handlePreviewFocus(sid)
-                  }
+                  void focusTranslationReviewSentence(sid, fid)
                 }"
                 :on-active-count-change="(n: number | null) => { translationReviewActiveCount = n }"
                 class="workbench-bottom-drawer__qa"
@@ -15492,6 +15575,32 @@ onBeforeRouteLeave(async () => {
   min-height: 0;
   overflow: auto;
   border-radius: 4px;
+}
+
+.workbench-bottom-drawer--translation-review :deep(.term-qa-dialog__table-wrap) {
+  min-height: 0;
+  height: max(80px, calc(var(--workbench-visible-bottom-panel-height) - 88px));
+  max-height: max(80px, calc(var(--workbench-visible-bottom-panel-height) - 88px));
+  overflow-x: auto;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #8fa9b5 #eef3f5;
+}
+
+.workbench-bottom-drawer--translation-review :deep(.term-qa-dialog__table-wrap::-webkit-scrollbar) {
+  width: 10px;
+  height: 10px;
+}
+
+.workbench-bottom-drawer--translation-review :deep(.term-qa-dialog__table-wrap::-webkit-scrollbar-track) {
+  background: #eef3f5;
+}
+
+.workbench-bottom-drawer--translation-review :deep(.term-qa-dialog__table-wrap::-webkit-scrollbar-thumb) {
+  border: 2px solid #eef3f5;
+  border-radius: 999px;
+  background: #8fa9b5;
 }
 
 .workbench-bottom-drawer__qa .term-qa-dialog__table {

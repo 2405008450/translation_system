@@ -434,6 +434,7 @@ class ExportSegment:
     matched_source_text: str = ""
     target_html: str | None = None
     source_html: str | None = None
+    target_layout_text: str | None = None
     math_placeholders: dict[str, str] = field(default_factory=dict)
     sequence_index: int | None = None
     source_structure_changed: bool = False
@@ -729,6 +730,7 @@ def _group_segments_by_block(
         cell_index = _to_optional_int(_get_segment_value(segment, "cell_index"))
         sentence_id = str(_get_segment_value(segment, "sentence_id", "") or "")
         target_html = _get_segment_value(segment, "target_html")
+        target_layout_text = str(_get_segment_value(segment, "target_layout_text", "") or "")
         block_key = _resolve_export_segment_block_key(
             segment=segment,
             fallback=(block_type, block_index, row_index, cell_index),
@@ -749,11 +751,25 @@ def _group_segments_by_block(
             source_html = source_segment_by_id.get("source_html")
         if not source_html and has_original_source_match and source_segment_by_text is not None:
             source_html = source_segment_by_text.get("source_html")
+        target_text = str(_get_segment_value(segment, "target_text", "") or "")
+        source_segment = source_segment_by_id or source_segment_by_text
+        source_format_map = (
+            source_segment.get("source_format_map", {})
+            if source_segment is not None
+            else {}
+        )
         resolved_target_html = str(target_html) if target_html else _derive_target_html_from_source(
             str(source_html) if source_html else None,
-            str(_get_segment_value(segment, "target_text", "") or ""),
+            target_text,
         )
-        target_text = str(_get_segment_value(segment, "target_text", "") or "")
+        if target_layout_text and isinstance(source_format_map, dict):
+            from app.services.adapters.pptx_inline_tags import (
+                is_target_layout_valid,
+                tagged_fragment_to_html,
+            )
+
+            if is_target_layout_valid(target_text, target_layout_text):
+                resolved_target_html = tagged_fragment_to_html(target_layout_text, source_format_map)
         revision = revision_map.get(sentence_id)
         if revision is not None and revision.after_text != target_text:
             # 只导出仍对应当前译文的待审修订，避免把过期快照写入 Word。
@@ -769,6 +785,7 @@ def _group_segments_by_block(
                 matched_source_text=str(_get_segment_value(segment, "matched_source_text", "") or ""),
                 target_html=resolved_target_html,
                 source_html=str(source_html) if source_html else None,
+                target_layout_text=target_layout_text or None,
                 math_placeholders=dict(math_map.get(sentence_id) or {}),
                 sequence_index=_get_export_sequence_index(segment),
                 source_structure_changed=bool(source_segment_list) and not has_original_source_match,
@@ -3986,9 +4003,34 @@ def _resolve_segment_block_type(story_kind: str, block_type: str) -> str:
 
 
 def _get_segment_value(segment: Any, name: str, default: Any = None) -> Any:
+    """读取导出句段字段，并兼容数据库句段的 JSON 元数据字段。"""
     if isinstance(segment, Mapping):
-        return segment.get(name, default)
-    return getattr(segment, name, default)
+        if name in segment:
+            return segment[name]
+        metadata_raw = segment.get("segment_metadata")
+    else:
+        value = getattr(segment, name, None)
+        if value is not None:
+            return value
+        metadata_raw = getattr(segment, "segment_metadata", None)
+
+    metadata: Mapping[str, Any] = {}
+    if isinstance(metadata_raw, Mapping):
+        metadata = metadata_raw
+    elif isinstance(metadata_raw, str) and metadata_raw.strip():
+        try:
+            import json
+            parsed = json.loads(metadata_raw)
+            if isinstance(parsed, dict):
+                metadata = parsed
+        except (TypeError, ValueError):
+            metadata = {}
+
+    metadata_name = {
+        "source_format_map": "source_layout_formats",
+    }.get(name, name)
+    return metadata.get(metadata_name, default)
+
 
 
 def _to_optional_int(value: Any) -> int | None:

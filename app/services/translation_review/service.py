@@ -193,19 +193,28 @@ async def run_review_with_rules(
     all_items: list[TranslationReviewReportItem] = []
     category_counts: dict[str, int] = {}
     file_counts: dict[str, int] = {}
-    total_segs = 0
     checked_segs = 0
     failed = False
 
+    # 先确定总句段数，保证前端在整个任务期间都能显示稳定的 N / total。
+    prepared_files: list[tuple[FileRecord, int, list[Segment]]] = []
+    total_segs = 0
     for file_record in files:
-        file_order = file_order_map.get(file_record.id, 0)
         segments = _load_segments_for_scope(db, file_record, segment_scope)
+        prepared_files.append((file_record, file_order_map.get(file_record.id, 0), segments))
         total_segs += len(segments)
 
+    report.total_segments = total_segs
+    report.checked_segments = 0
+    _update_progress(db, report, "", checked_segs, total_segs)
+    db.commit()
+
+    for file_record, file_order, segments in prepared_files:
         # 按 REVIEW_BATCH_SIZE 分批
         for batch_start in range(0, len(segments), REVIEW_BATCH_SIZE):
             batch = segments[batch_start: batch_start + REVIEW_BATCH_SIZE]
             _update_progress(db, report, file_record.filename or "", checked_segs, total_segs)
+            db.commit()
 
             try:
                 findings = await run_llm_check_batch(
@@ -240,7 +249,8 @@ async def run_review_with_rules(
                 file_counts[fid] = file_counts.get(fid, 0) + 1
 
             checked_segs += len(batch)
-            db.flush()
+            _update_progress(db, report, file_record.filename or "", checked_segs, total_segs)
+            db.commit()
 
     # 汇总统计
     _update_report_counts(db, report, category_counts, file_counts, all_items)
@@ -387,8 +397,12 @@ def _update_progress(
     total: int,
 ) -> None:
     pct = round(checked / max(total, 1) * 100)
+    report.checked_segments = checked
+    report.total_segments = total
     progress = {
         "overall_percent": pct,
+        "checked_segments": checked,
+        "total_segments": total,
         "current_file_name": current_file,
         "updated_at": datetime.utcnow().isoformat(),
     }
@@ -438,8 +452,19 @@ def list_merge_view_reports(db: Session, merge_view_id: UUID, limit: int = 1) ->
 
 
 def load_report_items(db: Session, report_id: UUID) -> list[TranslationReviewReportItem]:
-    return (
-        db.query(TranslationReviewReportItem)
+    """加载报告条目，并同步当前句段的文档显示序号。
+
+    报告条目保存的是生成报告时的序号快照；句段拆分、合并或重新解析后，
+    编辑器使用的 Segment.display_index 可能已经变化。用外连接读取最新序号，
+    同时保留已删除句段的历史快照，避免审校列表编号与编辑器不一致。
+    """
+    rows = (
+        db.query(TranslationReviewReportItem, Segment.display_index)
+        .outerjoin(
+            Segment,
+            (Segment.file_record_id == TranslationReviewReportItem.file_record_id)
+            & (Segment.sentence_id == TranslationReviewReportItem.sentence_id),
+        )
         .filter(TranslationReviewReportItem.report_id == report_id)
         .order_by(
             TranslationReviewReportItem.file_order,
@@ -449,8 +474,17 @@ def load_report_items(db: Session, report_id: UUID) -> list[TranslationReviewRep
             TranslationReviewReportItem.sequence_index,
             TranslationReviewReportItem.sentence_id,
             TranslationReviewReportItem.category_index,
-        ).all()
+        )
+        .all()
     )
+
+    items: list[TranslationReviewReportItem] = []
+    for item, current_display_index in rows:
+        if current_display_index is not None:
+            item.display_index = int(current_display_index)
+        items.append(item)
+    return items
+
 
 
 def load_agent_runs(db: Session, report_id: UUID) -> list[TranslationReviewAgentRun]:

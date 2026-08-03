@@ -18805,3 +18805,55 @@ def match_terms(
             for term_match in term_matches
         ],
     }
+
+
+@router.post("/merge-views/{view_id}/style-tag-check-reports")
+async def create_merge_view_style_tag_check_report(
+    view_id: UUID,
+    run_ai: bool = Query(default=True),
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """为合并视图中的 DOCX/PPTX 文件生成样式标记专检报告。"""
+    view, project, files = _get_merge_view_context(db, view_id, current_user)
+    report = create_style_tag_check_report(
+        db,
+        project=project,
+        files=files,
+        current_user=current_user,
+        scope="merge_view",
+        merge_view_id=view.id,
+    )
+    if run_ai and report.candidate_count > 0:
+        await run_ai_style_tag_check_for_report(db, report, provider=provider, model=model)
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+@router.get("/merge-views/{view_id}/style-tag-check-reports")
+def list_merge_view_style_tag_check_reports(
+    view_id: UUID,
+    limit: int = 1,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """读取当前合并视图最近的样式标记专检报告。"""
+    _view, _project, _files = _get_merge_view_context(db, view_id, current_user)
+    safe_limit = min(max(int(limit), 1), 20)
+    reports = (
+        db.query(StyleTagCheckReport)
+        .filter(
+            StyleTagCheckReport.merge_view_id == view_id,
+            StyleTagCheckReport.scope == "merge_view",
+        )
+        .order_by(StyleTagCheckReport.created_at.desc(), StyleTagCheckReport.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+    return {
+        "items": [
+            serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+            for report in reports
+        ]
+    }

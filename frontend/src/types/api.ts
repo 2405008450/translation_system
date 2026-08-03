@@ -730,6 +730,7 @@ export interface StyleTagCheckReport {
   id: string
   project_id: string | null
   file_record_id: string | null
+  merge_view_id: string | null
   scope: string
   file_ids: string[]
   total_files: number
@@ -812,6 +813,8 @@ export interface TranslationReviewCategoryStat {
 export interface TranslationReviewProgress {
   phase?: string
   overall_percent: number
+  checked_segments?: number
+  total_segments?: number
   current_category?: string
   current_file_name?: string
   categories?: TranslationReviewCategoryStat[]

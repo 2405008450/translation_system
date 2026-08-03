@@ -24,6 +24,7 @@ const props = defineProps<{
   fileRecordId: string | null
   mergeViewId: string | null
   isMergeWorkbench: boolean
+  mergeViewFiles?: Array<{ id: string; filename: string }>
   projectId: string | null
   onFocusSentence: (sentenceId: string, fileRecordId?: string) => void
   onActiveCountChange?: (count: number | null) => void
@@ -83,6 +84,16 @@ const progressFileLabel = computed(() => {
   return report.value?.progress?.current_file_name ?? ''
 })
 
+const progressCheckedSegments = computed(() => Math.max(
+  0,
+  report.value?.progress?.checked_segments ?? report.value?.checked_segments ?? 0,
+))
+
+const progressTotalSegments = computed(() => Math.max(
+  0,
+  report.value?.progress?.total_segments ?? report.value?.total_segments ?? 0,
+))
+
 const filteredItems = computed((): TranslationReviewReportItem[] => {
   const items = report.value?.items ?? []
   return items.filter(item => {
@@ -117,9 +128,10 @@ const mergeViewFiles = computed(() => {
   if (!props.isMergeWorkbench || !report.value) return []
   const fileIds: string[] = report.value.file_ids ?? []
   const fileCounts = (report.value.file_counts ?? {}) as Record<string, number | string>
+  const fileNames = new Map((props.mergeViewFiles ?? []).map(file => [file.id, file.filename]))
   return fileIds.map(fid => ({
     id: fid,
-    name: report.value!.items.find(i => i.file_record_id === fid)?.file_name ?? fid,
+    name: fileNames.get(fid) ?? report.value!.items.find(i => i.file_record_id === fid)?.file_name ?? fid,
     count: Number(fileCounts[fid] ?? 0),
   }))
 })
@@ -159,6 +171,9 @@ async function loadExistingReport() {
       fetched = await fetchMergeViewTranslationReviewReport(props.mergeViewId)
     } else if (props.fileRecordId) {
       fetched = await fetchFileTranslationReviewReport(props.fileRecordId)
+    }
+    if (fetched?.id) {
+      fetched = await fetchTranslationReviewReport(fetched.id)
     }
     report.value = fetched
     props.onActiveCountChange?.(fetched?.active_issue_count ?? null)
@@ -404,7 +419,10 @@ loadExistingReport()
 </script>
 
 <template>
-  <div class="workbench-bottom-drawer__qa">
+  <div
+    class="workbench-bottom-drawer__qa"
+    :class="{ 'is-running': isRunning || (generating && !!report) }"
+  >
     <!-- Header — mirrors number-check header exactly -->
     <div class="workbench-bottom-drawer__header workbench-bottom-drawer__header--qa">
       <div class="workbench-bottom-drawer__header-lead">
@@ -553,7 +571,7 @@ loadExistingReport()
     <div v-if="(isRunning || generating) && report" class="number-check__progress">
       <div class="number-check__progress-head">
         <span class="number-check__progress-text">
-          正在检查{{ progressFileLabel ? `：${progressFileLabel}` : '' }}（每批 50 条句段）
+          正在检查{{ progressFileLabel ? `：${progressFileLabel}` : '' }} · 已检查 {{ progressCheckedSegments }} / {{ progressTotalSegments }} 个句段
         </span>
         <span class="number-check__progress-pct">{{ overallProgress }}%</span>
       </div>
@@ -790,6 +808,57 @@ loadExistingReport()
 </template>
 
 <style scoped>
+/* Keep the review result list inside the drawer and provide a stable vertical scrollbar. */
+.workbench-bottom-drawer__qa {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 6px;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.workbench-bottom-drawer__qa.is-running {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.workbench-bottom-drawer__qa > .term-qa-dialog__table-wrap {
+  min-height: 0;
+  height: max(80px, calc(var(--workbench-visible-bottom-panel-height) - 88px));
+  max-height: max(80px, calc(var(--workbench-visible-bottom-panel-height) - 88px));
+  overflow-x: auto;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #8fa9b5 #eef3f5;
+}
+
+.workbench-bottom-drawer__qa > .term-qa-dialog__table-wrap::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.workbench-bottom-drawer__qa > .term-qa-dialog__table-wrap::-webkit-scrollbar-track {
+  background: #eef3f5;
+}
+
+.workbench-bottom-drawer__qa > .term-qa-dialog__table-wrap::-webkit-scrollbar-thumb {
+  border: 2px solid #eef3f5;
+  border-radius: 999px;
+  background: #8fa9b5;
+}
+
+.workbench-bottom-drawer__qa > .term-qa-dialog__table-wrap::-webkit-scrollbar-thumb:hover {
+  background: #668591;
+}
+
+.workbench-bottom-drawer__qa.is-running > .term-qa-dialog__table-wrap {
+  height: auto;
+  max-height: none;
+}
+
 /* Header single-row layout matching number-check */
 .workbench-bottom-drawer__header--qa {
   flex-wrap: nowrap !important;

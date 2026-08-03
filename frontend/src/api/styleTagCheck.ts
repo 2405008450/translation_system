@@ -88,3 +88,20 @@ export async function applyAllStyleTagCheckItems(reportId: string, itemIds: stri
   )
   return data
 }
+
+export async function fetchMergeViewStyleTagCheckReport(viewId: string) {
+  const { data } = await http.get<{ items: StyleTagCheckReport[] }>(
+    `/merge-views/${viewId}/style-tag-check-reports`,
+    { params: { limit: 1 } },
+  )
+  return data.items[0] ?? null
+}
+
+export async function createMergeViewStyleTagCheckReport(viewId: string, options: GenerateOptions = {}) {
+  const { data } = await http.post<StyleTagCheckReport>(
+    `/merge-views/${viewId}/style-tag-check-reports`,
+    null,
+    { params: buildParams({ runAi: true, ...options }) },
+  )
+  return data
+}
