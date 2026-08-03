@@ -876,6 +876,17 @@ export const useSegmentStore = defineStore('segment', () => {
     return data
   }
 
+  async function translateFilename(fileRecordId: string, provider = 'openrouter', model?: string | null) {
+    const { data } = await http.post<{ file_record_id: string; filename: string; translated_filename: string }>(
+      `/file-records/${fileRecordId}/translate-filename`,
+      { provider, model: model || null },
+    )
+    if (fileRecord.value && fileRecord.value.id === fileRecordId) {
+      fileRecord.value = { ...fileRecord.value, translated_filename: data.translated_filename }
+    }
+    return data.translated_filename
+  }
+
   async function fetchSegmentPage(fileRecordId: string, query: SegmentPageQuery = {}) {
     const resolved = resolvePageQuery(query)
     const requestPage = async (pageQuery: typeof resolved) => {
@@ -1627,6 +1638,8 @@ export const useSegmentStore = defineStore('segment', () => {
     const segment = segments.value[index]
     const confirm = options.confirm === true
     const nextTargetHtml = targetHtml || null
+    // 译文永远是纯文本；target_layout_text 只由样式标记检查/人工标签编辑写入，
+    // 编辑译文本身不读也不写它（后端靠 hash 判定其是否随译文改动而失效）。
     const currentTargetText = segment.target_text || ''
     const currentTargetHtml = segment.target_html || null
     if (
@@ -1713,6 +1726,37 @@ export const useSegmentStore = defineStore('segment', () => {
       // 恢复原值
       segments.value[index] = segment
       throw error
+    }
+  }
+
+  /**
+   * 人工标签编辑：写入/清除带标签版式译文（target_layout_text）。只用于“选中译文
+   * 加/删样式标签”的只读预览通道，绝不改动 target_text 本身——不产生 revision、
+   * 不改 version。写入前后端会做双重强校验（剥标签后必须与当前译文逐字相同 +
+   * 标签结构合法），失败会抛出错误，调用方需捕获并提示。
+   */
+  async function updateTargetLayoutText(sentenceId: string, targetLayoutText: string) {
+    const index = getSegmentIndex(sentenceId)
+    if (index === -1) {
+      return
+    }
+    const segment = segments.value[index]
+    const fileId = mergeViewId.value
+      ? (fileRecordIdForSegment(segment) ?? null)
+      : (fileRecord.value?.id ?? null)
+    if (!fileId) {
+      return
+    }
+    const { data } = await http.put<{ sentence_id: string; target_text: string; target_layout_text: string | null }>(
+      `/file-records/${fileId}/segments/${segment.sentence_id}/target-layout`,
+      { target_layout_text: targetLayoutText },
+    )
+    const current = segments.value[index]
+    if (current) {
+      segments.value[index] = {
+        ...current,
+        target_layout_text: data.target_layout_text,
+      }
     }
   }
 
@@ -2533,6 +2577,7 @@ export const useSegmentStore = defineStore('segment', () => {
 
     const currentSegment = segments.value[index]
     const isLLMSource = source === 'llm'
+    // 翻译结果永远是纯文本；target_layout_text 不在这里读写。
     const nextStatus = status || resolveUnconfirmedSegmentStatus(currentSegment, targetText)
     const nextSegment = {
       ...currentSegment,
@@ -2970,6 +3015,7 @@ export const useSegmentStore = defineStore('segment', () => {
 
   return {
     fileRecord,
+    translateFilename,
     segments,
     previewHtml,
     previewSupported,
@@ -3041,6 +3087,7 @@ export const useSegmentStore = defineStore('segment', () => {
     applyServerSegmentPatches,
     updateTarget,
     updateSource,
+    updateTargetLayoutText,
     setProjectSyncDisabled,
     disableProjectSyncForCurrentFile,
     setActiveSentence,

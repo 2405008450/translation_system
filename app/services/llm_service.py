@@ -40,6 +40,17 @@ class LLMConfigurationError(LLMServiceError):
 class LLMRequestError(LLMServiceError):
     """LLM 请求异常。"""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
 
 class LLMResponseValidationError(LLMServiceError):
     """LLM 返回内容不符合约束。"""
@@ -89,6 +100,8 @@ class LLMChatCompletionResult:
     content: str
     provider: str
     model: str
+    annotations: list[dict] = field(default_factory=list)
+    web_search_requests: int = 0
 
 
 @dataclass(frozen=True)
@@ -169,8 +182,12 @@ def _failures_for_tasks(tasks: list[LLMTranslationTask], message: str) -> list[L
 NUMERIC_LIKE_FRAGMENT_RE = re.compile(r"^[0-9\s,.\-+/%()（）$€¥￥£:：]+$")
 MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_\d+⟧")
 LINE_BREAK_PLACEHOLDER_RE = re.compile(r"⟦LB_\d+⟧")
+# 行内格式标签：⟦1⟧…⟦/1⟧（纯数字 id，容忍模型在括号内塞空格）。
+# 注意与 ⟦MATH_n⟧ / ⟦LB_n⟧ 不冲突，因为那两个带字母前缀。
+FORMAT_TAG_RE = re.compile(r"⟦\s*(/?)\s*(\d+)\s*⟧")
 SYMBOL_VALIDATION_ERROR_MESSAGE = "复选框或特殊符号未按原文原样保留。"
 LINE_BREAK_VALIDATION_ERROR_MESSAGE = "版式换行未按原文保留。"
+FORMAT_TAG_VALIDATION_ERROR_MESSAGE = "行内格式标签未按原文原样保留。"
 STRICT_PRESERVE_SYMBOLS = frozenset(
     {
         "□",
@@ -218,12 +235,19 @@ def _line_break_count(text: str) -> int:
 
 def _task_layout_source_text(task: LLMTranslationTask) -> str:
     layout_text = _normalize_line_breaks(task.source_layout_text or "")
+    # 翻译链路彻底不感知行内格式标签（⟦n⟧）：模型只收纯文本、只回纯文本，标签标注
+    # 完全交给独立的样式标记检查/人工编辑流程（写入 target_layout_text），不再靠翻译
+    # 阶段“保留标签”来实现，从根上解决多标签句段翻译不稳定的问题。
+    # 换行占位符 ⟦LB_n⟧ 走另一条正则（LINE_BREAK_PLACEHOLDER_RE），不受影响。
+    layout_text = FORMAT_TAG_RE.sub("", layout_text)
     return layout_text or _normalize_line_breaks(task.source_text)
 
 
 def _task_preservation_source_text(task: LLMTranslationTask) -> str:
     layout_text = _task_layout_source_text(task)
-    return layout_text if "\n" in layout_text else task.source_text
+    if "\n" in layout_text or _has_format_tags(layout_text):
+        return layout_text
+    return task.source_text
 
 
 def _encode_line_break_placeholders(text: str) -> str:
@@ -245,16 +269,24 @@ def _decode_line_break_placeholders(text: str) -> str:
 
 def _format_source_for_prompt(task: LLMTranslationTask) -> str:
     layout_text = _task_layout_source_text(task)
-    if "\n" not in layout_text:
-        return task.source_text
-    return _encode_line_break_placeholders(layout_text)
+    if "\n" in layout_text:
+        # 换行占位符编码时格式标签作为普通字符原样透传
+        return _encode_line_break_placeholders(layout_text)
+    if _has_format_tags(layout_text):
+        return layout_text
+    return task.source_text
 
 
 def _format_batch_source_for_prompt(task: LLMTranslationTask) -> str:
     source = _format_source_for_prompt(task)
-    line_break_instruction = _line_break_instruction(task)
-    if line_break_instruction:
-        return f"{source}\n    {line_break_instruction}"
+    notes = [
+        note
+        for note in (_line_break_instruction(task),)
+        if note
+    ]
+    if notes:
+        joined = "\n    ".join(notes)
+        return f"{source}\n    {joined}"
     return source
 
 
@@ -620,8 +652,10 @@ async def _request_translation(
     timeout_seconds: float,
     model_override: str | None = None,
     response_format: dict | None = None,
+    tools: list[dict] | None = None,
+    extra_body: dict | None = None,
 ) -> str:
-    payload = {
+    payload: dict = {
         "model": model_override or provider.model,
         "messages": messages,
         "temperature": temperature,
@@ -629,6 +663,12 @@ async def _request_translation(
     }
     if response_format:
         payload["response_format"] = response_format
+    # openrouter:web_search 是 OpenRouter 专属能力，只向 openrouter provider 发送；
+    # 向其他 provider（deepseek / openai 等）发送会导致 400 Invalid Request。
+    if tools and provider.name == "openrouter":
+        payload["tools"] = tools
+    if extra_body and provider.name == "openrouter":
+        payload.update(extra_body)
     headers = {
         "Authorization": f"Bearer {provider.api_key}",
         "Content-Type": "application/json",
@@ -669,7 +709,19 @@ async def _request_translation(
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        raise LLMRequestError(f"{provider.name} 返回错误：{exc.response.text}") from exc
+        status_code = exc.response.status_code
+        retry_after_header = exc.response.headers.get("Retry-After")
+        retry_after: float | None = None
+        if retry_after_header is not None:
+            try:
+                retry_after = float(retry_after_header)
+            except ValueError:
+                pass
+        raise LLMRequestError(
+            f"{provider.name} 返回错误：{exc.response.text}",
+            status_code=status_code,
+            retry_after=retry_after,
+        ) from exc
 
     return _extract_translation_from_payload(response.json(), provider.name)
 
@@ -683,7 +735,22 @@ async def request_chat_completion(
     temperature: float | None = None,
     settings: Settings | None = None,
     allow_fallback: bool = True,
+    tools: list[dict] | None = None,
+    extra_body: dict | None = None,
 ) -> LLMChatCompletionResult:
+    """
+    通用 chat completion 调用。
+
+    新增参数：
+    - tools: OpenAI/OpenRouter tool 列表（如 openrouter:web_search）
+    - extra_body: 额外合并进请求体的字段（如 max_tool_calls）
+
+    退避策略（改进）：
+    - 429 / 5xx: 指数退避 min(2**attempt * 1.0, 30) + jitter，Retry-After 优先；
+      同一 provider 先耗尽重试，再 fallback 到下一 provider。
+    - 其他错误: 保持原有线性退避，不改动既有行为。
+    """
+    import random as _random
     config = settings or get_settings()
     providers = validate_provider_choice(provider=provider, settings=config)
     if not allow_fallback:
@@ -706,12 +773,49 @@ async def request_chat_completion(
                         timeout_seconds=config.llm_timeout_seconds,
                         model_override=model_override,
                         response_format=response_format,
+                        tools=tools,
+                        extra_body=extra_body,
                     )
+                    # content may be a plain str or dict depending on whether tools were used
+                    if isinstance(content, dict):
+                        text_content = content.get("content") or ""
+                        annotations = content.get("annotations") or []
+                        web_requests = int(content.get("web_search_requests") or 0)
+                    else:
+                        text_content = content
+                        annotations = []
+                        web_requests = 0
                     return LLMChatCompletionResult(
-                        content=content,
+                        content=text_content,
                         provider=item.name,
                         model=model_override or item.model,
+                        annotations=annotations,
+                        web_search_requests=web_requests,
                     )
+                except LLMRequestError as exc:
+                    last_error = exc
+                    status_code = getattr(exc, "status_code", None)
+                    retry_after = getattr(exc, "retry_after", None)
+                    logger.warning(
+                        "llm chat completion failed provider=%s model=%s attempt=%s "
+                        "status_code=%s error=%s",
+                        item.name,
+                        model_override or item.model,
+                        attempt_index + 1,
+                        status_code,
+                        exc,
+                    )
+                    if attempt_index + 1 >= retry_attempts:
+                        break
+                    # 429 or 5xx → exponential backoff
+                    if status_code is not None and (status_code == 429 or status_code >= 500):
+                        if retry_after is not None:
+                            delay = min(retry_after + _random.uniform(0, 1), 60.0)
+                        else:
+                            delay = min(1.0 * (2 ** attempt_index) + _random.uniform(0, 1), 30.0)
+                    else:
+                        delay = min(0.5 * (attempt_index + 1), 2.0)
+                    await asyncio.sleep(delay)
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
                     logger.warning(
@@ -742,6 +846,54 @@ async def request_chat_completion(
             for item in providers
         }
         return await _run_with_clients(clients)
+
+
+async def translate_filename(
+    filename: str,
+    source_language: str | None,
+    target_language: str | None,
+    provider: LLMProvider = "auto",
+    *,
+    model_override: str | None = None,
+) -> str:
+    """翻译文件名（不含扩展名部分），返回翻译后的文件名（保留原扩展名）。"""
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    extension = filename[len(stem):]
+    stem = stem.strip()
+    if not stem:
+        return filename
+
+    source_label = _format_language_for_prompt(source_language, "源语言")
+    target_label = _format_language_for_prompt(target_language, "目标语言")
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"你是专业的文档翻译专家，请将文件名从{source_label}翻译为{target_label}。"
+                "只输出翻译后的文件名本身，不要输出扩展名，不要加引号、路径或解释，"
+                "不要使用文件系统不允许的字符（如 / \\ : * ? \" < > |）。"
+            ),
+        },
+        {"role": "user", "content": stem},
+    ]
+    result = await request_chat_completion(
+        messages,
+        provider=provider,
+        model_override=model_override,
+        temperature=0.2,
+    )
+    translated_stem = _sanitize_translated_filename_stem(result.content) or stem
+    return f"{translated_stem}{extension}"
+
+
+_INVALID_FILENAME_CHARS_PATTERN = re.compile(r'[\\/:*?"<>|\r\n]+')
+
+
+def _sanitize_translated_filename_stem(raw_text: str) -> str:
+    text = raw_text.strip().strip('"').strip("'")
+    text = _INVALID_FILENAME_CHARS_PATTERN.sub(" ", text)
+    text = " ".join(text.split())
+    return text[:200]
 
 
 def _build_messages(
@@ -822,7 +974,7 @@ def _build_messages(
                     "如果内容中包含可翻译文字，只翻译文字部分，并尽量保留数字和原有排版格式。\n"
                     "除非原文明确体现需要按目标语言转换的数字单位或本地格式，否则不要擅自改动千分位、小数点、货币符号、编号格式或特殊符号。\n\n"
                     f"原文：{prompt_source}\n"
-                    f"{line_break_prompt_block}\n"
+                    f"{line_break_prompt_block}"
                     f"{_optional_glossary_prompt_block(task)}"
                     f"只输出最终结果。{retry_instruction}"
                 ),
@@ -838,7 +990,7 @@ def _build_messages(
                 "不要补充未提供的上下文，也不要参考前后句。"
                 "\n"
                 f"原文：{prompt_source}\n"
-                f"{line_break_prompt_block}\n"
+                f"{line_break_prompt_block}"
                 f"{_optional_glossary_prompt_block(task)}"
                 f"请严格保留原文中的数字、复选框、勾选框、项目符号、箭头和特殊符号，不得擅自新增、替换或改变其状态。\n\n只输出{target_label}译文。{retry_instruction}"
             ),
@@ -902,6 +1054,32 @@ def _extract_math_placeholder_sequence(text: str) -> list[str]:
     return MATH_PLACEHOLDER_RE.findall(text)
 
 
+def _extract_format_tag_sequence(text: str) -> list[str]:
+    """提取并规范化行内格式标签（折叠括号内空格）。"""
+    return [
+        f"⟦{'/' if match.group(1) else ''}{match.group(2)}⟧"
+        for match in FORMAT_TAG_RE.finditer(text or "")
+    ]
+
+
+def _has_format_tags(text: str) -> bool:
+    return bool(FORMAT_TAG_RE.search(text or ""))
+
+
+def split_format_tagged_translation(text: str) -> tuple[str, str]:
+    """把 LLM 译文拆成 (纯译文, 带标签版式译文)。
+
+    - 纯译文：剥掉行内格式标签（⟦n⟧），用于入库 target_text、TM、匹配、展示；
+    - 版式译文：保留标签，单独存放（segment_metadata.target_layout_text）供导出还原 run 级格式。
+    无格式标签时版式译文为空串。
+    """
+    if not text or not _has_format_tags(text):
+        return text, ""
+    layout_text = text
+    clean_text = FORMAT_TAG_RE.sub("", text)
+    return clean_text, layout_text
+
+
 def _validate_or_repair_translation_output(task: LLMTranslationTask, translated_text: str) -> str:
     translated_text = _decode_line_break_placeholders(translated_text)
     try:
@@ -941,6 +1119,14 @@ def _validate_translation_output(task: LLMTranslationTask, translated_text: str)
         output_math_placeholders = _extract_math_placeholder_sequence(translated_text)
         if output_math_placeholders != source_math_placeholders:
             raise LLMResponseValidationError("数学公式占位符未按原文原样保留。")
+
+    # 行内格式标签：允许语序重排（用排序后的多重集比较），但标签集合与配对必须完全一致。
+    # 更严格的扁平/嵌套校验在导出端 rebuild 时执行，失败则整段回退第一个 run。
+    source_format_tags = sorted(_extract_format_tag_sequence(_task_preservation_source_text(task)))
+    if source_format_tags:
+        output_format_tags = sorted(_extract_format_tag_sequence(translated_text))
+        if output_format_tags != source_format_tags:
+            raise LLMResponseValidationError(FORMAT_TAG_VALIDATION_ERROR_MESSAGE)
 
     source_line_breaks = _line_break_count(_task_layout_source_text(task))
     if source_line_breaks and _line_break_count(translated_text) != source_line_breaks:
@@ -1082,7 +1268,12 @@ def _request_translation_with_urllib(
     return _extract_translation_from_payload(parsed_payload, provider.name)
 
 
-def _extract_translation_from_payload(payload: dict, provider_name: str) -> str:
+def _extract_translation_from_payload(payload: dict, provider_name: str) -> str | dict:
+    """
+    从 LLM 响应中提取翻译文本。
+    如果响应包含 tool-use 注释（如 OpenRouter web_search），
+    返回 dict{'content', 'annotations', 'web_search_requests'} 而不是纯字符串。
+    """
     choices = payload.get("choices") or []
     if not choices:
         raise LLMRequestError(f"{provider_name} 未返回可用结果。")
@@ -1092,6 +1283,17 @@ def _extract_translation_from_payload(payload: dict, provider_name: str) -> str:
     translated_text = _normalize_response_content(content)
     if not translated_text:
         raise LLMRequestError(f"{provider_name} 返回空译文。")
+
+    # 检查是否有 url_citation 注释（tool use）
+    annotations = message.get("annotations") or []
+    usage = payload.get("usage") or {}
+    web_requests = int(usage.get("web_search_requests") or 0)
+    if annotations or web_requests:
+        return {
+            "content": translated_text,
+            "annotations": annotations,
+            "web_search_requests": web_requests,
+        }
 
     return translated_text
 
@@ -1239,7 +1441,13 @@ def _build_paragraph_messages(
         layout_source = _task_layout_source_text(task)
         if "\n" in layout_source:
             item["source_layout_text"] = _encode_line_break_placeholders(layout_source)
-            item["layout_note"] = _line_break_instruction(task)
+            layout_notes = [
+                note
+                for note in (_line_break_instruction(task),)
+                if note
+            ]
+            if layout_notes:
+                item["layout_note"] = " ".join(layout_notes)
         if task.should_translate:
             required_sentence_ids.append(task.sentence_id)
         if task.status == "fuzzy":

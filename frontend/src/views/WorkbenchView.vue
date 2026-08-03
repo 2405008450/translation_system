@@ -27,6 +27,7 @@ import {
   Maximize2,
   MessageSquare,
   Minimize2,
+  Palette,
   Pilcrow,
   Redo2,
   RotateCcw,
@@ -41,6 +42,8 @@ import {
   Strikethrough,
   Subscript,
   Superscript,
+  Tag as TagIcon,
+  Tags,
   Type,
   Underline,
   Undo2,
@@ -60,7 +63,11 @@ import Pagination from '../components/Pagination.vue'
 import PreviewPanel from '../components/PreviewPanel.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import RevisionSettingsDialog from '../components/RevisionSettingsDialog.vue'
-import ExportStyleSettingsDialog, { type ExportStyleSettings } from '../components/ExportStyleSettingsDialog.vue'
+import ExportStyleSettingsDialog, {
+  type ExportStyleSettings,
+  createDefaultPptxLayoutSettings,
+  normalizePptxLayoutSettings,
+} from '../components/ExportStyleSettingsDialog.vue'
 import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
 import TMMatchPanel from '../components/TMMatchPanel.vue'
@@ -69,8 +76,10 @@ import WorkbenchHistoryPanel from '../components/WorkbenchHistoryPanel.vue'
 import WorkbenchMatchPanel from '../components/WorkbenchMatchPanel.vue'
 import WorkbenchTermsPanel from '../components/WorkbenchTermsPanel.vue'
 import ReferencePanel from '../components/ReferencePanel.vue'
+import TranslationReviewPanel from '../components/TranslationReviewPanel.vue'
 import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { http } from '../api/http'
+import { queryOnlineTerms, type OnlineTermSource } from '../api/onlineTerms'
 import {
   createMergeViewQAResult,
   fetchMergeViewSegmentPosition,
@@ -86,6 +95,16 @@ import {
   restoreNumberCheckItem,
   setNumberCheckItemIgnored,
 } from '../api/numberCheck'
+import {
+  applyAllStyleTagCheckItems,
+  applyStyleTagCheckItem,
+  createFileStyleTagCheckReport,
+  fetchFileStyleTagCheckReport,
+  recheckStyleTagCheckReport,
+  rejectStyleTagCheckItem,
+  rerunStyleTagCheckItem,
+  restoreStyleTagCheckItem,
+} from '../api/styleTagCheck'
 import { refreshGlobalNotifications } from '../utils/notifications'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
@@ -129,11 +148,14 @@ import type {
   TMCollection,
   TermBase,
   TermEntryRecord,
+  OnlineTermResult,
   QualityQASettingsResponse,
   WorkbenchQAResult,
   WorkbenchQAResultItem,
   NumberCheckReport,
   NumberCheckReportItem,
+  StyleTagCheckReport,
+  StyleTagCheckReportItem,
   WorkflowProgress,
 } from '../types/api'
 import { buildDocumentPreviewHtml } from '../utils/documentPreview'
@@ -151,8 +173,8 @@ const props = defineProps<{
   mergeViewId?: string
 }>()
 
-type BottomToolKey = 'qa-result' | 'number-check' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
-type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result' | 'number-check'>
+type BottomToolKey = 'qa-result' | 'number-check' | 'style-tag-check' | 'translation-review' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
+type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result' | 'number-check' | 'style-tag-check' | 'translation-review'>
 type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes' | 'reference'
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
@@ -574,11 +596,26 @@ const numberCheckFilter = ref<NumberCheckFilter>('all')
 const numberCheckVisibleLimit = ref(100)
 const numberCheckAiScope = ref<'program_only' | 'all'>('program_only')
 const numberCheckModel = ref<string>('')
+const numberCheckShowAiReason = ref(false)
 const showNumberCheckSettings = ref(false)
 const selectedNumberCheckItemIds = ref<Set<string>>(new Set())
 const numberCheckItemBusyId = ref<string | null>(null)
 const numberCheckBulkBusy = ref(false)
 const locatingNumberCheckItemId = ref<string | null>(null)
+
+type StyleTagCheckFilter = 'all' | 'open' | 'applied' | 'rejected' | 'failed'
+const styleTagCheckReport = ref<StyleTagCheckReport | null>(null)
+const loadingStyleTagCheck = ref(false)
+const generatingStyleTagCheck = ref(false)
+const recheckingStyleTagCheck = ref(false)
+const styleTagCheckFilter = ref<StyleTagCheckFilter>('all')
+const styleTagCheckVisibleLimit = ref(100)
+const styleTagCheckModel = ref<string>('')
+const showStyleTagCheckSettings = ref(false)
+const selectedStyleTagCheckItemIds = ref<Set<string>>(new Set())
+const styleTagCheckItemBusyId = ref<string | null>(null)
+const styleTagCheckBulkBusy = ref(false)
+const locatingStyleTagCheckItemId = ref<string | null>(null)
 
 interface NumberCheckProgress {
   stage: 'program' | 'ai' | 'done'
@@ -651,8 +688,12 @@ const pendingFormatsForEditor = computed(() => ({
   _overrideActive: richTextEditor.formatOverrideActive.value,
 }))
 
+const TERM_ENTRY_PAGE_SIZE = 100
 const termBases = ref<TermBase[]>([])
 const termEntries = ref<TermEntryRecord[]>([])
+const termEntriesTotal = ref(0)
+const loadingMoreTermEntries = ref(false)
+const hasMoreTermEntries = computed(() => termEntries.value.length < termEntriesTotal.value)
 const selectedTermBaseId = ref('')
 const loadingTermBases = ref(false)
 const loadingTermEntries = ref(false)
@@ -672,6 +713,17 @@ const addTermTargetText = ref('')
 const addTermTargetBaseId = ref('')
 const addTermFormError = ref('')
 const termsMessage = ref(t('workbench.terms.defaultMessage'))
+const onlineTermEntries = ref<OnlineTermResult[]>([])
+const addedOnlineTermKeys = ref<string[]>([])
+const onlineTermsLoading = ref(false)
+const onlineTermsError = ref('')
+const canWriteSelectedTermBase = computed(() => Boolean(
+  selectedTermBaseId.value
+  && (
+    authStore.isBusinessManager
+    || activeWorkbenchFileContext.value?.term_base_write_ids?.includes(selectedTermBaseId.value)
+  ),
+))
 
 // 参考文件匹配结果
 
@@ -884,12 +936,12 @@ let exportPollTimer: number | null = null
 const groupedExportOptions = computed(() => groupExportOptions(exportOptions.value))
 type WordExportMode = 'standard' | 'revision'
 
-// 导出样式设置（仅对 DOCX 生效）
+// 导出样式设置（DOCX 文字样式 / PPTX 版式优化）
 const EXPORT_STYLE_SETTINGS_STORAGE_KEY = 'workbench.exportStyleSettings'
 const showExportStyleDialog = ref(false)
 
 function createEmptyExportStyleSettings(): ExportStyleSettings {
-  return { enabled: false, defaults: {}, styles: {}, hyphenation: {} }
+  return { enabled: false, defaults: {}, styles: {}, hyphenation: {}, pptx: createDefaultPptxLayoutSettings() }
 }
 
 function loadExportStyleSettings(): ExportStyleSettings {
@@ -904,6 +956,7 @@ function loadExportStyleSettings(): ExportStyleSettings {
       defaults: parsed?.defaults && typeof parsed.defaults === 'object' ? parsed.defaults : {},
       styles: parsed?.styles && typeof parsed.styles === 'object' ? parsed.styles : {},
       hyphenation: parsed?.hyphenation && typeof parsed.hyphenation === 'object' ? parsed.hyphenation : {},
+      pptx: normalizePptxLayoutSettings(parsed?.pptx),
     }
   } catch {
     return createEmptyExportStyleSettings()
@@ -2640,25 +2693,109 @@ async function loadTermBases() {
   }
 }
 
-async function loadTermEntries() {
+async function loadTermEntries(append = false) {
   if (!selectedTermBaseId.value) {
     termEntries.value = []
+    termEntriesTotal.value = 0
     return
   }
 
-  loadingTermEntries.value = true
+  if (append) {
+    if (loadingMoreTermEntries.value || !hasMoreTermEntries.value) return
+    loadingMoreTermEntries.value = true
+  } else {
+    loadingTermEntries.value = true
+  }
+
   try {
-    const { data } = await http.get<{ items: TermEntryRecord[] }>(`/term-bases/${selectedTermBaseId.value}/entries`, {
-      params: { limit: 200 },
+    const { data } = await http.get<{
+      items: TermEntryRecord[]
+      total: number
+    }>(`/term-bases/${selectedTermBaseId.value}/entries`, {
+      params: {
+        skip: append ? termEntries.value.length : 0,
+        limit: TERM_ENTRY_PAGE_SIZE,
+      },
     })
-    termEntries.value = data.items
+    termEntries.value = append ? [...termEntries.value, ...data.items] : data.items
+    termEntriesTotal.value = Number(data.total || 0)
     window.localStorage.setItem(getTermBaseStorageKey(), selectedTermBaseId.value)
-    termsMessage.value = t('workbench.terms.loadedEntries', { count: data.items.length })
+    termsMessage.value = t('workbench.terms.loadedEntries', { count: termEntries.value.length })
   } catch (error) {
     termsMessage.value = getErrorMessage(error, t('workbench.errors.termEntriesLoad'))
   } finally {
-    loadingTermEntries.value = false
+    if (append) {
+      loadingMoreTermEntries.value = false
+    } else {
+      loadingTermEntries.value = false
+    }
   }
+}
+
+function onlineTermKey(sourceText: string, targetText: string) {
+  return `${sourceText}\u0000${targetText}`.toLocaleLowerCase()
+}
+
+async function handleOnlineTermQuery(request: { query: string; sources: OnlineTermSource[] }) {
+  if (!selectedTermBaseId.value || !request.query.trim()) return
+  onlineTermsLoading.value = true
+  onlineTermsError.value = ''
+  onlineTermEntries.value = []
+  addedOnlineTermKeys.value = []
+  try {
+    const result = await queryOnlineTerms(selectedTermBaseId.value, request.query, request.sources)
+    onlineTermEntries.value = result.items
+  } catch (error) {
+    onlineTermsError.value = getErrorMessage(error, t('workbench.errors.onlineTermsQuery'))
+  } finally {
+    onlineTermsLoading.value = false
+  }
+}
+
+async function handleAddOnlineTerm(entry: OnlineTermResult) {
+  if (!selectedTermBaseId.value || !canWriteSelectedTermBase.value || !activeWorkbenchFileId.value) return
+  try {
+    await http.post(`/term-bases/${selectedTermBaseId.value}/entries`, {
+      source_text: entry.source_text,
+      target_text: entry.target_text,
+      file_record_id: activeWorkbenchFileId.value,
+      metadata: {
+        origin: 'online',
+        source_name: entry.source_name,
+        source_url: entry.source_url,
+        confidence: entry.confidence,
+        note: entry.note,
+      },
+    })
+    addedOnlineTermKeys.value = [
+      ...new Set([...addedOnlineTermKeys.value, onlineTermKey(entry.source_text, entry.target_text)]),
+    ]
+    await loadTermEntries()
+    toast.success(t('workbench.terms.onlineAdded'))
+  } catch (error) {
+    toast.error(getErrorMessage(error, t('workbench.errors.onlineTermAdd')))
+  }
+}
+
+async function handleRevokeOnlineTerm(entryId: string) {
+  const entry = termEntries.value.find((item) => item.id === entryId)
+  try {
+    await http.delete(`/term-entries/${entryId}`)
+    if (entry) {
+      const key = onlineTermKey(entry.source_text, entry.target_text)
+      addedOnlineTermKeys.value = addedOnlineTermKeys.value.filter((item) => item !== key)
+    }
+    await loadTermEntries()
+    toast.success(t('workbench.terms.onlineRevoked'))
+  } catch (error) {
+    toast.error(getErrorMessage(error, t('workbench.errors.onlineTermRevoke')))
+  }
+}
+
+function resetOnlineTermResults() {
+  onlineTermEntries.value = []
+  addedOnlineTermKeys.value = []
+  onlineTermsError.value = ''
 }
 
 function resetResourceSearchResults(message = '请输入关键词，搜索当前文件绑定的记忆库和术语库。') {
@@ -3536,6 +3673,22 @@ async function updateSegmentSource(sentenceId: string, sourceText: string) {
     await segmentStore.updateSource(sentenceId, sourceText)
   } catch (error) {
     console.error('Failed to update source text:', error)
+  }
+}
+
+async function updateSegmentTargetLayout(sentenceId: string, targetLayoutText: string) {
+  const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
+  if (segment && !segment.can_write) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
+  try {
+    await segmentStore.updateTargetLayoutText(sentenceId, targetLayoutText)
+  } catch (error) {
+    toast.error({
+      title: '标签操作失败',
+      message: getErrorMessage(error, '译文可能已发生变化，请重试。'),
+    })
   }
 }
 
@@ -4851,6 +5004,15 @@ function numberCheckHasCorrection(item: NumberCheckReportItem) {
   )
 }
 
+function numberCheckAiReason(item: NumberCheckReportItem): string {
+  const first = item.ai_errors?.[0]
+  if (!first) {
+    return ''
+  }
+  const reason = (first as Record<string, unknown>)['修改理由']
+  return typeof reason === 'string' ? reason : ''
+}
+
 interface NumberCheckStatusTag {
   text: string
   tone: 'ok' | 'warn' | 'muted' | 'done'
@@ -5284,6 +5446,571 @@ async function focusNumberCheckReportItem(item: NumberCheckReportItem) {
     })
   } finally {
     locatingNumberCheckItemId.value = null
+  }
+}
+
+const NUMBER_CHECK_RENDER_STEP_STYLE = 100
+
+const styleTagCheckFilteredItems = computed(() => {
+  const items = styleTagCheckReport.value?.items ?? []
+  if (styleTagCheckFilter.value === 'all') {
+    return items
+  }
+  return items.filter((item) => item.status === styleTagCheckFilter.value)
+})
+
+const visibleStyleTagCheckItems = computed(() => (
+  styleTagCheckFilteredItems.value.slice(0, styleTagCheckVisibleLimit.value)
+))
+
+const styleTagCheckHasMore = computed(() => (
+  styleTagCheckVisibleLimit.value < styleTagCheckFilteredItems.value.length
+))
+
+const styleTagCheckCountText = computed(() => {
+  const total = styleTagCheckFilteredItems.value.length
+  const shown = Math.min(styleTagCheckVisibleLimit.value, total)
+  return `${shown} / ${total}`
+})
+
+function onStyleTagCheckScroll(event: Event) {
+  const el = event.target as HTMLElement | null
+  if (!el) {
+    return
+  }
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 200 && styleTagCheckHasMore.value) {
+    styleTagCheckVisibleLimit.value += NUMBER_CHECK_RENDER_STEP_STYLE
+  }
+}
+
+const styleTagCheckSelectableItems = computed(() => (
+  styleTagCheckFilteredItems.value.filter((item) => item.status === 'open')
+))
+
+const selectedStyleTagCheckItems = computed(() => (
+  (styleTagCheckReport.value?.items ?? []).filter((item) => selectedStyleTagCheckItemIds.value.has(item.id))
+))
+
+const allStyleTagCheckItemsSelected = computed(() => (
+  styleTagCheckSelectableItems.value.length > 0
+  && styleTagCheckSelectableItems.value.every((item) => selectedStyleTagCheckItemIds.value.has(item.id))
+))
+
+const styleTagCheckMetaText = computed(() => {
+  const report = styleTagCheckReport.value
+  if (!report) {
+    return ''
+  }
+  return [
+    `候选 ${report.candidate_count} 处`,
+    report.ai_checked ? `已应用 ${report.applied_count} 处` : 'AI 未标注',
+    report.failed_count ? `失败 ${report.failed_count} 处` : '',
+    formatWorkbenchStatusTime(report.created_at),
+  ].filter(Boolean).join(' · ')
+})
+
+const canRunStyleTagCheck = computed(() => {
+  if (generatingStyleTagCheck.value) {
+    return false
+  }
+  if (isMergeWorkbench.value) {
+    return false
+  }
+  return Boolean(segmentStore.fileRecord)
+})
+
+const styleTagCheckButtonTitle = computed(() => {
+  if (isMergeWorkbench.value) {
+    return '样式标记专检暂不支持合并工作台'
+  }
+  return styleTagCheckReport.value
+    ? `样式标记专检：${styleTagCheckReport.value.candidate_count} 处候选`
+    : '生成样式标记专检'
+})
+
+// ========== 底部 AI 能力下拉（数字专检 / 样式标记专检） ==========
+const showAiCapabilityMenu = ref(false)
+const aiCapabilityTriggerRef = ref<HTMLButtonElement | null>(null)
+const aiCapabilityMenuRef = ref<HTMLElement | null>(null)
+const aiCapabilityMenuStyle = ref<Record<string, string>>({})
+type AiCapabilityKey = 'number-check' | 'style-tag-check' | 'translation-review'
+
+const isAiCapabilityBusy = computed(() => (
+  loadingNumberCheck.value
+  || generatingNumberCheck.value
+  || loadingStyleTagCheck.value
+  || generatingStyleTagCheck.value
+))
+
+const aiCapabilityButtonTitle = computed(() => {
+  if (activeBottomTool.value === 'number-check') {
+    return numberCheckButtonTitle.value
+  }
+  if (activeBottomTool.value === 'style-tag-check') {
+    return styleTagCheckButtonTitle.value
+  }
+  return 'AI能力：数字专检 / 样式标记专检'
+})
+
+// 翻译内容校对独立状态（供 badge 显示）
+const translationReviewActiveCount = ref<number | null>(null)
+
+const aiCapabilityBadgeCount = computed(() => {
+  if (activeBottomTool.value === 'number-check' && numberCheckReport.value) {
+    return numberCheckReport.value.active_issue_count
+  }
+  if (activeBottomTool.value === 'style-tag-check' && styleTagCheckReport.value) {
+    return styleTagCheckReport.value.candidate_count
+  }
+  if (activeBottomTool.value === 'translation-review') {
+    return translationReviewActiveCount.value
+  }
+  return null
+})
+
+function updateAiCapabilityMenuPosition() {
+  const trigger = aiCapabilityTriggerRef.value
+  if (!trigger) {
+    return
+  }
+
+  const rect = trigger.getBoundingClientRect()
+  const gap = 6
+  const viewportPadding = 8
+  const menuWidth = 190
+  const menuHeight = aiCapabilityMenuRef.value?.offsetHeight ?? 0
+  const maxLeft = window.innerWidth - menuWidth - viewportPadding
+  const left = Math.min(Math.max(viewportPadding, rect.left), Math.max(viewportPadding, maxLeft))
+  const top = Math.max(viewportPadding, rect.top - menuHeight - gap)
+
+  aiCapabilityMenuStyle.value = {
+    position: 'fixed',
+    top: `${Math.round(top)}px`,
+    left: `${Math.round(left)}px`,
+    zIndex: '3000',
+    minWidth: `${menuWidth}px`,
+  }
+}
+
+function handleAiCapabilityDocumentClick(event: MouseEvent) {
+  const target = event.target
+  if (!(target instanceof Node)) {
+    closeAiCapabilityMenu()
+    return
+  }
+  if (aiCapabilityTriggerRef.value?.contains(target) || aiCapabilityMenuRef.value?.contains(target)) {
+    return
+  }
+  closeAiCapabilityMenu()
+}
+
+function handleAiCapabilityDocumentKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') {
+    closeAiCapabilityMenu()
+  }
+}
+
+function removeAiCapabilityMenuListeners() {
+  document.removeEventListener('click', handleAiCapabilityDocumentClick)
+  document.removeEventListener('keydown', handleAiCapabilityDocumentKeydown)
+  window.removeEventListener('resize', closeAiCapabilityMenu)
+  window.removeEventListener('scroll', closeAiCapabilityMenu, true)
+}
+
+async function toggleAiCapabilityMenu() {
+  if (showAiCapabilityMenu.value) {
+    closeAiCapabilityMenu()
+    return
+  }
+
+  showAiCapabilityMenu.value = true
+  updateAiCapabilityMenuPosition()
+  document.addEventListener('click', handleAiCapabilityDocumentClick)
+  document.addEventListener('keydown', handleAiCapabilityDocumentKeydown)
+  window.addEventListener('resize', closeAiCapabilityMenu)
+  window.addEventListener('scroll', closeAiCapabilityMenu, true)
+  await nextTick()
+  updateAiCapabilityMenuPosition()
+}
+
+function closeAiCapabilityMenu() {
+  if (!showAiCapabilityMenu.value) {
+    return
+  }
+  showAiCapabilityMenu.value = false
+  removeAiCapabilityMenuListeners()
+}
+
+async function selectAiCapability(key: AiCapabilityKey) {
+  closeAiCapabilityMenu()
+  if (key === 'number-check') {
+    await openNumberCheck()
+  } else if (key === 'style-tag-check') {
+    await openStyleTagCheck()
+  } else {
+    // translation-review
+    if (activeBottomTool.value === 'translation-review') {
+      closeBottomDrawer()
+      return
+    }
+    previewPanelRendering.value = false
+    activeBottomTool.value = 'translation-review'
+    await scrollBottomPanelIntoView()
+  }
+}
+
+interface StyleTagCheckStatusTag {
+  text: string
+  tone: 'ok' | 'warn' | 'muted' | 'done'
+}
+
+function styleTagCheckStatusTag(item: StyleTagCheckReportItem): StyleTagCheckStatusTag {
+  switch (item.status) {
+    case 'applied':
+      return { text: '已应用', tone: 'done' }
+    case 'rejected':
+      return { text: '已拒绝', tone: 'muted' }
+    case 'failed':
+      return { text: `AI失败·${item.ai_error_status || ''}`, tone: 'warn' }
+    case 'open':
+      return { text: 'AI已标注·待审校', tone: 'ok' }
+    default:
+      return { text: '待标注', tone: 'muted' }
+  }
+}
+
+function styleTagPreviewHtml(text: string, formatMap: Record<string, [string, string]>): string {
+  const base = formatMap.base || ['', '']
+  const out: string[] = []
+  const re = /⟦\s*(\/?)\s*(\d+)\s*⟧/g
+  let cursor = 0
+  let currentId: string | null = null
+  let match: RegExpExecArray | null
+
+  const emit = (piece: string, id: string | null) => {
+    if (!piece) return
+    const [open, close] = id === null ? base : (formatMap[id] || base)
+    out.push(`${open}${escapeStyleTagCheckHtml(piece)}${close}`)
+  }
+
+  while ((match = re.exec(text)) !== null) {
+    emit(text.slice(cursor, match.index), currentId)
+    cursor = match.index + match[0].length
+    currentId = match[1] ? null : match[2]
+  }
+  emit(text.slice(cursor), currentId)
+  return out.join('')
+}
+
+function escapeStyleTagCheckHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+function styleTagCheckSourcePreviewHtml(item: StyleTagCheckReportItem): string {
+  return styleTagPreviewHtml(item.source_layout_text, item.format_map)
+}
+
+function styleTagCheckSuggestedPreviewHtml(item: StyleTagCheckReportItem): string {
+  const suggested = item.status === 'applied'
+    ? (item.suggested_target_layout_text || '')
+    : (item.suggested_target_layout_text || '')
+  if (!suggested) {
+    return ''
+  }
+  return styleTagPreviewHtml(suggested, item.format_map)
+}
+
+function setCurrentStyleTagCheckReport(
+  report: StyleTagCheckReport | null,
+  options: { keepPage?: boolean; keepSelection?: boolean } = {},
+) {
+  styleTagCheckReport.value = report
+  if (!options.keepPage) {
+    styleTagCheckVisibleLimit.value = NUMBER_CHECK_RENDER_STEP_STYLE
+  }
+  if (!options.keepSelection) {
+    selectedStyleTagCheckItemIds.value = new Set()
+  }
+}
+
+function setStyleTagCheckFilter(filter: StyleTagCheckFilter) {
+  styleTagCheckFilter.value = filter
+  styleTagCheckVisibleLimit.value = NUMBER_CHECK_RENDER_STEP_STYLE
+}
+
+function toggleStyleTagCheckItemSelection(itemId: string, event: Event) {
+  const checked = (event.target as HTMLInputElement | null)?.checked ?? false
+  const next = new Set(selectedStyleTagCheckItemIds.value)
+  if (checked) {
+    next.add(itemId)
+  } else {
+    next.delete(itemId)
+  }
+  selectedStyleTagCheckItemIds.value = next
+}
+
+function toggleAllStyleTagCheckItems(selected: boolean) {
+  const next = new Set(selectedStyleTagCheckItemIds.value)
+  for (const item of styleTagCheckSelectableItems.value) {
+    if (selected) {
+      next.add(item.id)
+    } else {
+      next.delete(item.id)
+    }
+  }
+  selectedStyleTagCheckItemIds.value = next
+}
+
+async function loadStyleTagCheckReport() {
+  if (!segmentStore.fileRecord) {
+    return
+  }
+  loadingStyleTagCheck.value = true
+  try {
+    const report = await fetchFileStyleTagCheckReport(segmentStore.fileRecord.id)
+    setCurrentStyleTagCheckReport(report)
+  } catch (error) {
+    // 尚无报告时忽略错误
+  } finally {
+    loadingStyleTagCheck.value = false
+  }
+}
+
+async function openStyleTagCheck() {
+  if (loadingStyleTagCheck.value || generatingStyleTagCheck.value) {
+    return
+  }
+  if (activeBottomTool.value === 'style-tag-check') {
+    closeBottomDrawer()
+    return
+  }
+  previewPanelRendering.value = false
+  activeBottomTool.value = 'style-tag-check'
+  await scrollBottomPanelIntoView()
+  if (!styleTagCheckReport.value) {
+    await loadStyleTagCheckReport()
+  }
+}
+
+function resolveStyleTagCheckGenerateOptions() {
+  const model = styleTagCheckModel.value.trim()
+  const provider = model
+    ? (llmModelOptions.find((option) => option.id === model)?.provider || 'auto')
+    : 'auto'
+  return {
+    runAi: true,
+    provider,
+    model: model || undefined,
+  }
+}
+
+async function generateStyleTagCheckReport() {
+  if (generatingStyleTagCheck.value || !canRunStyleTagCheck.value || !segmentStore.fileRecord) {
+    return
+  }
+  generatingStyleTagCheck.value = true
+  activeBottomTool.value = 'style-tag-check'
+  await scrollBottomPanelIntoView()
+  try {
+    const options = resolveStyleTagCheckGenerateOptions()
+    const report = await createFileStyleTagCheckReport(segmentStore.fileRecord.id, options)
+    setCurrentStyleTagCheckReport(report)
+    toast.show({
+      title: '样式标记专检完成',
+      message: `共 ${report.candidate_count} 处多样式候选句段`,
+    })
+  } catch (error) {
+    toast.error({
+      title: '样式标记专检失败',
+      message: getErrorMessage(error, '无法生成样式标记专检结果。'),
+    })
+  } finally {
+    generatingStyleTagCheck.value = false
+  }
+}
+
+async function recheckSelectedStyleTagCheck() {
+  const ids = selectedStyleTagCheckItems.value.map((item) => item.id)
+  if (ids.length === 0 || !styleTagCheckReport.value || recheckingStyleTagCheck.value) {
+    return
+  }
+  recheckingStyleTagCheck.value = true
+  try {
+    const options = resolveStyleTagCheckGenerateOptions()
+    const report = await recheckStyleTagCheckReport(styleTagCheckReport.value.id, ids, options)
+    setCurrentStyleTagCheckReport(report, { keepPage: true, keepSelection: true })
+    toast.show({ title: 'AI 重新标注完成', message: `已重新标注 ${ids.length} 项` })
+  } catch (error) {
+    toast.error({
+      title: 'AI 重新标注失败',
+      message: getErrorMessage(error, '无法完成 AI 重新标注。'),
+    })
+  } finally {
+    recheckingStyleTagCheck.value = false
+  }
+}
+
+async function rerunStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
+  if (styleTagCheckItemBusyId.value) {
+    return
+  }
+  styleTagCheckItemBusyId.value = item.id
+  try {
+    const options = resolveStyleTagCheckGenerateOptions()
+    const report = await rerunStyleTagCheckItem(item.id, options)
+    setCurrentStyleTagCheckReport(report, { keepPage: true, keepSelection: true })
+  } catch (error) {
+    toast.error({
+      title: '重新标注失败',
+      message: getErrorMessage(error, '无法重新标注该项。'),
+    })
+  } finally {
+    styleTagCheckItemBusyId.value = null
+  }
+}
+
+async function refreshAfterStyleTagCheckChange() {
+  try {
+    await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize)
+  } catch (error) {
+    // 编辑器刷新失败不影响报告操作
+  }
+}
+
+async function applyStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
+  if (styleTagCheckItemBusyId.value) {
+    return
+  }
+  styleTagCheckItemBusyId.value = item.id
+  try {
+    const report = await applyStyleTagCheckItem(item.id)
+    setCurrentStyleTagCheckReport(report, { keepPage: true, keepSelection: true })
+    await refreshAfterStyleTagCheckChange()
+    toast.show({ title: '已应用样式标注', message: '译文样式预览已更新，纯译文未受影响。' })
+  } catch (error) {
+    toast.error({
+      title: '应用失败',
+      message: getErrorMessage(error, '无法应用样式标注建议。'),
+    })
+  } finally {
+    styleTagCheckItemBusyId.value = null
+  }
+}
+
+async function rejectStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
+  if (styleTagCheckItemBusyId.value) {
+    return
+  }
+  styleTagCheckItemBusyId.value = item.id
+  try {
+    const report = await rejectStyleTagCheckItem(item.id)
+    setCurrentStyleTagCheckReport(report, { keepPage: true, keepSelection: true })
+  } catch (error) {
+    toast.error({
+      title: '操作失败',
+      message: getErrorMessage(error, '无法拒绝该建议。'),
+    })
+  } finally {
+    styleTagCheckItemBusyId.value = null
+  }
+}
+
+async function restoreStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
+  if (styleTagCheckItemBusyId.value) {
+    return
+  }
+  styleTagCheckItemBusyId.value = item.id
+  try {
+    const report = await restoreStyleTagCheckItem(item.id)
+    setCurrentStyleTagCheckReport(report, { keepPage: true, keepSelection: true })
+    await refreshAfterStyleTagCheckChange()
+    toast.show({ title: '已恢复', message: '样式标注已恢复到应用前的状态。' })
+  } catch (error) {
+    toast.error({
+      title: '恢复失败',
+      message: getErrorMessage(error, '无法恢复该项。'),
+    })
+  } finally {
+    styleTagCheckItemBusyId.value = null
+  }
+}
+
+const styleTagCheckApplicableCount = computed(() => (
+  (styleTagCheckReport.value?.items ?? []).filter((item) => item.status === 'open').length
+))
+
+async function applyAllStyleTagCheck() {
+  if (!styleTagCheckReport.value || styleTagCheckBulkBusy.value) {
+    return
+  }
+  const ids = selectedStyleTagCheckItems.value.map((item) => item.id)
+  styleTagCheckBulkBusy.value = true
+  try {
+    const report = await applyAllStyleTagCheckItems(styleTagCheckReport.value.id, ids)
+    setCurrentStyleTagCheckReport(report, { keepPage: true })
+    await refreshAfterStyleTagCheckChange()
+    toast.show({
+      title: '一键应用完成',
+      message: `已应用 ${report.applied_count} 处标注`,
+    })
+  } catch (error) {
+    toast.error({
+      title: '一键应用失败',
+      message: getErrorMessage(error, '无法批量应用标注。'),
+    })
+  } finally {
+    styleTagCheckBulkBusy.value = false
+  }
+}
+
+async function focusStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
+  if (locatingStyleTagCheckItemId.value) {
+    return
+  }
+  const fileRecord = segmentStore.fileRecord
+  if (!fileRecord) {
+    return
+  }
+
+  locatingStyleTagCheckItemId.value = item.id
+  try {
+    const currentPageIndex = editorSegments.value.findIndex((segment) => (
+      segment.sentence_id === item.sentence_id
+    ))
+    if (currentPageIndex >= 0) {
+      await focusEditorSegmentAtIndex(currentPageIndex)
+      return
+    }
+
+    const synced = await syncPendingWorkbenchEdits()
+    if (!synced) {
+      return
+    }
+
+    const data = (await http.get<SegmentPositionResponse>(
+      `/file-records/${fileRecord.id}/segments/${encodeURIComponent(item.sentence_id)}/position`,
+      { params: { page_size: segmentStore.pageSize } },
+    )).data
+    await clearSegmentFiltersForTermQANavigation()
+    await refreshSegmentPage(data.page, data.page_size)
+    const targetIndex = editorSegments.value.findIndex((segment) => (
+      segment.sentence_id === item.sentence_id
+    ))
+    if (targetIndex === -1) {
+      toast.warn('已切换到目标页，但未找到对应句段。')
+      return
+    }
+    await focusEditorSegmentAtIndex(targetIndex)
+  } catch (error) {
+    toast.error({
+      title: '跳转句段失败',
+      message: getErrorMessage(error, '无法定位报告中的句段。'),
+    })
+  } finally {
+    locatingStyleTagCheckItemId.value = null
   }
 }
 
@@ -5767,6 +6494,23 @@ function toggleVisibleCharacters() {
   } else {
     toast.info(t('workbench.ribbon.messages.visibleCharsOff'))
   }
+}
+
+/**
+ * 切换译文样式预览（非编辑态按标签渲染逐词样式，只读；编辑框始终是纯文本）
+ */
+function toggleFormatMarks() {
+  const enabled = richTextEditor.toggleFormatMarks()
+  toast.info(enabled ? '已开启原文/译文样式预览' : '已关闭原文/译文样式预览')
+}
+
+/**
+ * 切换标签编辑模式：开启后可在译文样式预览区选中文字一键加/删样式标签
+ * （只写 target_layout_text，不改动译文本身）。开启时会自动打开样式预览。
+ */
+function toggleTagEditMode() {
+  const enabled = richTextEditor.toggleTagEditMode()
+  toast.info(enabled ? '已开启标签编辑：可在译文中选词加/删样式标签' : '已关闭标签编辑')
 }
 
 /**
@@ -6824,7 +7568,8 @@ async function exportWithTypeForFile(
       return
     }
 
-    const stylePayload = exportStyleSettings.value.enabled ? exportStyleSettings.value : null
+    const styleActive = exportStyleSettings.value.enabled || Boolean(exportStyleSettings.value.pptx?.enabled)
+    const stylePayload = styleActive ? exportStyleSettings.value : null
     const includeRevisionMarks = (
       exportType === 'original'
       && wordExportMode === 'revision'
@@ -6884,12 +7629,32 @@ async function exportWithType(exportType: string, wordExportMode: WordExportMode
   await exportWithTypeForFile(exportType, segmentStore.fileRecord?.id, wordExportMode)
 }
 
+const translatingFilename = ref(false)
+
+async function translateCurrentFilename() {
+  const fileRecordId = segmentStore.fileRecord?.id
+  if (!fileRecordId || translatingFilename.value) return
+  translatingFilename.value = true
+  try {
+    const translated = await segmentStore.translateFilename(fileRecordId)
+    toast.success(`文件名已翻译：${translated}`)
+  } catch (error) {
+    toast.error({
+      title: '文件名翻译失败',
+      message: getErrorMessage(error, '无法翻译文件名，请稍后重试。'),
+    })
+  } finally {
+    translatingFilename.value = false
+  }
+}
+
 // 点击外部关闭导出菜单
 function handleClickOutside(event: MouseEvent) {
   const target = event.target as HTMLElement
   if (!target.closest('.export-dropdown')) {
     showExportMenu.value = false
   }
+
   if (
     !target.closest('.workbench-confirm-menu')
     && !target.closest('.workbench-confirm-menu__dropdown')
@@ -7197,11 +7962,16 @@ watch(() => segmentStore.activeFileRecordId, () => {
 })
 
 watch(selectedTermBaseId, () => {
+  resetOnlineTermResults()
   if (!selectedTermBaseId.value) {
     termEntries.value = []
     return
   }
   void loadTermEntries()
+})
+
+watch(activeSegmentSourceText, () => {
+  resetOnlineTermResults()
 })
 
 watch(
@@ -7307,6 +8077,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('click', handleClickOutside)
   document.removeEventListener('selectionchange', handleSelectionChange)
   document.removeEventListener('fullscreenchange', handleWorkbenchFullscreenChange)
+  removeAiCapabilityMenuListeners()
   clearExportPollTimer()
   commentStore.stopPolling()
 })
@@ -7380,6 +8151,26 @@ onBeforeRouteLeave(async () => {
               <ChevronDown :size="12" />
             </button>
             <div v-if="showExportMenu" class="export-dropdown__menu">
+              <div class="export-dropdown__group">
+                <div class="export-dropdown__group-title">文件名翻译</div>
+                <div class="export-dropdown__filename-translate">
+                  <span v-if="segmentStore.fileRecord?.translated_filename" class="export-dropdown__filename-translated">
+                    {{ segmentStore.fileRecord.translated_filename }}
+                  </span>
+                  <span v-else class="export-dropdown__filename-translated export-dropdown__filename-translated--empty">
+                    尚未翻译文件名
+                  </span>
+                  <button
+                    type="button"
+                    class="export-dropdown__item export-dropdown__filename-translate-btn"
+                    :disabled="translatingFilename"
+                    @click="translateCurrentFilename"
+                  >
+                    <Loader2 v-if="translatingFilename" class="lucide-spin" :size="14" />
+                    <span>{{ translatingFilename ? '翻译中' : (segmentStore.fileRecord?.translated_filename ? '重新翻译' : '翻译文件名') }}</span>
+                  </button>
+                </div>
+              </div>
               <div v-if="loadingExportOptions" class="export-dropdown__loading">
                 <Loader2 class="lucide-spin" :size="14" />
                 <span>{{ t('common.loading') }}</span>
@@ -7734,33 +8525,18 @@ onBeforeRouteLeave(async () => {
         </div>
 
         <div class="tool-group custom-style">
-          <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-bold" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
+          <div class="custom-style__grid">
+            <button class="style-item tool-button" type="button" data-testid="workbench-format-bold" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
               <span class="icon-text-area"><span class="tool-item"><Bold class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-strikethrough" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
-              <span class="icon-text-area"><span class="tool-item"><Strikethrough class="tool-label-icon" :size="15" /></span></span>
-            </button>
-          </span>
-          <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-italic" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
+            <button class="style-item tool-button" type="button" data-testid="workbench-format-italic" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
               <span class="icon-text-area"><span class="tool-item"><Italic class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-superscript" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
-              <span class="icon-text-area"><span class="tool-item"><Superscript class="tool-label-icon" :size="15" /></span></span>
-            </button>
-          </span>
-          <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-underline" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
+            <button class="style-item tool-button" type="button" data-testid="workbench-format-underline" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
               <span class="icon-text-area"><span class="tool-item"><Underline class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-subscript" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
-              <span class="icon-text-area"><span class="tool-item"><Subscript class="tool-label-icon" :size="15" /></span></span>
-            </button>
-          </span>
-          <span class="tool-col align-left">
             <div class="case-menu">
-              <button class="tool-line style-item tool-button" type="button" data-testid="workbench-case-menu-button" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
+              <button class="style-item tool-button" type="button" data-testid="workbench-case-menu-button" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
                 <span class="icon-text-area has_dropdown"><span class="tool-item"><Type class="tool-label-icon" :size="15" /></span></span>
                 <span class="dropdown-link" aria-hidden="true">
                   <ChevronDown :size="10" />
@@ -7773,10 +8549,27 @@ onBeforeRouteLeave(async () => {
                 <button type="button" class="case-menu__item" data-testid="workbench-case-sentence" @mousedown.prevent @click="applyCase('sentence')">{{ t('workbench.ribbon.caseSentence') }}</button>
               </div>
             </div>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
+            <button class="style-item tool-button" type="button" data-testid="workbench-format-strikethrough" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
+              <span class="icon-text-area"><span class="tool-item"><Strikethrough class="tool-label-icon" :size="15" /></span></span>
+            </button>
+            <button class="style-item tool-button" type="button" data-testid="workbench-format-superscript" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
+              <span class="icon-text-area"><span class="tool-item"><Superscript class="tool-label-icon" :size="15" /></span></span>
+            </button>
+            <button class="style-item tool-button" type="button" data-testid="workbench-format-subscript" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
+              <span class="icon-text-area"><span class="tool-item"><Subscript class="tool-label-icon" :size="15" /></span></span>
+            </button>
+            <button class="style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
               <span class="icon-text-area"><span class="tool-item"><Pilcrow class="tool-label-icon" :size="15" /></span></span>
             </button>
-          </span>
+            <button class="style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.formatMarksVisible.value }" title="显示/隐藏原文与译文样式预览" @click="toggleFormatMarks">
+              <span class="icon-text-area"><span class="tool-item"><Tags class="tool-label-icon" :size="15" /></span></span>
+            </button>
+            <button class="style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.tagEditModeEnabled.value }" :disabled="!activeSegmentCanWrite" title="选中译文样式预览中的文字，一键加/删样式标签" @click="toggleTagEditMode">
+              <span class="icon-text-area"><span class="tool-item"><TagIcon class="tool-label-icon" :size="15" /></span></span>
+            </button>
+            <span class="style-item custom-style__placeholder" aria-hidden="true"></span>
+            <span class="style-item custom-style__placeholder" aria-hidden="true"></span>
+          </div>
         </div>
 
         <div class="tool-group">
@@ -8264,6 +9057,26 @@ onBeforeRouteLeave(async () => {
               {{ t('workbench.exportStyleSettings.button') }}
             </button>
             <div v-if="showExportMenu" class="export-dropdown__menu">
+              <div class="export-dropdown__group">
+                <div class="export-dropdown__group-title">文件名翻译</div>
+                <div class="export-dropdown__filename-translate">
+                  <span v-if="segmentStore.fileRecord?.translated_filename" class="export-dropdown__filename-translated">
+                    {{ segmentStore.fileRecord.translated_filename }}
+                  </span>
+                  <span v-else class="export-dropdown__filename-translated export-dropdown__filename-translated--empty">
+                    尚未翻译文件名
+                  </span>
+                  <button
+                    type="button"
+                    class="export-dropdown__item export-dropdown__filename-translate-btn"
+                    :disabled="translatingFilename"
+                    @click="translateCurrentFilename"
+                  >
+                    <Loader2 v-if="translatingFilename" class="lucide-spin" :size="14" />
+                    <span>{{ translatingFilename ? '翻译中' : (segmentStore.fileRecord?.translated_filename ? '重新翻译' : '翻译文件名') }}</span>
+                  </button>
+                </div>
+              </div>
               <div v-if="loadingExportOptions" class="export-dropdown__loading">
                 <Loader2 class="lucide-spin" :size="14" />
                 <span>{{ t('common.loading') }}</span>
@@ -9138,6 +9951,8 @@ onBeforeRouteLeave(async () => {
                       :target-search-query="targetSearchQuery"
                       :search-case-sensitive="searchCaseSensitive"
                       :show-visible-chars="richTextEditor.visibleCharactersEnabled.value"
+                      :show-format-marks="richTextEditor.formatMarksVisible.value"
+                      :tag-edit-mode="richTextEditor.tagEditModeEnabled.value"
                       :pending-formats="pendingFormatsForEditor"
                       @focus="segmentStore.setActiveSentence"
                       @activate-target="handleSegmentTargetActivate"
@@ -9146,6 +9961,7 @@ onBeforeRouteLeave(async () => {
                       @copy-source-to-target="copySourceToTargetForSegment"
                       @update="updateSegmentTarget"
                       @update-source="updateSegmentSource"
+                      @update-target-layout="updateSegmentTargetLayout"
                       @toggle-project-sync="toggleProjectSegmentSync"
                       @apply-partial-revision="handleApplyPartialRevision"
                       @ctrl-click="handleSegmentClick"
@@ -9213,26 +10029,100 @@ onBeforeRouteLeave(async () => {
                 {{ termQAReport.active_issue_count }}
               </span>
             </button>
-            <button
-              class="segment-editor-bottom-tool segment-editor-bottom-tool--qa"
-              :class="{ 'is-active': activeBottomTool === 'number-check' }"
-              type="button"
-              :title="numberCheckButtonTitle"
-              :aria-pressed="activeBottomTool === 'number-check'"
-              :disabled="loadingNumberCheck || generatingNumberCheck"
-              @click="void openNumberCheck()"
-            >
-              <Loader2 v-if="loadingNumberCheck || generatingNumberCheck" class="lucide-spin" :size="14" />
-              <Sigma v-else :size="14" />
-              <span>数字专检</span>
-              <span
-                v-if="numberCheckReport"
-                class="segment-editor-bottom-tool__badge"
-                :class="{ 'is-clean': numberCheckReport.active_issue_count === 0 }"
+            <div class="segment-editor-bottom-tool-dropdown">
+              <button
+                ref="aiCapabilityTriggerRef"
+                class="segment-editor-bottom-tool segment-editor-bottom-tool--qa segment-editor-bottom-tool--ai-capability"
+                :class="{ 'is-active': activeBottomTool === 'number-check' || activeBottomTool === 'style-tag-check' }"
+                type="button"
+                :title="aiCapabilityButtonTitle"
+                :aria-expanded="showAiCapabilityMenu"
+                aria-haspopup="menu"
+                :disabled="isAiCapabilityBusy"
+                @click.stop="void toggleAiCapabilityMenu()"
               >
-                {{ numberCheckReport.active_issue_count }}
-              </span>
-            </button>
+                <Loader2 v-if="isAiCapabilityBusy" class="lucide-spin" :size="14" />
+                <Bot v-else :size="14" />
+                <span>AI能力</span>
+                <ChevronUp v-if="showAiCapabilityMenu" :size="12" />
+                <ChevronDown v-else :size="12" />
+                <span
+                  v-if="aiCapabilityBadgeCount !== null"
+                  class="segment-editor-bottom-tool__badge"
+                  :class="{ 'is-clean': aiCapabilityBadgeCount === 0 }"
+                >
+                  {{ aiCapabilityBadgeCount }}
+                </span>
+              </button>
+              <Teleport to="body">
+                <div
+                  v-if="showAiCapabilityMenu"
+                  ref="aiCapabilityMenuRef"
+                  class="segment-editor-bottom-tool-dropdown__menu"
+                  :style="aiCapabilityMenuStyle"
+                  role="menu"
+                  aria-label="AI能力"
+                  @click.stop
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    class="segment-editor-bottom-tool-dropdown__item"
+                    :class="{ 'is-active': activeBottomTool === 'number-check' }"
+                    :disabled="loadingNumberCheck || generatingNumberCheck"
+                    @click="void selectAiCapability('number-check')"
+                  >
+                    <Loader2 v-if="loadingNumberCheck || generatingNumberCheck" class="lucide-spin" :size="14" />
+                    <Sigma v-else :size="14" />
+                    <span>数字专检</span>
+                    <span
+                      v-if="numberCheckReport"
+                      class="segment-editor-bottom-tool-dropdown__badge"
+                      :class="{ 'is-clean': numberCheckReport.active_issue_count === 0 }"
+                    >
+                      {{ numberCheckReport.active_issue_count }}
+                    </span>
+                  </button>
+                  <button
+                    v-if="!isMergeWorkbench"
+                    type="button"
+                    role="menuitem"
+                    class="segment-editor-bottom-tool-dropdown__item"
+                    :class="{ 'is-active': activeBottomTool === 'style-tag-check' }"
+                    :disabled="loadingStyleTagCheck || generatingStyleTagCheck"
+                    @click="void selectAiCapability('style-tag-check')"
+                  >
+                    <Loader2 v-if="loadingStyleTagCheck || generatingStyleTagCheck" class="lucide-spin" :size="14" />
+                    <Palette v-else :size="14" />
+                    <span>样式标记专检</span>
+                    <span
+                      v-if="styleTagCheckReport"
+                      class="segment-editor-bottom-tool-dropdown__badge"
+                      :class="{ 'is-clean': styleTagCheckReport.candidate_count === 0 }"
+                    >
+                      {{ styleTagCheckReport.candidate_count }}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    class="segment-editor-bottom-tool-dropdown__item"
+                    :class="{ 'is-active': activeBottomTool === 'translation-review' }"
+                    @click="void selectAiCapability('translation-review')"
+                  >
+                    <ShieldCheck :size="14" />
+                    <span>翻译内容校对</span>
+                    <span
+                      v-if="translationReviewActiveCount !== null"
+                      class="segment-editor-bottom-tool-dropdown__badge"
+                      :class="{ 'is-clean': translationReviewActiveCount === 0 }"
+                    >
+                      {{ translationReviewActiveCount }}
+                    </span>
+                  </button>
+                </div>
+              </Teleport>
+            </div>
             <button
               v-for="tool in bottomToolButtons"
               :key="tool.key"
@@ -9267,7 +10157,7 @@ onBeforeRouteLeave(async () => {
               :class="[
                 `workbench-bottom-drawer--${activeBottomTool}`,
                 {
-                  'is-wide': activeBottomTool === 'split-preview' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check',
+                  'is-wide': activeBottomTool === 'split-preview' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check' || activeBottomTool === 'style-tag-check' || activeBottomTool === 'translation-review',
                   'is-loading': bottomDrawerPreviewBusy,
                   'is-resizable': isBottomDrawerResizable,
                   'is-resizing': isBottomDrawerResizing,
@@ -9293,7 +10183,7 @@ onBeforeRouteLeave(async () => {
               />
 
               <button
-                v-if="activeBottomTool === 'history' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check'"
+                v-if="activeBottomTool === 'history' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check' || activeBottomTool === 'style-tag-check'"
                 class="workbench-bottom-drawer__close"
                 type="button"
                 title="关闭"
@@ -9820,6 +10710,10 @@ onBeforeRouteLeave(async () => {
                               </template>
                               <span v-else class="number-check__no-fix">—</span>
                             </div>
+                            <div
+                              v-if="numberCheckShowAiReason && numberCheckHasCorrection(item) && numberCheckAiReason(item)"
+                              class="number-check__ai-reason"
+                            >AI 修改理由：{{ numberCheckAiReason(item) }}</div>
                           </td>
                           <td class="number-check__cell">
                             <div class="number-check__status">
@@ -9890,6 +10784,257 @@ onBeforeRouteLeave(async () => {
                   </button>
                 </div>
               </div>
+
+              <div v-else-if="activeBottomTool === 'style-tag-check'" class="workbench-bottom-drawer__qa">
+                <div class="workbench-bottom-drawer__header workbench-bottom-drawer__header--qa">
+                  <div class="workbench-bottom-drawer__header-lead">
+                    <div class="section-title section-title--tight">样式标记专检</div>
+                    <p class="panel-subtitle">根据原文样式为多样式句段的译文补全样式，不改动译文本身。</p>
+                  </div>
+
+                  <div v-if="styleTagCheckReport" class="term-qa-dialog__summary">
+                    <span class="term-qa-stat">
+                      <em class="term-qa-stat__value">{{ styleTagCheckApplicableCount }}</em>
+                      <span class="term-qa-stat__label">待审校</span>
+                    </span>
+                    <span class="term-qa-stat is-muted">
+                      <em class="term-qa-stat__value">{{ styleTagCheckReport.applied_count }}</em>
+                      <span class="term-qa-stat__label">已应用</span>
+                    </span>
+                    <span class="term-qa-dialog__meta">{{ styleTagCheckMetaText }}</span>
+                  </div>
+
+                  <div class="term-qa-dialog__actions">
+                    <div class="number-check__settings">
+                      <button
+                        class="button button--ghost term-qa-dialog__action-button"
+                        type="button"
+                        title="样式标记专检设置"
+                        @click="showStyleTagCheckSettings = true"
+                      >
+                        <Settings :size="14" />
+                        设置
+                      </button>
+                    </div>
+                    <select
+                      v-if="styleTagCheckReport"
+                      class="term-qa-dialog__filter-select"
+                      :value="styleTagCheckFilter"
+                      title="筛选报告项"
+                      @change="setStyleTagCheckFilter(($event.target as HTMLSelectElement).value as StyleTagCheckFilter)"
+                    >
+                      <option value="all">全部</option>
+                      <option value="open">待审校</option>
+                      <option value="applied">已应用</option>
+                      <option value="rejected">已拒绝</option>
+                      <option value="failed">AI失败</option>
+                    </select>
+                    <button
+                      v-if="styleTagCheckReport"
+                      class="button button--ghost term-qa-dialog__action-button"
+                      type="button"
+                      :disabled="styleTagCheckApplicableCount === 0 || styleTagCheckBulkBusy"
+                      :title="selectedStyleTagCheckItems.length ? '对所选项一键应用标注' : '对全部待审校项一键应用标注'"
+                      @click="void applyAllStyleTagCheck()"
+                    >
+                      <Loader2 v-if="styleTagCheckBulkBusy" class="lucide-spin" :size="14" />
+                      一键应用{{ selectedStyleTagCheckItems.length ? ` ${selectedStyleTagCheckItems.length}` : '' }}
+                    </button>
+                    <button
+                      v-if="styleTagCheckReport"
+                      class="button button--ghost term-qa-dialog__action-button"
+                      type="button"
+                      :disabled="selectedStyleTagCheckItems.length === 0 || recheckingStyleTagCheck"
+                      title="对所选项重新运行 AI 标注"
+                      @click="void recheckSelectedStyleTagCheck()"
+                    >
+                      <Loader2 v-if="recheckingStyleTagCheck" class="lucide-spin" :size="14" />
+                      重新标注选中{{ selectedStyleTagCheckItems.length ? ` ${selectedStyleTagCheckItems.length}` : '' }}
+                    </button>
+                    <button
+                      class="button button--ghost term-qa-dialog__action-button"
+                      type="button"
+                      :disabled="!canRunStyleTagCheck"
+                      :title="styleTagCheckButtonTitle"
+                      @click="void generateStyleTagCheckReport()"
+                    >
+                      <Loader2 v-if="generatingStyleTagCheck" class="lucide-spin" :size="14" />
+                      {{ styleTagCheckReport ? '重新检查' : '开始检查' }}
+                    </button>
+                  </div>
+                </div>
+
+                <div v-if="loadingStyleTagCheck && !generatingStyleTagCheck" class="empty-state">
+                  <Loader2 class="lucide-spin" :size="28" />
+                  正在加载样式标记专检结果
+                </div>
+
+                <template v-else-if="styleTagCheckReport">
+                  <div v-if="styleTagCheckFilteredItems.length === 0" class="empty-state">
+                    未发现需要标注的多样式候选句段。
+                  </div>
+                  <div v-else class="term-qa-dialog__table-wrap" @scroll="onStyleTagCheckScroll">
+                    <table class="term-qa-dialog__table number-check__table">
+                      <thead>
+                        <tr>
+                          <th class="term-qa-dialog__col-select">
+                            <input
+                              type="checkbox"
+                              :checked="allStyleTagCheckItemsSelected"
+                              :disabled="styleTagCheckSelectableItems.length === 0"
+                              aria-label="全选"
+                              @change="toggleAllStyleTagCheckItems(!allStyleTagCheckItemsSelected)"
+                            >
+                          </th>
+                          <th class="term-qa-dialog__col-segment">序号</th>
+                          <th class="number-check__col-reason">原文（含样式）</th>
+                          <th class="number-check__col-target">AI 标注建议</th>
+                          <th class="number-check__col-status">状态</th>
+                          <th class="number-check__col-action">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr
+                          v-for="item in visibleStyleTagCheckItems"
+                          :key="item.id"
+                          class="term-qa-dialog__row"
+                          :class="{
+                            'is-locating': locatingStyleTagCheckItemId === item.id,
+                            'is-ignored': item.status === 'rejected',
+                          }"
+                          tabindex="0"
+                          @click="void focusStyleTagCheckReportItem(item)"
+                          @keydown.enter.prevent="void focusStyleTagCheckReportItem(item)"
+                          @keydown.space.prevent="void focusStyleTagCheckReportItem(item)"
+                        >
+                          <td>
+                            <input
+                              type="checkbox"
+                              :checked="selectedStyleTagCheckItemIds.has(item.id)"
+                              :disabled="item.status !== 'open'"
+                              aria-label="选择报告项"
+                              @click.stop
+                              @change.stop="toggleStyleTagCheckItemSelection(item.id, $event)"
+                            >
+                          </td>
+                          <td>
+                            <span class="term-qa-dialog__segment" :title="item.sentence_id">
+                              <Loader2
+                                v-if="locatingStyleTagCheckItemId === item.id"
+                                class="lucide-spin"
+                                :size="13"
+                              />
+                              {{ formatTermQASegmentNumber(item.sentence_id) }}
+                            </span>
+                          </td>
+                          <td class="number-check__cell">
+                            <div class="number-check__reason" v-html="styleTagCheckSourcePreviewHtml(item)"></div>
+                          </td>
+                          <td class="number-check__cell">
+                            <div v-if="item.suggested_target_layout_text" class="number-check__fix" v-html="styleTagCheckSuggestedPreviewHtml(item)"></div>
+                            <span v-else class="number-check__no-fix">{{ item.target_text }}</span>
+                          </td>
+                          <td class="number-check__cell">
+                            <div class="number-check__status">
+                              <span
+                                class="number-check__status-tag"
+                                :class="`number-check__status-tag--${styleTagCheckStatusTag(item).tone}`"
+                              >{{ styleTagCheckStatusTag(item).text }}</span>
+                            </div>
+                          </td>
+                          <td>
+                            <div class="term-qa-dialog__inline-actions number-check__actions">
+                              <button
+                                v-if="item.status === 'open'"
+                                class="button button--ghost term-qa-dialog__inline-action number-check__action"
+                                type="button"
+                                title="应用该标注建议"
+                                :disabled="styleTagCheckItemBusyId === item.id"
+                                @click.stop="void applyStyleTagCheckReportItem(item)"
+                              >
+                                <Loader2 v-if="styleTagCheckItemBusyId === item.id" class="lucide-spin" :size="14" />
+                                应用
+                              </button>
+                              <button
+                                v-else-if="item.status === 'applied'"
+                                class="button button--ghost term-qa-dialog__inline-action number-check__action"
+                                type="button"
+                                title="恢复应用前的样式预览"
+                                :disabled="styleTagCheckItemBusyId === item.id"
+                                @click.stop="void restoreStyleTagCheckReportItem(item)"
+                              >
+                                <Loader2 v-if="styleTagCheckItemBusyId === item.id" class="lucide-spin" :size="14" />
+                                恢复
+                              </button>
+                              <button
+                                v-if="item.status === 'open'"
+                                class="button button--ghost term-qa-dialog__inline-action number-check__action"
+                                type="button"
+                                title="拒绝该标注建议"
+                                :disabled="styleTagCheckItemBusyId === item.id"
+                                @click.stop="void rejectStyleTagCheckReportItem(item)"
+                              >
+                                拒绝
+                              </button>
+                              <button
+                                v-if="item.status === 'failed' || item.status === 'rejected'"
+                                class="button button--ghost term-qa-dialog__inline-action number-check__action"
+                                type="button"
+                                title="重新运行 AI 标注"
+                                :disabled="styleTagCheckItemBusyId === item.id"
+                                @click.stop="void rerunStyleTagCheckReportItem(item)"
+                              >
+                                <Loader2 v-if="styleTagCheckItemBusyId === item.id" class="lucide-spin" :size="14" />
+                                重新标注
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                    <div v-if="styleTagCheckFilteredItems.length > 0" class="number-check__count">
+                      已显示 {{ styleTagCheckCountText }}
+                      <span v-if="styleTagCheckHasMore" class="number-check__count-hint">（向下滚动加载更多）</span>
+                    </div>
+                  </div>
+                </template>
+
+                <div v-else-if="!generatingStyleTagCheck" class="empty-state">
+                  暂无样式标记专检结果
+                  <button
+                    class="button"
+                    type="button"
+                    :disabled="!canRunStyleTagCheck"
+                    :title="styleTagCheckButtonTitle"
+                    @click="void generateStyleTagCheckReport()"
+                  >
+                    <Loader2 v-if="generatingStyleTagCheck" class="lucide-spin" :size="14" />
+                    开始检查
+                  </button>
+                </div>
+              </div>
+
+              <TranslationReviewPanel
+                v-else-if="activeBottomTool === 'translation-review'"
+                key="translation-review"
+                :file-record-id="isMergeWorkbench ? null : (segmentStore.fileRecord?.id ?? null)"
+                :merge-view-id="isMergeWorkbench ? (segmentStore.mergeViewId ?? props.mergeViewId ?? null) : null"
+                :is-merge-workbench="isMergeWorkbench"
+                :active-file-record-id="activeWorkbenchFileId"
+                :project-id="activeWorkbenchProjectId"
+                :on-focus-sentence="(sid: string, fid?: string) => {
+                  if (fid && isMergeWorkbench) {
+                    const key = segmentStore.segments.find(s => s.sentence_id === sid && s.file_record_id === fid)
+                      ? segmentStore.segmentKeyOf(segmentStore.segments.find(s => s.sentence_id === sid && s.file_record_id === fid) as any)
+                      : sid
+                    void handlePreviewFocus(key)
+                  } else {
+                    void handlePreviewFocus(sid)
+                  }
+                }"
+                :on-active-count-change="(n: number | null) => { translationReviewActiveCount = n }"
+                class="workbench-bottom-drawer__qa"
+              />
             </section>
           </Transition>
 
@@ -10206,7 +11351,19 @@ onBeforeRouteLeave(async () => {
             :active-source-text="activeSegmentSourceText"
             :loading-bases="loadingTermBases"
             :loading-entries="loadingTermEntries"
+            :local-total="termEntriesTotal"
+            :loading-more-local="loadingMoreTermEntries"
+            :has-more-local="hasMoreTermEntries"
             :message="termsMessage"
+            :online-entries="onlineTermEntries"
+            :added-online-term-keys="addedOnlineTermKeys"
+            :online-loading="onlineTermsLoading"
+            :online-error="onlineTermsError"
+            :can-write-selected-term-base="canWriteSelectedTermBase"
+            @query-online="handleOnlineTermQuery"
+            @add-online-term="handleAddOnlineTerm"
+            @revoke-online-term="handleRevokeOnlineTerm"
+            @load-more-local="() => void loadTermEntries(true)"
           />
           <section
             v-else-if="activeSideTool === 'resource-search'"
@@ -10512,11 +11669,46 @@ onBeforeRouteLeave(async () => {
             >{{ modelOption.name }}</option>
           </select>
         </div>
+        <div class="number-check__settings-group">
+          <div class="number-check__settings-label">显示选项</div>
+          <label class="number-check__settings-option">
+            <input type="checkbox" v-model="numberCheckShowAiReason">
+            显示 AI 修改理由
+          </label>
+        </div>
         <p class="hint-text">设置在下次“开始检查 / 重新检查”时生效。</p>
       </div>
 
       <template #footer>
         <button class="button button--primary" type="button" @click="showNumberCheckSettings = false">
+          完成
+        </button>
+      </template>
+    </Modal>
+
+    <Modal
+      :open="showStyleTagCheckSettings"
+      title="样式标记专检设置"
+      width="min(420px, calc(100vw - 32px))"
+      @close="showStyleTagCheckSettings = false"
+    >
+      <div class="number-check__settings-dialog">
+        <div class="number-check__settings-group">
+          <div class="number-check__settings-label">AI 模型</div>
+          <select class="term-qa-dialog__filter-select" v-model="styleTagCheckModel">
+            <option value="">使用配置默认模型</option>
+            <option
+              v-for="modelOption in llmModelOptions"
+              :key="modelOption.id"
+              :value="modelOption.id"
+            >{{ modelOption.name }}</option>
+          </select>
+        </div>
+        <p class="hint-text">设置在下次“开始检查 / 重新标注选中”时生效。批量标注时模型需要连续输出多个 ⟦n⟧ 标签，若某模型经常出现标签格式错误（校验失败率高），可换用其他模型试试。</p>
+      </div>
+
+      <template #footer>
+        <button class="button button--primary" type="button" @click="showStyleTagCheckSettings = false">
           完成
         </button>
       </template>
@@ -11631,19 +12823,29 @@ onBeforeRouteLeave(async () => {
   padding-left: 5px;
 }
 
-.custom-style .tool-col {
-  width: 24px;
-}
-
-.custom-style .tool-col + .tool-col {
-  margin-left: 2px;
+.custom-style__grid {
+  display: grid;
+  grid-template-columns: repeat(4, 24px);
+  grid-auto-rows: 24px;
+  gap: 2px;
+  align-content: center;
+  justify-content: start;
 }
 
 .style-item.tool-button {
+  display: inline-flex;
   justify-content: center;
+  align-items: center;
   width: 23px;
   height: 23px;
   padding: 0;
+}
+
+.custom-style__placeholder {
+  width: 23px;
+  height: 23px;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .style-item .dropdown-link {
@@ -12325,6 +13527,13 @@ onBeforeRouteLeave(async () => {
 
 .number-check__fix {
   line-height: 1.5;
+}
+
+.number-check__ai-reason {
+  margin-top: 3px;
+  color: #8a6d00;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .number-check__actions {
@@ -13901,13 +15110,110 @@ onBeforeRouteLeave(async () => {
     color 140ms ease;
 }
 
-.segment-editor-bottom-tool:first-child {
+.segment-editor-bottom-tools > .segment-editor-bottom-tool:first-child,
+.segment-editor-bottom-tools > .segment-editor-bottom-tool-dropdown:first-child .segment-editor-bottom-tool {
   border-left: 0;
   border-radius: 0;
 }
 
-.segment-editor-bottom-tool:last-child {
+.segment-editor-bottom-tools > .segment-editor-bottom-tool:last-child,
+.segment-editor-bottom-tools > .segment-editor-bottom-tool-dropdown:last-child .segment-editor-bottom-tool {
   border-radius: 0;
+}
+
+.segment-editor-bottom-tool-dropdown {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.segment-editor-bottom-tool-dropdown .segment-editor-bottom-tool {
+  height: 100%;
+}
+
+.segment-editor-bottom-tool-dropdown__menu {
+  display: grid;
+  gap: 2px;
+  max-width: calc(100vw - 16px);
+  padding: 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-soft);
+}
+
+.segment-editor-bottom-tool-dropdown__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.2;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.segment-editor-bottom-tool-dropdown__item svg {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+}
+
+.segment-editor-bottom-tool-dropdown__item span:first-of-type {
+  flex: 1 1 auto;
+}
+
+.segment-editor-bottom-tool-dropdown__item:hover:not(:disabled),
+.segment-editor-bottom-tool-dropdown__item:focus-visible {
+  background: var(--surface-muted);
+  color: var(--text-primary);
+  outline: none;
+}
+
+.segment-editor-bottom-tool-dropdown__item.is-active {
+  background: var(--surface-muted);
+  color: var(--brand-700);
+}
+
+.segment-editor-bottom-tool-dropdown__item.is-active svg {
+  color: var(--brand-700);
+}
+
+.segment-editor-bottom-tool-dropdown__item:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.segment-editor-bottom-tool-dropdown__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #fff4e5;
+  color: #9b4d07;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.segment-editor-bottom-tool-dropdown__badge.is-clean {
+  background: #e6f6ef;
+  color: #15795d;
+}
+
+.segment-editor-bottom-tool--ai-capability {
+  gap: 4px;
 }
 
 .segment-editor-bottom-tool svg {
@@ -14365,6 +15671,11 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-bottom-drawer__qa .number-check__nums {
+  margin-top: 1px;
+  line-height: 1.25;
+}
+
+.workbench-bottom-drawer__qa .number-check__ai-reason {
   margin-top: 1px;
   line-height: 1.25;
 }
@@ -15774,6 +17085,37 @@ onBeforeRouteLeave(async () => {
   color: #6b7c85;
   font-size: 11px;
   font-weight: 700;
+}
+
+.export-dropdown__filename-translate {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 8px 6px;
+}
+
+.export-dropdown__filename-translated {
+  font-size: 13px;
+  color: #2c3e50;
+  overflow-wrap: anywhere;
+}
+
+.export-dropdown__filename-translated--empty {
+  color: #9aa7ad;
+}
+
+.export-dropdown__filename-translate-btn {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #0d7a68;
+  background: rgba(13, 122, 104, 0.08);
+}
+
+.export-dropdown__filename-translate-btn:hover {
+  background: rgba(13, 122, 104, 0.16);
 }
 
 .export-dropdown__item {

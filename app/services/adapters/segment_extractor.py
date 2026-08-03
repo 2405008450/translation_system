@@ -92,14 +92,36 @@ class SegmentExtractor:
                     segments.append(segment)
                 else:
                     # 其他格式：按句子分割
-                    sentences = self._split_sentences(text)
-                    for sentence_text, display_text in sentences:
+                    raw_sentences = self._split_sentences(text)
+                    layout_fragments = self._compute_layout_fragments(node, text, raw_sentences)
+                    html_fragments = self._compute_source_html_fragments(node, text, raw_sentences)
+                    format_map = (node.metadata or {}).get("source_layout_formats") or {}
+                    for idx, (sentence_text, display_text, _start, _end) in enumerate(raw_sentences):
                         if sentence_text:  # 跳过空句子
+                            layout = layout_fragments[idx] if layout_fragments else ""
+                            # 随句携带格式表（只取本句用到的 id + base），供前端渲染译文样式：
+                            # - 统一样式句段：只带 base，让整段译文套用同一 run 样式；
+                            # - 多样式句段：带 base + 本句 ⟦n⟧ 用到的 id。
+                            seg_format_map: dict = {}
+                            if format_map:
+                                base_tokens = format_map.get("base")
+                                if base_tokens and (base_tokens[0] or base_tokens[1]):
+                                    seg_format_map["base"] = base_tokens
+                                if "⟦" in layout:
+                                    used_ids = set(re.findall(r"⟦\s*/?\s*(\d+)\s*⟧", layout))
+                                    for used_id in used_ids:
+                                        if used_id in format_map:
+                                            seg_format_map[used_id] = format_map[used_id]
                             segment = self._create_segment(
                                 source_text=sentence_text,
                                 display_text=display_text,
                                 block_path=path,
                                 metadata=node.metadata,
+                                source_layout_text=layout,
+                                source_html=(
+                                    html_fragments[idx] if html_fragments else ""
+                                ),
+                                source_format_map=seg_format_map,
                             )
                             segments.append(segment)
         
@@ -112,19 +134,78 @@ class SegmentExtractor:
         
         return segments
 
-    def _split_sentences(self, text: str) -> List[Tuple[str, str]]:
+    def _compute_layout_fragments(
+        self,
+        node: BlockNode,
+        text: str,
+        raw_sentences: List[Tuple[str, str, int, int]],
+    ) -> List[str] | None:
+        """为逐句句段计算带行内格式标签的版式原文。
+
+        仅当块节点携带 ``source_layout_tagged``（PPTX 解析注入的整段带标签文本）且其
+        去标签后的纯文本与断句所依据的 ``text`` 完全一致时才对齐；标签跨句或纯文本
+        不一致都返回 ``None``，调用方退回无标签路径（零倒退）。
+        """
+        tagged_text = (node.metadata or {}).get("source_layout_tagged")
+        if not tagged_text or not raw_sentences:
+            return None
+
+        from app.services.adapters.pptx_inline_tags import (
+            slice_tagged_paragraph,
+            strip_format_tags,
+        )
+
+        if strip_format_tags(tagged_text) != text:
+            return None
+
+        bounds = [(start, end) for _source, _display, start, end in raw_sentences]
+        return slice_tagged_paragraph(tagged_text, bounds)
+
+    def _compute_source_html_fragments(
+        self,
+        node: BlockNode,
+        text: str,
+        raw_sentences: List[Tuple[str, str, int, int]],
+    ) -> List[str] | None:
+        """把逐句片段渲染为带基础格式的原文 HTML，供前端原文列展示样式。
+
+        与 LLM 版式原文解耦：即使整段统一格式（无“异类” run、无标签）也会渲染，
+        因此像“整段加粗/下划线”的标题也能在原文列显示样式。
+        """
+        tagged_html = (node.metadata or {}).get("source_layout_html_tagged")
+        format_map = (node.metadata or {}).get("source_layout_formats")
+        if not tagged_html or not format_map or not raw_sentences:
+            return None
+
+        from app.services.adapters.pptx_inline_tags import (
+            slice_tagged_paragraph,
+            strip_format_tags,
+            tagged_fragment_to_html,
+        )
+
+        if strip_format_tags(tagged_html) != text:
+            return None
+        bounds = [(start, end) for _source, _display, start, end in raw_sentences]
+        fragments = slice_tagged_paragraph(tagged_html, bounds)
+        if fragments is None:
+            return None
+        return [tagged_fragment_to_html(fragment, format_map) for fragment in fragments]
+
+    def _split_sentences(self, text: str) -> List[Tuple[str, str, int, int]]:
         """将文本分割为句子
         
         Args:
             text: 原始文本
             
         Returns:
-            List[Tuple[str, str]]: (规范化文本, 显示文本) 元组列表
+            List[Tuple[str, str, int, int]]: (规范化文本, 显示文本, 起始偏移, 结束偏移)
+            元组列表，按顺序连续覆盖整个 ``text``（含规范化后为空的片段，便于逐句对齐
+            版式标签；调用方负责跳过空句子）。
         """
         if not text:
             return []
         
-        sentences: List[Tuple[str, str]] = []
+        sentences: List[Tuple[str, str, int, int]] = []
         start = 0
         i = 0
         
@@ -188,10 +269,11 @@ class SegmentExtractor:
                 
                 display_text = text[start:end].strip()
                 source_text = self._normalize_text(display_text)
-                
-                if source_text:
-                    sentences.append((source_text, display_text))
-                
+
+                # 连续覆盖 [start, end)，规范化后为空的片段也保留以维持偏移对齐，
+                # 由调用方跳过空句子。
+                sentences.append((source_text, display_text, start, end))
+
                 start = end
                 i = end
             else:
@@ -201,8 +283,7 @@ class SegmentExtractor:
         if start < len(text):
             display_text = text[start:].strip()
             source_text = self._normalize_text(display_text)
-            if source_text:
-                sentences.append((source_text, display_text))
+            sentences.append((source_text, display_text, start, len(text)))
         
         return sentences
 
@@ -224,6 +305,9 @@ class SegmentExtractor:
         display_text: str,
         block_path: str,
         metadata: dict = None,
+        source_layout_text: str = "",
+        source_html: str = "",
+        source_format_map: dict = None,
     ) -> Segment:
         """创建 Segment 实例
         
@@ -249,6 +333,9 @@ class SegmentExtractor:
             block_path=block_path,
             position=position,
             metadata=metadata or {},
+            source_layout_text=source_layout_text,
+            source_html=source_html,
+            source_format_map=source_format_map or {},
         )
 
 

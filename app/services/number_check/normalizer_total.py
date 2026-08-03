@@ -1014,18 +1014,47 @@ class CompareResult:
     mismatches: List[dict] = field(default_factory=list)
 
 
+def _diff_number_lists(src_list: List[str], tgt_list: List[str]) -> List[Dict]:
+    """
+    对比原文/译文数值列表，返回差异项列表（多重集合贪心匹配，不依赖位置顺序）。
+    每项: {"type": "MISSING"|"EXTRA"|"ORDER", "msg": str}
+      - MISSING：译文缺少某个原文中存在的数值
+      - EXTRA：译文多出某个原文中不存在的数值
+      - ORDER：数量对齐且逐个值都能配对，但顺序发生了变化
+    """
+    src_used = [False] * len(src_list)
+    tgt_used = [False] * len(tgt_list)
+    diffs: List[Dict] = []
+
+    for i, s in enumerate(src_list):
+        for j, t in enumerate(tgt_list):
+            if not tgt_used[j] and s == t:
+                src_used[i] = True
+                tgt_used[j] = True
+                break
+
+    for i, s in enumerate(src_list):
+        if not src_used[i]:
+            diffs.append({"type": "MISSING", "msg": f"译文缺失数值 {s}（原文存在）"})
+
+    for j, t in enumerate(tgt_list):
+        if not tgt_used[j]:
+            diffs.append({"type": "EXTRA", "msg": f"译文多出数值 {t}（原文不存在）"})
+
+    if len(src_list) == len(tgt_list) and not diffs:
+        for i in range(len(src_list)):
+            if src_list[i] != tgt_list[i]:
+                diffs.append({"type": "ORDER", "msg": f"数值顺序变化：{src_list[i]} → {tgt_list[i]}"})
+
+    return diffs
+
+
 def compare_numbers(cn: str, en: str) -> CompareResult:
     cn_nums = extract_numbers(cn)
     en_nums = extract_numbers(en)
     res = CompareResult(cn_nums, en_nums)
-    ok = True
-    for i in range(max(len(cn_nums), len(en_nums))):
-        a = cn_nums[i] if i < len(cn_nums) else None
-        b = en_nums[i] if i < len(en_nums) else None
-        if a != b:
-            ok = False
-            res.mismatches.append({"i": i, "cn": a, "en": b})
-    res.matched = ok
+    res.mismatches = _diff_number_lists(cn_nums, en_nums)
+    res.matched = not res.mismatches
     return res
 
 
@@ -1039,7 +1068,7 @@ def print_compare(label: str, cn: str, en: str):
     if r.mismatches:
         print("不匹配项:")
         for m in r.mismatches:
-            print(f"  #{m['i']}: 中文={m['cn']} vs 英文={m['en']}")
+            print(f"  [{m['type']}] {m['msg']}")
     print()
 
 # ─────────────────────────────────────────

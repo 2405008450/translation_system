@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model: str = "google/gemini-3-flash-preview"
+    online_term_search_engine: str = "auto"
+    online_term_search_model: str | None = None
+    online_term_search_max_results: int = 5
+    online_term_search_max_uses: int = 2
     llm_timeout_seconds: float = 60.0
     llm_stall_timeout_seconds: float = 120.0
     llm_max_concurrency: int = 5
@@ -67,6 +71,11 @@ class Settings(BaseSettings):
     reference_llm_api_key: str | None = None
     reference_llm_model: str = "google/gemini-3.5-flash"
     reference_llm_base_url: str = "https://openrouter.ai/api/v1"
+    # 样式标记专检：AI 自动标注默认使用的 provider/model；留空 model 时沿用
+    # request_chat_completion 的通用默认（DEEPSEEK_MODEL / OPENROUTER_MODEL）。
+    # 前端设置面板若显式选择模型会覆盖此处配置。
+    style_tag_check_llm_provider: str = "auto"
+    style_tag_check_llm_model: str | None = None
     redis_url: str | None = None
     import_queue_backend: str = "local"
     arq_max_jobs: int = 1
@@ -89,6 +98,21 @@ class Settings(BaseSettings):
     libreoffice_soffice_path: str | None = None
     libreoffice_python_path: str | None = None
     libreoffice_timeout_seconds: float = 60.0
+    # PPTX 版式优化：视觉复核统一走的 LLM provider（需支持多模态 image_url，如 openrouter）。
+    pptx_layout_vlm_provider: str = "openrouter"
+    # PPTX 版式优化：可选视觉模型列表（前端下拉与后端校验共用；从 env 传 JSON 数组）。
+    pptx_layout_vlm_models: list[str] = Field(
+        default_factory=lambda: [
+            "google/gemini-3.1-pro-preview",
+            "google/gemini-3.6-flash",
+            "anthropic/claude-sonnet-5",
+            "anthropic/claude-fable-5",
+        ]
+    )
+    # PPTX 版式优化：默认视觉模型（留空则取模型列表首个）。
+    pptx_layout_vlm_model: str = "google/gemini-3.1-pro-preview"
+    # PPTX 版式优化：LibreOffice 渲染页面截图的 DPI。
+    pptx_layout_render_dpi: int = 200
     # ODA File Converter（DWG <-> DXF 跨平台转换器，需用户自行安装）
     # Windows 例：C:\Program Files\ODA\ODAFileConverter 25.12.0\ODAFileConverter.exe
     # Linux 例：  /usr/bin/ODAFileConverter
@@ -147,6 +171,19 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+    # ─── 翻译内容校对（Translation Review）配置 ──────────────────────
+    translation_review_max_concurrency: int = 3
+    translation_review_requests_per_minute: int = 60
+    translation_review_batch_size_default: int = 12
+    translation_review_default_segment_scope: str = "all"
+    # 联网查证：none | openrouter | custom
+    translation_review_web_search_provider: str = "none"
+    translation_review_web_search_engine: str = "auto"
+    translation_review_web_search_max_results: int = 5
+    translation_review_web_search_max_uses: int = 2
+    translation_review_web_allow_domains: list[str] = Field(default_factory=list)
+    translation_review_web_search_custom_url: str | None = None
+    translation_review_web_search_custom_api_key: str | None = None
 
 
 @lru_cache

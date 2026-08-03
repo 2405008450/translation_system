@@ -52,6 +52,7 @@ RUN apt-get update \
         libreoffice-impress \
         libreoffice-writer \
         p7zip-full \
+        poppler-utils \
         postgresql-client \
         python3-uno \
         tzdata \

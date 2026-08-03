@@ -471,6 +471,13 @@ export interface Segment {
   display_text: string
   source_body_text?: string
   source_layout_text?: string | null
+  /** 逐标记样式表：{标签 id / "base": [开 span, 闭 span]}，用于把译文里的 ⟦n⟧ 渲染为行内样式 */
+  source_format_map?: Record<string, [string, string]> | null
+  /**
+   * 带标签版式译文，仅供只读样式预览/标签编辑使用（后端已校验有效性：
+   * strip 后等于 target_text 才会下发）。绝不作为译文编辑框的取值来源。
+   */
+  target_layout_text?: string | null
   automatic_numbering_text?: string | null
   target_automatic_numbering_text?: string | null
   source_html?: string | null
@@ -693,6 +700,159 @@ export interface NumberCheckReport {
   items: NumberCheckReportItem[]
 }
 
+export interface StyleTagCheckReportItem {
+  id: string
+  report_id: string
+  project_id: string | null
+  file_record_id: string
+  segment_id: string | null
+  sentence_id: string
+  file_name: string
+  source_text: string
+  source_layout_text: string
+  target_text: string
+  format_map: Record<string, [string, string]>
+  suggested_target_layout_text: string | null
+  original_target_layout_text: string | null
+  ai_error_status: string
+  ai_checked: boolean
+  applied: boolean
+  applied_at: string | null
+  status: 'pending' | 'open' | 'applied' | 'rejected' | 'failed'
+  can_apply: boolean
+  block_index: number
+  row_index: number | null
+  cell_index: number | null
+  created_at: string | null
+}
+
+export interface StyleTagCheckReport {
+  id: string
+  project_id: string | null
+  file_record_id: string | null
+  scope: string
+  file_ids: string[]
+  total_files: number
+  total_segments: number
+  candidate_count: number
+  applied_count: number
+  failed_count: number
+  ai_checked: boolean
+  status: string
+  created_at: string | null
+  items: StyleTagCheckReportItem[]
+}
+
+// ─── Translation Review ───────────────────────────────────
+
+export interface TranslationReviewReportItem {
+  id: string
+  report_id: string
+  file_record_id: string
+  sentence_id: string
+  file_name: string
+  file_order: number
+  display_index: number
+  category_key: string
+  category_index: number
+  category_label: string
+  rule_ref: string
+  severity: 'error' | 'warning' | 'suggestion'
+  origin: 'program' | 'ai'
+  source_text: string
+  target_text: string
+  quote: string
+  quote_start: number
+  quote_end: number
+  locate_status: 'ok' | 'normalized' | 'unlocatable' | 'ambiguous'
+  replace_anchor: string
+  suggested_value: string
+  suggested_target_text: string
+  reason: string
+  confidence: 'high' | 'medium' | 'low'
+  citations: Array<{ title?: string; url?: string; snippet?: string }>
+  apply_mode: 'anchor' | 'full' | 'manual'
+  applied: boolean
+  applied_at: string | null
+  apply_batch_id: string | null
+  status: 'open' | 'applied' | 'rejected' | 'ignored' | 'stale'
+  ignored_at: string | null
+  block_index: number
+  row_index: number | null
+  cell_index: number | null
+  created_at: string | null
+}
+
+export interface TranslationReviewAgentRun {
+  category_key: string
+  category_index: number
+  label: string
+  mode: string
+  input_segment_count: number
+  ai_input_count: number
+  program_finding_count: number
+  ai_finding_count: number
+  dropped_count: number
+  status: string
+  error_message: string
+  web_search_requests: number
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface TranslationReviewCategoryStat {
+  key: string
+  label: string
+  status: string
+  current: number
+  total: number
+  finding_count: number
+}
+
+export interface TranslationReviewProgress {
+  phase?: string
+  overall_percent: number
+  current_category?: string
+  current_file_name?: string
+  categories?: TranslationReviewCategoryStat[]
+  files?: Array<{ file_id: string; file_name: string; done_categories: number; total_categories: number; finding_count: number }>
+  updated_at?: string
+}
+
+export interface TranslationReviewReport {
+  id: string
+  project_id: string | null
+  file_record_id: string | null
+  merge_view_id: string | null
+  scope: 'file' | 'merge_view'
+  segment_scope: string
+  enabled_categories: string[]
+  file_ids: string[]
+  total_files: number
+  total_segments: number
+  checked_segments: number
+  category_counts: Record<string, number>
+  file_counts: Record<string, string>
+  issue_count: number
+  active_issue_count: number
+  applied_count: number
+  ignored_count: number
+  multi_category_segment_count: number
+  provider: string
+  model: string
+  web_verify_provider: string
+  web_search_requests: number
+  task_id: string
+  status: 'running' | 'completed' | 'partial_failed' | 'failed'
+  progress: TranslationReviewProgress
+  failed_categories: string[]
+  error_message: string
+  created_at: string | null
+  finished_at: string | null
+  items: TranslationReviewReportItem[]
+  agent_runs: TranslationReviewAgentRun[]
+}
+
 export interface ProjectSegmentSyncSummary {
   filled_count: number
   updated_count: number
@@ -710,6 +870,7 @@ export interface FileRecordDetail {
   id: string
   project_id: string | null
   filename: string
+  translated_filename?: string | null
   status: string
   active_operation: string | null
   active_operation_message: string
@@ -1171,6 +1332,14 @@ export interface TMEntryRecord {
   updated_at: string
 }
 
+export interface TermEntryMetadata {
+  origin?: 'online' | string
+  source_name?: string
+  source_url?: string
+  confidence?: number
+  note?: string
+}
+
 export interface TermEntryRecord {
   id: string
   term_base_id: string
@@ -1184,6 +1353,16 @@ export interface TermEntryRecord {
   last_modified_by_name?: string | null
   created_at: string
   updated_at: string
+  metadata?: TermEntryMetadata | null
+}
+
+export interface OnlineTermResult {
+  source_text: string
+  target_text: string
+  source_name: string
+  source_url: string
+  confidence: number
+  note: string
 }
 
 export interface GlossaryEntryRecord {

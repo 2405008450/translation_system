@@ -79,15 +79,10 @@ _SOURCE_ISSUE_SCHEMA = """{
 
 def _format_program_reason(result: CompareResult) -> str:
     """把数值不一致项拼成可读的错误原因。"""
-    parts: list[str] = []
-    for mismatch in result.mismatches:
-        cn = mismatch.get("cn")
-        en = mismatch.get("en")
-        cn_text = cn if cn is not None else "—"
-        en_text = en if en is not None else "—"
-        parts.append(f"原文[{cn_text}] ≠ 译文[{en_text}]")
+    parts = [str(mismatch.get("msg") or "") for mismatch in result.mismatches]
+    parts = [part for part in parts if part]
     if parts:
-        return "; ".join(parts)
+        return "；".join(parts)
     return "原文与译文数值不一致"
 
 

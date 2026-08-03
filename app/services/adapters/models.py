@@ -126,6 +126,13 @@ class Segment:
     block_path: str
     position: int
     metadata: dict = field(default_factory=dict)
+    # 版式原文：保留行内格式标签（⟦1⟧…⟦/1⟧）的带标签句子文本。
+    # 仅当来源段落存在 run 级格式差异时才非空，否则留空走无标签路径。
+    source_layout_text: str = ""
+    # 原文 HTML：把 run 级格式渲染为基础格式标签，供前端原文列展示样式。
+    source_html: str = ""
+    # 行内样式格式表：{标签 id / "base": [开 span, 闭 span]}，供前端按 ⟦n⟧ 标记渲染译文样式。
+    source_format_map: dict = field(default_factory=dict)
 
     @staticmethod
     def generate_id(block_path: str, position: int, content_hash: str) -> str:
@@ -145,6 +152,9 @@ class Segment:
             "block_path": self.block_path,
             "position": self.position,
             "metadata": self.metadata,
+            "source_layout_text": self.source_layout_text,
+            "source_html": self.source_html,
+            "source_format_map": self.source_format_map,
         }
 
     @classmethod
@@ -157,6 +167,9 @@ class Segment:
             block_path=data["block_path"],
             position=data["position"],
             metadata=data.get("metadata", {}),
+            source_layout_text=data.get("source_layout_text", ""),
+            source_html=data.get("source_html", ""),
+            source_format_map=data.get("source_format_map", {}) or {},
         )
 
 

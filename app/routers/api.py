@@ -65,6 +65,8 @@ from app.models import (
     Segment,
     SegmentQAIssue,
     SegmentRevision,
+    StyleTagCheckReport,
+    StyleTagCheckReportItem,
     TMCollection,
     TermQAReport,
     TermQAReportItem,
@@ -162,6 +164,7 @@ from app.services.file_record_service import (
     _can_auto_merge_stale_segment,
     apply_segment_status,
     backfill_file_record_source_html,
+    backfill_file_record_pptx_layout,
     batch_update_segments,
     calculate_file_record_progress,
     create_file_record_with_segments,
@@ -178,6 +181,7 @@ from app.services.file_record_service import (
     load_file_record_source,
     refresh_segment_display_indexes,
     resolve_file_record_status,
+    set_segment_target_layout_text,
     sync_file_record_status,
     update_segment_by_sentence_id,
     update_segment_source_text,
@@ -215,6 +219,7 @@ from app.services.llm_service import (
     LLMTranslationFailure,
     LLMTranslationTask,
     iter_batch_translate,
+    translate_filename as llm_translate_filename,
     validate_provider_choice,
 )
 from app.services.term_entry_service import build_term_entry_conflict_items, save_term_entries_batch
@@ -408,9 +413,43 @@ from app.services.number_check_service import (
     serialize_number_check_report,
     set_number_check_item_ignored,
 )
+from app.services.style_tag_check_service import (
+    aiter_style_tag_check_generation,
+    apply_all_style_tag_check_items,
+    apply_style_tag_check_item,
+    create_style_tag_check_report,
+    load_style_tag_check_items,
+    reject_style_tag_check_item,
+    restore_style_tag_check_item,
+    rerun_style_tag_check_item,
+    run_ai_style_tag_check_for_report,
+    serialize_style_tag_check_report,
+)
 from app.services.tm_vector import sync_tm_embeddings
 from app.services.translation_memory_service import TMUpsertEntry, batch_upsert_tm_entries
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
+from app.services.docx_report_exporter import (
+    build_docx_download_response as tr_build_docx_download_response,
+    build_translation_review_docx,
+)
+from app.services.translation_review.service import (
+    apply_batch as tr_apply_batch,
+    apply_item as tr_apply_item,
+    create_review_report,
+    extract_text_from_upload,
+    get_project_rules,
+    get_report as tr_get_report,
+    list_file_reports as tr_list_file_reports,
+    list_merge_view_reports as tr_list_merge_view_reports,
+    load_agent_runs as tr_load_agent_runs,
+    load_report_items as tr_load_report_items,
+    reject_item as tr_reject_item,
+    restore_item as tr_restore_item,
+    serialize_report as tr_serialize_report,
+    set_items_ignored as tr_set_items_ignored,
+    undo_batch as tr_undo_batch,
+    upload_project_rules,
+)
 
 try:
     from arq import create_pool as arq_create_pool
@@ -427,6 +466,7 @@ ARQ_MAINTENANCE_QUEUE_NAME = "arq:maintenance"
 ARQ_AUTO_TM_QUEUE_NAME = "arq:auto-tm"
 ARQ_SEGMENT_SYNC_QUEUE_NAME = "arq:segment-sync"
 ARQ_PRETRANSLATION_QUEUE_NAME = "arq:pretranslation"
+ARQ_TRANSLATION_REVIEW_QUEUE_NAME = "arq:translation-review"
 ARQ_AUTO_TM_BACKGROUND_JOB_ID = "auto-tm-background"
 ARQ_AUTO_TM_REMATCH_BACKGROUND_JOB_ID = "auto-tm-rematch-background"
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -1478,6 +1518,21 @@ class PretranslationWorkerSettings:
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
 
+def _build_translation_review_arq_settings():
+    """延迟导入避免循环依赖。"""
+    from app.services.translation_review.service import translation_review_job
+    return translation_review_job
+
+
+class TranslationReviewWorkerSettings:
+    """翻译内容校对 arq worker 配置。队列：arq:translation-review"""
+    queue_name = ARQ_TRANSLATION_REVIEW_QUEUE_NAME
+    keep_result = 0
+    max_jobs = 1
+    functions = [_build_translation_review_arq_settings()]
+    redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
+
+
 class WorkerSettings(MaintenanceWorkerSettings):
     pass
 
@@ -1494,6 +1549,11 @@ class SegmentUpdate(BaseModel):
 
 class SegmentSourceUpdate(BaseModel):
     source_text: str
+
+
+class SegmentTargetLayoutUpdate(BaseModel):
+    """人工标签编辑：只写带标签版式译文，绝不改动 target_text 本身。"""
+    target_layout_text: str = ""
 
 
 class LiveSpellingPreviewRequest(BaseModel):
@@ -5152,6 +5212,63 @@ def _get_llm_write_skip_reason(segment: Segment, task: LLMTranslationTask, scope
     return None
 
 
+def _segment_metadata_layout_text(segment: Any) -> str:
+    """从句段 segment_metadata 里取带行内格式标签的版式原文（PPTX 解析注入）。
+
+    无 DB 迁移方案：标签化版式原文随 segment_metadata JSON 落库，翻译阶段在此还原，
+    供 LLM 保留 run 级格式。解析失败或字段缺失时返回空串，回退到 display_text。
+    """
+    raw = getattr(segment, "segment_metadata", None)
+    if not raw:
+        return ""
+    try:
+        metadata = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("source_layout_text") or "")
+
+
+def _segment_metadata_format_map(segment: Any) -> dict:
+    """从句段 segment_metadata 取逐标记样式表（供前端渲染译文行内样式）。"""
+    raw = getattr(segment, "segment_metadata", None)
+    if not raw:
+        return {}
+    try:
+        metadata = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(metadata, dict):
+        return {}
+    format_map = metadata.get("source_layout_formats")
+    return format_map if isinstance(format_map, dict) else {}
+
+def _segment_metadata_target_layout_text(segment: Any) -> str:
+    """从句段 segment_metadata 取带标签版式译文（供前端只读样式预览/标签编辑）。
+
+    下发前校验有效性：strip(layout) 必须等于当前 target_text，否则说明译文已被改动，
+    标注已失效，不下发（前端展示纯译文，导出侧走兜底），避免预览与实际译文错位。
+    """
+    raw = getattr(segment, "segment_metadata", None)
+    if not raw:
+        return ""
+    try:
+        metadata = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(metadata, dict):
+        return ""
+    layout_text = str(metadata.get("target_layout_text") or "")
+    if not layout_text:
+        return ""
+
+    from app.services.adapters.pptx_inline_tags import is_target_layout_valid
+
+    target_text = str(getattr(segment, "target_text", "") or "")
+    return layout_text if is_target_layout_valid(target_text, layout_text) else ""
+
+
 def _build_llm_translation_tasks(
     db: Session,
     file_record_id: UUID,
@@ -5216,6 +5333,7 @@ def _build_llm_translation_tasks(
         matched_source_text = getattr(segment, "matched_source_text", None)
         source_layout_text = (
             getattr(segment, "source_layout_text", "")
+            or _segment_metadata_layout_text(segment)
             or getattr(segment, "display_text", "")
             or ""
         )
@@ -5965,7 +6083,7 @@ def _serialize_tm_collection(collection: MemoryBase, entry_count: int | None = N
         "created_at": collection.created_at.isoformat(),
         "updated_at": collection.updated_at.isoformat(),
         "entry_count": int(
-            getattr(collection, "entry_count", 0)
+            (getattr(collection, "entry_count", 0) or 0)
             if entry_count is None
             else entry_count
         ),
@@ -9108,6 +9226,821 @@ def ignore_all_number_check_report_items(
     return result
 
 
+class StyleTagCheckRecheckRequest(BaseModel):
+    item_ids: list[UUID] = Field(default_factory=list)
+
+
+def _get_style_tag_check_report_or_404(db: Session, report_id: UUID) -> StyleTagCheckReport:
+    report = (
+        db.query(StyleTagCheckReport)
+        .filter(StyleTagCheckReport.id == report_id)
+        .first()
+    )
+    if not report:
+        raise HTTPException(status_code=404, detail="样式标记专检报告不存在。")
+    return report
+
+
+def _get_style_tag_check_item_or_404(db: Session, item_id: UUID) -> StyleTagCheckReportItem:
+    item = (
+        db.query(StyleTagCheckReportItem)
+        .filter(StyleTagCheckReportItem.id == item_id)
+        .first()
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="样式标记专检报告项不存在。")
+    return item
+
+
+def _require_style_tag_check_report_read_access(
+    report: StyleTagCheckReport,
+    current_user: User,
+    db: Session,
+) -> None:
+    if report.file_record_id:
+        file_record = get_file_record_model(db, report.file_record_id)
+        if file_record:
+            _require_file_record_read_access(file_record, current_user)
+            return
+    if report.project_id:
+        project = db.query(Project).filter(Project.id == report.project_id).first()
+        if project:
+            _require_project_read_access(project, current_user, db)
+            return
+    if not can_access_all_projects(current_user):
+        raise HTTPException(status_code=403, detail="无权访问该样式标记专检报告。")
+
+
+def _require_style_tag_check_report_write_access(
+    db: Session,
+    report: StyleTagCheckReport,
+    current_user: User,
+) -> None:
+    file_ids = {
+        row.file_record_id
+        for row in db.query(StyleTagCheckReportItem.file_record_id)
+        .filter(StyleTagCheckReportItem.report_id == report.id)
+        .distinct()
+        .all()
+    }
+    for file_record_id in file_ids:
+        file_record = get_file_record_model(db, file_record_id)
+        if file_record is None:
+            continue
+        _require_file_record_work_access(file_record, current_user)
+
+
+@router.post("/file-records/{file_record_id}/style-tag-check-reports")
+async def create_file_record_style_tag_check_report(
+    file_record_id: UUID,
+    run_ai: bool = Query(default=True),
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    project = _resolve_file_record_project(db, file_record)
+    report = create_style_tag_check_report(
+        db,
+        project=project,
+        files=[file_record],
+        current_user=current_user,
+        scope="file",
+    )
+    if run_ai and report.candidate_count > 0:
+        await run_ai_style_tag_check_for_report(db, report, provider=provider, model=model)
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+def _build_style_tag_check_stream(
+    db: Session,
+    request: Request,
+    *,
+    project: Project | None,
+    files: list[FileRecord],
+    current_user: User,
+    scope: str,
+    provider: str,
+    model: str | None,
+):
+    async def event_stream():
+        report_id: str | None = None
+        try:
+            async for event in aiter_style_tag_check_generation(
+                db,
+                project=project,
+                files=files,
+                current_user=current_user,
+                scope=scope,
+                provider=provider,
+                model=model,
+            ):
+                if await request.is_disconnected():
+                    break
+                stage = event.get("stage")
+                if stage == "complete":
+                    report_id = event.get("report_id")
+                    break
+                yield _sse_event(stage, event)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("style-tag-check stream failed")
+            yield _sse_event("error", {"message": str(exc)})
+            return
+
+        if report_id is not None and not await request.is_disconnected():
+            report = _get_style_tag_check_report_or_404(db, UUID(report_id))
+            yield _sse_event(
+                "complete",
+                {"report": serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))},
+            )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/file-records/{file_record_id}/style-tag-check-reports/stream")
+async def stream_file_record_style_tag_check_report(
+    file_record_id: UUID,
+    request: Request,
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    project = _resolve_file_record_project(db, file_record)
+    return _build_style_tag_check_stream(
+        db,
+        request,
+        project=project,
+        files=[file_record],
+        current_user=current_user,
+        scope="file",
+        provider=provider,
+        model=model,
+    )
+
+
+@router.get("/file-records/{file_record_id}/style-tag-check-reports")
+def list_file_record_style_tag_check_reports(
+    file_record_id: UUID,
+    limit: int = 1,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    safe_limit = min(max(int(limit), 1), 20)
+    reports = (
+        db.query(StyleTagCheckReport)
+        .filter(StyleTagCheckReport.file_record_id == file_record_id)
+        .order_by(StyleTagCheckReport.created_at.desc(), StyleTagCheckReport.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+    return {
+        "items": [
+            serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+            for report in reports
+        ]
+    }
+
+
+@router.get("/style-tag-check-reports/{report_id}")
+def get_style_tag_check_report(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_style_tag_check_report_or_404(db, report_id)
+    _require_style_tag_check_report_read_access(report, current_user, db)
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+@router.post("/style-tag-check-reports/{report_id}/ai-recheck")
+async def recheck_style_tag_check_report(
+    report_id: UUID,
+    payload: StyleTagCheckRecheckRequest | None = None,
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_style_tag_check_report_or_404(db, report_id)
+    _require_style_tag_check_report_read_access(report, current_user, db)
+    item_ids = list(dict.fromkeys((payload.item_ids if payload else []) or [])) or None
+    await run_ai_style_tag_check_for_report(
+        db,
+        report,
+        item_ids=item_ids,
+        provider=provider,
+        model=model,
+    )
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+@router.post("/style-tag-check-report-items/{item_id}/rerun")
+async def rerun_style_tag_check_report_item(
+    item_id: UUID,
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_style_tag_check_item_or_404(db, item_id)
+    file_record = get_file_record_model(db, item.file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="对应文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
+    await rerun_style_tag_check_item(db, item, provider=provider, model=model)
+    report = _get_style_tag_check_report_or_404(db, item.report_id)
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+@router.patch("/style-tag-check-report-items/{item_id}/apply")
+def apply_style_tag_check_report_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_style_tag_check_item_or_404(db, item_id)
+    file_record = get_file_record_model(db, item.file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="对应文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
+    apply_style_tag_check_item(db, item)
+    report = _get_style_tag_check_report_or_404(db, item.report_id)
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+@router.patch("/style-tag-check-report-items/{item_id}/reject")
+def reject_style_tag_check_report_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_style_tag_check_item_or_404(db, item_id)
+    file_record = get_file_record_model(db, item.file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="对应文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
+    reject_style_tag_check_item(db, item)
+    report = _get_style_tag_check_report_or_404(db, item.report_id)
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+@router.patch("/style-tag-check-report-items/{item_id}/restore")
+def restore_style_tag_check_report_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_style_tag_check_item_or_404(db, item_id)
+    file_record = get_file_record_model(db, item.file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="对应文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
+    restore_style_tag_check_item(db, item)
+    report = _get_style_tag_check_report_or_404(db, item.report_id)
+    return serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+
+
+@router.post("/style-tag-check-reports/{report_id}/apply-all")
+def apply_all_style_tag_check_report_items(
+    report_id: UUID,
+    payload: StyleTagCheckRecheckRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_style_tag_check_report_or_404(db, report_id)
+    _require_style_tag_check_report_write_access(db, report, current_user)
+    item_ids = list(dict.fromkeys((payload.item_ids if payload else []) or [])) or None
+    applied_count = apply_all_style_tag_check_items(db, report, item_ids=item_ids)
+    db.refresh(report)
+    result = serialize_style_tag_check_report(report, load_style_tag_check_items(db, report.id))
+    result["applied_count"] = applied_count
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+# 翻译内容校对（Translation Review）端点
+# ─────────────────────────────────────────────────────────────
+
+class TranslationReviewTaskRequest(BaseModel):
+    segment_scope: str = "all"
+    provider: str = "auto"
+    model: str = ""
+
+
+class TranslationReviewIgnoreRequest(BaseModel):
+    item_ids: list[UUID]
+    ignored: bool
+
+
+class TranslationReviewApplyBatchRequest(BaseModel):
+    mode: str = "high_confidence"   # program | high_confidence | category | selected
+    category_key: str | None = None
+    item_ids: list[UUID] | None = None
+
+
+class TranslationReviewUndoBatchRequest(BaseModel):
+    apply_batch_id: UUID | None = None
+
+
+def _get_tr_report_or_404(db: Session, report_id: UUID) -> "TranslationReviewReport":
+    from app.models import TranslationReviewReport
+    report = db.query(TranslationReviewReport).filter(
+        TranslationReviewReport.id == report_id
+    ).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="校对报告不存在。")
+    return report
+
+
+def _get_tr_item_or_404(db: Session, item_id: UUID) -> "TranslationReviewReportItem":
+    from app.models import TranslationReviewReportItem
+    item = db.query(TranslationReviewReportItem).filter(
+        TranslationReviewReportItem.id == item_id
+    ).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="报告条目不存在。")
+    return item
+
+
+def _build_file_order_map(files: list["FileRecord"]) -> "dict[UUID, int]":
+    return {f.id: i for i, f in enumerate(files)}
+
+
+def _run_translation_review_background(
+    db: "Session",
+    report_id: "UUID",
+    files: list["FileRecord"],
+    file_order_map: "dict[UUID, int]",
+    segment_scope: str,
+    rules_text: str,
+    report_provider: str,
+    report_model: str,
+) -> None:
+    """本地后台回退（arq 未启用时）。"""
+    import asyncio as _asyncio
+    from app.models import TranslationReviewReport
+    from app.services.translation_review.service import run_review_with_rules
+    report = db.query(TranslationReviewReport).filter(
+        TranslationReviewReport.id == report_id
+    ).first()
+    if not report:
+        return
+    _asyncio.run(run_review_with_rules(
+        db, report, files, file_order_map, rules_text,
+        segment_scope=segment_scope,
+        provider=report_provider or "auto",
+        model=report_model or None,
+    ))
+
+
+@router.post("/projects/{project_id}/translation-rules")
+async def upload_translation_rules(
+    project_id: UUID,
+    file: UploadFile,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """上传项目翻译规则文件（.docx / .txt / .md），提取文本后存入项目。"""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    _require_project_read_access(project, current_user, db)
+
+    raw_bytes = await file.read()
+    if len(raw_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="文件过大，请上传 5MB 以内的规则文件。")
+
+    rules_text = extract_text_from_upload(file.filename or "", raw_bytes)
+    if not rules_text.strip():
+        raise HTTPException(status_code=400, detail="无法从文件中提取文本内容。")
+
+    updated = upload_project_rules(db, project_id, rules_text, file.filename or "")
+    return {
+        "project_id": str(project_id),
+        "filename": updated.translation_rules_filename,
+        "char_count": len(rules_text),
+        "updated_at": updated.translation_rules_updated_at.isoformat()
+                      if updated.translation_rules_updated_at else None,
+    }
+
+
+@router.get("/projects/{project_id}/translation-rules")
+def get_translation_rules(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """读取项目翻译规则信息。"""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    _require_project_read_access(project, current_user, db)
+    result = get_project_rules(db, project_id)
+    result["char_count"] = len(result.get("rules", ""))
+    result["project_id"] = str(project_id)
+    # 不把全文返回给前端（可能很长），只返回摘要
+    result["preview"] = (result.get("rules") or "")[:200]
+    del result["rules"]
+    return result
+
+
+@router.delete("/projects/{project_id}/translation-rules")
+def delete_translation_rules(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """清除项目翻译规则。"""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    _require_project_read_access(project, current_user, db)
+    project.translation_rules = ""
+    project.translation_rules_filename = ""
+    project.translation_rules_updated_at = None
+    db.commit()
+    return {"deleted": True}
+
+
+@router.post("/file-records/{file_record_id}/translation-review-tasks")
+async def create_file_translation_review_task(
+    file_record_id: UUID,
+    payload: TranslationReviewTaskRequest | None = None,
+    background_tasks: BackgroundTasks = ...,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    body = payload or TranslationReviewTaskRequest()
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    project = _resolve_file_record_project(db, file_record)
+    # 从项目读取规则文本
+    rules_text = (project.translation_rules or "") if project else ""
+    if not rules_text.strip():
+        raise HTTPException(status_code=400, detail="当前项目尚未上传翻译规则文件，请先在项目设置中上传后再开始校对。")
+    files = [file_record]
+    file_order_map = _build_file_order_map(files)
+
+    report = create_review_report(
+        db,
+        project=project,
+        files=files,
+        file_order_map=file_order_map,
+        merge_view=None,
+        current_user=current_user,
+        segment_scope=body.segment_scope,
+        provider=body.provider,
+        model=body.model,
+    )
+    db.commit()
+
+    enqueued = await _enqueue_arq_job(
+        "translation_review_job",
+        str(report.id),
+        queue_name=ARQ_TRANSLATION_REVIEW_QUEUE_NAME,
+    )
+    if not enqueued:
+        background_tasks.add_task(
+            _run_translation_review_background,
+            db, report.id, files, file_order_map,
+            body.segment_scope, rules_text,
+            report.provider, report.model,
+        )
+
+    return {"task_id": str(report.id), "report_id": str(report.id)}
+
+
+@router.get("/file-records/{file_record_id}/translation-review-reports")
+def list_file_translation_review_reports(
+    file_record_id: UUID,
+    limit: int = 1,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    reports = tr_list_file_reports(db, file_record_id, limit=limit)
+    return {
+        "items": [
+            tr_serialize_report(r, tr_load_report_items(db, r.id), tr_load_agent_runs(db, r.id))
+            for r in reports
+        ]
+    }
+
+
+@router.get("/translation-review-tasks/{task_id}")
+def get_translation_review_task(
+    task_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_tr_report_or_404(db, task_id)
+    return {
+        "status": report.status,
+        "report_id": str(report.id),
+        "progress": json.loads(report.progress or "{}"),
+        "error_message": report.error_message,
+    }
+
+
+@router.get("/translation-review-reports/{report_id}")
+def get_translation_review_report(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_tr_report_or_404(db, report_id)
+    return tr_serialize_report(
+        report,
+        tr_load_report_items(db, report_id),
+        tr_load_agent_runs(db, report_id),
+    )
+
+
+@router.post("/translation-review-report-items/{item_id}/apply")
+def apply_translation_review_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_tr_item_or_404(db, item_id)
+    result_status = tr_apply_item(db, item, current_user)
+    db.commit()
+    return {"status": result_status}
+
+
+@router.post("/translation-review-report-items/{item_id}/restore")
+def restore_translation_review_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_tr_item_or_404(db, item_id)
+    success = tr_restore_item(db, item, current_user)
+    db.commit()
+    return {"success": success}
+
+
+@router.post("/translation-review-report-items/{item_id}/reject")
+def reject_translation_review_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_tr_item_or_404(db, item_id)
+    tr_reject_item(db, item)
+    db.commit()
+    return {"status": "rejected"}
+
+
+@router.patch("/translation-review-report-items/ignore")
+def ignore_translation_review_items(
+    payload: TranslationReviewIgnoreRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not payload.item_ids:
+        raise HTTPException(status_code=400, detail="请选择要操作的条目。")
+    changed = tr_set_items_ignored(db, payload.item_ids, payload.ignored, current_user)
+    db.commit()
+    return {"changed_count": changed}
+
+
+@router.post("/translation-review-reports/{report_id}/apply-batch")
+def apply_translation_review_batch(
+    report_id: UUID,
+    payload: TranslationReviewApplyBatchRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_tr_report_or_404(db, report_id)
+    result = tr_apply_batch(
+        db,
+        report_id=report.id,
+        mode=payload.mode,
+        current_user=current_user,
+        category_key=payload.category_key,
+        item_ids=payload.item_ids,
+    )
+    return result
+
+
+@router.post("/translation-review-reports/{report_id}/undo-batch")
+def undo_translation_review_batch(
+    report_id: UUID,
+    payload: TranslationReviewUndoBatchRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_tr_report_or_404(db, report_id)
+    body = payload or TranslationReviewUndoBatchRequest()
+    result = tr_undo_batch(db, report.id, current_user, apply_batch_id=body.apply_batch_id)
+    return result
+
+
+# ─── 合并视图变体 ─────────────────────────────────────────
+
+@router.post("/merge-views/{view_id}/translation-review-tasks")
+async def create_merge_view_translation_review_task(
+    view_id: UUID,
+    payload: TranslationReviewTaskRequest | None = None,
+    background_tasks: BackgroundTasks = ...,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    body = payload or TranslationReviewTaskRequest()
+    view, project, files = _get_merge_view_context(db, view_id, current_user)
+    rules_text = (project.translation_rules or "") if project else ""
+    if not rules_text.strip():
+        raise HTTPException(status_code=400, detail="当前项目尚未上传翻译规则文件，请先在项目设置中上传后再开始校对。")
+    file_order_map = _build_file_order_map(files)
+
+    report = create_review_report(
+        db,
+        project=project,
+        files=files,
+        file_order_map=file_order_map,
+        merge_view=view,
+        current_user=current_user,
+        segment_scope=body.segment_scope,
+        provider=body.provider,
+        model=body.model,
+    )
+    db.commit()
+
+    enqueued = await _enqueue_arq_job(
+        "translation_review_job",
+        str(report.id),
+        queue_name=ARQ_TRANSLATION_REVIEW_QUEUE_NAME,
+    )
+    if not enqueued:
+        background_tasks.add_task(
+            _run_translation_review_background,
+            db, report.id, files, file_order_map,
+            body.segment_scope, rules_text,
+            report.provider, report.model,
+        )
+
+    return {"task_id": str(report.id), "report_id": str(report.id)}
+
+
+@router.get("/merge-views/{view_id}/translation-review-reports")
+def list_merge_view_translation_review_reports(
+    view_id: UUID,
+    limit: int = 1,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    view, _project, _files = _get_merge_view_context(db, view_id, current_user)
+    reports = tr_list_merge_view_reports(db, view.id, limit=limit)
+    return {
+        "items": [
+            tr_serialize_report(r, tr_load_report_items(db, r.id), tr_load_agent_runs(db, r.id))
+            for r in reports
+        ]
+    }
+
+
+@router.get("/translation-review-reports/{report_id}/export-docx")
+def export_translation_review_report_docx(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_tr_report_or_404(db, report_id)
+    items = tr_load_report_items(db, report_id)
+    runs = tr_load_agent_runs(db, report_id)
+    report_data = tr_serialize_report(report, items, runs)
+    items_data = report_data.pop("items", [])
+    runs_data = report_data.pop("agent_runs", [])
+    docx_bytes = build_translation_review_docx(report_data, items_data, runs_data)
+    safe_name = f"review-{str(report_id)[:8]}.docx"
+    if report.scope == "file" and report.file_record_id:
+        file_record = db.query(FileRecord).filter(FileRecord.id == report.file_record_id).first()
+        if file_record and file_record.filename:
+            base = file_record.filename.rsplit(".", 1)[0] if "." in file_record.filename else file_record.filename
+            safe_name = f"{base}-校对报告.docx"
+    return tr_build_docx_download_response(safe_name, docx_bytes)
+
+
+class TranslationReviewRerunRequest(BaseModel):
+    category_keys: list[str] | None = None
+    item_ids: list[UUID] | None = None
+
+
+@router.post("/translation-review-reports/{report_id}/rerun")
+async def rerun_translation_review_report(
+    report_id: UUID,
+    payload: TranslationReviewRerunRequest | None = None,
+    background_tasks: BackgroundTasks = ...,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """全量重跑（清空旧 items 后重新检查）。"""
+    from app.models import TranslationReviewReport, TranslationReviewReportItem
+    report = _get_tr_report_or_404(db, report_id)
+
+    # 清空旧结果
+    report.status = "running"
+    report.error_message = ""
+    db.query(TranslationReviewReportItem).filter(
+        TranslationReviewReportItem.report_id == report_id
+    ).delete(synchronize_session="fetch")
+    db.commit()
+
+    files: list[FileRecord] = []
+    if report.scope == "merge_view" and report.merge_view_id:
+        from app.models import ProjectMergeView
+        from app.services.merge_view_service import load_view_file_records
+        view = db.query(ProjectMergeView).filter(ProjectMergeView.id == report.merge_view_id).first()
+        if view:
+            _, project, files = _get_merge_view_context(db, view.id, current_user)
+    else:
+        if report.file_record_id:
+            fr = db.query(FileRecord).filter(FileRecord.id == report.file_record_id).first()
+            files = [fr] if fr else []
+
+    project = _resolve_file_record_project(db, files[0]) if files else None
+    rules_text = (project.translation_rules or "") if project else ""
+    file_order_map = {f.id: i for i, f in enumerate(files)}
+
+    enqueued = await _enqueue_arq_job(
+        "translation_review_job",
+        str(report_id),
+        queue_name=ARQ_TRANSLATION_REVIEW_QUEUE_NAME,
+    )
+    if not enqueued:
+        background_tasks.add_task(
+            _run_translation_review_background,
+            db, report_id, files, file_order_map,
+            report.segment_scope or "all",
+            rules_text,
+            report.provider or "auto",
+            report.model or "",
+        )
+    return {"task_id": str(report_id), "report_id": str(report_id)}
+
+
+@router.get("/translation-review-reports/{report_id}/export-xlsx")
+def export_translation_review_report_xlsx(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_tr_report_or_404(db, report_id)
+    items = tr_load_report_items(db, report_id)
+    rows = [
+        [
+            item.sentence_id,
+            item.file_name,
+            item.category_key,
+            item.rule_ref,
+            item.severity,
+            item.origin,
+            item.source_text,
+            item.target_text,
+            item.quote,
+            item.reason,
+            item.suggested_value,
+            item.confidence,
+            item.status,
+            item.applied_at.isoformat() if item.applied_at else "",
+        ]
+        for item in items
+    ]
+    xlsx_bytes = build_tabular_xlsx(
+        sheet_title="翻译校对结果",
+        headers=["句段ID", "文件", "类别", "规则", "严重程度", "来源", "原文", "译文", "问题片段", "问题说明", "修改建议", "置信度", "状态", "应用时间"],
+        rows=rows,
+    )
+    return build_xlsx_download_response(f"review-{str(report_id)[:8]}.xlsx", xlsx_bytes)
+
+
 @router.get("/projects/{project_id}")
 def get_project_detail(
     project_id: UUID,
@@ -10096,6 +11029,8 @@ def _serialize_workbench_segment(
     source_layout_text = getattr(seg, "source_layout_text", "") or ""
     if not source_layout_text and "\n" in (seg.display_text or ""):
         source_layout_text = seg.display_text or ""
+    source_format_map = _segment_metadata_format_map(seg)
+    target_layout_text = _segment_metadata_target_layout_text(seg)
     resolved_workflow_step_id = seg.workflow_step_id
     if resolved_workflow_step_id is None and workflow_step_by_id:
         resolved_workflow_step_id = next(iter(workflow_step_by_id.keys()), None)
@@ -10122,6 +11057,8 @@ def _serialize_workbench_segment(
         "display_text": seg.display_text,
         "source_body_text": seg.source_text,
         "source_layout_text": source_layout_text or None,
+        "source_format_map": source_format_map or None,
+        "target_layout_text": target_layout_text or None,
         "automatic_numbering_text": automatic_numbering_text or None,
         "target_automatic_numbering_text": target_automatic_numbering_text or None,
         "source_html": seg.source_html,
@@ -11083,7 +12020,7 @@ def get_file_record(
     if clear_stale_file_operation_lock(db, file_record):
         db.commit()
         db.refresh(file_record)
-    if backfill_file_record_source_html(db, file_record):
+    if backfill_file_record_source_html(db, file_record) or backfill_file_record_pptx_layout(db, file_record):
         db.commit()
         result = get_file_record_with_segments(
             db,
@@ -11180,6 +12117,7 @@ def get_file_record(
         "id": file_record.id,
         "project_id": str(file_record.project_id) if file_record.project_id else None,
         "filename": file_record.filename,
+        "translated_filename": getattr(file_record, "translated_filename", None),
         "status": file_record.status,
         "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
         "document_parse_options": _get_file_record_document_parse_options(file_record),
@@ -13913,6 +14851,69 @@ def update_segment_source(
     }
 
 
+@router.put("/file-records/{file_record_id}/segments/{sentence_id}/target-layout")
+@router.put("/documents/{file_record_id}/segments/{sentence_id}/target-layout", include_in_schema=False)
+def update_segment_target_layout(
+    file_record_id: UUID,
+    sentence_id: str,
+    update: SegmentTargetLayoutUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    """人工标签编辑：写入/清除带标签版式译文（target_layout_text）。
+
+    只用于“选中译文加/删样式标签”，绝不改动 target_text 本身——不产生 revision、
+    不改 version，和译文编辑完全解耦。写入前做两道强制校验：
+    1. 剥标签后必须与当前 target_text 逐字相同（不允许借道改写译文）；
+    2. 标签结构必须合法（扁平成对、每个 id 最多一次、id 必须来自该句段的样式表），
+       与导出端使用的是同一套规则，校验通过即保证导出时一定能重建。
+    传空串等价于清除标注。
+    """
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not segment:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+    _require_segment_work_access(db, file_record, segment, current_user)
+
+    from app.services.adapters.pptx_inline_tags import (
+        sanitize_tagged_text,
+        strip_format_tags,
+        validate_tagged_text_structure,
+    )
+
+    layout_text = sanitize_tagged_text(update.target_layout_text or "")
+    if layout_text:
+        current_target_text = segment.target_text or ""
+        if strip_format_tags(layout_text) != current_target_text:
+            raise HTTPException(
+                status_code=400,
+                detail="标签内容与当前译文不一致：只能在原有文字上增删标签，不能改动译文本身。",
+            )
+        format_map = _segment_metadata_format_map(segment)
+        valid_ids = {int(key) for key in format_map.keys() if key != "base" and key.isdigit()}
+        if not validate_tagged_text_structure(layout_text, valid_ids):
+            raise HTTPException(
+                status_code=400,
+                detail="标签结构不合法：需成对出现、不可交叉嵌套，且标签编号必须来自该句段的可用样式。",
+            )
+
+    set_segment_target_layout_text(segment, layout_text)
+    db.commit()
+    db.refresh(segment)
+    publish_segment_changes([file_record_id])
+
+    return {
+        "sentence_id": segment.sentence_id,
+        "target_text": segment.target_text,
+        "target_layout_text": layout_text or None,
+    }
+
+
 @router.patch("/file-records/{file_record_id}/segments/{sentence_id}/project-sync")
 def update_segment_project_sync(
     file_record_id: UUID,
@@ -15408,6 +16409,57 @@ def save_file_record_extracted_terms(
     )
 
 
+class TranslateFilenameRequest(BaseModel):
+    provider: Literal["auto", "deepseek", "openrouter"] = "openrouter"
+    model: str | None = Field(default=None, max_length=120)
+
+
+@router.post("/file-records/{file_record_id}/translate-filename")
+async def translate_file_record_filename(
+    file_record_id: UUID,
+    payload: TranslateFilenameRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    """使用 LLM 翻译文件名，写回 translated_filename，导出时可选用作为输出文件名。"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    _require_file_record_work_access(file_record, current_user)
+    ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
+    source_language, target_language = _resolve_file_record_language_pair(file_record)
+
+    body = payload or TranslateFilenameRequest()
+    requested_model = normalize_text(body.model or "") or None
+    try:
+        validate_provider_choice(body.provider, model_override=requested_model)
+    except LLMConfigurationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    source_filename = get_file_record_source_filename(file_record)
+    try:
+        translated_filename = await llm_translate_filename(
+            source_filename,
+            source_language,
+            target_language,
+            provider=body.provider,
+            model_override=requested_model,
+        )
+    except LLMRequestError as exc:
+        raise HTTPException(status_code=502, detail=f"文件名翻译失败：{exc}") from exc
+
+    file_record.translated_filename = translated_filename
+    db.commit()
+
+    return {
+        "file_record_id": str(file_record_id),
+        "filename": file_record.filename,
+        "translated_filename": translated_filename,
+    }
+
+
 @router.post("/file-records/{file_record_id}/llm-translate")
 @router.post("/documents/{file_record_id}/llm-translate", include_in_schema=False)
 async def llm_translate_file_record(
@@ -15584,6 +16636,9 @@ async def llm_translate_file_record(
                     try:
                         with fdb.begin_nested():
                             before_text = segment.target_text
+                            # 翻译链路彻底不感知行内格式标签：模型只收纯文本、只回纯文本，
+                            # 这里不再拆分，也绝不触碰 target_layout_text（它只由样式标记
+                            # 检查/人工标签编辑写入，翻译写回不应清空既有标注）。
                             translated_text = (
                                 strip_automatic_numbering_prefix(
                                     result.translated_text,

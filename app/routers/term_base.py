@@ -37,6 +37,8 @@ from app.services.resource_export_queue import (
     ensure_export_task_status,
     queue_resource_export,
 )
+from app.services.llm_service import LLMConfigurationError, LLMRequestError
+from app.services.online_term_service import query_online_terms
 from app.services.term_entry_service import (
     build_term_entry_conflict_items,
     save_term_entries_batch,
@@ -100,6 +102,7 @@ class TermEntryUpdatePayload(BaseModel):
     source_text: str
     target_text: str
     file_record_id: UUID | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class TermEntryDraftPayload(BaseModel):
@@ -114,6 +117,11 @@ class TermEntryConflictPayload(BaseModel):
 
 class TermEntryBatchPayload(BaseModel):
     entries: list[TermEntryDraftPayload]
+
+
+class OnlineTermQueryPayload(BaseModel):
+    source_text: str
+    sources: list[str] = []
 
 
 def _normalize_term_base_name(name: str) -> str:
@@ -241,6 +249,7 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
         "last_modified_by_name": last_modified_by_name,
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
+        "metadata": entry.tmx_metadata if isinstance(entry.tmx_metadata, dict) else None,
     }
 
 
@@ -1135,6 +1144,40 @@ async def import_term_base_xlsx(
         raise
 
 
+@router.post("/term-bases/{term_base_id}/online-query")
+async def query_term_base_online(
+    term_base_id: UUID,
+    payload: OnlineTermQueryPayload,
+    db: Session = Depends(get_db),
+):
+    term_base = _get_term_base_or_404(db, term_base_id)
+    source_text = normalize_text(payload.source_text)[:2000]
+    if not source_text:
+        raise HTTPException(status_code=400, detail="联网查询内容不能为空。")
+
+    try:
+        items = await query_online_terms(
+            source_text=source_text,
+            source_language=term_base.source_language,
+            target_language=term_base.target_language,
+            sources=payload.sources,
+        )
+    except LLMConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except LLMRequestError as exc:
+        raise HTTPException(status_code=502, detail=f"联网术语查询失败：{exc}") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return {
+        "query": source_text,
+        "items": items,
+        "source_language": term_base.source_language,
+        "target_language": term_base.target_language,
+        "read_only": True,
+    }
+
+
 @router.post("/term-bases/{term_base_id}/entries/conflicts")
 def check_term_base_entry_conflicts(
     term_base_id: UUID,
@@ -1321,6 +1364,21 @@ def create_term_base_entry(
     if duplicate is not None:
         raise HTTPException(status_code=409, detail="当前术语库中已存在相同原文的术语条目。")
 
+    entry_metadata = None
+    if payload.metadata and payload.metadata.get("origin") == "online":
+        raw_confidence = payload.metadata.get("confidence", 0.0)
+        try:
+            confidence = max(0.0, min(float(raw_confidence), 1.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        entry_metadata = {
+            "origin": "online",
+            "source_name": str(payload.metadata.get("source_name") or "Web")[:100],
+            "source_url": str(payload.metadata.get("source_url") or "")[:2000],
+            "confidence": confidence,
+            "note": str(payload.metadata.get("note") or "")[:500],
+        }
+
     entry = TermEntry(
         term_base_id=term_base.id,
         source_text=source_text,
@@ -1330,6 +1388,7 @@ def create_term_base_entry(
         target_language=term_base.target_language,
         creator_id=current_user.id,
         last_modified_by_id=current_user.id,
+        tmx_metadata=entry_metadata,
     )
     db.add(entry)
     db.commit()

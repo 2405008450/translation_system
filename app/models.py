@@ -56,6 +56,16 @@ class Project(Base):
     auto_tm_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("true")
     )
+    # 项目级翻译校对规则（从上传文件提取的纯文本）
+    translation_rules: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=text("''")
+    )
+    translation_rules_filename: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default=text("''")
+    )
+    translation_rules_updated_at: Mapped[DateTime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -197,6 +207,7 @@ class FileRecord(Base):
         nullable=True,
     )
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    translated_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
     file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
     document_parse_mode: Mapped[str] = mapped_column(
@@ -1343,6 +1354,126 @@ class NumberCheckReportItem(Base):
     file_record: Mapped["FileRecord"] = relationship("FileRecord")
     segment: Mapped["Segment | None"] = relationship("Segment")
     ignored_by: Mapped["User | None"] = relationship("User", foreign_keys=[ignored_by_id])
+
+
+class StyleTagCheckReport(Base):
+    """样式标记专检报告：对多样式句段做 AI 标签标注（写入 target_layout_text）。"""
+
+    __tablename__ = "style_tag_check_reports"
+    __table_args__ = (
+        Index("ix_style_tag_check_reports_project_id", "project_id"),
+        Index("ix_style_tag_check_reports_file_record_id", "file_record_id"),
+        Index("ix_style_tag_check_reports_created_by_id", "created_by_id"),
+        Index("ix_style_tag_check_reports_created_at", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    file_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    scope: Mapped[str] = mapped_column(String(20), nullable=False, default="file")
+    file_ids: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    total_files: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    total_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    candidate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    applied_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    ai_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="completed", server_default=text("'completed'"))
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    project: Mapped["Project | None"] = relationship("Project")
+    file_record: Mapped["FileRecord | None"] = relationship("FileRecord")
+    created_by: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+    items: Mapped[list["StyleTagCheckReportItem"]] = relationship(
+        "StyleTagCheckReportItem",
+        back_populates="report",
+        cascade="all, delete-orphan",
+    )
+
+
+class StyleTagCheckReportItem(Base):
+    """样式标记专检明细：单个多样式句段的 AI 标注建议与应用状态。"""
+
+    __tablename__ = "style_tag_check_report_items"
+    __table_args__ = (
+        Index("ix_style_tag_check_report_items_report_id", "report_id"),
+        Index("ix_style_tag_check_report_items_project_id", "project_id"),
+        Index("ix_style_tag_check_report_items_file_record_id", "file_record_id"),
+        Index("ix_style_tag_check_report_items_segment_id", "segment_id"),
+        Index("ix_style_tag_check_report_items_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    report_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("style_tag_check_reports.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    segment_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("segments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    source_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    source_layout_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    target_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    # {标签 id / "base": [开span, 闭span]} 的 JSON，供审校面板渲染样式预览
+    format_map: Mapped[str] = mapped_column(Text, nullable=False, default="{}", server_default=text("'{}'"))
+    suggested_target_layout_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    original_target_layout_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    ai_error_status: Mapped[str] = mapped_column(String(40), nullable=False, default="", server_default=text("''"))
+    ai_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    applied_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default=text("'pending'"))
+    block_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    row_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cell_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    report: Mapped["StyleTagCheckReport"] = relationship("StyleTagCheckReport", back_populates="items")
+    project: Mapped["Project | None"] = relationship("Project")
+    file_record: Mapped["FileRecord"] = relationship("FileRecord")
+    segment: Mapped["Segment | None"] = relationship("Segment")
 
 
 class SegmentQAIssue(Base):
@@ -2533,3 +2664,252 @@ class ReferenceFile(Base):
     profile: Mapped["ReferenceProfile"] = relationship(
         "ReferenceProfile", back_populates="reference_files"
     )
+
+
+class PptxLayoutReport(Base):
+    """PPTX 版式优化报告：记录一次导出后处理的整体情况与参数。"""
+
+    __tablename__ = "pptx_layout_reports"
+    __table_args__ = (
+        Index("ix_pptx_layout_reports_file_record_id", "file_record_id"),
+        Index("ix_pptx_layout_reports_created_by_id", "created_by_id"),
+        Index("ix_pptx_layout_reports_created_at", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    file_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    export_task_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    export_type: Mapped[str] = mapped_column(String(40), nullable=False, default="", server_default=text("''"))
+    filename: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default=text("''"))
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default=text("''"))
+    provider: Mapped[str] = mapped_column(String(40), nullable=False, default="", server_default=text("''"))
+    model: Mapped[str] = mapped_column(String(120), nullable=False, default="", server_default=text("''"))
+    total_candidates: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    adjusted_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    vlm_used: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="completed", server_default=text("'completed'"))
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    file_record: Mapped["FileRecord | None"] = relationship("FileRecord")
+    created_by: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+    items: Mapped[list["PptxLayoutReportItem"]] = relationship(
+        "PptxLayoutReportItem",
+        back_populates="report",
+        cascade="all, delete-orphan",
+    )
+
+
+class PptxLayoutReportItem(Base):
+    """PPTX 版式优化报告项：单个文本框的 AI 判断与实际调整结果。"""
+
+    __tablename__ = "pptx_layout_report_items"
+    __table_args__ = (
+        Index("ix_pptx_layout_report_items_report_id", "report_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    report_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("pptx_layout_reports.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    slide_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    tag: Mapped[str] = mapped_column(String(40), nullable=False, default="", server_default=text("''"))
+    uid: Mapped[str] = mapped_column(String(80), nullable=False, default="", server_default=text("''"))
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default=text("''"))
+    source_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    orig_left: Mapped[float | None] = mapped_column(Float, nullable=True)
+    orig_top: Mapped[float | None] = mapped_column(Float, nullable=True)
+    orig_width: Mapped[float | None] = mapped_column(Float, nullable=True)
+    orig_height: Mapped[float | None] = mapped_column(Float, nullable=True)
+    new_left: Mapped[float | None] = mapped_column(Float, nullable=True)
+    new_top: Mapped[float | None] = mapped_column(Float, nullable=True)
+    new_width: Mapped[float | None] = mapped_column(Float, nullable=True)
+    new_height: Mapped[float | None] = mapped_column(Float, nullable=True)
+    overflow_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    font_scale: Mapped[float | None] = mapped_column(Float, nullable=True)
+    applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    report: Mapped["PptxLayoutReport"] = relationship("PptxLayoutReport", back_populates="items")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 翻译内容校对（Translation Review）
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TranslationReviewReport(Base):
+    __tablename__ = "translation_review_reports"
+    __table_args__ = (
+        Index("ix_translation_review_reports_project_id", "project_id"),
+        Index("ix_translation_review_reports_file_record_id", "file_record_id"),
+        Index("ix_translation_review_reports_merge_view_id", "merge_view_id"),
+        Index("ix_translation_review_reports_created_by_id", "created_by_id"),
+        Index("ix_translation_review_reports_task_id", "task_id"),
+        Index("ix_translation_review_reports_created_at", "created_at"),
+        Index("ix_translation_review_reports_scope_created_at", "scope", "created_at"),
+        Index("ix_translation_review_reports_merge_view_created_at", "merge_view_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=UUID_SQL_DEFAULT)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True)
+    file_record_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("file_records.id", ondelete="CASCADE"), nullable=True)
+    merge_view_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("project_merge_views.id", ondelete="CASCADE"), nullable=True)
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    scope: Mapped[str] = mapped_column(String(20), nullable=False, default="file", server_default=text("'file'"))
+    segment_scope: Mapped[str] = mapped_column(String(30), nullable=False, default="all", server_default=text("'all'"))
+    enabled_categories: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    file_ids: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    total_files: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    total_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    checked_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    category_counts: Mapped[str] = mapped_column(Text, nullable=False, default="{}", server_default=text("'{}'"))
+    file_counts: Mapped[str] = mapped_column(Text, nullable=False, default="{}", server_default=text("'{}'"))
+    issue_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    active_issue_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    applied_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    ignored_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    multi_category_segment_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    provider: Mapped[str] = mapped_column(String(40), nullable=False, default="", server_default=text("''"))
+    model: Mapped[str] = mapped_column(String(200), nullable=False, default="", server_default=text("''"))
+    web_verify_provider: Mapped[str] = mapped_column(String(20), nullable=False, default="none", server_default=text("'none'"))
+    web_search_requests: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default=text("''"))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="running", server_default=text("'running'"))
+    progress: Mapped[str] = mapped_column(Text, nullable=False, default="{}", server_default=text("'{}'"))
+    failed_categories: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+    finished_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+
+    project: Mapped["Project | None"] = relationship("Project")
+    file_record: Mapped["FileRecord | None"] = relationship("FileRecord")
+    merge_view: Mapped["ProjectMergeView | None"] = relationship("ProjectMergeView")
+    created_by: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+    items: Mapped[list["TranslationReviewReportItem"]] = relationship(
+        "TranslationReviewReportItem", back_populates="report", cascade="all, delete-orphan",
+    )
+    agent_runs: Mapped[list["TranslationReviewAgentRun"]] = relationship(
+        "TranslationReviewAgentRun", back_populates="report", cascade="all, delete-orphan",
+    )
+
+
+class TranslationReviewReportItem(Base):
+    __tablename__ = "translation_review_report_items"
+    __table_args__ = (
+        Index("ix_translation_review_report_items_report_id", "report_id"),
+        Index("ix_translation_review_report_items_project_id", "project_id"),
+        Index("ix_translation_review_report_items_file_record_id", "file_record_id"),
+        Index("ix_translation_review_report_items_segment_id", "segment_id"),
+        Index("ix_translation_review_report_items_category_key", "category_key"),
+        Index("ix_translation_review_report_items_status", "status"),
+        Index("ix_translation_review_report_items_report_sentence", "report_id", "sentence_id"),
+        Index("ix_translation_review_report_items_apply_batch_id", "apply_batch_id"),
+        Index(
+            "ix_translation_review_report_items_sort_order",
+            "report_id", "file_order", "block_index", "row_index",
+            "cell_index", "sequence_index", "sentence_id", "category_index",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=UUID_SQL_DEFAULT)
+    report_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("translation_review_reports.id", ondelete="CASCADE"), nullable=False)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True)
+    file_record_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("file_records.id", ondelete="CASCADE"), nullable=False)
+    segment_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("segments.id", ondelete="SET NULL"), nullable=True)
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False, default="", server_default=text("''"))
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default=text("''"))
+    file_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    display_index: Mapped[int] = mapped_column(Integer, nullable=False, default=-1, server_default=text("-1"))
+    sequence_index: Mapped[int] = mapped_column(Integer, nullable=False, default=-1, server_default=text("-1"))
+    category_key: Mapped[str] = mapped_column(String(40), nullable=False, default="", server_default=text("''"))
+    category_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    rule_ref: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default=text("''"))
+    severity: Mapped[str] = mapped_column(String(20), nullable=False, default="error", server_default=text("'error'"))
+    origin: Mapped[str] = mapped_column(String(10), nullable=False, default="ai", server_default=text("'ai'"))
+    source_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    target_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    quote: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    quote_start: Mapped[int] = mapped_column(Integer, nullable=False, default=-1, server_default=text("-1"))
+    quote_end: Mapped[int] = mapped_column(Integer, nullable=False, default=-1, server_default=text("-1"))
+    locate_status: Mapped[str] = mapped_column(String(20), nullable=False, default="ok", server_default=text("'ok'"))
+    replace_anchor: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    suggested_value: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    suggested_target_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    confidence: Mapped[str] = mapped_column(String(10), nullable=False, default="medium", server_default=text("'medium'"))
+    citations: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    apply_mode: Mapped[str] = mapped_column(String(10), nullable=False, default="manual", server_default=text("'manual'"))
+    original_target_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    applied_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    apply_batch_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open", server_default=text("'open'"))
+    ignored_by_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    ignored_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    block_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    row_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cell_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+
+    report: Mapped["TranslationReviewReport"] = relationship("TranslationReviewReport", back_populates="items")
+    project: Mapped["Project | None"] = relationship("Project")
+    file_record: Mapped["FileRecord"] = relationship("FileRecord")
+    segment: Mapped["Segment | None"] = relationship("Segment")
+    ignored_by: Mapped["User | None"] = relationship("User", foreign_keys=[ignored_by_id])
+
+
+class TranslationReviewAgentRun(Base):
+    __tablename__ = "translation_review_agent_runs"
+    __table_args__ = (
+        Index("ix_translation_review_agent_runs_report_id", "report_id"),
+        Index("ix_translation_review_agent_runs_report_category", "report_id", "category_key"),
+        Index("ix_translation_review_agent_runs_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=UUID_SQL_DEFAULT)
+    report_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("translation_review_reports.id", ondelete="CASCADE"), nullable=False)
+    category_key: Mapped[str] = mapped_column(String(40), nullable=False, default="", server_default=text("''"))
+    category_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default=text("''"))
+    input_segment_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    ai_input_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    batch_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    llm_request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    web_search_requests: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    program_finding_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    ai_finding_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    dropped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="ok", server_default=text("'ok'"))
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    provider: Mapped[str] = mapped_column(String(40), nullable=False, default="", server_default=text("''"))
+    model: Mapped[str] = mapped_column(String(200), nullable=False, default="", server_default=text("''"))
+    started_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    finished_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+
+    report: Mapped["TranslationReviewReport"] = relationship("TranslationReviewReport", back_populates="agent_runs")

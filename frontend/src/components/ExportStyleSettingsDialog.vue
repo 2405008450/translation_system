@@ -1,15 +1,59 @@
-<script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
-import { useI18n } from 'vue-i18n'
+<script lang="ts">
+// 运行时导出（类型 + 常量 + 工具函数）必须放在普通 <script> 模块块中，
+// <script setup> 不允许除 defineXxx 宏外的 export 声明。
+export type PptxLayoutMode = 'model_scale' | 'shrink' | 'both' | 'expand'
 
-import Modal from './base/Modal.vue'
+export interface PptxLayoutSettings {
+  enabled: boolean
+  mode: PptxLayoutMode
+  model: string
+}
 
 export interface ExportStyleSettings {
   enabled: boolean
   defaults: Record<string, string>
   styles: Record<string, Record<string, string>>
   hyphenation: Record<string, string>
+  pptx: PptxLayoutSettings
 }
+
+export const PPTX_LAYOUT_MODES: PptxLayoutMode[] = ['model_scale', 'shrink', 'both', 'expand']
+
+// 视觉复核仅走 OpenRouter，模型固定为以下几个（均支持多模态）。
+export const PPTX_LAYOUT_VLM_MODELS = [
+  'google/gemini-3.1-pro-preview',
+  'google/gemini-3.6-flash',
+  'anthropic/claude-sonnet-5',
+  'anthropic/claude-fable-5',
+] as const
+
+export const DEFAULT_PPTX_LAYOUT_VLM_MODEL = PPTX_LAYOUT_VLM_MODELS[0]
+
+export function createDefaultPptxLayoutSettings(): PptxLayoutSettings {
+  return { enabled: false, mode: 'model_scale', model: DEFAULT_PPTX_LAYOUT_VLM_MODEL }
+}
+
+export function normalizePptxLayoutSettings(raw: unknown): PptxLayoutSettings {
+  const source = (raw && typeof raw === 'object' ? raw : {}) as Partial<PptxLayoutSettings>
+  const mode = PPTX_LAYOUT_MODES.includes(source.mode as PptxLayoutMode)
+    ? (source.mode as PptxLayoutMode)
+    : 'model_scale'
+  const model = PPTX_LAYOUT_VLM_MODELS.includes(source.model as typeof PPTX_LAYOUT_VLM_MODELS[number])
+    ? (source.model as string)
+    : DEFAULT_PPTX_LAYOUT_VLM_MODEL
+  return {
+    enabled: Boolean(source.enabled),
+    mode,
+    model,
+  }
+}
+</script>
+
+<script setup lang="ts">
+import { computed, reactive, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+
+import Modal from './base/Modal.vue'
 
 type FieldType = 'text' | 'number' | 'select'
 
@@ -283,7 +327,7 @@ const ALL_STYLE_KEYS: string[] = [
 ].map((s) => s.key)
 
 function emptySettings(): ExportStyleSettings {
-  return { enabled: false, defaults: {}, styles: {}, hyphenation: {} }
+  return { enabled: false, defaults: {}, styles: {}, hyphenation: {}, pptx: createDefaultPptxLayoutSettings() }
 }
 
 const form = reactive<ExportStyleSettings>(emptySettings())
@@ -315,6 +359,7 @@ function syncForm() {
     styles[key] = { ...((source.styles || {})[key] || {}) }
   })
   form.styles = styles
+  form.pptx = normalizePptxLayoutSettings(source.pptx)
   activeCategory.value = CATEGORIES[0].key
 }
 
@@ -341,6 +386,7 @@ function buildPayload(): ExportStyleSettings {
     defaults: pruneEmpty(form.defaults),
     styles,
     hyphenation: pruneEmpty(form.hyphenation),
+    pptx: { ...form.pptx },
   }
 }
 
@@ -368,7 +414,16 @@ function resetAll() {
   ALL_STYLE_KEYS.forEach((key) => {
     form.styles[key] = {}
   })
+  form.pptx = createDefaultPptxLayoutSettings()
 }
+
+const pptxModeOptions = computed<FieldOption[]>(() => PPTX_LAYOUT_MODES.map((mode) => ({
+  value: mode,
+  label: t(`workbench.exportStyleSettings.pptx.modes.${mode}`),
+})))
+
+// 暴露给模板使用（普通 <script> 块的绑定不会自动进入模板作用域）。
+const pptxVlmModels = PPTX_LAYOUT_VLM_MODELS
 
 function countConfigured(values: Record<string, string> | undefined): number {
   return Object.keys(pruneEmpty(values || {})).length
@@ -537,6 +592,37 @@ watch(() => props.modelValue, () => {
         </div>
       </div>
 
+      <section class="export-style__pptx">
+        <label class="export-style__enable">
+          <input v-model="form.pptx.enabled" type="checkbox">
+          <span>
+            <strong>{{ t('workbench.exportStyleSettings.pptx.enable') }}</strong>
+            <small>{{ t('workbench.exportStyleSettings.pptx.enableHint') }}</small>
+          </span>
+        </label>
+
+        <div class="export-style__pptx-fields" :class="{ 'is-disabled': !form.pptx.enabled }">
+          <div class="field-row">
+            <div class="field-row__head">
+              <span class="field-row__label">{{ t('workbench.exportStyleSettings.pptx.modeLabel') }}</span>
+              <span class="field-row__hint">{{ t(`workbench.exportStyleSettings.pptx.modeHints.${form.pptx.mode}`) }}</span>
+            </div>
+            <select v-model="form.pptx.mode" class="field-row__control" :disabled="!form.pptx.enabled">
+              <option v-for="opt in pptxModeOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+            </select>
+          </div>
+          <div class="field-row">
+            <div class="field-row__head">
+              <span class="field-row__label">{{ t('workbench.exportStyleSettings.pptx.modelLabel') }}</span>
+              <span class="field-row__hint">{{ t('workbench.exportStyleSettings.pptx.modelHint') }}</span>
+            </div>
+            <select v-model="form.pptx.model" class="field-row__control" :disabled="!form.pptx.enabled">
+              <option v-for="m in pptxVlmModels" :key="m" :value="m">{{ m }}</option>
+            </select>
+          </div>
+        </div>
+      </section>
+
       <div class="export-style__actions">
         <span class="export-style__count">已配置 {{ configuredCount }} 项</span>
         <div class="export-style__actions-buttons">
@@ -592,6 +678,31 @@ watch(() => props.modelValue, () => {
 
 .export-style__hint {
   margin: 0;
+}
+
+.export-style__pptx {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.export-style__pptx-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.export-style__pptx-fields.is-disabled {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+@media (max-width: 640px) {
+  .export-style__pptx-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .export-style__layout {
