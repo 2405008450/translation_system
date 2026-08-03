@@ -145,6 +145,10 @@ ALTER TABLE IF EXISTS memory_entries
     ADD COLUMN IF NOT EXISTS tmx_metadata JSONB;
 ALTER TABLE IF EXISTS memory_entries
     ADD COLUMN IF NOT EXISTS import_batch_id UUID REFERENCES resource_import_batches(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS memory_entries
+    ADD COLUMN IF NOT EXISTS source_embedding vector(128);
+ALTER TABLE IF EXISTS memory_entries
+    ADD COLUMN IF NOT EXISTS source_embedding_version INTEGER;
 
 CREATE INDEX IF NOT EXISTS ix_memory_entries_creator_id
     ON memory_entries (creator_id);
