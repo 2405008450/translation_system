@@ -59,3 +59,6 @@ TMX下载/
 /term_*.jsonl
 outputs/
 .codex
+
+# Local translation-rule sample; production rules are uploaded per project
+/广东地方志翻译规则_230620.docx
