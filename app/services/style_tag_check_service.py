@@ -36,6 +36,7 @@ from app.config import get_settings
 from app.models import (
     FileRecord,
     Project,
+    ProjectMergeView,
     Segment,
     StyleTagCheckReport,
     StyleTagCheckReportItem,
@@ -52,6 +53,11 @@ from app.services.file_record_service import (
     backfill_file_record_source_html,
     list_segments_for_file_record,
     set_segment_target_layout_text,
+)
+from app.services.merge_view_service import (
+    compute_merge_display_offsets,
+    load_view_file_records,
+    parse_file_ids,
 )
 from app.services.llm_service import (
     LLMConfigurationError,
@@ -790,6 +796,7 @@ def serialize_style_tag_check_item(item: StyleTagCheckReportItem) -> dict[str, A
         "file_record_id": str(item.file_record_id),
         "segment_id": str(item.segment_id) if item.segment_id else None,
         "sentence_id": item.sentence_id,
+        "display_index": int(getattr(item, "_display_index", -1)),
         "file_name": item.file_name,
         "source_text": item.source_text,
         "source_layout_text": item.source_layout_text,
@@ -856,8 +863,33 @@ def serialize_style_tag_check_report(
 
 
 def load_style_tag_check_items(db: Session, report_id: UUID) -> list[StyleTagCheckReportItem]:
-    return (
-        db.query(StyleTagCheckReportItem)
+    rows = (
+        db.query(StyleTagCheckReportItem, Segment.display_index)
+        .outerjoin(
+            Segment,
+            (Segment.file_record_id == StyleTagCheckReportItem.file_record_id)
+            & (Segment.sentence_id == StyleTagCheckReportItem.sentence_id),
+        )
         .filter(StyleTagCheckReportItem.report_id == report_id)
         .all()
     )
+    report = db.query(StyleTagCheckReport).filter(StyleTagCheckReport.id == report_id).first()
+    offsets = {}
+    if report and report.scope == "merge_view":
+        file_ids = parse_file_ids(report.file_ids)
+        if report.merge_view_id:
+            view = db.query(ProjectMergeView).filter(
+                ProjectMergeView.id == report.merge_view_id,
+            ).first()
+            if view:
+                file_ids = [file_record.id for file_record in load_view_file_records(db, view)]
+        offsets = compute_merge_display_offsets(db, file_ids)
+
+    items: list[StyleTagCheckReportItem] = []
+    for item, current_display_index in rows:
+        display_index = int(current_display_index) if current_display_index is not None else -1
+        if display_index >= 0:
+            display_index += offsets.get(item.file_record_id, 0)
+        setattr(item, "_display_index", display_index)
+        items.append(item)
+    return items

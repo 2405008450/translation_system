@@ -26,6 +26,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -42,7 +43,7 @@ from app.services.file_record_service import (
     list_segments_for_file_record,
     update_segment_by_sentence_id,
 )
-from app.services.merge_view_service import serialize_file_ids
+from app.services.merge_view_service import load_view_file_records, serialize_file_ids
 
 logger = logging.getLogger(__name__)
 
@@ -478,10 +479,45 @@ def load_report_items(db: Session, report_id: UUID) -> list[TranslationReviewRep
         .all()
     )
 
+    merge_display_offsets: dict[UUID, int] = {}
+    report = db.query(TranslationReviewReport).filter(
+        TranslationReviewReport.id == report_id,
+    ).first()
+    if report and report.scope == "merge_view" and report.merge_view_id:
+        view = db.query(ProjectMergeView).filter(
+            ProjectMergeView.id == report.merge_view_id,
+        ).first()
+        if view:
+            view_files = load_view_file_records(db, view)
+            file_ids = [file_record.id for file_record in view_files]
+            segment_counts = {}
+            if file_ids:
+                segment_counts = {
+                    file_id: int(count or 0)
+                    for file_id, count in db.query(
+                        Segment.file_record_id,
+                        func.count(Segment.id),
+                    ).filter(
+                        Segment.file_record_id.in_(file_ids),
+                    ).group_by(Segment.file_record_id).all()
+                }
+            offset = 0
+            for file_record in view_files:
+                merge_display_offsets[file_record.id] = offset
+                offset += segment_counts.get(file_record.id, 0)
+
     items: list[TranslationReviewReportItem] = []
     for item, current_display_index in rows:
-        if current_display_index is not None:
-            item.display_index = int(current_display_index)
+        local_display_index = current_display_index
+        if local_display_index is not None:
+            local_display_index = int(local_display_index)
+            item.display_index = local_display_index
+        if item.file_record_id in merge_display_offsets and (local_display_index is not None):
+            item.display_index = (
+                merge_display_offsets[item.file_record_id] + local_display_index
+                if local_display_index >= 0
+                else -1
+            )
         items.append(item)
     return items
 

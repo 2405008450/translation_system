@@ -595,6 +595,7 @@ const generatingNumberCheck = ref(false)
 const recheckingNumberCheck = ref(false)
 const numberCheckAiEnabled = ref(true)
 const numberCheckFilter = ref<NumberCheckFilter>('all')
+const numberCheckFileId = ref('all')
 const numberCheckVisibleLimit = ref(100)
 const numberCheckAiScope = ref<'program_only' | 'all'>('program_only')
 const numberCheckModel = ref<string>('')
@@ -611,6 +612,7 @@ const loadingStyleTagCheck = ref(false)
 const generatingStyleTagCheck = ref(false)
 const recheckingStyleTagCheck = ref(false)
 const styleTagCheckFilter = ref<StyleTagCheckFilter>('all')
+const styleTagCheckFileId = ref('all')
 const styleTagCheckVisibleLimit = ref(100)
 const styleTagCheckModel = ref<string>('')
 const showStyleTagCheckSettings = ref(false)
@@ -1617,6 +1619,12 @@ function formatTermQASegmentNumber(sentenceId: string) {
     return sentenceId
   }
   return String(Number.parseInt(match[0], 10))
+}
+
+function formatCheckSegmentNumber(displayIndex: number | null | undefined, sentenceId: string) {
+  return typeof displayIndex === 'number' && Number.isFinite(displayIndex) && displayIndex >= 0
+    ? String(displayIndex + 1)
+    : formatTermQASegmentNumber(sentenceId)
 }
 
 const qualityQARules = [
@@ -4835,8 +4843,28 @@ async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
 
 const NUMBER_CHECK_RENDER_STEP = 100
 
+const numberCheckFiles = computed(() => {
+  const report = numberCheckReport.value
+  if (!report || !isMergeWorkbench.value) {
+    return []
+  }
+  const fileIds = report.file_ids ?? []
+  const detailFiles = segmentStore.mergeViewDetail?.files ?? []
+  return fileIds.map((fileId) => {
+    const file = detailFiles.find((candidate) => candidate.id === fileId)
+    const items = report.items.filter((item) => item.file_record_id === fileId)
+    return {
+      id: fileId,
+      name: file?.filename || items[0]?.file_name || fileId,
+      count: items.length,
+    }
+  })
+})
+
 const numberCheckFilteredItems = computed(() => {
-  const items = numberCheckReport.value?.items ?? []
+  const items = (numberCheckReport.value?.items ?? []).filter((item) => (
+    numberCheckFileId.value === 'all' || item.file_record_id === numberCheckFileId.value
+  ))
   switch (numberCheckFilter.value) {
     case 'program':
       return items.filter((item) => item.status !== 'ignored')
@@ -5035,6 +5063,7 @@ function setCurrentNumberCheckReport(
   numberCheckReport.value = report
   if (!options.keepPage) {
     numberCheckVisibleLimit.value = NUMBER_CHECK_RENDER_STEP
+    numberCheckFileId.value = 'all'
   }
   if (!options.keepSelection) {
     selectedNumberCheckItemIds.value = new Set()
@@ -5421,8 +5450,28 @@ async function focusNumberCheckReportItem(item: NumberCheckReportItem) {
 
 const NUMBER_CHECK_RENDER_STEP_STYLE = 100
 
+const styleTagCheckFiles = computed(() => {
+  const report = styleTagCheckReport.value
+  if (!report || !isMergeWorkbench.value) {
+    return []
+  }
+  const fileIds = report.file_ids ?? []
+  const detailFiles = segmentStore.mergeViewDetail?.files ?? []
+  return fileIds.map((fileId) => {
+    const file = detailFiles.find((candidate) => candidate.id === fileId)
+    const items = report.items.filter((item) => item.file_record_id === fileId)
+    return {
+      id: fileId,
+      name: file?.filename || items[0]?.file_name || fileId,
+      count: items.length,
+    }
+  })
+})
+
 const styleTagCheckFilteredItems = computed(() => {
-  const items = styleTagCheckReport.value?.items ?? []
+  const items = (styleTagCheckReport.value?.items ?? []).filter((item) => (
+    styleTagCheckFileId.value === 'all' || item.file_record_id === styleTagCheckFileId.value
+  ))
   if (styleTagCheckFilter.value === 'all') {
     return items
   }
@@ -5714,6 +5763,7 @@ function setCurrentStyleTagCheckReport(
   styleTagCheckReport.value = report
   if (!options.keepPage) {
     styleTagCheckVisibleLimit.value = NUMBER_CHECK_RENDER_STEP_STYLE
+    styleTagCheckFileId.value = 'all'
   }
   if (!options.keepSelection) {
     selectedStyleTagCheckItemIds.value = new Set()
@@ -5816,7 +5866,7 @@ async function generateStyleTagCheckReport() {
     setCurrentStyleTagCheckReport(report)
     toast.show({
       title: '样式标记专检完成',
-      message: `共 ${report.candidate_count} 处多样式候选句段`,
+      message: `已检查 ${report.total_segments} 个句段，发现 ${report.candidate_count} 处样式候选`,
     })
   } catch (error) {
     toast.error({
@@ -5966,15 +6016,19 @@ async function focusStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
   if (locatingStyleTagCheckItemId.value) {
     return
   }
+  const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+  const isMergeMode = Boolean(isMergeWorkbench.value && mergeViewId)
   const fileRecord = segmentStore.fileRecord
-  if (!fileRecord) {
+  if (!isMergeMode && !fileRecord) {
     return
   }
 
   locatingStyleTagCheckItemId.value = item.id
   try {
     const currentPageIndex = editorSegments.value.findIndex((segment) => (
-      segment.sentence_id === item.sentence_id
+      isMergeMode
+        ? segment.file_record_id === item.file_record_id && segment.sentence_id === item.sentence_id
+        : segment.sentence_id === item.sentence_id
     ))
     if (currentPageIndex >= 0) {
       await focusEditorSegmentAtIndex(currentPageIndex)
@@ -5986,14 +6040,26 @@ async function focusStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
       return
     }
 
-    const data = (await http.get<SegmentPositionResponse>(
-      `/file-records/${fileRecord.id}/segments/${encodeURIComponent(item.sentence_id)}/position`,
-      { params: { page_size: segmentStore.pageSize } },
-    )).data
+    let data: SegmentPositionResponse
+    if (isMergeMode) {
+      data = await fetchMergeViewSegmentPosition(mergeViewId, item.file_record_id, item.sentence_id, {
+        pageSize: segmentStore.pageSize,
+      })
+    } else {
+      if (!fileRecord) {
+        return
+      }
+      data = (await http.get<SegmentPositionResponse>(
+        `/file-records/${fileRecord.id}/segments/${encodeURIComponent(item.sentence_id)}/position`,
+        { params: { page_size: segmentStore.pageSize } },
+      )).data
+    }
     await clearSegmentFiltersForTermQANavigation()
     await refreshSegmentPage(data.page, data.page_size)
     const targetIndex = editorSegments.value.findIndex((segment) => (
-      segment.sentence_id === item.sentence_id
+      isMergeMode
+        ? segment.file_record_id === item.file_record_id && segment.sentence_id === item.sentence_id
+        : segment.sentence_id === item.sentence_id
     ))
     if (targetIndex === -1) {
       toast.warn('已切换到目标页，但未找到对应句段。')
@@ -10557,6 +10623,17 @@ onBeforeRouteLeave(async () => {
                       <option value="modified">已修改</option>
                       <option value="ignored">已忽略</option>
                     </select>
+                    <select
+                      v-if="numberCheckReport && isMergeWorkbench && numberCheckFiles.length > 1"
+                      v-model="numberCheckFileId"
+                      class="term-qa-dialog__filter-select"
+                      title="按文件筛选"
+                    >
+                      <option value="all">全部文件</option>
+                      <option v-for="file in numberCheckFiles" :key="file.id" :value="file.id">
+                        {{ file.name }}{{ file.count > 0 ? ` (${file.count})` : '' }}
+                      </option>
+                    </select>
                     <label class="term-qa-dialog__toggle" title="生成时默认对程序筛选结果进行 AI 复核">
                       <input type="checkbox" v-model="numberCheckAiEnabled">
                       AI 复核
@@ -10670,7 +10747,7 @@ onBeforeRouteLeave(async () => {
                                 class="lucide-spin"
                                 :size="13"
                               />
-                              {{ formatTermQASegmentNumber(item.sentence_id) }}
+                              {{ formatCheckSegmentNumber(item.display_index, item.sentence_id) }}
                             </span>
                           </td>
                           <td
@@ -10809,17 +10886,15 @@ onBeforeRouteLeave(async () => {
                       </button>
                     </div>
                     <select
-                      v-if="styleTagCheckReport"
+                      v-if="styleTagCheckReport && isMergeWorkbench && styleTagCheckFiles.length > 1"
+                      v-model="styleTagCheckFileId"
                       class="term-qa-dialog__filter-select"
-                      :value="styleTagCheckFilter"
-                      title="筛选报告项"
-                      @change="setStyleTagCheckFilter(($event.target as HTMLSelectElement).value as StyleTagCheckFilter)"
+                      title="按文件筛选"
                     >
-                      <option value="all">全部</option>
-                      <option value="open">待审校</option>
-                      <option value="applied">已应用</option>
-                      <option value="rejected">已拒绝</option>
-                      <option value="failed">AI失败</option>
+                      <option value="all">全部文件</option>
+                      <option v-for="file in styleTagCheckFiles" :key="file.id" :value="file.id">
+                        {{ file.name }}{{ file.count > 0 ? ` (${file.count})` : '' }}
+                      </option>
                     </select>
                     <button
                       v-if="styleTagCheckReport"
@@ -10879,6 +10954,7 @@ onBeforeRouteLeave(async () => {
                             >
                           </th>
                           <th class="term-qa-dialog__col-segment">序号</th>
+                          <th v-if="isMergeWorkbench" class="term-qa-dialog__col-file">文件</th>
                           <th class="number-check__col-reason">原文（含样式）</th>
                           <th class="number-check__col-target">AI 标注建议</th>
                           <th class="number-check__col-status">状态</th>
@@ -10916,9 +10992,14 @@ onBeforeRouteLeave(async () => {
                                 class="lucide-spin"
                                 :size="13"
                               />
-                              {{ formatTermQASegmentNumber(item.sentence_id) }}
+                              {{ formatCheckSegmentNumber(item.display_index, item.sentence_id) }}
                             </span>
                           </td>
+                          <td
+                            v-if="isMergeWorkbench"
+                            class="number-check__cell"
+                            :title="item.file_name"
+                          >{{ item.file_name }}</td>
                           <td class="number-check__cell">
                             <div class="number-check__reason" v-html="styleTagCheckSourcePreviewHtml(item)"></div>
                           </td>

@@ -36,6 +36,7 @@ from app.services.file_record_service import (
     list_segments_for_file_record,
     update_segment_by_sentence_id,
 )
+from app.services.merge_view_service import compute_merge_display_offsets, parse_file_ids
 from app.services.llm_service import (
     LLMConfigurationError,
     LLMRequestError,
@@ -955,6 +956,7 @@ def serialize_number_check_item(item: NumberCheckReportItem) -> dict[str, Any]:
         "file_record_id": str(item.file_record_id),
         "segment_id": str(item.segment_id) if item.segment_id else None,
         "sentence_id": item.sentence_id,
+        "display_index": int(getattr(item, "_display_index", -1)),
         "file_name": item.file_name,
         "source_text": item.source_text,
         "target_text": item.target_text,
@@ -1024,8 +1026,26 @@ def serialize_number_check_report(
 
 
 def load_number_check_items(db: Session, report_id: UUID) -> list[NumberCheckReportItem]:
-    return (
-        db.query(NumberCheckReportItem)
+    rows = (
+        db.query(NumberCheckReportItem, Segment.display_index)
+        .outerjoin(
+            Segment,
+            (Segment.file_record_id == NumberCheckReportItem.file_record_id)
+            & (Segment.sentence_id == NumberCheckReportItem.sentence_id),
+        )
         .filter(NumberCheckReportItem.report_id == report_id)
         .all()
     )
+    report = db.query(NumberCheckReport).filter(NumberCheckReport.id == report_id).first()
+    offsets = {}
+    if report and report.scope == "merge_view":
+        offsets = compute_merge_display_offsets(db, parse_file_ids(report.file_ids))
+
+    items: list[NumberCheckReportItem] = []
+    for item, current_display_index in rows:
+        display_index = int(current_display_index) if current_display_index is not None else -1
+        if display_index >= 0:
+            display_index += offsets.get(item.file_record_id, 0)
+        setattr(item, "_display_index", display_index)
+        items.append(item)
+    return items

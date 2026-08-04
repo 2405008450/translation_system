@@ -12,9 +12,10 @@ from __future__ import annotations
 import json
 from uuid import UUID
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models import FileRecord, ProjectMergeView, User
+from app.models import FileRecord, ProjectMergeView, Segment, User
 from app.services.file_record_service import calculate_file_record_progress
 
 
@@ -209,3 +210,24 @@ def _file_status_stats(db: Session, file_record_id: UUID) -> dict[str, int]:
         "confirmed": int(rows.confirmed or 0),
         "empty_target": int(rows.empty_target or 0),
     }
+
+
+def compute_merge_display_offsets(db: Session, file_ids: list[UUID]) -> dict[UUID, int]:
+    """Return the global display-index offset for each file in merge-view order."""
+    if not file_ids:
+        return {}
+    counts = {
+        file_id: int(count or 0)
+        for file_id, count in db.query(
+            Segment.file_record_id,
+            func.count(Segment.id),
+        ).filter(
+            Segment.file_record_id.in_(file_ids),
+        ).group_by(Segment.file_record_id).all()
+    }
+    offsets: dict[UUID, int] = {}
+    offset = 0
+    for file_id in file_ids:
+        offsets[file_id] = offset
+        offset += counts.get(file_id, 0)
+    return offsets

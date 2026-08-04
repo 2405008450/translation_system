@@ -653,6 +653,7 @@ export interface NumberCheckReportItem {
   file_record_id: string
   segment_id: string | null
   sentence_id: string
+  display_index: number
   file_name: string
   source_text: string
   target_text: string
@@ -707,6 +708,7 @@ export interface StyleTagCheckReportItem {
   file_record_id: string
   segment_id: string | null
   sentence_id: string
+  display_index: number
   file_name: string
   source_text: string
   source_layout_text: string
