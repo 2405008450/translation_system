@@ -625,7 +625,32 @@ const qualityQARules = [
   { key: 'repeated_punctuation', label: '重复标点', defaultEnabled: false },
   { key: 'extra_space_after_punctuation', label: '标点符号后有多余空格', defaultEnabled: false },
   { key: 'missing_space_after_punctuation', label: '标点符号后遗漏空格', defaultEnabled: false },
+  { key: 'punctuation_leading_extra_space', label: '标点符号前有多余空格', defaultEnabled: false },
+  { key: 'punctuation_leading_missing_space', label: '标点符号前遗漏空格', defaultEnabled: false },
+  { key: 'multiple_spaces', label: '多个空格', defaultEnabled: false },
+  { key: 'segment_trailing_extra_space', label: '句段结束后有多余空格', defaultEnabled: false },
+  { key: 'source_target_initial_case_mismatch', label: '原文和译文首字母大小写不一致', defaultEnabled: false },
+  { key: 'target_word_multiple_upper_initials', label: '译文一个单词中有多个大写首字母', defaultEnabled: false },
+  { key: 'source_target_same_word_case_mismatch', label: '原文和译文的同一单词首字母有不同的大小写', defaultEnabled: false },
+  { key: 'consecutive_duplicate_words', label: '连续重复单词', defaultEnabled: false },
+  { key: 'source_target_identical', label: '原文和译文相同', defaultEnabled: false },
+  { key: 'target_word_count_exceeds_source', label: '译文字数超过原文字数的', defaultEnabled: false, defaultThreshold: 50, suffix: '%' },
+  { key: 'target_word_count_below_source', label: '译文字数少于原文字数的', defaultEnabled: false, defaultThreshold: 50, suffix: '%' },
+  { key: 'source_target_word_count_gap_too_large', label: '译文与原文字数相差过大', defaultEnabled: false },
+  { key: 'number_mismatch', label: '原文和译文数字不一致', defaultEnabled: false },
+  { key: 'parameter_mismatch', label: '原文与译文参数不一致', defaultEnabled: false },
+  { key: 'email_mismatch', label: '原文与译文邮件信息不一致', defaultEnabled: false },
+  { key: 'link_mismatch', label: '原文和译文链接信息不一致', defaultEnabled: false },
+  { key: 'special_symbol_mismatch', label: '特殊符号不一致', defaultEnabled: false },
+  { key: 'context_translation_mismatch', label: '翻译与上下文匹配不一致', defaultEnabled: false },
 ] as const
+
+// 可调阈值的规则 key，用于前端 draft.thresholds 类型 & payload 组装。
+const qualityQAThresholdRuleKeys = [
+  'target_word_count_exceeds_source',
+  'target_word_count_below_source',
+] as const
+type QualityQAThresholdRuleKey = typeof qualityQAThresholdRuleKeys[number]
 
 type QualityQAPlaceholderRule = {
   key: string
@@ -634,29 +659,55 @@ type QualityQAPlaceholderRule = {
   suffix?: string
 }
 
-const qualityQAPlaceholderRules: readonly QualityQAPlaceholderRule[] = [
-  { key: 'punctuation_leading_extra_space', label: '标点符号前有多余空格' },
-  { key: 'punctuation_leading_missing_space', label: '标点符号前遗漏空格' },
-  { key: 'multiple_spaces', label: '多个空格' },
-  { key: 'segment_trailing_extra_space', label: '句段结束后有多余空格' },
-  { key: 'source_target_initial_case_mismatch', label: '原文和译文首字母大小写不一致' },
-  { key: 'target_word_multiple_upper_initials', label: '译文一个单词中有多个大写首字母' },
-  { key: 'source_target_same_word_case_mismatch', label: '原文和译文的同一单词首字母有不同的大小写' },
-  { key: 'target_word_count_exceeds_source', label: '译文字数超过原文字数的', percent: 50, suffix: '%' },
-  { key: 'target_word_count_below_source', label: '译文字数少于原文字数的', percent: 50, suffix: '%' },
-  { key: 'source_target_word_count_gap_too_large', label: '译文与原文字数相差过大' },
-  { key: 'context_translation_mismatch', label: '翻译与上下文匹配不一致' },
-  { key: 'number_mismatch', label: '原文和译文数字不一致' },
-  { key: 'parameter_mismatch', label: '原文与译文参数不一致' },
-  { key: 'email_mismatch', label: '原文与译文邮件信息不一致' },
-  { key: 'link_mismatch', label: '原文和译文链接信息不一致' },
-  { key: 'consecutive_duplicate_words', label: '连续重复单词' },
-  { key: 'source_target_identical', label: '原文和译文相同' },
-  { key: 'special_symbol_mismatch', label: '特殊符号不一致' },
+const qualityQAPlaceholderRules: readonly QualityQAPlaceholderRule[] = []
+
+// 用于表格渲染的统一列表：按 1-30 数字编号顺序把实装项与占位项合并，
+// 让 UI 里的规则编号永远与设计文档对齐。
+type QualityQARuleDisplayItem =
+  | {
+      kind: 'rule'
+      key: typeof qualityQARules[number]['key']
+      label: string
+      thresholdKey?: QualityQAThresholdRuleKey
+      suffix?: string
+    }
+  | { kind: 'placeholder'; key: string; label: string; percent?: number; suffix?: string }
+
+const qualityQARuleDisplayItems: readonly QualityQARuleDisplayItem[] = [
+  ...qualityQARules.slice(0, 19).map((rule) => ({ kind: 'rule' as const, key: rule.key, label: rule.label })),
+  { kind: 'rule', key: 'target_word_count_exceeds_source', label: '译文字数超过原文字数的', thresholdKey: 'target_word_count_exceeds_source', suffix: '%' },
+  { kind: 'rule', key: 'target_word_count_below_source', label: '译文字数少于原文字数的', thresholdKey: 'target_word_count_below_source', suffix: '%' },
+  { kind: 'rule', key: 'source_target_word_count_gap_too_large', label: '译文与原文字数相差过大' },
+  { kind: 'rule', key: 'context_translation_mismatch', label: '翻译与上下文匹配不一致' },
+  { kind: 'rule', key: 'number_mismatch', label: '原文和译文数字不一致' },
+  { kind: 'rule', key: 'parameter_mismatch', label: '原文与译文参数不一致' },
+  { kind: 'rule', key: 'email_mismatch', label: '原文与译文邮件信息不一致' },
+  { kind: 'rule', key: 'link_mismatch', label: '原文和译文链接信息不一致' },
+  { kind: 'rule', key: 'consecutive_duplicate_words', label: '连续重复单词' },
+  { kind: 'rule', key: 'source_target_identical', label: '原文和译文相同' },
+  { kind: 'rule', key: 'special_symbol_mismatch', label: '特殊符号不一致' },
 ]
 
 type QualityQARuleKey = typeof qualityQARules[number]['key']
 type QualityQARuleDraft = Record<QualityQARuleKey, boolean>
+type QualityQAThresholdDraft = Record<QualityQAThresholdRuleKey, number>
+
+const QUALITY_QA_THRESHOLD_MIN = 1
+const QUALITY_QA_THRESHOLD_MAX = 500
+
+function clampQualityQAThreshold(value: number, fallback: number) {
+  if (!Number.isFinite(value)) return fallback
+  const rounded = Math.round(value)
+  if (rounded < QUALITY_QA_THRESHOLD_MIN) return QUALITY_QA_THRESHOLD_MIN
+  if (rounded > QUALITY_QA_THRESHOLD_MAX) return QUALITY_QA_THRESHOLD_MAX
+  return rounded
+}
+
+function getRuleDefaultThreshold(key: QualityQAThresholdRuleKey): number {
+  const rule = qualityQARules.find((r) => r.key === key)
+  const raw = rule && 'defaultThreshold' in rule ? (rule as { defaultThreshold?: number }).defaultThreshold : undefined
+  return typeof raw === 'number' ? raw : 50
+}
 
 function createQualityQARuleDraft(): QualityQARuleDraft {
   return qualityQARules.reduce((draft, rule) => {
@@ -665,8 +716,16 @@ function createQualityQARuleDraft(): QualityQARuleDraft {
   }, {} as QualityQARuleDraft)
 }
 
+function createQualityQAThresholdDraft(): QualityQAThresholdDraft {
+  return qualityQAThresholdRuleKeys.reduce((draft, key) => {
+    draft[key] = getRuleDefaultThreshold(key)
+    return draft
+  }, {} as QualityQAThresholdDraft)
+}
+
 const qualityQADraft = reactive({
   rules: createQualityQARuleDraft(),
+  thresholds: createQualityQAThresholdDraft(),
 })
 
 const enabledQualityQARuleCount = computed(() => (
@@ -687,9 +746,22 @@ function getSavedQualityQARuleEnabled(rule: typeof qualityQARules[number]) {
   }
   return rule.defaultEnabled
 }
-const qualityQASettingsDirty = computed(() => (
-  qualityQARules.some((rule) => qualityQADraft.rules[rule.key] !== getSavedQualityQARuleEnabled(rule))
-))
+function getSavedQualityQARuleThreshold(key: QualityQAThresholdRuleKey) {
+  const raw = qualityQASettings.value?.settings.rules?.[key]?.threshold
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return clampQualityQAThreshold(raw, getRuleDefaultThreshold(key))
+  }
+  return getRuleDefaultThreshold(key)
+}
+const qualityQASettingsDirty = computed(() => {
+  const rulesChanged = qualityQARules.some(
+    (rule) => qualityQADraft.rules[rule.key] !== getSavedQualityQARuleEnabled(rule),
+  )
+  if (rulesChanged) return true
+  return qualityQAThresholdRuleKeys.some(
+    (key) => qualityQADraft.thresholds[key] !== getSavedQualityQARuleThreshold(key),
+  )
+})
 const qualityQARuleStatusText = computed(() => {
   if (enabledQualityQARuleCount.value === 0) {
     return '全部关闭'
@@ -3399,15 +3471,25 @@ function syncQualityQADraftFromSettings(data: QualityQASettingsResponse) {
       ? ruleSetting.enabled
       : (rule.key === 'spelling_grammar' ? data.settings.spelling_grammar.enabled : rule.defaultEnabled)
   }
+  for (const key of qualityQAThresholdRuleKeys) {
+    const raw = data.settings.rules?.[key]?.threshold
+    qualityQADraft.thresholds[key] = typeof raw === 'number' && Number.isFinite(raw)
+      ? clampQualityQAThreshold(raw, getRuleDefaultThreshold(key))
+      : getRuleDefaultThreshold(key)
+  }
 }
 
 function buildQualityQARulesPayload() {
   return qualityQARules.reduce((payload, rule) => {
-    payload[rule.key] = {
+    const entry: { enabled: boolean; threshold?: number } = {
       enabled: qualityQADraft.rules[rule.key],
     }
+    if ((qualityQAThresholdRuleKeys as readonly string[]).includes(rule.key)) {
+      entry.threshold = qualityQADraft.thresholds[rule.key as QualityQAThresholdRuleKey]
+    }
+    payload[rule.key] = entry
     return payload
-  }, {} as Record<QualityQARuleKey, { enabled: boolean }>)
+  }, {} as Record<QualityQARuleKey, { enabled: boolean; threshold?: number }>)
 }
 
 function toggleAllQualityQARules(event: Event) {
@@ -6173,37 +6255,26 @@ onBeforeUnmount(() => {
                       </thead>
                       <tbody>
                         <tr
-                          v-for="(rule, index) in qualityQARules"
+                          v-for="(rule, index) in qualityQARuleDisplayItems"
                           :key="rule.key"
+                          :class="{ 'is-placeholder': rule.kind === 'placeholder' }"
                           :data-rule-key="rule.key"
                           :data-testid="`quality-qa-rule-${rule.key}`"
+                          :title="rule.kind === 'placeholder' ? '占位展示，后端暂未接入。' : undefined"
                         >
                           <td>{{ index + 1 }}</td>
                           <td class="quality-qa-settings__check-cell">
                             <label class="quality-qa-settings__rule-check">
                               <input
+                                v-if="rule.kind === 'rule'"
                                 v-model="qualityQADraft.rules[rule.key]"
                                 type="checkbox"
                                 :data-testid="`quality-qa-rule-toggle-${rule.key}`"
                                 :disabled="savingQualityQASettings || loadingQualityQASettings"
                                 :aria-label="`启用${rule.label}`"
                               />
-                            </label>
-                          </td>
-                          <td>{{ rule.label }}</td>
-                        </tr>
-                        <tr
-                          v-for="(rule, index) in qualityQAPlaceholderRules"
-                          :key="rule.key"
-                          class="is-placeholder"
-                          :data-rule-key="rule.key"
-                          :data-testid="`quality-qa-rule-${rule.key}`"
-                          title="占位展示，后端暂未接入。"
-                        >
-                          <td>{{ qualityQARules.length + index + 1 }}</td>
-                          <td class="quality-qa-settings__check-cell">
-                            <label class="quality-qa-settings__rule-check">
                               <input
+                                v-else
                                 type="checkbox"
                                 disabled
                                 :data-testid="`quality-qa-rule-toggle-${rule.key}`"
@@ -6213,7 +6284,22 @@ onBeforeUnmount(() => {
                           </td>
                           <td>
                             <span class="quality-qa-settings__rule-text">
-                              <template v-if="typeof rule.percent === 'number'">
+                              <template v-if="rule.kind === 'rule' && rule.thresholdKey">
+                                <span>{{ rule.label }}</span>
+                                <input
+                                  v-model.number="qualityQADraft.thresholds[rule.thresholdKey]"
+                                  class="quality-qa-settings__inline-number"
+                                  type="number"
+                                  :min="1"
+                                  :max="500"
+                                  step="1"
+                                  :disabled="savingQualityQASettings || loadingQualityQASettings || !qualityQADraft.rules[rule.key]"
+                                  :data-testid="`quality-qa-rule-threshold-${rule.key}`"
+                                  @blur="qualityQADraft.thresholds[rule.thresholdKey] = clampQualityQAThreshold(qualityQADraft.thresholds[rule.thresholdKey], getRuleDefaultThreshold(rule.thresholdKey))"
+                                />
+                                <span>{{ rule.suffix }}</span>
+                              </template>
+                              <template v-else-if="rule.kind === 'placeholder' && typeof rule.percent === 'number'">
                                 <span>{{ rule.label }}</span>
                                 <input
                                   class="quality-qa-settings__inline-number"

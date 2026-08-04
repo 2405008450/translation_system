@@ -536,6 +536,24 @@ export type WorkbenchQAResultRuleKey =
   | 'repeated_punctuation'
   | 'extra_space_after_punctuation'
   | 'missing_space_after_punctuation'
+  | 'punctuation_leading_extra_space'
+  | 'punctuation_leading_missing_space'
+  | 'multiple_spaces'
+  | 'segment_trailing_extra_space'
+  | 'consecutive_duplicate_words'
+  | 'source_target_initial_case_mismatch'
+  | 'target_word_multiple_upper_initials'
+  | 'source_target_same_word_case_mismatch'
+  | 'source_target_identical'
+  | 'target_word_count_exceeds_source'
+  | 'target_word_count_below_source'
+  | 'source_target_word_count_gap_too_large'
+  | 'number_mismatch'
+  | 'parameter_mismatch'
+  | 'email_mismatch'
+  | 'link_mismatch'
+  | 'special_symbol_mismatch'
+  | 'context_translation_mismatch'
   | 'target_without_tag'
   | 'target_tag_missing'
   | 'unmatched_closing_tag'
@@ -996,6 +1014,7 @@ export interface QualityQASettingsResponse {
   settings: {
     rules: Record<string, {
       enabled: boolean
+      threshold?: number
     }>
     spelling_grammar: {
       enabled: boolean
