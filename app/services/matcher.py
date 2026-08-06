@@ -18,6 +18,7 @@ from app.schemas import MatchResult, TMMatchCandidate
 from app.services.normalizer import (
     build_source_hash,
     compact_match_core,
+    has_searchable_content,
     is_short_structural_fragment,
     normalize_match_text,
     normalize_text,
@@ -327,6 +328,10 @@ def _allow_fuzzy_lookup(sentence: PreparedSentence) -> bool:
 def _allow_fuzzy_text(match_text: str | None) -> bool:
     normalized = normalize_match_text(match_text or "") or (match_text or "").strip()
     if not normalized:
+        return False
+    # 纯标点/符号占位符（如 [?]、---、✅）没有可用的词元，pg_trgm 无法有效
+    # 使用 GIN 索引，容易退化为大分区顺序扫描。它们仍会参与前置的哈希精确匹配。
+    if not has_searchable_content(normalized):
         return False
     return not is_short_structural_fragment(normalized)
 

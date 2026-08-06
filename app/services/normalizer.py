@@ -53,6 +53,17 @@ def compact_match_core(text: str) -> str:
     return NON_ALNUM_CJK_PATTERN.sub("", normalized)
 
 
+def has_searchable_content(text: str) -> bool:
+    """判断文本是否包含适合全文/模糊检索的 Unicode 字母或数字。
+
+    纯标点、括号、装饰符号和 emoji 不会产生有意义的 trigram；让这类文本进入
+    PostgreSQL 模糊检索，可能退化为大范围顺序扫描。精确匹配仍可使用原文哈希，
+    因此这里只限制模糊检索，不改变占位符的精确匹配行为。
+    """
+    normalized = normalize_match_text(text)
+    return any(character.isalnum() for character in normalized)
+
+
 def is_short_structural_fragment(text: str) -> bool:
     core = compact_match_core(text)
     if not core:
