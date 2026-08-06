@@ -13,6 +13,7 @@ import {
 import { computed, nextTick, ref, watch } from 'vue'
 
 import { useToast } from '../composables/useToast'
+import { formatLanguagePair } from '../constants/languages'
 import type {
   AssignmentDraft,
   AssignmentSaveRequest,
@@ -29,6 +30,8 @@ interface AssignmentFile {
   total_segments: number
   creator: string | null
   created_at: string
+  source_language: string | null
+  target_language: string | null
 }
 
 interface Allocation {
@@ -780,7 +783,8 @@ defineExpose({ showWorkflowTransitionPrompt })
                     <span>
                       <strong :title="file.filename">{{ file.filename }}</strong>
                       <small>
-                        {{ file.total_segments }} 段
+                        语言对：{{ formatLanguagePair(file.source_language, file.target_language) }}
+                        · {{ file.total_segments }} 段
                         <template v-if="file.creator"> · 创建人 {{ file.creator }}</template>
                       </small>
                     </span>
@@ -837,7 +841,10 @@ defineExpose({ showWorkflowTransitionPrompt })
             <template v-if="advancedFile">
               <div class="assignment-advanced-file">
                 <strong :title="advancedFile.filename">{{ advancedFile.filename }}</strong>
-                <span>共 {{ advancedFile.total_segments }} 段</span>
+                <span>
+                  语言对：{{ formatLanguagePair(advancedFile.source_language, advancedFile.target_language) }}
+                  · 共 {{ advancedFile.total_segments }} 段
+                </span>
               </div>
               <div v-if="advancedAllocations.length" class="assignment-range-list">
                 <div v-for="allocation in advancedAllocations" :key="allocationKey(allocation)">

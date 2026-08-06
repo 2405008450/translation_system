@@ -27,6 +27,8 @@ const files = Array.from({ length: 120 }, (_, index) => ({
   total_segments: 800 + index * 7,
   creator: `创建人 ${index % 8 + 1}`,
   created_at: '2026-07-21T00:00:00',
+  source_language: index % 2 === 0 ? 'zh-CN' : 'en-US',
+  target_language: index % 2 === 0 ? 'en-US' : 'zh-CN',
 }))
 
 const assignments: AssignmentDraft[] = [

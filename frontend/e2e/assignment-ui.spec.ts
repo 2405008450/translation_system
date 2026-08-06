@@ -33,6 +33,7 @@ test('大量文件与译者下保持单文件列表并锁定已分配文件', as
 
   await page.getByLabel('文件分配状态').selectOption('assigned')
   const wholeFileRow = page.getByTestId('assignment-file-row').filter({ hasText: '001_公司年度可持续发展报告' })
+  await expect(wholeFileRow).toContainText('语言对：中文（简体） -> 英语（美国）')
   await expect(wholeFileRow).toContainText('测试译者 1 · 整文件')
   await expect(wholeFileRow.getByRole('checkbox')).toBeDisabled()
   await page.getByLabel('负责人筛选').selectOption('user-1')
