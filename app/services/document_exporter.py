@@ -50,6 +50,7 @@ from app.services.document_workspace import (
     should_merge_table_cell_paragraph_texts,
 )
 from app.services.normalizer import compact_match_core, normalize_text
+from app.services.language_pairs import is_right_to_left_language
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
 
 
@@ -613,6 +614,8 @@ def export_translated_docx(
         _clean_story_formatting(stories)
     if not document_parse_options.get("preserve_hyperlinks", True):
         _strip_story_hyperlinks(stories)
+
+    _apply_rtl_document_direction(stories, target_language)
 
     modified_part_names = (
         {story.part_name for story in stories}
@@ -3722,6 +3725,74 @@ def _apply_drawingml_run_font(run_element: ET.Element) -> None:
             font_element = ET.Element(_qn("a", child_name))
             run_properties.append(font_element)
         font_element.set("typeface", EXPORT_FONT_FAMILY)
+
+
+def _apply_rtl_document_direction(
+    stories: Iterable[StoryPart],
+    target_language: str | None,
+) -> None:
+    """为 RTL 目标语言写入 Word/DrawingML 的段落方向和复杂文字属性。"""
+    if not is_right_to_left_language(target_language):
+        return
+
+    language = (target_language or "").strip()
+    for story in stories:
+        for paragraph in story.root.iter(_qn("w", "p")):
+            _apply_word_paragraph_rtl(paragraph, language)
+        for paragraph in story.root.iter(_qn("a", "p")):
+            _apply_drawingml_paragraph_rtl(paragraph, language)
+
+
+def _apply_word_paragraph_rtl(paragraph: ET.Element, language: str) -> None:
+    paragraph_properties = paragraph.find("w:pPr", NS)
+    if paragraph_properties is None:
+        paragraph_properties = ET.Element(_qn("w", "pPr"))
+        paragraph.insert(0, paragraph_properties)
+
+    bidi = paragraph_properties.find("w:bidi", NS)
+    if bidi is None:
+        bidi = ET.Element(_qn("w", "bidi"))
+        alignment = paragraph_properties.find("w:jc", NS)
+        if alignment is None:
+            paragraph_properties.append(bidi)
+        else:
+            paragraph_properties.insert(list(paragraph_properties).index(alignment), bidi)
+    bidi.set(_qn("w", "val"), "1")
+
+    alignment = paragraph_properties.find("w:jc", NS)
+    if alignment is None:
+        alignment = ET.SubElement(paragraph_properties, _qn("w", "jc"))
+    alignment.set(_qn("w", "val"), "right")
+
+    for run in paragraph.iter(_qn("w", "r")):
+        run_properties = run.find("w:rPr", NS)
+        if run_properties is None:
+            run_properties = ET.Element(_qn("w", "rPr"))
+            run.insert(0, run_properties)
+
+        rtl = run_properties.find("w:rtl", NS)
+        if rtl is None:
+            rtl = ET.SubElement(run_properties, _qn("w", "rtl"))
+        rtl.set(_qn("w", "val"), "1")
+
+        lang = run_properties.find("w:lang", NS)
+        if lang is None:
+            lang = ET.SubElement(run_properties, _qn("w", "lang"))
+        lang.set(_qn("w", "bidi"), language)
+
+
+def _apply_drawingml_paragraph_rtl(paragraph: ET.Element, language: str) -> None:
+    paragraph_properties = paragraph.find("a:pPr", NS)
+    if paragraph_properties is None:
+        paragraph_properties = ET.Element(_qn("a", "pPr"))
+        paragraph.insert(0, paragraph_properties)
+    paragraph_properties.set("rtl", "1")
+    paragraph_properties.set("algn", "r")
+
+    for property_name in ("rPr", "defRPr", "endParaRPr"):
+        for run_properties in paragraph.iter(_qn("a", property_name)):
+            run_properties.set("rtl", "1")
+            run_properties.set("lang", language)
 
 
 def _namespace_uri(tag: str) -> str:

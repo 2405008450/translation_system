@@ -3509,6 +3509,14 @@ body.modal-open {
   zoom: var(--preview-zoom, 1);
 }
 
+/* RTL 译文预览需要覆盖源文档遗留的左对齐内联样式。 */
+.preview-panel__body.is-rtl .doc-paragraph,
+.preview-panel__body.is-rtl .doc-table-cell,
+.preview-panel__body.is-rtl .doc-textbox {
+  direction: rtl;
+  text-align: right !important;
+}
+
 .preview-panel__empty {
   display: grid;
   place-items: center;

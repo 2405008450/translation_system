@@ -1854,6 +1854,10 @@ function getMergeGroupFile(segment: Segment) {
   const fileId = segment.file_record_id || ''
   return segmentStore.mergeViewDetail?.files.find((file) => file.id === fileId) ?? null
 }
+
+function getSegmentLanguageContext(segment: Segment) {
+  return isMergeWorkbench.value ? getMergeGroupFile(segment) : segmentStore.fileRecord
+}
 function getMergeGroupProgressText(segment: Segment) {
   const file = getMergeGroupFile(segment)
   if (!file) {
@@ -9954,6 +9958,8 @@ onBeforeRouteLeave(async () => {
                       :show-format-marks="richTextEditor.formatMarksVisible.value"
                       :tag-edit-mode="richTextEditor.tagEditModeEnabled.value"
                       :pending-formats="pendingFormatsForEditor"
+                      :source-language="getSegmentLanguageContext(item)?.source_language || null"
+                      :target-language="getSegmentLanguageContext(item)?.target_language || null"
                       @focus="segmentStore.setActiveSentence"
                       @activate-target="handleSegmentTargetActivate"
                       @activate-source="handleSegmentSourceActivate"
@@ -10226,6 +10232,8 @@ onBeforeRouteLeave(async () => {
                 :target-update-token="segmentStore.previewUpdateToken"
                 :comments="commentStore.comments"
                 :active-comment-id="commentStore.activeCommentId"
+                :source-language="activeWorkbenchFileContext?.source_language || null"
+                :target-language="activeWorkbenchFileContext?.target_language || null"
                 @close="closeBottomDrawer"
                 @focus-sentence="handlePreviewFocus"
                 @focus-comment="handleCommentFocus"
@@ -10245,6 +10253,9 @@ onBeforeRouteLeave(async () => {
                 :comments="commentStore.comments"
                 :active-comment-id="commentStore.activeCommentId"
                 :enable-comment-selection="true"
+                :language="activeBottomTool === 'source-preview'
+                  ? (activeWorkbenchFileContext?.source_language || null)
+                  : (activeWorkbenchFileContext?.target_language || null)"
                 :render-mode="activeBottomTool === 'target-preview' ? targetPreviewRenderMode : 'static'"
                 :segments="activeBottomTool === 'target-preview' && targetPreviewRenderMode === 'target' ? segmentStore.segments : []"
                 :updated-sentence-id="activeBottomTool === 'target-preview' ? segmentStore.lastPreviewUpdatedSentenceId : null"

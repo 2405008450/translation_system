@@ -3,6 +3,7 @@ import { RotateCcw, ZoomIn, ZoomOut } from 'lucide-vue-next'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import type { CommentAnchorDraft, SegmentComment } from '../types/api'
+import { getLanguageDirection } from '../constants/languages'
 import { buildTargetPreviewTextMap } from '../utils/targetTextSpacing'
 import FloatingCommentButton from './FloatingCommentButton.vue'
 
@@ -33,6 +34,7 @@ const props = withDefaults(defineProps<{
   comments?: SegmentComment[]
   activeCommentId?: string | null
   enableCommentSelection?: boolean
+  language?: string | null
 }>(), {
   syncSentenceId: null,
   title: '原文预览',
@@ -46,6 +48,7 @@ const props = withDefaults(defineProps<{
   comments: () => [],
   activeCommentId: null,
   enableCommentSelection: false,
+  language: null,
 })
 
 const emit = defineEmits<{
@@ -71,6 +74,7 @@ const MIN_PREVIEW_ZOOM = 0.75
 const MAX_PREVIEW_ZOOM = 1.8
 const PREVIEW_ZOOM_STEP = 0.1
 const previewZoomPercent = computed(() => Math.round(previewZoom.value * 100))
+const textDirection = computed(() => getLanguageDirection(props.language))
 const canZoomOut = computed(() => previewZoom.value > MIN_PREVIEW_ZOOM)
 const canZoomIn = computed(() => previewZoom.value < MAX_PREVIEW_ZOOM)
 const previewZoomStyle = computed(() => ({
@@ -774,6 +778,9 @@ watch(() => props.syncSentenceId, (sentenceId) => {
           v-if="supported"
           ref="containerRef"
           class="preview-panel__body"
+          :class="{ 'is-rtl': textDirection === 'rtl' }"
+          :dir="textDirection"
+          :lang="language || undefined"
           :aria-busy="loading || isRendering"
           @click="handleClick"
           @dblclick="handleDoubleClick"

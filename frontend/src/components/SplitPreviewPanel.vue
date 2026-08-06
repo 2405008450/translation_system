@@ -19,6 +19,8 @@ const props = withDefaults(defineProps<{
   targetUpdateToken?: number
   comments?: SegmentComment[]
   activeCommentId?: string | null
+  sourceLanguage?: string | null
+  targetLanguage?: string | null
 }>(), {
   targetRenderMode: 'static',
   sourceLoading: false,
@@ -29,6 +31,8 @@ const props = withDefaults(defineProps<{
   targetUpdateToken: 0,
   comments: () => [],
   activeCommentId: null,
+  sourceLanguage: null,
+  targetLanguage: null,
 })
 
 const emit = defineEmits<{
@@ -151,6 +155,7 @@ onBeforeUnmount(() => {
           :enable-comment-selection="true"
           :sync-sentence-id="sourceSyncSentenceId"
           :closable="false"
+          :language="sourceLanguage"
           @focus-sentence="emit('focusSentence', $event)"
           @focus-comment="emit('focusComment', $event)"
           @request-comment="emit('requestComment', $event)"
@@ -183,6 +188,7 @@ onBeforeUnmount(() => {
           :updated-sentence-text="targetUpdatedSentenceText"
           :update-token="targetUpdateToken"
           :closable="false"
+          :language="targetLanguage"
           @focus-sentence="emit('focusSentence', $event)"
           @focus-comment="emit('focusComment', $event)"
           @request-comment="emit('requestComment', $event)"

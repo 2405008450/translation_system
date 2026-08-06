@@ -66,6 +66,7 @@ LANGUAGE_OPTIONS: tuple[LanguageOption, ...] = (
 )
 
 LANGUAGE_LABELS = {option.code: option.label for option in LANGUAGE_OPTIONS}
+RTL_LANGUAGE_BASES = frozenset({"ar", "fa", "he", "iw", "ur"})
 
 LANGUAGE_ALIASES: dict[str, str] = {option.code.lower(): option.code for option in LANGUAGE_OPTIONS}
 LANGUAGE_ALIASES.update(
@@ -158,6 +159,15 @@ def require_language_pair(
     if normalized_source == normalized_target:
         raise ValueError("源语言和目标语言不能相同。")
     return normalized_source, normalized_target
+
+
+def is_right_to_left_language(value: str | None) -> bool:
+    """按 BCP 47 基础语言子标签判断是否采用从右到左的阅读方向。"""
+    cleaned = normalize_text(value or "").lower()
+    if not cleaned:
+        return False
+    base_language = cleaned.replace("_", "-").split("-", 1)[0]
+    return base_language in RTL_LANGUAGE_BASES
 
 
 def format_language_pair(

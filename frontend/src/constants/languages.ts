@@ -7,6 +7,10 @@ export const DEFAULT_LOCALE = 'zh-CN' as const
 export const SUPPORTED_UI_LOCALES = ['zh-CN', 'en-US'] as const
 export type UILocale = typeof SUPPORTED_UI_LOCALES[number]
 
+export type LanguageDirection = 'ltr' | 'rtl'
+
+const RTL_LANGUAGE_BASES = new Set(['ar', 'fa', 'he', 'iw', 'ur'])
+
 export function isSupportedUILocale(value: string | null | undefined): value is UILocale {
   return SUPPORTED_UI_LOCALES.includes(value as UILocale)
 }
@@ -273,6 +277,20 @@ export function normalizeLanguageCode(value: string | null | undefined): string 
     }
   }
   return null
+}
+
+/**
+ * 根据 BCP 47 语言标签判断阅读方向。
+ * 使用基础语言子标签，既兼容当前规范化语言码，也兼容未来新增的地区变体。
+ */
+export function isRightToLeftLanguage(value: string | null | undefined): boolean {
+  const language = (normalizeLanguageCode(value) || value || '').trim().toLowerCase()
+  const baseLanguage = language.split(/[-_]/, 1)[0]
+  return RTL_LANGUAGE_BASES.has(baseLanguage)
+}
+
+export function getLanguageDirection(value: string | null | undefined): LanguageDirection {
+  return isRightToLeftLanguage(value) ? 'rtl' : 'ltr'
 }
 
 /** 返回规范化后的源/目标语言对；缺省、非法或源目标相同时返回 null。 */

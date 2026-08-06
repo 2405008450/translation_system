@@ -5,6 +5,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from 'vue'
 import InteractiveDiffText from './InteractiveDiffText.vue'
 
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
+import { getLanguageDirection } from '../constants/languages'
 import { useAuthStore } from '../stores/auth'
 import type { LiveSpellingIssue, RevisionDisplaySettings, Segment, SegmentQAIssue, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
 import { findTermTextRanges } from '../utils/termMatching'
@@ -34,6 +35,8 @@ const props = withDefaults(defineProps<{
   pendingFormats?: Record<TextFormat, boolean> & { _overrideActive?: boolean }
   /** 句段对外标识：单文件模式即 sentence_id；合并模式为复合键 ${file_record_id}:${sentence_id} */
   segmentKey?: string
+  sourceLanguage?: string | null
+  targetLanguage?: string | null
 }>(), {
   disabled: false,
   sourceEditing: false,
@@ -59,6 +62,8 @@ const props = withDefaults(defineProps<{
     _overrideActive: false,
   }),
   segmentKey: '',
+  sourceLanguage: null,
+  targetLanguage: null,
 })
 
 const emit = defineEmits<{
@@ -87,6 +92,8 @@ const pendingSourceFocusPoint = ref<{ x: number; y: number } | null>(null)
 
 // 对外标识：合并视图使用复合键，单文件回退为 sentence_id
 const segmentKey = computed(() => props.segmentKey || props.segment.sentence_id)
+const sourceDirection = computed(() => getLanguageDirection(props.sourceLanguage))
+const targetDirection = computed(() => getLanguageDirection(props.targetLanguage))
 const MAX_EDITOR_HISTORY_SIZE = 100
 const EDITOR_HISTORY_GROUP_TIMEOUT_MS = 1200
 const REVISION_RERENDER_DEBOUNCE_MS = 150
@@ -2932,6 +2939,8 @@ watch(
           class="segment-row__source-editor"
           :class="{ 'is-focused': isSourceFocused, 'is-readonly': !sourceEditing }"
           :contenteditable="!disabled"
+          :dir="sourceDirection"
+          :lang="sourceLanguage || undefined"
           tabindex="0"
           spellcheck="false"
           @focus="handleSourceFocus"
@@ -2942,7 +2951,13 @@ watch(
           @mouseup="emitSourceCaret"
           @keyup="emitSourceCaret"
         ></div>
-        <div v-else class="segment-row__text" v-html="sourceHtmlContent"></div>
+        <div
+          v-else
+          class="segment-row__text"
+          :dir="sourceDirection"
+          :lang="sourceLanguage || undefined"
+          v-html="sourceHtmlContent"
+        ></div>
       </div>
     </div>
 
@@ -3015,6 +3030,8 @@ watch(
           ]"
           :style="revisionColorStyle"
           :contenteditable="!disabled"
+          :dir="targetDirection"
+          :lang="targetLanguage || undefined"
           tabindex="0"
           data-testid="segment-target-editor"
           :data-revision-visible="hasPendingRevision ? 'true' : 'false'"
@@ -3044,6 +3061,8 @@ watch(
           class="segment-row__target-preview"
           :class="{ 'is-tag-edit-mode': tagEditMode }"
           data-testid="segment-target-preview"
+          :dir="targetDirection"
+          :lang="targetLanguage || undefined"
           :aria-label="`translation style preview for segment ${index + 1}`"
           tabindex="0"
           @click="handleTargetPreviewClick"
