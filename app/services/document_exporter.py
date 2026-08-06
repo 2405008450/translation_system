@@ -637,6 +637,35 @@ def build_translated_docx_filename(filename: str) -> str:
     return f"{source_path.stem}_translated.docx"
 
 
+def apply_docx_rtl_direction(
+    raw_bytes: bytes,
+    target_language: str | None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> bytes:
+    """在所有其它 DOCX 后处理完成后，最终校正 RTL 目标文档方向。"""
+    if not is_right_to_left_language(target_language):
+        return raw_bytes
+
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(
+        document_parse_options,
+        document_parse_mode,
+    )
+    package = DocxPackage(raw_bytes)
+    stories = _build_story_parts(
+        package,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
+    _apply_rtl_document_direction(stories, target_language)
+    return _build_modified_docx(
+        raw_bytes=raw_bytes,
+        package=package,
+        part_names={story.part_name for story in stories},
+    )
+
+
 def build_bilingual_docx_filename(filename: str, order: str = BILINGUAL_LAYOUT_SOURCE_FIRST) -> str:
     order = _normalize_bilingual_layout_order(order)
     source_path = Path(filename or "document.docx")

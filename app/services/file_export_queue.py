@@ -21,6 +21,7 @@ from app.config import get_settings
 from app.database import SessionLocal, engine
 from app.models import FileExportTask, FileRecord, User
 from app.services.adapters import export_file
+from app.services.document_exporter import apply_docx_rtl_direction
 from app.services.task_file_service import (
     BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS,
     BILINGUAL_PPTX_EXPORT_TYPE,
@@ -499,19 +500,26 @@ def build_file_record_exported_file(
             if word_revision_marks_enabled
             else None
         )
-        return _apply_style_settings_to_export(
+        target_language = _resolve_file_record_target_language(file_record)
+        exported_file = _apply_style_settings_to_export(
             export_translated_task_file(
                 raw_bytes=raw_bytes,
                 filename=export_filename,
                 segments=segments,
                 document_parse_mode=document_parse_mode,
                 document_parse_options=document_parse_options,
-                target_language=getattr(file_record, "target_language", None),
+                target_language=target_language,
                 revisions=revisions,
                 include_revision_marks=word_revision_marks_enabled,
             ),
             style_settings,
             report_context,
+        )
+        return _apply_final_docx_rtl_direction(
+            exported_file,
+            target_language=target_language,
+            document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
         )
 
     if export_type in BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS:
@@ -608,6 +616,42 @@ def _apply_style_settings_to_export(
     if lowered.endswith(".pptx"):
         return _apply_pptx_layout_settings(exported_file, style_settings, filename, report_context)
     return exported_file
+
+
+def _resolve_file_record_target_language(file_record: FileRecord) -> str | None:
+    target_language = getattr(file_record, "target_language", None)
+    collection = getattr(file_record, "collection", None)
+    if not target_language and collection is not None:
+        target_language = getattr(collection, "target_language", None)
+    return target_language
+
+
+def _apply_final_docx_rtl_direction(
+    exported_file,
+    *,
+    target_language: str | None,
+    document_parse_mode: str,
+    document_parse_options: dict[str, object],
+):
+    """样式调整可能覆盖段落属性，因此 RTL 必须作为 DOCX 导出的最后一步。"""
+    filename = getattr(exported_file, "filename", "") or ""
+    if not filename.lower().endswith(".docx"):
+        return exported_file
+
+    adjusted = apply_docx_rtl_direction(
+        exported_file.content,
+        target_language=target_language,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
+    if adjusted is exported_file.content or adjusted == exported_file.content:
+        return exported_file
+    return _GenericExportedFile(
+        content=adjusted,
+        media_type=getattr(exported_file, "media_type", None)
+        or "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=filename,
+    )
 
 
 def _apply_docx_style_settings(exported_file, style_settings: dict[str, Any], filename: str):
