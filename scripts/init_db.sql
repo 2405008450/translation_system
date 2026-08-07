@@ -614,6 +614,7 @@ CREATE TABLE IF NOT EXISTS projects (
     )::uuid,
     name VARCHAR(200) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'draft',
+    workflow_template_id VARCHAR(40) NOT NULL DEFAULT 'custom',
     document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full',
     source_language VARCHAR(20),
     target_language VARCHAR(20),
@@ -627,6 +628,8 @@ CREATE TABLE IF NOT EXISTS projects (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE IF EXISTS projects
+    ADD COLUMN IF NOT EXISTS workflow_template_id VARCHAR(40) NOT NULL DEFAULT 'custom';
 ALTER TABLE IF EXISTS projects
     ADD COLUMN IF NOT EXISTS document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full';
 ALTER TABLE IF EXISTS projects

@@ -12,6 +12,12 @@ import { findTermTextRanges } from '../utils/termMatching'
 import { computeDiff } from '../utils/textDiff'
 import type { TextFormat } from '../composables/useRichTextEditor'
 
+type ProofreadingSuggestion = {
+  text: string
+  label: string
+  tone: 'changed' | 'unchanged' | 'error' | 'pending'
+}
+
 const props = withDefaults(defineProps<{
   segment: Segment
   index: number
@@ -37,6 +43,12 @@ const props = withDefaults(defineProps<{
   segmentKey?: string
   sourceLanguage?: string | null
   targetLanguage?: string | null
+  /** Excel 校对导入时的不可变原译文；非校对任务为 null。 */
+  originalTargetText?: string | null
+  /** 校对任务中是否显示原译文与校对版的行内差异。 */
+  showProofreadingDiff?: boolean
+  /** 校对工作台专用的 LLM 修改建议；非校对任务为 null。 */
+  proofreadingSuggestion?: ProofreadingSuggestion | null
 }>(), {
   disabled: false,
   sourceEditing: false,
@@ -64,6 +76,9 @@ const props = withDefaults(defineProps<{
   segmentKey: '',
   sourceLanguage: null,
   targetLanguage: null,
+  originalTargetText: null,
+  showProofreadingDiff: true,
+  proofreadingSuggestion: null,
 })
 
 const emit = defineEmits<{
@@ -258,6 +273,13 @@ const isEmptyTarget = computed(() => {
   const targetText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
   return targetText.length === 0
 })
+const proofreadingTargetText = computed(() => (
+  props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
+))
+const isProofreadingChanged = computed(() => (
+  props.originalTargetText !== null
+  && proofreadingTargetText.value !== (props.originalTargetText || '')
+))
 const statusMeta = computed(() => getSegmentStatusMeta(effectiveSegmentStatus.value))
 const sourceMeta = computed(() => getSegmentSourceMeta(props.segment.source))
 const isProjectSynced = computed(() => props.segment.source === 'project_sync')
@@ -310,6 +332,22 @@ const sourceTitle = computed(() => {
 const revisionSourceMeta = computed(() => getSegmentSourceMeta(props.pendingRevision?.source || 'manual'))
 const revisionAuthorRole = computed(() => props.pendingRevision?.author?.role || 'admin')
 const hasPendingRevision = computed(() => Boolean(props.pendingRevision))
+const visibleRevisionText = computed<{ before: string; after: string } | null>(() => {
+  if (props.pendingRevision) {
+    return {
+      before: props.pendingRevision.before_text || '',
+      after: props.pendingRevision.after_text || '',
+    }
+  }
+  if (props.showProofreadingDiff && isProofreadingChanged.value && props.originalTargetText !== null) {
+    return {
+      before: props.originalTargetText || '',
+      after: proofreadingTargetText.value,
+    }
+  }
+  return null
+})
+const hasVisibleRevisionMarks = computed(() => Boolean(visibleRevisionText.value))
 const revisionAuthorClass = computed(() => (
   revisionAuthorRole.value === 'user' ? 'is-revision-author-user' : 'is-revision-author-admin'
 ))
@@ -324,7 +362,7 @@ const revisionDeleteColor = computed(() => {
   return settings?.author_colors?.[authorId]?.delete || settings?.default_delete_color || '#dc2626'
 })
 const revisionColorStyle = computed(() => (
-  hasPendingRevision.value
+  hasVisibleRevisionMarks.value
     ? {
       '--rev-insert-color': revisionInsertColor.value,
       '--rev-delete-color': revisionDeleteColor.value,
@@ -332,6 +370,9 @@ const revisionColorStyle = computed(() => (
     : {}
 ))
 const revisionTooltip = computed(() => {
+  if (!props.pendingRevision && hasVisibleRevisionMarks.value) {
+    return '原译文 → 校对版'
+  }
   if (!props.pendingRevision || props.revisionSettings?.show_author_time === false) {
     return ''
   }
@@ -572,11 +613,11 @@ const targetHtmlContent = computed(() => {
 })
 
 const editorHtmlContent = computed(() => {
-  const revision = props.pendingRevision
+  const revision = visibleRevisionText.value
   if (!revision) {
     return targetHtmlContent.value
   }
-  return computeDiff(revision.before_text || '', revision.after_text || '')
+  return computeDiff(revision.before, revision.after)
     .map((segment) => {
       const editableAttr = segment.type === 'delete' ? ' contenteditable="false"' : ''
       const titleAttr = revisionTooltip.value ? ` title="${escapeHtml(revisionTooltip.value)}"` : ''
@@ -956,7 +997,7 @@ function hasRenderedTargetHighlights(): boolean {
 }
 
 function hasRenderedEditorDecorations(): boolean {
-  return Boolean(props.pendingRevision) || props.showVisibleChars || hasRenderedTargetHighlights()
+  return hasVisibleRevisionMarks.value || props.showVisibleChars || hasRenderedTargetHighlights()
 }
 
 function editorHasDecorationNodes(editor: HTMLElement): boolean {
@@ -2887,7 +2928,7 @@ watch(
 <template>
   <article
     class="segment-row"
-    :class="[statusClass, parityClass, { 'is-active': active, 'is-selected': selected, 'has-pending-revision': hasPendingRevision, 'is-empty-target': isEmptyTarget }]"
+    :class="[statusClass, parityClass, { 'is-active': active, 'is-selected': selected, 'has-pending-revision': hasPendingRevision, 'is-empty-target': isEmptyTarget, 'is-proofreading-changed': isProofreadingChanged }]"
     :id="`segment-${segmentKey}`"
     data-testid="segment-row"
     :data-sentence-id="segmentKey"
@@ -2961,10 +3002,19 @@ watch(
       </div>
     </div>
 
+    <div v-if="originalTargetText !== null" class="segment-row__cell segment-row__cell--original-target">
+      <div v-if="isProofreadingChanged" class="segment-row__original-target-label">
+        <strong>已修订</strong>
+      </div>
+      <div class="segment-row__original-target-text" :dir="targetDirection" :lang="targetLanguage || undefined">
+        {{ originalTargetText || '（空）' }}
+      </div>
+    </div>
+
     <div class="segment-row__cell segment-row__cell--target" :class="{ 'is-pending': hasPendingRevision }">
       <div
         class="segment-row__editor-shell"
-        :class="{ 'is-focused': isFocused, 'is-disabled': disabled, 'has-revision': hasPendingRevision }"
+        :class="{ 'is-focused': isFocused, 'is-disabled': disabled, 'has-revision': hasVisibleRevisionMarks }"
         @mousedown="handleSelectMouseDown"
         @click="handleEditorShellClick"
       >
@@ -2990,6 +3040,7 @@ watch(
       </div>
       <div class="segment-row__target-content">
         <button
+          v-if="originalTargetText === null"
           class="segment-row__copy-source-button"
           type="button"
           data-testid="segment-copy-source-to-target"
@@ -3025,7 +3076,7 @@ watch(
           ref="editorRef"
           class="segment-row__editor"
           :class="[
-            { 'is-focused': isFocused, 'has-revision': hasPendingRevision },
+            { 'is-focused': isFocused, 'has-revision': hasVisibleRevisionMarks },
             revisionAuthorClass,
           ]"
           :style="revisionColorStyle"
@@ -3034,7 +3085,7 @@ watch(
           :lang="targetLanguage || undefined"
           tabindex="0"
           data-testid="segment-target-editor"
-          :data-revision-visible="hasPendingRevision ? 'true' : 'false'"
+          :data-revision-visible="hasVisibleRevisionMarks ? 'true' : 'false'"
           data-segment-target="true"
           :data-sentence-id="segmentKey"
           :aria-label="`translation for segment ${index + 1}`"
@@ -3114,7 +3165,17 @@ watch(
       </div>
     </Teleport>
 
-    <div class="segment-row__cell segment-row__cell--state" :title="stateCellTitle">
+    <div
+      v-if="proofreadingSuggestion !== null"
+      class="segment-row__cell segment-row__cell--suggestion"
+      :class="`is-${proofreadingSuggestion.tone}`"
+      :title="proofreadingSuggestion.text"
+    >
+      <span class="segment-row__suggestion-label">{{ proofreadingSuggestion.label }}</span>
+      <span class="segment-row__suggestion-text">{{ proofreadingSuggestion.text }}</span>
+    </div>
+
+    <div v-else class="segment-row__cell segment-row__cell--state" :title="stateCellTitle">
       <span
         v-if="segment.status === 'confirmed' && !isProjectSynced"
         class="segment-row__confirm-mark"
@@ -3147,7 +3208,7 @@ watch(
       </span>
     </div>
 
-    <div class="segment-row__cell segment-row__cell--workflow">
+    <div v-if="proofreadingSuggestion === null" class="segment-row__cell segment-row__cell--workflow">
       <span class="segment-row__workflow-label">{{ workflowLabel }}</span>
     </div>
   </article>
@@ -3161,8 +3222,46 @@ watch(
   border-radius: 4px;
 }
 
+.segment-row__cell--original-target {
+  min-width: 0;
+  padding: 12px;
+  background: #f8fafc;
+  color: var(--ink-700);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.segment-row__original-target-label {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-bottom: 5px;
+  color: var(--ink-500);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.segment-row__original-target-label strong {
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #dbeafe;
+  color: #0759b8;
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.segment-row__original-target-text {
+  line-height: 1.55;
+}
+
 .segment-row__cell--target.is-pending {
   box-shadow: inset 2px 0 0 rgba(0, 122, 204, 0.36);
+}
+
+.segment-row.is-proofreading-changed .segment-row__cell--target {
+  background: linear-gradient(0deg, rgba(219, 234, 254, 0.38), rgba(239, 246, 255, 0.5));
+  box-shadow: inset 3px 0 0 #3b82f6;
 }
 
 .segment-row__source-content,
@@ -3254,7 +3353,8 @@ watch(
 }
 
 .segment-row__cell--state,
-.segment-row__cell--workflow {
+.segment-row__cell--workflow,
+.segment-row__cell--suggestion {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -3279,6 +3379,69 @@ watch(
   font-weight: 500;
   line-height: 1;
   white-space: nowrap;
+}
+
+.segment-row__cell--suggestion {
+  align-items: flex-start;
+  justify-content: center;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 10px;
+  background: #fffdf5;
+  color: #5f4b18;
+  line-height: 1.4;
+}
+
+.segment-row__cell--suggestion.is-unchanged {
+  background: #f6fbf8;
+  color: #426257;
+}
+
+.segment-row__cell--suggestion.is-error {
+  background: #fff5f5;
+  color: #9f2d2d;
+}
+
+.segment-row__cell--suggestion.is-pending {
+  background: #f7f9fb;
+  color: #667784;
+}
+
+.segment-row__suggestion-label {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(197, 143, 25, 0.13);
+  color: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.segment-row__cell--suggestion.is-unchanged .segment-row__suggestion-label {
+  background: rgba(22, 101, 52, 0.1);
+}
+
+.segment-row__cell--suggestion.is-error .segment-row__suggestion-label {
+  background: rgba(190, 24, 93, 0.1);
+}
+
+.segment-row__suggestion-text {
+  display: -webkit-box;
+  width: 100%;
+  overflow: hidden;
+  color: inherit;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.segment-row.is-active .segment-row__suggestion-text {
+  display: block;
+  overflow: visible;
 }
 
 .segment-row__workflow-label {

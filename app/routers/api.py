@@ -62,6 +62,7 @@ from app.models import (
     PretranslationRun,
     PretranslationTask,
     ProjectWorkflowStep,
+    ProofreadingSegmentBaseline,
     Segment,
     SegmentQAIssue,
     SegmentRevision,
@@ -3283,6 +3284,13 @@ def _can_manage_workflow(current_user: User | None) -> bool:
 
 WORKFLOW_TEMPLATE_DEFINITIONS: list[dict[str, Any]] = [
     {
+        "id": "proofread",
+        "name": "校对",
+        "steps": [
+            {"step_key": "proofread", "name": "校对", "step_type": "proofread"},
+        ],
+    },
+    {
         "id": "translate",
         "name": "翻译",
         "steps": [
@@ -3391,20 +3399,32 @@ def _create_project_workflow_steps(
     if len(source_steps) > 8:
         raise HTTPException(status_code=400, detail="工作流阶段最多支持 8 个。")
 
+    is_proofread_template = str(template["id"]) == "proofread"
+    if is_proofread_template and len(source_steps) != 1:
+        raise HTTPException(status_code=400, detail="校对工作流只能包含一个“校对”阶段。")
+
     normalized: list[ProjectWorkflowStep] = []
     used_keys: set[str] = set()
     for index, item in enumerate(source_steps):
         name = (item.name or "").strip()
         if not name:
             raise HTTPException(status_code=400, detail="工作流阶段名称不能为空。")
-        if index == 0 and name != "翻译":
+        if index == 0 and not is_proofread_template and name != "翻译":
             raise HTTPException(status_code=400, detail="工作流第一个阶段必须是“翻译”。")
+        if index == 0 and is_proofread_template and name != "校对":
+            raise HTTPException(status_code=400, detail="校对工作流阶段名称必须是“校对”。")
 
         raw_key = (item.step_key or "").strip().lower()
-        step_key = raw_key or ("translate" if index == 0 else f"step_{index + 1}")
+        step_key = raw_key or (
+            "proofread" if is_proofread_template and index == 0
+            else "translate" if index == 0
+            else f"step_{index + 1}"
+        )
         step_key = re.sub(r"[^a-z0-9_]+", "_", step_key).strip("_") or f"step_{index + 1}"
-        if index == 0:
+        if index == 0 and not is_proofread_template:
             step_key = "translate"
+        elif index == 0:
+            step_key = "proofread"
         base_key = step_key
         suffix = 2
         while step_key in used_keys:
@@ -3412,9 +3432,15 @@ def _create_project_workflow_steps(
             suffix += 1
         used_keys.add(step_key)
 
-        step_type = (item.step_type or ("translation" if index == 0 else "custom")).strip().lower()
-        if index == 0:
+        step_type = (item.step_type or (
+            "proofread" if is_proofread_template and index == 0
+            else "translation" if index == 0
+            else "custom"
+        )).strip().lower()
+        if index == 0 and not is_proofread_template:
             step_type = "translation"
+        elif index == 0:
+            step_type = "proofread"
 
         normalized.append(
             ProjectWorkflowStep(
@@ -6609,6 +6635,7 @@ def create_project(
         status="draft",
         source_language=source_language,
         target_language=target_language,
+        workflow_template_id=(payload.workflow_template_id or "custom").strip() or "custom",
         creator_id=current_user.id,
         deadline=deadline_dt,
         access_level=payload.access_level,
@@ -6629,6 +6656,7 @@ def create_project(
         "name": project.name,
         "filename": project.name,
         "status": project.status,
+        "workflow_template_id": project.workflow_template_id,
         "source_language": project.source_language,
         "target_language": project.target_language,
         "creator": get_user_display_name(current_user),
@@ -6683,6 +6711,7 @@ def duplicate_project(
         document_parse_mode=source_project.document_parse_mode,
         source_language=source_language,
         target_language=target_language,
+        workflow_template_id=getattr(source_project, "workflow_template_id", "custom") or "custom",
         creator_id=current_user.id,
         deadline=deadline_dt,
         access_level=payload.access_level or source_project.access_level or "team",
@@ -6744,6 +6773,7 @@ def _build_project_summary_payload(
         "pretranslation_progress": pretranslation_progress,
         "source_language": project.source_language,
         "target_language": project.target_language,
+        "workflow_template_id": getattr(project, "workflow_template_id", "custom") or "custom",
         "creator": creator_name,
         "deadline": project.deadline.isoformat() if project.deadline else None,
         "access_level": project.access_level,
@@ -11249,6 +11279,14 @@ def _apply_segment_scope_filter(query, scope: str):
         )
     if normalized_scope == "empty_target":
         return query.filter(func.coalesce(Segment.target_text, "") == "")
+    if normalized_scope == "proofreading_changed":
+        return query.join(
+            ProofreadingSegmentBaseline,
+            ProofreadingSegmentBaseline.segment_id == Segment.id,
+        ).filter(
+            func.coalesce(Segment.target_text, "")
+            != func.coalesce(ProofreadingSegmentBaseline.original_target_text, ""),
+        )
     return query
 
 

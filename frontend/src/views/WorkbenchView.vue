@@ -15,6 +15,8 @@ import {
   Copy,
   Download,
   ExternalLink,
+  Eye,
+  EyeOff,
   FileCheck,
   FileText,
   Flag,
@@ -80,6 +82,12 @@ import TranslationReviewPanel from '../components/TranslationReviewPanel.vue'
 import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { http } from '../api/http'
 import { queryOnlineTerms, type OnlineTermSource } from '../api/onlineTerms'
+import {
+  downloadProofreadingBatchExport,
+  exportProofreadingBatch,
+  getProofreadingBatch,
+  type ProofreadingBatch,
+} from '../api/proofreading'
 import {
   createMergeViewQAResult,
   fetchMergeViewSegmentPosition,
@@ -179,7 +187,7 @@ type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes' | 'refer
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
-type SegmentDisplayScope = 'all' | 'project_sync_only' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'pending_confirmation' | 'confirmed_only' | 'empty_target'
+type SegmentDisplayScope = 'all' | 'project_sync_only' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'pending_confirmation' | 'confirmed_only' | 'empty_target' | 'proofreading_changed'
 type RevisionMenuKind = 'track' | 'accept' | 'reject'
 type ResourceSearchMode = 'exact' | 'fuzzy'
 type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
@@ -284,8 +292,38 @@ type ResourceSearchResponse = {
   query: string
   mode: ResourceSearchMode
 }
+type ProofreadingBaselineResponse = {
+  is_proofreading: boolean
+  proofreading_context: {
+    batch_id: string
+    batch_status: string
+    sheet_name: string
+    target_language: string
+    provider: string
+    model: string
+    user_instructions: string
+    actual_provider: string
+    actual_model: string
+  } | null
+  items: Array<{
+    segment_id: string
+    sentence_id: string
+    original_target_text: string
+    review_suggestion: string
+    review_category: string
+    review_confidence: string
+  }>
+}
+
+type ProofreadingSuggestion = {
+  text: string
+  label: string
+  tone: 'changed' | 'unchanged' | 'error' | 'pending'
+}
 
 const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceEnabled'
+const PROOFREADING_REVISION_VISIBLE_STORAGE_KEY = 'workbench.proofreadingRevisionVisible'
+const PROOFREADING_HIDE_UNCHANGED_STORAGE_KEY = 'workbench.proofreadingHideUnchanged'
 const WORKBENCH_RIBBON_COLLAPSED_STORAGE_KEY = 'workbench.ribbonCollapsed'
 const SEGMENT_EDITOR_FONT_SCALE_STORAGE_KEY = 'workbench.segmentEditorFontScale'
 const QA_RESULT_PAGE_SIZE = 50
@@ -303,6 +341,20 @@ function getInitialRevisionTraceVisible() {
     return false
   }
   return window.localStorage.getItem(REVISION_TRACE_VISIBLE_STORAGE_KEY) === '1'
+}
+
+function getInitialProofreadingRevisionVisible() {
+  if (typeof window === 'undefined') {
+    return true
+  }
+  return window.localStorage.getItem(PROOFREADING_REVISION_VISIBLE_STORAGE_KEY) !== '0'
+}
+
+function getInitialProofreadingHideUnchanged() {
+  if (typeof window === 'undefined') {
+    return false
+  }
+  return window.localStorage.getItem(PROOFREADING_HIDE_UNCHANGED_STORAGE_KEY) === '1'
 }
 
 function clampSegmentEditorFontScale(value: number) {
@@ -345,6 +397,222 @@ const workbenchPageRef = ref<HTMLElement | null>(null)
 const segmentEditorResultsRef = ref<HTMLElement | null>(null)
 const segmentEditorRowRefs = new Map<string, SegmentEditorRowPublic>()
 const matchPanelRef = ref<WorkbenchMatchPanelPublic | null>(null)
+const proofreadingBaselines = ref<Record<string, string>>({})
+const proofreadingReviewItems = ref<Record<string, {
+  reason: string
+  category: string
+  confidence: string
+}>>({})
+const isProofreadingWorkbench = ref(false)
+const proofreadingContext = ref<ProofreadingBaselineResponse['proofreading_context']>(null)
+const proofreadingDiffVisible = ref(getInitialProofreadingRevisionVisible())
+const proofreadingExporting = ref(false)
+const proofreadingExportProgress = ref(0)
+const proofreadingExportStatus = ref<ProofreadingBatch['export_status']>('idle')
+const hasProofreadingBaselines = computed(() => Object.keys(proofreadingBaselines.value).length > 0)
+const proofreadingChangedCount = computed(() => segmentStore.segments.filter((segment) => {
+  const original = proofreadingBaselines.value[segment.id]
+  return original !== undefined && (segment.target_text || '') !== original
+}).length)
+const proofreadingCurrentPageCount = computed(() => segmentStore.segments.filter(
+  (segment) => proofreadingBaselines.value[segment.id] !== undefined,
+).length)
+const proofreadingUnchangedCount = computed(() => Math.max(
+  0,
+  proofreadingCurrentPageCount.value - proofreadingChangedCount.value,
+))
+const proofreadingConfirmedCount = computed(() => segmentStore.segments.filter((segment) => segment.status === 'confirmed').length)
+const proofreadingModelLabel = computed(() => {
+  const context = proofreadingContext.value
+  if (!context) return '尚未生成'
+  if (context.actual_provider || context.actual_model) {
+    return `${context.actual_provider || '默认提供方'} / ${context.actual_model || '默认模型'}`
+  }
+  if (context.provider === 'deepseek') return `DeepSeek / ${context.model || 'deepseek-chat'}`
+  if (context.provider === 'openrouter') return `OpenRouter / ${context.model || '默认模型'}`
+  return '自动：优先 DeepSeek Chat，失败回退 OpenRouter'
+})
+const proofreadingExportButtonLabel = computed(() => {
+  if (!proofreadingExporting.value) return '导出校对版'
+  if (proofreadingExportProgress.value > 0 && proofreadingExportProgress.value < 100) {
+    return `导出 ${Math.round(proofreadingExportProgress.value)}%`
+  }
+  return proofreadingExportStatus.value === 'completed' ? '下载中' : '生成中'
+})
+
+function proofreadingOriginalTarget(segment: Segment) {
+  return proofreadingBaselines.value[segment.id] ?? null
+}
+
+function proofreadingCategoryLabel(category: string) {
+  const labels: Record<string, string> = {
+    accuracy: '准确性',
+    consistency: '一致性',
+    format: '格式',
+    fluency: '流畅性',
+    grammar: '语法',
+    mistranslation: '误译',
+    omission: '漏译',
+    style: '表达',
+    terminology: '术语',
+    translation: '翻译完整性',
+    untranslated: '未翻译',
+    generation_error: '生成失败',
+  }
+  const normalizedCategory = category.trim().toLowerCase()
+  return labels[normalizedCategory] || category || '修改建议'
+}
+
+function proofreadingSuggestionFor(segment: Segment): ProofreadingSuggestion {
+  const reviewItem = proofreadingReviewItems.value[segment.id]
+  if (reviewItem?.category === 'generation_error') {
+    return {
+      text: reviewItem.reason || '本条校对生成失败，请重试或进行人工审查。',
+      label: '生成失败',
+      tone: 'error',
+    }
+  }
+  if (reviewItem) {
+    return {
+      text: reviewItem.reason || '译文已由模型调整，请结合原文进行人工复核。',
+      label: proofreadingCategoryLabel(reviewItem.category),
+      tone: 'changed',
+    }
+  }
+
+  const originalTarget = proofreadingBaselines.value[segment.id]
+  const batchStatus = proofreadingContext.value?.batch_status || ''
+  if (['ready', 'queued', 'running'].includes(batchStatus)) {
+    return {
+      text: batchStatus === 'ready' ? '尚未开始生成校对建议。' : '正在生成校对建议。',
+      label: '等待校对',
+      tone: 'pending',
+    }
+  }
+  if (originalTarget !== undefined && (segment.target_text || '') !== originalTarget) {
+    return {
+      text: '当前译文已发生人工调整，请结合修订差异进行复核。',
+      label: '人工调整',
+      tone: 'changed',
+    }
+  }
+  return {
+    text: '模型校对后未发现需要修改的内容。',
+    label: '无需修改',
+    tone: 'unchanged',
+  }
+}
+
+function toggleProofreadingRevisionVisible() {
+  proofreadingDiffVisible.value = !proofreadingDiffVisible.value
+  try {
+    window.localStorage.setItem(
+      PROOFREADING_REVISION_VISIBLE_STORAGE_KEY,
+      proofreadingDiffVisible.value ? '1' : '0',
+    )
+  } catch {}
+}
+
+function syncProofreadingExportState(batch: ProofreadingBatch) {
+  proofreadingExportStatus.value = batch.export_status
+  proofreadingExportProgress.value = Number(batch.export_progress || 0)
+}
+
+async function downloadCompletedProofreadingExport(batch: ProofreadingBatch) {
+  const response = await downloadProofreadingBatchExport(batch.id)
+  const fallback = `${batch.filename.replace(/\.xlsx$/i, '')}_校对版.xlsx`
+  downloadBlob(
+    response.data,
+    resolveDownloadFilename(response.headers['content-disposition'], fallback),
+  )
+}
+
+async function exportProofreadingWorkbook() {
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId || proofreadingExporting.value) return
+
+  proofreadingExporting.value = true
+  proofreadingExportProgress.value = 0
+  pageError.value = ''
+  try {
+    await saveNow()
+    let batch = await getProofreadingBatch(batchId)
+    syncProofreadingExportState(batch)
+
+    if (batch.export_status !== 'completed' && !['queued', 'running'].includes(batch.export_status)) {
+      try {
+        await exportProofreadingBatch(batch.id)
+      } catch (error) {
+        if (!axios.isAxiosError(error) || error.response?.status !== 409) {
+          throw error
+        }
+      }
+      batch = await getProofreadingBatch(batch.id)
+      syncProofreadingExportState(batch)
+    }
+
+    for (let attempt = 0; ['queued', 'running'].includes(batch.export_status) && attempt < 240; attempt += 1) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 1500))
+      batch = await getProofreadingBatch(batch.id)
+      syncProofreadingExportState(batch)
+    }
+
+    if (batch.export_status === 'failed') {
+      throw new Error(batch.export_error_message || '生成校对版 Excel 失败。')
+    }
+    if (batch.export_status !== 'completed') {
+      throw new Error('生成校对版 Excel 超时，请稍后重试。')
+    }
+
+    proofreadingExportProgress.value = 100
+    await downloadCompletedProofreadingExport(batch)
+    toast.success('校对版 Excel 已导出')
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '导出校对版 Excel 失败。')
+  } finally {
+    proofreadingExporting.value = false
+  }
+}
+
+async function loadProofreadingBaselines(fileRecordId: string) {
+  proofreadingBaselines.value = {}
+  proofreadingReviewItems.value = {}
+  isProofreadingWorkbench.value = false
+  proofreadingContext.value = null
+  segmentStore.setLiveSpellingEnabled(true)
+  try {
+    const { data } = await http.get<ProofreadingBaselineResponse>(`/file-records/${fileRecordId}/proofreading-baselines`)
+    isProofreadingWorkbench.value = data.is_proofreading
+    segmentStore.setLiveSpellingEnabled(!data.is_proofreading)
+    proofreadingContext.value = data.proofreading_context
+    proofreadingBaselines.value = Object.fromEntries(
+      data.items.map((item) => [item.segment_id, item.original_target_text]),
+    )
+    proofreadingReviewItems.value = Object.fromEntries(
+      data.items
+        .filter((item) => item.review_suggestion || item.review_category)
+        .map((item) => [item.segment_id, {
+          reason: item.review_suggestion,
+          category: item.review_category,
+          confidence: item.review_confidence,
+        }]),
+    )
+    if (data.is_proofreading) {
+      activeBottomTool.value = null
+      setSegmentDisplayScope(
+        getInitialProofreadingHideUnchanged() ? 'proofreading_changed' : 'all',
+      )
+    } else if (segmentDisplayScope.value === 'proofreading_changed') {
+      setSegmentDisplayScope('all')
+    }
+  } catch {
+    segmentStore.setLiveSpellingEnabled(true)
+    if (segmentDisplayScope.value === 'proofreading_changed') {
+      setSegmentDisplayScope('all')
+    }
+    // 普通翻译任务没有校对基线，保持原有两列工作台。
+  }
+}
 
 const bottomPanelRef = ref<HTMLElement | null>(null)
 const bottomDrawerRef = ref<HTMLElement | null>(null)
@@ -548,6 +816,7 @@ const sourceSearchInputRef = ref<HTMLInputElement | null>(null)
 const targetSearchInputRef = ref<HTMLInputElement | null>(null)
 const guidelinesEditorRef = ref<HTMLTextAreaElement | null>(null)
 const segmentDisplayScope = ref<SegmentDisplayScope>('all')
+const proofreadingHideUnchanged = computed(() => segmentDisplayScope.value === 'proofreading_changed')
 const sourceSearchQuery = ref('')
 const targetSearchQuery = ref('')
 const sourceExcludeQuery = ref('')
@@ -2214,16 +2483,23 @@ function countTargetReplaceOccurrences(segment: Segment) {
   return (segment.target_text || '').match(regexp)?.length || 0
 }
 
-const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; label: string }>>(() => [
-  { value: 'all', label: t('workbench.search.scopes.all') },
-  { value: 'project_sync_only', label: t('workbench.statusSummary.projectSync') },
-  { value: 'exact_only', label: t('workbench.statusSummary.exact') },
-  { value: 'fuzzy_only', label: t('workbench.search.scopes.fuzzyOnly') },
-  { value: 'none_only', label: t('workbench.search.scopes.noneOnly') },
-  { value: 'pending_confirmation', label: '待确认译文' },
-  { value: 'confirmed_only', label: '已确认译文' },
-  { value: 'empty_target', label: '空译文' },
-])
+const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; label: string }>>(() => {
+  const options: Array<{ value: SegmentDisplayScope; label: string }> = [
+    { value: 'all', label: t('workbench.search.scopes.all') },
+    { value: 'project_sync_only', label: t('workbench.statusSummary.projectSync') },
+    { value: 'exact_only', label: t('workbench.statusSummary.exact') },
+    { value: 'fuzzy_only', label: t('workbench.search.scopes.fuzzyOnly') },
+    { value: 'none_only', label: t('workbench.search.scopes.noneOnly') },
+    { value: 'pending_confirmation', label: '待确认译文' },
+    { value: 'confirmed_only', label: '已确认译文' },
+    { value: 'empty_target', label: '空译文' },
+    { value: 'proofreading_changed', label: '仅显示已修改' },
+  ]
+  const proofreadingScopes: SegmentDisplayScope[] = ['all', 'proofreading_changed', 'pending_confirmation', 'confirmed_only']
+  return isProofreadingWorkbench.value
+    ? options.filter((option) => proofreadingScopes.includes(option.value))
+    : options.filter((option) => option.value !== 'proofreading_changed')
+})
 
 function normalizeWorkbenchMatchText(value: string | null | undefined) {
   return (value || '').trim().replace(/\s+/g, ' ').replace(/[\u3002\uff01\uff1f!?.]+$/u, '')
@@ -2286,10 +2562,18 @@ function matchesSegmentDisplayScope(segment: Segment) {
     return isEmptyTargetForWorkbench(segment.target_text)
       || retainedEmptyTargetSentenceIds.value.has(segment.sentence_id)
   }
+  if (segmentDisplayScope.value === 'proofreading_changed') {
+    const originalTarget = proofreadingBaselines.value[segment.id]
+    return originalTarget !== undefined && (segment.target_text || '') !== originalTarget
+  }
   return true
 }
 
-const editorSegments = computed(() => segmentStore.segments)
+const editorSegments = computed(() => (
+  segmentDisplayScope.value === 'proofreading_changed'
+    ? segmentStore.segments.filter(matchesSegmentDisplayScope)
+    : segmentStore.segments
+))
 
 const replaceableOccurrenceCount = computed(() => (
   editorSegments.value.reduce((count, segment) => count + countTargetReplaceOccurrences(segment), 0)
@@ -2566,13 +2850,18 @@ function handleBottomPreviewRenderingChange(rendering: boolean) {
   previewPanelRendering.value = rendering
 }
 
-const sideToolButtons = computed(() => ([
-  { key: 'match-info' as const, label: t('workbench.tools.matchInfo'), icon: Info, tone: 'info' },
-  { key: 'terms' as const, label: t('workbench.tools.terms'), icon: Languages, tone: 'language' },
-  { key: 'resource-search' as const, label: '搜索', icon: Search, tone: 'search' },
-  { key: 'notes' as const, label: t('workbench.tools.notes'), icon: MessageSquare, tone: 'note' },
-  { key: 'reference' as const, label: '参考文件', icon: FileText, tone: 'reference' },
-]))
+const sideToolButtons = computed(() => {
+  const items = [
+    { key: 'match-info' as const, label: t('workbench.tools.matchInfo'), icon: Info, tone: 'info' },
+    { key: 'terms' as const, label: t('workbench.tools.terms'), icon: Languages, tone: 'language' },
+    { key: 'resource-search' as const, label: '搜索', icon: Search, tone: 'search' },
+    { key: 'notes' as const, label: t('workbench.tools.notes'), icon: MessageSquare, tone: 'note' },
+    { key: 'reference' as const, label: '参考文件', icon: FileText, tone: 'reference' },
+  ]
+  return isProofreadingWorkbench.value
+    ? items.filter((item) => ['terms', 'resource-search', 'notes'].includes(item.key))
+    : items
+})
 
 const isMergeWorkbench = computed(() => Boolean(segmentStore.mergeViewId || props.mergeViewId))
 const workbenchHeaderTitle = computed(() => (
@@ -3590,6 +3879,18 @@ function setSegmentDisplayScope(scope: SegmentDisplayScope) {
     retainedEmptyTargetSentenceIds.value = new Set()
   }
   segmentDisplayScope.value = scope
+  if (isProofreadingWorkbench.value) {
+    try {
+      window.localStorage.setItem(
+        PROOFREADING_HIDE_UNCHANGED_STORAGE_KEY,
+        scope === 'proofreading_changed' ? '1' : '0',
+      )
+    } catch {}
+  }
+}
+
+function toggleProofreadingHideUnchanged() {
+  setSegmentDisplayScope(proofreadingHideUnchanged.value ? 'all' : 'proofreading_changed')
 }
 
 function handleSegmentDisplayScopeChange(event: Event) {
@@ -7021,6 +7322,7 @@ async function loadTask() {
         Number(route.query.pageSize || segmentStore.pageSize || 100),
       ),
     })
+    await loadProofreadingBaselines(taskId)
     await replaceSegmentPageQueryIfNeeded()
     if (segmentStore.fileRecord?.is_edit_locked) {
       const message = segmentStore.fileRecord.active_operation_message || t('workbench.errors.editLocked')
@@ -8101,11 +8403,89 @@ onBeforeRouteLeave(async () => {
       'is-stable-grid': isStandaloneWorkbench,
       'is-ribbon-collapsed': isStandaloneWorkbench && workbenchRibbonCollapsed,
       'is-fullscreen': isWorkbenchFullscreen,
+      'has-proofreading-baseline': hasProofreadingBaselines,
+      'is-proofreading-workbench': isProofreadingWorkbench,
     }"
     data-testid="workbench-page"
   >
     <section
-      v-if="isStandaloneWorkbench"
+      v-if="isStandaloneWorkbench && isProofreadingWorkbench"
+      class="toolbar-panel workbench-toolbar workbench-ribbon proofreading-workbench-toolbar"
+      data-testid="proofreading-workbench-toolbar"
+    >
+      <div class="workbench-ribbon__tabs proofreading-workbench-toolbar__main">
+        <button class="workbench-ribbon__tab is-active proofreading-workbench-toolbar__back" type="button" title="返回项目" @click="goBack">
+          <ArrowLeft :size="14" />
+          <span>校对</span>
+        </button>
+        <div class="workbench-ribbon__task">
+          <strong>{{ workbenchHeaderTitle }}</strong>
+          <span>已有译文二次校对 · {{ currentLanguagePair }} · {{ proofreadingContext?.sheet_name || 'Excel' }}</span>
+        </div>
+        <div class="workbench-ribbon__top-actions" aria-label="校对编辑操作">
+          <button class="workbench-ribbon__top-action" data-testid="proofreading-save-button" type="button" :disabled="manualSaving" @click="saveNow">
+            <Loader2 v-if="manualSaving" class="lucide-spin" :size="15" />
+            <Save v-else :size="15" />
+            <span>{{ manualSaving ? '保存中' : '保存' }}</span>
+          </button>
+          <button
+            class="workbench-ribbon__top-action"
+            data-testid="proofreading-export-button"
+            type="button"
+            :disabled="manualSaving || proofreadingExporting || !proofreadingContext?.batch_id"
+            title="保存当前编辑并导出包含全部语言校对列的 Excel"
+            @click="void exportProofreadingWorkbook()"
+          >
+            <Loader2 v-if="proofreadingExporting" class="lucide-spin" :size="15" />
+            <Download v-else :size="15" />
+            <span>{{ proofreadingExportButtonLabel }}</span>
+          </button>
+          <button class="workbench-ribbon__top-action" type="button" title="撤回当前句段的编辑" @click="undoActiveSegmentEdit">
+            <Undo2 :size="15" /><span>撤回</span>
+          </button>
+          <button class="workbench-ribbon__top-action" type="button" title="恢复当前句段的编辑" @click="redoActiveSegmentEdit">
+            <Redo2 :size="15" /><span>恢复</span>
+          </button>
+          <button
+            class="workbench-ribbon__top-action"
+            type="button"
+            :class="{ 'is-active': proofreadingDiffVisible }"
+            :aria-pressed="proofreadingDiffVisible"
+            :title="proofreadingDiffVisible ? '关闭跟踪修订显示，只查看校对版' : '开启跟踪修订显示，查看删除和新增内容'"
+            @click="toggleProofreadingRevisionVisible"
+          >
+            <Columns :size="15" /><span>{{ proofreadingDiffVisible ? '隐藏修订' : '显示修订' }}</span>
+          </button>
+          <button class="workbench-ribbon__top-action proofreading-workbench-toolbar__primary" type="button" :disabled="!activeSegmentCanWrite" @click="confirmCurrentSentence">
+            <Check :size="15" /><span>确认当前</span>
+          </button>
+          <button class="workbench-ribbon__top-action proofreading-workbench-toolbar__primary" type="button" :disabled="!activeSegmentCanWrite" @click="void confirmAndMoveToNextUnconfirmed()">
+            <ArrowRight :size="15" /><span>确认并下一条</span>
+          </button>
+          <button class="workbench-ribbon__top-action" type="button" :title="workbenchFullscreenTitle" @click="void toggleWorkbenchFullscreen()">
+            <Minimize2 v-if="isWorkbenchFullscreen" :size="15" />
+            <Maximize2 v-else :size="15" />
+            <span>{{ workbenchFullscreenLabel }}</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="proofreading-workbench-toolbar__info-strip">
+        <span class="proofreading-workbench-toolbar__info-item">
+          <Bot :size="13" />模型：<strong>{{ proofreadingModelLabel }}</strong>
+        </span>
+        <span class="proofreading-workbench-toolbar__info-item">
+          <History :size="13" />当前页修订：<strong>{{ proofreadingChangedCount }} 条</strong>
+        </span>
+        <span v-if="proofreadingContext?.user_instructions" class="proofreading-workbench-toolbar__info-item proofreading-workbench-toolbar__prompt" :title="proofreadingContext.user_instructions">
+          <Info :size="13" />提示词：<strong>{{ proofreadingContext.user_instructions }}</strong>
+        </span>
+        <span class="proofreading-workbench-toolbar__legend">蓝色下划线为新增，红色删除线为删除</span>
+      </div>
+    </section>
+
+    <section
+      v-else-if="isStandaloneWorkbench"
       class="toolbar-panel workbench-toolbar workbench-ribbon"
       :class="{ 'is-collapsed': workbenchRibbonCollapsed }"
       data-testid="workbench-ribbon"
@@ -9334,12 +9714,18 @@ onBeforeRouteLeave(async () => {
       >
         <div class="panel-header panel-header--compact segment-editor-toolbar">
           <div class="segment-editor-toolbar__title">
-            <div class="section-title section-title--tight">{{ t('workbench.editorTitle') }}</div>
+            <div class="section-title section-title--tight">{{ isProofreadingWorkbench ? '校对条目' : t('workbench.editorTitle') }}</div>
             <span class="hint-text">
               当前句段 {{ segmentStore.currentPageStart }}-{{ segmentStore.currentPageEnd }} / {{ segmentStore.matchedSegmentCount }}，总句段 {{ segmentStore.totalSegmentCount }}
             </span>
           </div>
-          <div class="segment-editor-toolbar__overview">
+          <div v-if="isProofreadingWorkbench" class="segment-editor-toolbar__overview proofreading-editor-overview">
+            <span><strong>{{ proofreadingChangedCount }}</strong> 本页已修订</span>
+            <span><strong>{{ proofreadingUnchangedCount }}</strong> 本页未修改</span>
+            <span><strong>{{ proofreadingConfirmedCount }}</strong> 本页已确认</span>
+            <span class="segment-editor-toolbar__tip">蓝色条目表示校对版与原译文存在差异；展开“修订差异”可查看具体增删。</span>
+          </div>
+          <div v-else class="segment-editor-toolbar__overview">
             <button
               v-for="item in statusSummary"
               :key="item.key"
@@ -9413,6 +9799,20 @@ onBeforeRouteLeave(async () => {
               </select>
             </label>
             <button
+              v-if="isProofreadingWorkbench"
+              class="button proofreading-hide-unchanged"
+              :class="{ 'is-active': proofreadingHideUnchanged }"
+              type="button"
+              :title="proofreadingHideUnchanged ? '恢复显示未修改的校对条目' : '隐藏校对版与原译文相同的条目'"
+              :aria-pressed="proofreadingHideUnchanged"
+              @click="toggleProofreadingHideUnchanged"
+            >
+              <Eye v-if="proofreadingHideUnchanged" :size="15" />
+              <EyeOff v-else :size="15" />
+              {{ proofreadingHideUnchanged ? '显示未修改' : '隐藏未修改' }}
+            </button>
+            <button
+              v-if="!isProofreadingWorkbench"
               class="button segment-editor-toolbar__screening"
               :class="{ 'is-active': segmentScreeningPopoverOpen || hasSegmentScreeningFilters }"
               type="button"
@@ -9876,9 +10276,13 @@ onBeforeRouteLeave(async () => {
             <div class="segment-table-head" aria-hidden="true">
               <span>句段</span>
               <span>原文</span>
-              <span>译文</span>
-              <span>状态</span>
-              <span>阶段</span>
+              <span v-if="hasProofreadingBaselines">原译文</span>
+              <span>{{ hasProofreadingBaselines ? '校对版' : '译文' }}</span>
+              <span v-if="isProofreadingWorkbench">修改建议</span>
+              <template v-else>
+                <span>状态</span>
+                <span>阶段</span>
+              </template>
             </div>
 
             <div
@@ -9950,7 +10354,7 @@ onBeforeRouteLeave(async () => {
                       :revision-settings="segmentStore.revisionSettings"
                       :revision-busy="revisionActionLoading"
                       :matched-terms="segmentStore.activeSentenceId === segmentKeyOf(item) ? activeMatchedTerms : []"
-                      :qa-issues="segmentStore.getInlineSpellingIssues(item)"
+                      :qa-issues="isProofreadingWorkbench ? [] : segmentStore.getInlineSpellingIssues(item)"
                       :source-search-query="sourceSearchQuery"
                       :target-search-query="targetSearchQuery"
                       :search-case-sensitive="searchCaseSensitive"
@@ -9960,6 +10364,9 @@ onBeforeRouteLeave(async () => {
                       :pending-formats="pendingFormatsForEditor"
                       :source-language="getSegmentLanguageContext(item)?.source_language || null"
                       :target-language="getSegmentLanguageContext(item)?.target_language || null"
+                      :original-target-text="proofreadingOriginalTarget(item)"
+                      :show-proofreading-diff="proofreadingDiffVisible"
+                      :proofreading-suggestion="isProofreadingWorkbench ? proofreadingSuggestionFor(item) : null"
                       @focus="segmentStore.setActiveSentence"
                       @activate-target="handleSegmentTargetActivate"
                       @activate-source="handleSegmentSourceActivate"
@@ -10010,6 +10417,7 @@ onBeforeRouteLeave(async () => {
           </div>
 
           <div
+            v-if="!isProofreadingWorkbench"
             ref="bottomPanelRef"
             class="segment-editor-bottom-tools"
             :class="{ 'is-docked': activeBottomTool }"
@@ -12102,6 +12510,118 @@ onBeforeRouteLeave(async () => {
 .workbench-page.is-stable-grid {
   gap: 8px;
   background: #f3f6f8;
+}
+
+.proofreading-workbench-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 1200;
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: #f7f9fb;
+  box-shadow: 0 4px 10px rgba(17, 49, 42, 0.08);
+}
+
+.proofreading-workbench-toolbar__main {
+  min-height: 38px;
+}
+
+.proofreading-workbench-toolbar__back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.proofreading-workbench-toolbar__back svg {
+  color: var(--brand-700, #0d7a68);
+}
+
+.proofreading-workbench-toolbar .workbench-ribbon__task strong {
+  max-width: min(420px, 30vw);
+}
+
+.proofreading-workbench-toolbar .workbench-ribbon__top-action.is-active {
+  border-color: #a9cec5;
+  background: #eef8f5;
+  color: var(--brand-800, #095f52);
+}
+
+.proofreading-workbench-toolbar__primary {
+  border-color: var(--brand-700, #0d7a68) !important;
+  background: var(--brand-700, #0d7a68) !important;
+  color: #fff !important;
+}
+
+.proofreading-workbench-toolbar__primary svg {
+  color: #fff !important;
+}
+
+.proofreading-workbench-toolbar__primary:hover:not(:disabled),
+.proofreading-workbench-toolbar__primary:focus-visible {
+  background: var(--brand-800, #095f52) !important;
+}
+
+.proofreading-workbench-toolbar__info-strip {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 28px;
+  padding: 4px 10px;
+  border-bottom: 1px solid #d8e0e5;
+  background: #fff;
+  color: #52616a;
+  font-size: 11px;
+}
+
+.proofreading-workbench-toolbar__info-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.proofreading-workbench-toolbar__info-item svg {
+  flex: 0 0 auto;
+  color: #6ba99a;
+}
+
+.proofreading-workbench-toolbar__info-item strong {
+  color: #24413b;
+  font-weight: 650;
+}
+
+.proofreading-workbench-toolbar__prompt {
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.proofreading-workbench-toolbar__prompt strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proofreading-workbench-toolbar__legend {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: #6b7d85;
+  white-space: nowrap;
+}
+
+@media (max-width: 1280px) {
+  .proofreading-workbench-toolbar .workbench-ribbon__task span,
+  .proofreading-workbench-toolbar__legend {
+    display: none;
+  }
+  .proofreading-workbench-toolbar__info-strip {
+    gap: 8px;
+  }
 }
 
 .workbench-page.is-stable-grid .workbench-ribbon {
@@ -14386,6 +14906,10 @@ onBeforeRouteLeave(async () => {
   min-height: 0;
 }
 
+.workbench-page.has-proofreading-baseline .segment-editor-results {
+  --segment-editor-grid-template: 64px minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(210px, 0.78fr);
+}
+
 .segment-editor-results.has-workflow-readonly-notice {
   grid-template-rows: auto auto minmax(390px, var(--workbench-editor-stage-height));
 }
@@ -15961,6 +16485,24 @@ onBeforeRouteLeave(async () => {
   overflow: hidden;
 }
 
+.proofreading-editor-overview > span:not(.segment-editor-toolbar__tip) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border: 1px solid rgba(59, 130, 246, 0.16);
+  border-radius: 999px;
+  background: rgba(239, 246, 255, 0.86);
+  color: #415b73;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.proofreading-editor-overview > span strong {
+  color: #1d4ed8;
+  font-size: 12px;
+}
+
 .segment-editor-toolbar__overview .workbench-stat--compact {
   flex: 0 0 auto;
   min-height: 28px;
@@ -16110,6 +16652,27 @@ onBeforeRouteLeave(async () => {
 
 .segment-editor-toolbar__screening:hover,
 .segment-editor-toolbar__screening.is-active {
+  border-color: #8db9c4;
+  background: #edf8f6;
+  color: #0b6658;
+}
+
+.proofreading-hide-unchanged {
+  flex: 0 0 auto;
+  min-height: 30px;
+  height: 30px;
+  padding: 0 10px;
+  gap: 5px;
+  border-color: #cbd9df;
+  border-radius: 4px;
+  background: #fff;
+  color: #2d4651;
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.proofreading-hide-unchanged:hover,
+.proofreading-hide-unchanged.is-active {
   border-color: #8db9c4;
   background: #edf8f6;
   color: #0b6658;

@@ -47,6 +47,8 @@ SOURCE_LABELS = {
     "manual": "人工",
     "tm": "记忆库",
     "llm": "LLM",
+    "llm_review": "LLM 校对",
+    "imported_translation": "导入译文",
     "project_sync": "项目同步",
     "english_variant_conversion": "英文变体转换",
     "none": "未匹配",
@@ -146,7 +148,7 @@ def record_translation_metric_event(
     created_at: datetime | None = None,
 ) -> TranslationMetricEvent | None:
     normalized_source = (source or "manual").strip().lower() or "manual"
-    if normalized_source != "llm" and (before_text or "") == (after_text or ""):
+    if normalized_source not in {"llm", "llm_review"} and (before_text or "") == (after_text or ""):
         return None
     if not (after_text or "").strip():
         return None
@@ -229,7 +231,7 @@ def get_dashboard_payload(db: Session, granularity: str = "day") -> dict:
     llm_processed_source_words = sum(
         item["source_word_count"]
         for item in source_breakdown
-        if item["source"] == "llm"
+        if item["source"] in {"llm", "llm_review"}
     )
     summary = _build_summary(
         db,
@@ -467,7 +469,7 @@ def _build_summary(
         if llm_processed_source_words is None:
             llm_processed_source_words = int(
                 db.query(func.coalesce(func.sum(TranslationMetricEvent.source_word_count), 0))
-                .filter(TranslationMetricEvent.source == "llm")
+                .filter(TranslationMetricEvent.source.in_(["llm", "llm_review"]))
                 .scalar()
                 or 0
             )
@@ -500,7 +502,7 @@ def _build_summary(
     if llm_processed_source_words is None:
         llm_processed_source_words = int(
             db.query(func.coalesce(func.sum(TranslationMetricEvent.source_word_count), 0))
-            .filter(TranslationMetricEvent.source == "llm")
+            .filter(TranslationMetricEvent.source.in_(["llm", "llm_review"]))
             .scalar()
             or 0
         )
@@ -558,7 +560,7 @@ def _build_series(
         key = _bucket_key(event_created_at.date(), granularity)
         if target_was_empty:
             translated_words[key] += int(source_word_count or 0)
-        if source == "llm":
+        if source in {"llm", "llm_review"}:
             llm_words[key] += int(source_word_count or 0)
 
     active_users: defaultdict[str, set[UUID]] = defaultdict(set)
@@ -620,7 +622,7 @@ def _build_series_postgres(
                 {event_bucket_sql} AS bucket,
                 COALESCE(SUM(CASE WHEN target_was_empty THEN source_word_count ELSE 0 END), 0)
                     AS translated_source_word_count,
-                COALESCE(SUM(CASE WHEN source = 'llm' THEN source_word_count ELSE 0 END), 0)
+                COALESCE(SUM(CASE WHEN source IN ('llm', 'llm_review') THEN source_word_count ELSE 0 END), 0)
                     AS llm_processed_source_word_count
             FROM translation_metric_events
             WHERE created_at >= :start_at
@@ -689,7 +691,7 @@ def _build_llm_model_series(
                     COALESCE(NULLIF(BTRIM(llm_model), ''), :unknown_model) AS model,
                     COUNT(*) AS segment_count
                 FROM segments
-                WHERE source = 'llm'
+                WHERE source IN ('llm', 'llm_review')
                   AND updated_at >= :start_at
                 GROUP BY 1, 2
                 """
@@ -701,7 +703,7 @@ def _build_llm_model_series(
     else:
         rows = (
             db.query(Segment.updated_at, Segment.llm_model)
-            .filter(Segment.source == "llm", Segment.updated_at >= start_at)
+            .filter(Segment.source.in_(["llm", "llm_review"]), Segment.updated_at >= start_at)
             .all()
         )
         for updated_at, model in rows:
@@ -966,7 +968,7 @@ def _build_language_pairs(db: Session) -> list[dict]:
             TranslationMetricEvent.target_language,
             func.coalesce(func.sum(TranslationMetricEvent.source_word_count), 0),
         )
-        .filter(TranslationMetricEvent.source == "llm")
+        .filter(TranslationMetricEvent.source.in_(["llm", "llm_review"]))
         .group_by(TranslationMetricEvent.source_language, TranslationMetricEvent.target_language)
         .all()
     )

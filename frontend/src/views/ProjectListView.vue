@@ -36,6 +36,7 @@ import { useAuthStore } from '../stores/auth'
 
 interface ProjectItem {
   id: string
+  workflow_template_id: string
   name: string
   filename: string
   status: string
@@ -306,10 +307,12 @@ const canManageProjects = computed(() => authStore.isBusinessManager)
 const canCreateProjects = computed(() => authStore.isBusinessManager)
 const canAssignProjects = computed(() => authStore.isBusinessManager)
 const isCreateLanguagePairPartiallySelected = computed(() => (
-  Boolean(form.source_language) !== Boolean(form.target_language)
+  form.workflow_template_id !== 'proofread'
+  && Boolean(form.source_language) !== Boolean(form.target_language)
 ))
 const isCreateLanguagePairDuplicated = computed(() => (
-  Boolean(form.source_language)
+  form.workflow_template_id !== 'proofread'
+  && Boolean(form.source_language)
   && Boolean(form.target_language)
   && form.source_language === form.target_language
 ))
@@ -575,6 +578,9 @@ function normalizeWorkflowStepKey(value: string, index: number) {
 }
 
 function cloneWorkflowSteps(template: WorkflowTemplate): EditableWorkflowStep[] {
+  if (template.id === 'proofread') {
+    return [{ step_key: 'proofread', name: '校对', step_type: 'proofread' }]
+  }
   return template.steps.map((step, index) => ({
     step_key: index === 0 ? 'translate' : normalizeWorkflowStepKey(step.step_key || '', index),
     name: index === 0 ? '翻译' : step.name,
@@ -600,6 +606,10 @@ async function loadWorkflowTemplates() {
 function handleWorkflowTemplateChange() {
   const template = workflowTemplates.value.find((item) => item.id === form.workflow_template_id)
   form.workflow_steps = template ? cloneWorkflowSteps(template) : []
+  if (template?.id === 'proofread') {
+    form.source_language = ''
+    form.target_language = ''
+  }
 }
 
 function addWorkflowStep() {
@@ -749,11 +759,13 @@ async function createProject() {
     formError.value = t('projectList.errors.sameLanguage')
     return
   }
-  const workflowSteps = form.workflow_steps.map((step, index) => ({
-    step_key: index === 0 ? 'translate' : normalizeWorkflowStepKey(step.step_key, index),
-    name: index === 0 ? '翻译' : step.name.trim(),
-    step_type: index === 0 ? 'translation' : (step.step_type || 'custom'),
-  }))
+  const workflowSteps = form.workflow_template_id === 'proofread'
+    ? [{ step_key: 'proofread', name: '校对', step_type: 'proofread' }]
+    : form.workflow_steps.map((step, index) => ({
+        step_key: index === 0 ? 'translate' : normalizeWorkflowStepKey(step.step_key, index),
+        name: index === 0 ? '翻译' : step.name.trim(),
+        step_type: index === 0 ? 'translation' : (step.step_type || 'custom'),
+      }))
 
   creating.value = true
   formError.value = ''
@@ -1525,7 +1537,7 @@ onBeforeUnmount(() => {
           </select>
         </label>
 
-        <div class="field field--full project-language-binding">
+        <div v-if="form.workflow_template_id !== 'proofread'" class="field field--full project-language-binding">
           <span class="field__label">{{ t('projectList.form.languagePairBinding') }}</span>
           <p class="project-language-binding__hint">
             {{ t('projectList.form.languagePairBindingHint') }}
@@ -1610,7 +1622,7 @@ onBeforeUnmount(() => {
               删除
             </button>
           </div>
-          <button class="button button--ghost workflow-editor__add" type="button" @click="addWorkflowStep">
+          <button v-if="form.workflow_template_id !== 'proofread'" class="button button--ghost workflow-editor__add" type="button" @click="addWorkflowStep">
             <Plus :size="14" />
             添加阶段
           </button>

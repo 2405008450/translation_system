@@ -20,6 +20,8 @@ const fileStatusMap: Record<string, StatusMeta> = {
 
 const segmentStatusMap: Record<string, StatusMeta> = {
   project_sync: { value: 'project_sync', label: 'status.source.projectSync', tone: 'success' },
+  llm_review: { value: 'llm_review', label: 'LLM 校对', tone: 'info' },
+  imported_translation: { value: 'imported_translation', label: '导入译文', tone: 'default' },
   exact: { value: 'exact', label: 'status.segment.exact', tone: 'success' },
   fuzzy: { value: 'fuzzy', label: 'status.segment.fuzzy', tone: 'warning' },
   none: { value: 'none', label: 'status.segment.none', tone: 'default' },
@@ -32,6 +34,8 @@ const sourceStatusMap: Record<string, StatusMeta> = {
   llm: { value: 'llm', label: 'AI', tone: 'success' },
   tm: { value: 'tm', label: 'TM', tone: 'default' },
   project_sync: { value: 'project_sync', label: 'status.source.projectSync', tone: 'success' },
+  llm_review: { value: 'llm_review', label: 'LLM 校对', tone: 'info' },
+  imported_translation: { value: 'imported_translation', label: '导入译文', tone: 'default' },
   english_variant_conversion: {
     value: 'english_variant_conversion',
     label: 'status.source.englishVariantConversion',

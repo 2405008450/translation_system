@@ -158,15 +158,11 @@ const router = createRouter({
         {
           path: 'tasks/:id',
           name: 'workbench',
-          component: WorkbenchView,
-          props: true,
-          meta: {
-            navSection: 'tasks',
-            pageTitle: '翻译工作台',
-            pageDescription: '编辑句段、执行 AI 修正、导出译后文档',
-            pageTitleKey: 'pages.workbench.title',
-            pageDescriptionKey: 'pages.workbench.description',
-          },
+          redirect: (route) => ({
+            name: 'workbench-focus',
+            params: { id: route.params.id },
+            query: { ...route.query },
+          }),
         },
         {
           path: 'tm',

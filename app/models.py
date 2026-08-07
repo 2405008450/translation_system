@@ -36,6 +36,9 @@ class Project(Base):
     )
     source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    workflow_template_id: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="custom", server_default=text("'custom'")
+    )
     creator_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),
@@ -2770,6 +2773,7 @@ class TranslationReviewReport(Base):
         Index("ix_translation_review_reports_merge_view_id", "merge_view_id"),
         Index("ix_translation_review_reports_created_by_id", "created_by_id"),
         Index("ix_translation_review_reports_task_id", "task_id"),
+        Index("ix_translation_review_reports_proofreading_batch_id", "proofreading_batch_id"),
         Index("ix_translation_review_reports_created_at", "created_at"),
         Index("ix_translation_review_reports_scope_created_at", "scope", "created_at"),
         Index("ix_translation_review_reports_merge_view_created_at", "merge_view_id", "created_at"),
@@ -2781,6 +2785,12 @@ class TranslationReviewReport(Base):
     merge_view_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("project_merge_views.id", ondelete="CASCADE"), nullable=True)
     created_by_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     scope: Mapped[str] = mapped_column(String(20), nullable=False, default="file", server_default=text("'file'"))
+    report_mode: Mapped[str] = mapped_column(String(30), nullable=False, default="issue_check", server_default=text("'issue_check'"))
+    proofreading_batch_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("proofreading_batches.id", ondelete="CASCADE"),
+        nullable=True,
+    )
     segment_scope: Mapped[str] = mapped_column(String(30), nullable=False, default="all", server_default=text("'all'"))
     enabled_categories: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
     file_ids: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
@@ -2816,6 +2826,124 @@ class TranslationReviewReport(Base):
     agent_runs: Mapped[list["TranslationReviewAgentRun"]] = relationship(
         "TranslationReviewAgentRun", back_populates="report", cascade="all, delete-orphan",
     )
+
+
+class ProofreadingBatch(Base):
+    """一次多语种 Excel 校对导入、生成和合并导出的聚合根。"""
+
+    __tablename__ = "proofreading_batches"
+    __table_args__ = (
+        Index("ix_proofreading_batches_project_id", "project_id"),
+        Index("ix_proofreading_batches_status", "status"),
+        Index("ix_proofreading_batches_created_by_id", "created_by_id"),
+        Index("ix_proofreading_batches_created_at", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=UUID_SQL_DEFAULT
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default=text("''"))
+    source_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ready", server_default=text("'ready'"))
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    total_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    changed_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    skipped_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    failed_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    export_status: Mapped[str] = mapped_column(String(20), nullable=False, default="idle", server_default=text("'idle'"))
+    export_progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    export_error_message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    export_filename: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default=text("''"))
+    export_path: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    config_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}", server_default=text("'{}'"))
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    finished_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+
+    project: Mapped["Project"] = relationship("Project")
+    created_by: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+    bindings: Mapped[list["ProofreadingColumnBinding"]] = relationship(
+        "ProofreadingColumnBinding", back_populates="batch", cascade="all, delete-orphan"
+    )
+    baselines: Mapped[list["ProofreadingSegmentBaseline"]] = relationship(
+        "ProofreadingSegmentBaseline", back_populates="batch", cascade="all, delete-orphan"
+    )
+
+
+class ProofreadingColumnBinding(Base):
+    __tablename__ = "proofreading_column_bindings"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "sheet_index", "target_column", name="uq_proofreading_binding_target"),
+        Index("ix_proofreading_column_bindings_batch_id", "batch_id"),
+        Index("ix_proofreading_column_bindings_file_record_id", "file_record_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=UUID_SQL_DEFAULT
+    )
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("proofreading_batches.id", ondelete="CASCADE"), nullable=False
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("file_records.id", ondelete="CASCADE"), nullable=False
+    )
+    sheet_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    sheet_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    header_row: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_column: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_column: Mapped[int] = mapped_column(Integer, nullable=False)
+    output_column: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_header: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    target_header: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    target_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+
+    batch: Mapped["ProofreadingBatch"] = relationship("ProofreadingBatch", back_populates="bindings")
+    file_record: Mapped["FileRecord"] = relationship("FileRecord")
+
+
+class ProofreadingSegmentBaseline(Base):
+    __tablename__ = "proofreading_segment_baselines"
+    __table_args__ = (
+        UniqueConstraint("segment_id", name="uq_proofreading_segment_baseline_segment"),
+        Index("ix_proofreading_segment_baselines_batch_id", "batch_id"),
+        Index("ix_proofreading_segment_baselines_binding_id", "binding_id"),
+        Index("ix_proofreading_segment_baselines_segment_id", "segment_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=UUID_SQL_DEFAULT
+    )
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("proofreading_batches.id", ondelete="CASCADE"), nullable=False
+    )
+    binding_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("proofreading_column_bindings.id", ondelete="CASCADE"), nullable=False
+    )
+    segment_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("segments.id", ondelete="CASCADE"), nullable=False
+    )
+    sheet_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    row_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_cell_ref: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_cell_ref: Mapped[str] = mapped_column(String(20), nullable=False)
+    original_target_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+
+    batch: Mapped["ProofreadingBatch"] = relationship("ProofreadingBatch", back_populates="baselines")
+    binding: Mapped["ProofreadingColumnBinding"] = relationship("ProofreadingColumnBinding")
+    segment: Mapped["Segment"] = relationship("Segment")
 
 
 class TranslationReviewReportItem(Base):

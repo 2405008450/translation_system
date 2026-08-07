@@ -55,6 +55,7 @@ import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import Modal from '../components/base/Modal.vue'
 import PreTranslateDialog from '../components/PreTranslateDialog.vue'
 import Pagination from '../components/Pagination.vue'
+import ProofreadingPanel from '../components/ProofreadingPanel.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import StateView from '../components/base/StateView.vue'
 import TermExtractionDialog from '../components/TermExtractionDialog.vue'
@@ -148,6 +149,7 @@ type DocumentStatisticNumberKey =
 
 interface ProjectDetail {
   id: string
+  workflow_template_id: string
   name: string
   filename: string
   status: string
@@ -892,20 +894,26 @@ function setFilePageSize(size: number) {
   currentPage.value = 1
 }
 
-const tabs = computed(() => ([
-  { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
-  { key: 'views' as const, label: t('projectDetail.tabs.views'), disabled: false },
-  {
-    key: 'issues' as const,
-    label: `${t('projectDetail.tabs.issues')}${openIssueCount.value > 0 ? ` (${openIssueCount.value})` : ''}`,
-    disabled: false,
-  },
-  { key: 'assignments' as const, label: '指派记录', disabled: !canAssignProject.value },
-  { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: !canManageProject.value },
-  { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: !canManageProject.value },
-  { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
-  { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
-]))
+const isProofreadingProject = computed(() => project.value?.workflow_template_id === 'proofread')
+const tabs = computed(() => {
+  const items = [
+    { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
+    { key: 'views' as const, label: t('projectDetail.tabs.views'), disabled: false },
+    {
+      key: 'issues' as const,
+      label: `${t('projectDetail.tabs.issues')}${openIssueCount.value > 0 ? ` (${openIssueCount.value})` : ''}`,
+      disabled: false,
+    },
+    { key: 'assignments' as const, label: '指派记录', disabled: !canAssignProject.value },
+    { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: !canManageProject.value },
+    { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: !canManageProject.value },
+    { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
+    { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
+  ]
+  return isProofreadingProject.value
+    ? items.filter((item) => item.key !== 'views')
+    : items
+})
 const tableRows = computed<ProjectFileItem[]>(() => project.value?.files ?? [])
 const projectFileById = computed(() => new Map(tableRows.value.map((file) => [file.id, file])))
 const fileStatusFilterOptions = computed(() => {
@@ -1388,14 +1396,19 @@ async function confirmRevisionMarkedExport() {
   })
 }
 
-const columns = computed<DataTableColumn[]>(() => ([
-  { key: 'filename', label: t('projectDetail.files.columns.details'), width: '300px', sortable: true },
-  { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '150px', sortable: true },
-  { key: 'pretranslation_progress', label: t('projectDetail.files.columns.pretranslationProgress'), width: '150px', sortable: true },
-  { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '140px', sortable: true },
-  { key: 'status', label: t('projectDetail.files.columns.status'), width: '100px', sortable: true },
-  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '90px', sortable: true },
-]))
+const columns = computed<DataTableColumn[]>(() => {
+  const items: DataTableColumn[] = [
+    { key: 'filename', label: t('projectDetail.files.columns.details'), width: '300px', sortable: true },
+    { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '150px', sortable: true },
+    { key: 'pretranslation_progress', label: t('projectDetail.files.columns.pretranslationProgress'), width: '150px', sortable: true },
+    { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '140px', sortable: true },
+    { key: 'status', label: t('projectDetail.files.columns.status'), width: '100px', sortable: true },
+    { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '90px', sortable: true },
+  ]
+  return isProofreadingProject.value
+    ? items.filter((item) => item.key !== 'pretranslation_progress')
+    : items
+})
 
 const statisticsFileColumns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('projectDetail.stats.columns.file'), width: '320px' },
@@ -7144,24 +7157,32 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
+      <section v-if="activeTab === 'files' && project.workflow_template_id === 'proofread' && project.can_manage" class="panel pd-files-panel">
+        <ProofreadingPanel :project-id="project.id" @refresh-project="loadProject" />
+      </section>
+
       <section v-if="activeTab === 'files'" class="panel pd-files-panel">
         <div class="pd-panel-head">
           <div class="pd-panel-head__copy">
             <div class="section-title section-title--tight pd-files-title">
-              <span>{{ t('projectDetail.files.title') }}</span>
+              <span>{{ isProofreadingProject ? '校对语言任务' : t('projectDetail.files.title') }}</span>
               <span class="pd-files-count">
                 显示 {{ filteredTableRows.length }} / {{ tableRows.length }} 个文件
                 <template v-if="selectedFileIds.size > 0"> · 已选 {{ selectedFileIds.size }}</template>
               </span>
             </div>
-            <p class="panel-subtitle">{{ t('projectDetail.files.description') }}</p>
+            <p class="panel-subtitle">
+              {{ isProofreadingProject
+                ? '每个目标语言对应一个校对任务，可进入工作台复核、编辑并确认校对结果。'
+                : t('projectDetail.files.description') }}
+            </p>
           </div>
         </div>
 
         <div class="table-toolbar pd-toolbar">
           <div class="table-toolbar__left pd-toolbar__left">
             <button
-              v-if="canUploadProjectFiles"
+              v-if="canUploadProjectFiles && project.workflow_template_id !== 'proofread'"
               class="button button--primary pd-toolbar-primary"
               data-testid="project-upload-open"
               type="button"
@@ -7277,7 +7298,7 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <div class="pd-toolbar-action-strip" aria-label="文件批量操作">
-              <div class="pd-toolbar-action-group pd-toolbar-action-group--featured" aria-label="智能处理">
+              <div v-if="!isProofreadingProject" class="pd-toolbar-action-group pd-toolbar-action-group--featured" aria-label="智能处理">
                 <button
                   class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-action-button--accent"
                   type="button"
@@ -7304,7 +7325,7 @@ onBeforeUnmount(() => {
 
               <div class="pd-toolbar-action-group" aria-label="文件操作">
                 <button
-                  v-if="canManageProject && !authStore.isExternalTranslator"
+                  v-if="!isProofreadingProject && canManageProject && !authStore.isExternalTranslator"
                   class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-action-button--variant-copy"
                   :class="{
                     'pd-toolbar-action-button--british-copy': englishVariantCopyDirection !== 'to-american',
@@ -7322,7 +7343,7 @@ onBeforeUnmount(() => {
                   <span>{{ englishVariantCopyShortLabel }}</span>
                 </button>
                 <button
-                  v-if="canManageProject"
+                  v-if="!isProofreadingProject && canManageProject"
                   class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-action-button--template-copy"
                   data-testid="duplicate-file-template"
                   type="button"
@@ -7359,7 +7380,7 @@ onBeforeUnmount(() => {
                   <Users :size="15" />
                   <span>{{ t('projectDetail.files.actions.assign') }}</span>
                 </button>
-                <div class="pd-export-dropdown">
+                <div v-if="!isProofreadingProject" class="pd-export-dropdown">
                   <button
                     class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-export-button"
                     data-testid="project-file-export-selected"
@@ -7450,6 +7471,7 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
                 <button
+                  v-if="!isProofreadingProject"
                   class="button pd-toolbar-action-button pd-toolbar-action-button--labeled"
                   type="button"
                   :disabled="!canOpenMergeViewDialog"
@@ -7462,7 +7484,7 @@ onBeforeUnmount(() => {
                 </button>
               </div>
 
-              <div v-if="canManageProject" class="pd-toolbar-action-group pd-toolbar-action-group--reserved" aria-label="待开放操作">
+              <div v-if="canManageProject && !isProofreadingProject" class="pd-toolbar-action-group pd-toolbar-action-group--reserved" aria-label="待开放操作">
                 <button
                   class="button pd-toolbar-action-button"
                   type="button"
@@ -7492,7 +7514,7 @@ onBeforeUnmount(() => {
                 </button>
               </div>
 
-              <div class="pd-toolbar-action-group pd-toolbar-action-group--utility" aria-label="视图设置">
+              <div v-if="!isProofreadingProject" class="pd-toolbar-action-group pd-toolbar-action-group--utility" aria-label="视图设置">
                 <button
                   class="button pd-toolbar-action-button"
                   type="button"
@@ -8365,6 +8387,7 @@ onBeforeUnmount(() => {
 
 
     <PreTranslateDialog
+      v-if="!isProofreadingProject"
       :open="showPreTranslateDialog"
       :project-id="project?.id ?? null"
       :files="selectedProjectFiles"
@@ -8376,6 +8399,7 @@ onBeforeUnmount(() => {
       @progress="handlePreTranslateProgress"
     />
     <TermExtractionDialog
+      v-if="!isProofreadingProject"
       :open="showTermExtractionDialog"
       :file="selectedTermExtractionFile"
       :project-source-language="project?.source_language ?? null"

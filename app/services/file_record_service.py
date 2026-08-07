@@ -1146,9 +1146,11 @@ def _normalize_segment_target_for_save(
 
 MACHINE_SEGMENT_SOURCES = {
     "llm",
+    "llm_review",
     "tm",
     "project_sync",
     "english_variant_conversion",
+    "imported_translation",
     "none",
     "",
 }
@@ -1219,7 +1221,7 @@ def update_segment_target(
     _mark_segment_modified_by(segment, current_user)
     segment.version = int(segment.version or 1) + 1
     segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
-    if source == "llm":
+    if source in {"llm", "llm_review"}:
         segment.llm_provider = llm_provider
         segment.llm_model = llm_model
     else:

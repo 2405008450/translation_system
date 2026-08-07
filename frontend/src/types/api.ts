@@ -761,6 +761,7 @@ export interface TranslationReviewReportItem {
   origin: 'program' | 'ai'
   source_text: string
   target_text: string
+  original_target_text?: string
   quote: string
   quote_start: number
   quote_end: number
@@ -821,6 +822,8 @@ export interface TranslationReviewProgress {
 
 export interface TranslationReviewReport {
   id: string
+  report_mode?: 'issue_check' | 'proofread_generate'
+  proofreading_batch_id?: string | null
   project_id: string | null
   file_record_id: string | null
   merge_view_id: string | null

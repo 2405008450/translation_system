@@ -310,6 +310,7 @@ export const useSegmentStore = defineStore('segment', () => {
   const localRevisionBaselines = ref<Record<string, string>>({})
   const revisionTrackingEnabled = ref(getInitialRevisionTrackingEnabled())
   const revisionSettings = ref<RevisionDisplaySettings>(createDefaultRevisionSettings())
+  const liveSpellingEnabled = ref(true)
   const liveSpellingBySegmentKey = ref<Record<string, LiveSpellingState>>({})
 
   // ---- 合并视图(merge-view)模式状态 ----
@@ -1296,6 +1297,7 @@ export const useSegmentStore = defineStore('segment', () => {
     localRevisionBaselines.value = {}
     revisionTrackingEnabled.value = getInitialRevisionTrackingEnabled()
     revisionSettings.value = createDefaultRevisionSettings()
+    liveSpellingEnabled.value = true
     liveSpellingBySegmentKey.value = {}
     liveSpellingCooldownUntilByFileId.clear()
     syncPromise = null
@@ -1841,6 +1843,14 @@ export const useSegmentStore = defineStore('segment', () => {
     liveSpellingGeneration += 1
   }
 
+  function setLiveSpellingEnabled(enabled: boolean) {
+    liveSpellingEnabled.value = enabled
+    if (!enabled) {
+      clearLiveSpellingTimersAndRequest()
+      liveSpellingBySegmentKey.value = {}
+    }
+  }
+
   function isInlineSpellingIssue(issue: SegmentQAIssue | LiveSpellingIssue) {
     const issueType = (issue.issue_type || '').toLowerCase()
     const ruleId = (issue.rule_id || '').toUpperCase()
@@ -1854,6 +1864,9 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function getInlineSpellingIssues(segment: Segment): Array<SegmentQAIssue | LiveSpellingIssue> {
+    if (!liveSpellingEnabled.value) {
+      return []
+    }
     const key = segmentKeyOf(segment)
     const liveState = liveSpellingBySegmentKey.value[key]
     if (liveState) {
@@ -1876,6 +1889,9 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function scheduleLiveSpellingCheck(segmentKey: string, text: string, delayOverride?: number) {
+    if (!liveSpellingEnabled.value) {
+      return
+    }
     if (activeSentenceId.value !== segmentKey) {
       return
     }
@@ -1926,7 +1942,7 @@ export const useSegmentStore = defineStore('segment', () => {
     generation: number,
     retryCount: number,
   ) {
-    if (generation !== liveSpellingGeneration) {
+    if (!liveSpellingEnabled.value || generation !== liveSpellingGeneration) {
       return
     }
     const index = getSegmentIndex(segmentKey)
@@ -3094,6 +3110,7 @@ export const useSegmentStore = defineStore('segment', () => {
     refreshActiveTermMatches,
     getTermMatches,
     getInlineSpellingIssues,
+    setLiveSpellingEnabled,
     syncToBackend,
     acceptRevision,
     rejectRevision,

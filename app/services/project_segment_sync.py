@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 _SOURCE_PRIORITY = {
     "manual": 30,
     "llm": 20,
+    "llm_review": 20,
     "tm": 10,
     PROJECT_SYNC_SOURCE: 0,
 }

@@ -333,7 +333,7 @@ async function openNotification(notification: NotificationItem) {
   await markNotificationRead(notification)
   notificationsOpen.value = false
   if (notification.file_record_id) {
-    await router.push({ name: 'workbench', params: { id: notification.file_record_id } })
+    await router.push({ name: 'workbench-focus', params: { id: notification.file_record_id } })
     return
   }
   if (notification.project_id) {
