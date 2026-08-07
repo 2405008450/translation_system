@@ -3778,19 +3778,48 @@ def _apply_word_paragraph_rtl(paragraph: ET.Element, language: str) -> None:
         paragraph_properties = ET.Element(_qn("w", "pPr"))
         paragraph.insert(0, paragraph_properties)
 
-    bidi = paragraph_properties.find("w:bidi", NS)
-    if bidi is None:
-        bidi = ET.Element(_qn("w", "bidi"))
-        alignment = paragraph_properties.find("w:jc", NS)
-        if alignment is None:
-            paragraph_properties.append(bidi)
-        else:
-            paragraph_properties.insert(list(paragraph_properties).index(alignment), bidi)
+    # WordprocessingML 的 pPr/rPr 子元素有固定顺序。若简单 append 到 rPr 后面，
+    # Word 可能忽略后面的 bidi/jc，表现为方向正确但仍需手动点击“右对齐”。
+    bidi = _upsert_ordered_word_property(
+        paragraph_properties,
+        "bidi",
+        before=(
+            "adjustRightInd",
+            "snapToGrid",
+            "spacing",
+            "ind",
+            "contextualSpacing",
+            "mirrorIndents",
+            "suppressOverlap",
+            "jc",
+            "textDirection",
+            "textAlignment",
+            "textboxTightWrap",
+            "outlineLvl",
+            "divId",
+            "cnfStyle",
+            "rPr",
+            "sectPr",
+            "pPrChange",
+        ),
+    )
     bidi.set(_qn("w", "val"), "1")
 
-    alignment = paragraph_properties.find("w:jc", NS)
-    if alignment is None:
-        alignment = ET.SubElement(paragraph_properties, _qn("w", "jc"))
+    alignment = _upsert_ordered_word_property(
+        paragraph_properties,
+        "jc",
+        before=(
+            "textDirection",
+            "textAlignment",
+            "textboxTightWrap",
+            "outlineLvl",
+            "divId",
+            "cnfStyle",
+            "rPr",
+            "sectPr",
+            "pPrChange",
+        ),
+    )
     alignment.set(_qn("w", "val"), "right")
 
     for run in paragraph.iter(_qn("w", "r")):
@@ -3799,15 +3828,42 @@ def _apply_word_paragraph_rtl(paragraph: ET.Element, language: str) -> None:
             run_properties = ET.Element(_qn("w", "rPr"))
             run.insert(0, run_properties)
 
-        rtl = run_properties.find("w:rtl", NS)
-        if rtl is None:
-            rtl = ET.SubElement(run_properties, _qn("w", "rtl"))
+        rtl = _upsert_ordered_word_property(
+            run_properties,
+            "rtl",
+            before=("cs", "em", "lang", "eastAsianLayout", "specVanish", "oMath", "rPrChange"),
+        )
         rtl.set(_qn("w", "val"), "1")
 
-        lang = run_properties.find("w:lang", NS)
-        if lang is None:
-            lang = ET.SubElement(run_properties, _qn("w", "lang"))
+        lang = _upsert_ordered_word_property(
+            run_properties,
+            "lang",
+            before=("eastAsianLayout", "specVanish", "oMath", "rPrChange"),
+        )
         lang.set(_qn("w", "bidi"), language)
+
+
+def _upsert_ordered_word_property(
+    parent: ET.Element,
+    property_name: str,
+    *,
+    before: Iterable[str],
+) -> ET.Element:
+    """新增或移动 Word 属性，并去除重复项，保证其处于合法的架构顺序。"""
+    property_tag = _qn("w", property_name)
+    matches = [child for child in list(parent) if child.tag == property_tag]
+    element = matches[0] if matches else ET.Element(property_tag)
+    for match in matches:
+        parent.remove(match)
+
+    following_tags = {_qn("w", name) for name in before}
+    insert_at = len(parent)
+    for index, child in enumerate(parent):
+        if child.tag in following_tags:
+            insert_at = index
+            break
+    parent.insert(insert_at, element)
+    return element
 
 
 def _apply_drawingml_paragraph_rtl(paragraph: ET.Element, language: str) -> None:
