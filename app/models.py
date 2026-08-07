@@ -2837,6 +2837,7 @@ class ProofreadingBatch(Base):
         Index("ix_proofreading_batches_status", "status"),
         Index("ix_proofreading_batches_created_by_id", "created_by_id"),
         Index("ix_proofreading_batches_created_at", "created_at"),
+        Index("ix_proofreading_batches_batch_kind", "batch_kind"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -2851,6 +2852,9 @@ class ProofreadingBatch(Base):
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     file_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default=text("''"))
     source_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_language: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default=text("''"))
+    batch_kind: Mapped[str] = mapped_column(String(30), nullable=False, default="xlsx_columns", server_default=text("'xlsx_columns'"))
+    alignment_status: Mapped[str] = mapped_column(String(20), nullable=False, default="not_applicable", server_default=text("'not_applicable'"))
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="ready", server_default=text("'ready'"))
     progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
@@ -2879,6 +2883,65 @@ class ProofreadingBatch(Base):
     baselines: Mapped[list["ProofreadingSegmentBaseline"]] = relationship(
         "ProofreadingSegmentBaseline", back_populates="batch", cascade="all, delete-orphan"
     )
+    alignment_pairs: Mapped[list["DocumentAlignmentPair"]] = relationship(
+        "DocumentAlignmentPair", back_populates="batch", cascade="all, delete-orphan"
+    )
+    alignment_units: Mapped[list["DocumentAlignmentUnit"]] = relationship(
+        "DocumentAlignmentUnit", back_populates="batch", cascade="all, delete-orphan"
+    )
+
+
+class DocumentAlignmentPair(Base):
+    __tablename__ = "document_alignment_pairs"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "pair_order", name="uq_alignment_pair_order"),
+        Index("ix_document_alignment_pairs_batch_id", "batch_id"),
+        Index("ix_document_alignment_pairs_confidence", "batch_id", "confidence_level"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=UUID_SQL_DEFAULT)
+    batch_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("proofreading_batches.id", ondelete="CASCADE"), nullable=False)
+    pair_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    src_indices: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    tgt_indices: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    source_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    target_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default=text("0"))
+    confidence_level: Mapped[str] = mapped_column(String(10), nullable=False, default="medium", server_default=text("'medium'"))
+    method: Mapped[str] = mapped_column(String(30), nullable=False, default="dp", server_default=text("'dp'"))
+    features: Mapped[str] = mapped_column(Text, nullable=False, default="{}", server_default=text("'{}'"))
+    locked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    block_type: Mapped[str] = mapped_column(String(30), nullable=False, default="paragraph", server_default=text("'paragraph'"))
+    block_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    row_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cell_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=False), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    batch: Mapped["ProofreadingBatch"] = relationship("ProofreadingBatch", back_populates="alignment_pairs")
+
+
+class DocumentAlignmentUnit(Base):
+    __tablename__ = "document_alignment_units"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "side", "unit_index", name="uq_alignment_unit"),
+        Index("ix_document_alignment_units_batch_side", "batch_id", "side", "unit_index"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=UUID_SQL_DEFAULT)
+    batch_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("proofreading_batches.id", ondelete="CASCADE"), nullable=False)
+    side: Mapped[str] = mapped_column(String(10), nullable=False)
+    unit_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    para_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    block_type: Mapped[str] = mapped_column(String(30), nullable=False, default="paragraph", server_default=text("'paragraph'"))
+    block_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    row_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cell_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    numbering: Mapped[str] = mapped_column(String(60), nullable=False, default="", server_default=text("''"))
+    # 名为 text 的属性必须放在所有 sqlalchemy.text(...) 调用之后，避免类作用域遮蔽导入函数。
+    text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+
+    batch: Mapped["ProofreadingBatch"] = relationship("ProofreadingBatch", back_populates="alignment_units")
 
 
 class ProofreadingColumnBinding(Base):

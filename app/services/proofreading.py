@@ -1039,7 +1039,11 @@ def run_export_batch(batch_id: UUID) -> None:
         batch.export_error_message = ""
         db.commit()
         try:
-            content, filename = export_batch_xlsx(db, batch)
+            if getattr(batch, "batch_kind", "xlsx_columns") == "document_pair":
+                from app.services.document_alignment.export import export_document_pair_xlsx
+                content, filename = export_document_pair_xlsx(db, batch)
+            else:
+                content, filename = export_batch_xlsx(db, batch)
             export_dir = Path(get_settings().file_storage_dir) / "proofreading_exports"
             export_dir.mkdir(parents=True, exist_ok=True)
             output_path = export_dir / f"{batch.id}.xlsx"
@@ -1111,6 +1115,9 @@ def serialize_batch(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
         "project_id": str(batch.project_id),
         "filename": batch.filename,
         "source_language": batch.source_language,
+        "target_language": getattr(batch, "target_language", ""),
+        "batch_kind": getattr(batch, "batch_kind", "xlsx_columns"),
+        "alignment_status": getattr(batch, "alignment_status", "not_applicable"),
         "status": batch.status,
         "progress": batch.progress,
         "message": batch.message,

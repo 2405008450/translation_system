@@ -654,6 +654,9 @@ REQUIRED_SCHEMA = {
         "export_status",
         "export_progress",
         "export_path",
+        "batch_kind",
+        "alignment_status",
+        "target_language",
     },
     "proofreading_column_bindings": {
         "id",
@@ -670,6 +673,15 @@ REQUIRED_SCHEMA = {
         "binding_id",
         "segment_id",
         "original_target_text",
+    },
+    "document_alignment_pairs": {
+        "id", "batch_id", "pair_order", "src_indices", "tgt_indices",
+        "source_text", "target_text", "confidence", "confidence_level",
+        "method", "features", "locked",
+    },
+    "document_alignment_units": {
+        "id", "batch_id", "side", "unit_index", "text", "para_index",
+        "block_type", "block_index", "numbering",
     },
     "translation_review_report_items": {
         "id",
@@ -817,6 +829,7 @@ REQUIRED_INDEXES = {
         "ix_proofreading_batches_status",
         "ix_proofreading_batches_created_by_id",
         "ix_proofreading_batches_created_at",
+        "ix_proofreading_batches_batch_kind",
     },
     "proofreading_column_bindings": {
         "ix_proofreading_column_bindings_batch_id",
@@ -826,6 +839,13 @@ REQUIRED_INDEXES = {
         "ix_proofreading_segment_baselines_batch_id",
         "ix_proofreading_segment_baselines_binding_id",
         "ix_proofreading_segment_baselines_segment_id",
+    },
+    "document_alignment_pairs": {
+        "ix_document_alignment_pairs_batch_id",
+        "ix_document_alignment_pairs_confidence",
+    },
+    "document_alignment_units": {
+        "ix_document_alignment_units_batch_side",
     },
     "translation_review_report_items": {
         "ix_translation_review_report_items_report_id",
@@ -3687,6 +3707,9 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 filename VARCHAR(255) NOT NULL,
                 file_hash VARCHAR(64) NOT NULL DEFAULT '',
                 source_language VARCHAR(20) NOT NULL,
+                target_language VARCHAR(20) NOT NULL DEFAULT '',
+                batch_kind VARCHAR(30) NOT NULL DEFAULT 'xlsx_columns',
+                alignment_status VARCHAR(20) NOT NULL DEFAULT 'not_applicable',
                 status VARCHAR(20) NOT NULL DEFAULT 'ready',
                 progress INTEGER NOT NULL DEFAULT 0,
                 message TEXT NOT NULL DEFAULT '',
@@ -3726,6 +3749,18 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ALTER TABLE IF EXISTS proofreading_batches
             ADD COLUMN IF NOT EXISTS export_path TEXT NOT NULL DEFAULT ''
             """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS target_language VARCHAR(20) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS batch_kind VARCHAR(30) NOT NULL DEFAULT 'xlsx_columns'
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS alignment_status VARCHAR(20) NOT NULL DEFAULT 'not_applicable'
+            """,
             f"""
             CREATE TABLE IF NOT EXISTS proofreading_column_bindings (
                 id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
@@ -3760,6 +3795,32 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 CONSTRAINT uq_proofreading_segment_baseline_segment UNIQUE (segment_id)
             )
             """,
+            f"""
+            CREATE TABLE IF NOT EXISTS document_alignment_pairs (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                batch_id UUID NOT NULL REFERENCES proofreading_batches(id) ON DELETE CASCADE,
+                pair_order INTEGER NOT NULL, src_indices TEXT NOT NULL DEFAULT '[]',
+                tgt_indices TEXT NOT NULL DEFAULT '[]', source_text TEXT NOT NULL DEFAULT '',
+                target_text TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0,
+                confidence_level VARCHAR(10) NOT NULL DEFAULT 'medium', method VARCHAR(30) NOT NULL DEFAULT 'dp',
+                features TEXT NOT NULL DEFAULT '{{}}', locked BOOLEAN NOT NULL DEFAULT FALSE,
+                block_type VARCHAR(30) NOT NULL DEFAULT 'paragraph', block_index INTEGER NOT NULL DEFAULT 0,
+                row_index INTEGER, cell_index INTEGER, created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_alignment_pair_order UNIQUE (batch_id, pair_order)
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS document_alignment_units (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                batch_id UUID NOT NULL REFERENCES proofreading_batches(id) ON DELETE CASCADE,
+                side VARCHAR(10) NOT NULL, unit_index INTEGER NOT NULL, text TEXT NOT NULL DEFAULT '',
+                para_index INTEGER NOT NULL DEFAULT 0, block_type VARCHAR(30) NOT NULL DEFAULT 'paragraph',
+                block_index INTEGER NOT NULL DEFAULT 0, row_index INTEGER, cell_index INTEGER,
+                numbering VARCHAR(60) NOT NULL DEFAULT '',
+                CONSTRAINT uq_alignment_unit UNIQUE (batch_id, side, unit_index)
+            )
+            """,
             """
             CREATE INDEX IF NOT EXISTS ix_proofreading_batches_project_id
             ON proofreading_batches (project_id)
@@ -3775,6 +3836,22 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_proofreading_batches_created_at
             ON proofreading_batches (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_proofreading_batches_batch_kind
+            ON proofreading_batches (batch_kind)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_alignment_pairs_batch_id
+            ON document_alignment_pairs (batch_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_alignment_pairs_confidence
+            ON document_alignment_pairs (batch_id, confidence_level)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_alignment_units_batch_side
+            ON document_alignment_units (batch_id, side, unit_index)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_proofreading_column_bindings_batch_id

@@ -59,7 +59,10 @@ export interface ProofreadingBatch {
   project_id: string
   filename: string
   source_language: string
-  status: 'ready' | 'queued' | 'running' | 'completed' | 'partial_failed' | 'failed' | 'canceled'
+  target_language?: string
+  batch_kind?: 'xlsx_columns' | 'document_pair'
+  alignment_status?: 'not_applicable' | 'aligning' | 'draft' | 'confirmed' | 'failed'
+  status: 'aligning' | 'draft' | 'ready' | 'queued' | 'running' | 'completed' | 'partial_failed' | 'failed' | 'canceled'
   progress: number
   message: string
   error_message: string

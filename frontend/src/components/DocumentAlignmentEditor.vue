@@ -1,0 +1,211 @@
+<script setup lang="ts">
+import axios from 'axios'
+import { Check, ChevronDown, ChevronUp, Lock, Merge, RefreshCw, Scissors, Upload } from 'lucide-vue-next'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+
+import {
+  confirmAlignment, createDocumentAlignmentBatch, listAlignmentPairs, mergeAlignmentPairs,
+  patchAlignmentPair, previewDocumentAlignment, rerunAlignment, shiftAlignmentBoundary,
+  splitAlignmentPair, type AlignmentPair, type AlignmentPreview,
+} from '../api/documentAlignment'
+import { getProofreadingBatch, listProofreadingBatches } from '../api/proofreading'
+import { languageOptions } from '../constants/languages'
+
+const props = defineProps<{ projectId: string }>()
+const emit = defineEmits<{ refresh: []; openWorkbench: [fileRecordId: string] }>()
+const sourceFile = ref<File | null>(null)
+const targetFile = ref<File | null>(null)
+const preview = ref<AlignmentPreview | null>(null)
+const sourceLanguage = ref('zh-CN')
+const targetLanguage = ref('en-US')
+const granularity = ref<'sentence' | 'paragraph'>('sentence')
+const useLlm = ref(false)
+const batchId = ref('')
+const pairs = ref<AlignmentPair[]>([])
+const activeIndex = ref(0)
+const busy = ref(false)
+const message = ref('')
+const error = ref('')
+let pollTimer: ReturnType<typeof setInterval> | null = null
+
+const activePair = computed(() => pairs.value[activeIndex.value])
+const suspiciousCount = computed(() => pairs.value.filter(pair => pair.confidence_level === 'low' || !pair.src_indices.length || !pair.tgt_indices.length).length)
+
+function errorText(value: unknown) {
+  return axios.isAxiosError(value) ? String(value.response?.data?.detail || '操作失败。') : value instanceof Error ? value.message : '操作失败。'
+}
+
+function selectFile(side: 'source' | 'target', event: Event) {
+  const file = (event.target as HTMLInputElement).files?.[0] || null
+  if (side === 'source') sourceFile.value = file
+  else targetFile.value = file
+  preview.value = null
+}
+
+async function makePreview() {
+  if (!sourceFile.value || !targetFile.value) return
+  busy.value = true; error.value = ''
+  try { preview.value = await previewDocumentAlignment(props.projectId, sourceFile.value, targetFile.value) }
+  catch (value) { error.value = errorText(value) }
+  finally { busy.value = false }
+}
+
+async function createBatch() {
+  if (!preview.value) return
+  busy.value = true; error.value = ''; message.value = '正在生成对齐草稿…'
+  try {
+    const batch = await createDocumentAlignmentBatch(props.projectId, {
+      preview_token: preview.value.preview_token, source_language: sourceLanguage.value,
+      target_language: targetLanguage.value, granularity: granularity.value, use_llm_for_hard_blocks: useLlm.value,
+    })
+    batchId.value = batch.id
+    pollAlignment()
+  } catch (value) { error.value = errorText(value); busy.value = false }
+}
+
+function pollAlignment() {
+  if (pollTimer) clearInterval(pollTimer)
+  pollTimer = setInterval(async () => {
+    try {
+      const batch = await getProofreadingBatch(batchId.value)
+      message.value = batch.message
+      if (batch.alignment_status === 'draft') {
+        if (pollTimer) clearInterval(pollTimer)
+        pollTimer = null
+        const result = await listAlignmentPairs(batchId.value)
+        pairs.value = result.items
+        busy.value = false
+        emit('refresh')
+      } else if (batch.alignment_status === 'failed') {
+        throw new Error(batch.error_message || '对齐失败。')
+      }
+    } catch (value) {
+      if (pollTimer) clearInterval(pollTimer)
+      pollTimer = null; busy.value = false; error.value = errorText(value)
+    }
+  }, 1200)
+}
+
+async function reloadPairs() {
+  pairs.value = (await listAlignmentPairs(batchId.value)).items
+  activeIndex.value = Math.min(activeIndex.value, Math.max(0, pairs.value.length - 1))
+}
+
+async function toggleLock() {
+  if (!activePair.value) return
+  await patchAlignmentPair(activePair.value.id, { locked: !activePair.value.locked }); await reloadPairs()
+}
+
+async function splitCurrent() {
+  if (!activePair.value || activePair.value.src_indices.length + activePair.value.tgt_indices.length < 3) return
+  await splitAlignmentPair(batchId.value, activePair.value); await reloadPairs()
+}
+
+async function mergeNext() {
+  const current = activePair.value, next = pairs.value[activeIndex.value + 1]
+  if (!current || !next) return
+  await mergeAlignmentPairs(batchId.value, current.id, next.id); await reloadPairs()
+}
+
+async function shift(direction: 'next_into_current' | 'current_into_next') {
+  if (!activePair.value) return
+  await shiftAlignmentBoundary(batchId.value, activePair.value.id, direction); await reloadPairs()
+}
+
+function jumpSuspicious(step: 1 | -1) {
+  if (!pairs.value.length) return
+  for (let offset = 1; offset <= pairs.value.length; offset++) {
+    const index = (activeIndex.value + step * offset + pairs.value.length) % pairs.value.length
+    const pair = pairs.value[index]
+    if (pair.confidence_level === 'low' || !pair.src_indices.length || !pair.tgt_indices.length) { activeIndex.value = index; break }
+  }
+}
+
+async function rerun() {
+  busy.value = true; await rerunAlignment(batchId.value); pollAlignment()
+}
+
+async function confirm() {
+  if (!batchId.value) return
+  busy.value = true
+  try { const result = await confirmAlignment(batchId.value); emit('refresh'); emit('openWorkbench', result.file_record_id) }
+  catch (value) { error.value = errorText(value) }
+  finally { busy.value = false }
+}
+
+function onKeydown(event: KeyboardEvent) {
+  if (!pairs.value.length || event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return
+  if (event.key.toLowerCase() === 'j') jumpSuspicious(1)
+  else if (event.key.toLowerCase() === 'k') jumpSuspicious(-1)
+  else if (event.code === 'Space') { event.preventDefault(); void toggleLock() }
+  else if (event.altKey && event.key.toLowerCase() === 'm') { event.preventDefault(); void mergeNext() }
+  else if (event.altKey && event.key.toLowerCase() === 's') { event.preventDefault(); void splitCurrent() }
+  else if (event.altKey && event.key.toLowerCase() === 'r') { event.preventDefault(); void rerun() }
+  else if (event.altKey && event.key === 'ArrowDown') { event.preventDefault(); void shift('next_into_current') }
+  else if (event.altKey && event.key === 'ArrowUp') { event.preventDefault(); void shift('current_into_next') }
+}
+window.addEventListener('keydown', onKeydown)
+onMounted(async () => {
+  const existing = (await listProofreadingBatches(props.projectId)).find(batch => (
+    batch.batch_kind === 'document_pair' && ['aligning', 'draft'].includes(batch.alignment_status || '')
+  ))
+  if (!existing) return
+  batchId.value = existing.id
+  message.value = existing.message
+  if (existing.alignment_status === 'draft') await reloadPairs()
+  else { busy.value = true; pollAlignment() }
+})
+onBeforeUnmount(() => { window.removeEventListener('keydown', onKeydown); if (pollTimer) clearInterval(pollTimer) })
+</script>
+
+<template>
+  <section class="alignment-editor">
+    <header><div><strong>双文档对齐校对</strong><p>原文与译文只由程序解析；LLM 辅助开启时也只返回边界下标。</p></div></header>
+    <p v-if="error" class="form-message is-error">{{ error }}</p>
+    <div v-if="!pairs.length" class="alignment-upload">
+      <label class="file-pick"><Upload :size="15" />原文文档<input type="file" accept=".doc,.docx,.txt" @change="selectFile('source', $event)"><small>{{ sourceFile?.name || '未选择' }}</small></label>
+      <label class="file-pick"><Upload :size="15" />译文文档<input type="file" accept=".doc,.docx,.txt" @change="selectFile('target', $event)"><small>{{ targetFile?.name || '未选择' }}</small></label>
+      <button class="button" :disabled="busy || !sourceFile || !targetFile" @click="makePreview">解析预览</button>
+      <template v-if="preview">
+        <span>{{ preview.source.unit_count }} 个原文单元 ↔ {{ preview.target.unit_count }} 个译文单元</span>
+        <select v-model="sourceLanguage" class="field__control"><option v-for="item in languageOptions" :key="item.code" :value="item.code">{{ item.label }}</option></select>
+        <select v-model="targetLanguage" class="field__control"><option v-for="item in languageOptions" :key="item.code" :value="item.code">{{ item.label }}</option></select>
+        <select v-model="granularity" class="field__control"><option value="sentence">句粒度（默认）</option><option value="paragraph">段落粒度</option></select>
+        <label><input v-model="useLlm" type="checkbox">疑难区间使用受限 LLM</label>
+        <button class="button button--primary" :disabled="busy || sourceLanguage === targetLanguage" @click="createBatch">生成对齐草稿</button>
+      </template>
+      <span v-if="message">{{ message }}</span>
+    </div>
+    <template v-else>
+      <div class="alignment-toolbar">
+        <span>⚠ {{ suspiciousCount }} 个可疑配对 · {{ activeIndex + 1 }}/{{ pairs.length }}</span>
+        <button class="button" @click="jumpSuspicious(-1)"><ChevronUp :size="14" />上一个</button>
+        <button class="button" @click="jumpSuspicious(1)"><ChevronDown :size="14" />下一个</button>
+        <button class="button" @click="toggleLock"><Lock :size="14" />{{ activePair?.locked ? '解锁' : '锁定' }}</button>
+        <button class="button" @click="splitCurrent"><Scissors :size="14" />拆分</button>
+        <button class="button" @click="mergeNext"><Merge :size="14" />合并下一项</button>
+        <button class="button" :disabled="busy" @click="rerun"><RefreshCw :size="14" />重跑未锁定区间</button>
+        <button class="button button--primary" :disabled="busy" @click="confirm"><Check :size="14" />确认并生成句段</button>
+      </div>
+      <div class="alignment-grid">
+        <button v-for="(pair, index) in pairs" :key="pair.id" type="button" class="alignment-row" :class="[`is-${pair.confidence_level}`, { 'is-active': index === activeIndex }]" @click="activeIndex = index">
+          <div><small>S{{ pair.src_indices.join(', S') || '—' }}</small><p>{{ pair.source_text || '（增译）' }}</p></div>
+          <div class="alignment-state" :title="JSON.stringify(pair.features)">{{ pair.locked ? '🔒' : pair.target_text ? (pair.confidence_level === 'low' ? '⚠' : '●') : '✕' }}<small>{{ Math.round(pair.confidence * 100) }}%</small></div>
+          <div><small>T{{ pair.tgt_indices.join(', T') || '—' }}</small><p>{{ pair.target_text || '（缺译文）' }}</p></div>
+        </button>
+      </div>
+    </template>
+  </section>
+</template>
+
+<style scoped>
+.alignment-editor { display: grid; gap: 12px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.alignment-editor header p, .alignment-row p { margin: 4px 0 0; }
+.alignment-upload, .alignment-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.file-pick { display: grid; grid-template-columns: auto auto; gap: 4px 8px; padding: 10px; border: 1px dashed var(--line); border-radius: 8px; cursor: pointer; }
+.file-pick input { display: none; }.file-pick small { grid-column: 1 / -1; color: var(--ink-500); }
+.alignment-grid { display: grid; max-height: 620px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+.alignment-row { display: grid; grid-template-columns: minmax(0, 1fr) 68px minmax(0, 1fr); gap: 12px; padding: 12px; text-align: left; color: inherit; background: transparent; border: 0; border-bottom: 1px solid var(--line); cursor: pointer; }
+.alignment-row.is-active { outline: 2px solid var(--brand); outline-offset: -2px; }.alignment-row.is-low { background: #fff4e5; }.alignment-row.is-high { background: #f2fbf5; }
+.alignment-state { display: grid; place-content: center; text-align: center; border-inline: 1px solid var(--line); }.alignment-state small { display: block; }
+</style>

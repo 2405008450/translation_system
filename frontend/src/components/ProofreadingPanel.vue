@@ -18,6 +18,7 @@ import {
 } from '../api/proofreading'
 import { getLanguageLabel, languageOptions } from '../constants/languages'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import DocumentAlignmentEditor from './DocumentAlignmentEditor.vue'
 
 const props = defineProps<{ projectId: string }>()
 const emit = defineEmits<{ refreshProject: [] }>()
@@ -56,7 +57,7 @@ const errorMessage = ref('')
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 const hasRunningBatch = computed(() => batches.value.some((item) => (
-  ['queued', 'running'].includes(item.status) || ['queued', 'running'].includes(item.export_status)
+  ['aligning', 'queued', 'running'].includes(item.status) || ['queued', 'running'].includes(item.export_status)
 )))
 const canCreate = computed(() => {
   if (!preview.value || !sourceLanguage.value) return false
@@ -261,7 +262,7 @@ function startPolling() {
 
 function statusLabel(status: ProofreadingBatch['status']) {
   return ({
-    ready: '待生成', queued: '排队中', running: '校对中', completed: '已完成',
+    aligning: '对齐中', draft: '待确认对齐', ready: '待生成', queued: '排队中', running: '校对中', completed: '已完成',
     partial_failed: '部分失败', failed: '失败', canceled: '已取消',
   } as Record<string, string>)[status] || status
 }
@@ -278,6 +279,7 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="proofreading-panel">
+    <DocumentAlignmentEditor :project-id="projectId" @refresh="refreshBatches" @open-workbench="openWorkbench" />
     <div class="proofreading-panel__head">
       <div>
         <div class="section-title section-title--tight">多语种 Excel 校对</div>
