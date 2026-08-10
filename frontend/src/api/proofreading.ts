@@ -61,11 +61,12 @@ export interface ProofreadingBatch {
   source_language: string
   target_language?: string
   batch_kind?: 'xlsx_columns' | 'document_pair'
-  alignment_status?: 'not_applicable' | 'aligning' | 'draft' | 'confirmed' | 'failed'
-  status: 'aligning' | 'draft' | 'ready' | 'queued' | 'running' | 'completed' | 'partial_failed' | 'failed' | 'canceled'
+  alignment_status?: 'not_applicable' | 'aligning' | 'canceling' | 'canceled' | 'draft' | 'confirmed' | 'failed'
+  status: 'aligning' | 'draft' | 'ready' | 'queued' | 'running' | 'canceling' | 'completed' | 'partial_failed' | 'failed' | 'canceled'
   progress: number
   message: string
   error_message: string
+  cancel_requested?: boolean
   total_segments: number
   changed_segments: number
   skipped_segments: number
@@ -84,6 +85,36 @@ export interface ProofreadingBatch {
     actual_model: string
   }
   bindings: ProofreadingBinding[]
+}
+
+export type ProofreadingExportFormat =
+  | 'proofreading_docx_layout'
+  | 'proofreading_docx_ordered'
+  | 'proofreading_audit_xlsx'
+  | 'proofreading_xlsx_original'
+
+export interface ProofreadingExportReadiness {
+  batch_id: string
+  total: number
+  confirmed: number
+  unconfirmed: number
+  missing_translation: number
+  translation_only: number
+  translation_only_unreviewed: number
+  llm_failed: number
+  available_formats: ProofreadingExportFormat[]
+  has_warnings: boolean
+}
+
+export interface ProofreadingExportTask {
+  task_id: string
+  file_record_id: string
+  export_type: ProofreadingExportFormat
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  progress: number
+  message: string
+  filename?: string | null
+  error?: string | null
 }
 
 export async function previewProofreadingWorkbook(projectId: string, file: File) {
@@ -120,9 +151,15 @@ export async function generateProofreadingBatch(
     provider: 'auto' | 'deepseek' | 'openrouter'
     model?: string
     user_instructions?: string
+    retry_scope?: 'all' | 'failed_only'
   },
 ) {
   await http.post(`/proofreading-batches/${batchId}/generate`, payload)
+}
+
+export async function cancelProofreadingBatch(batchId: string) {
+  const { data } = await http.post<ProofreadingBatch>(`/proofreading-batches/${batchId}/cancel`)
+  return data
 }
 
 export async function exportProofreadingBatch(batchId: string) {
@@ -131,4 +168,32 @@ export async function exportProofreadingBatch(batchId: string) {
 
 export async function downloadProofreadingBatchExport(batchId: string) {
   return http.get<Blob>(`/proofreading-batches/${batchId}/exports/latest`, { responseType: 'blob' })
+}
+
+export async function getProofreadingExportReadiness(batchId: string) {
+  const { data } = await http.get<ProofreadingExportReadiness>(
+    `/proofreading-batches/${batchId}/export-readiness`,
+  )
+  return data
+}
+
+export async function createProofreadingExportTask(
+  batchId: string,
+  format: ProofreadingExportFormat,
+  acknowledgeWarnings: boolean,
+) {
+  const { data } = await http.post<ProofreadingExportTask>(
+    `/proofreading-batches/${batchId}/export-tasks`,
+    { format, acknowledge_warnings: acknowledgeWarnings },
+  )
+  return data
+}
+
+export async function getProofreadingExportTask(taskId: string) {
+  const { data } = await http.get<ProofreadingExportTask>(`/file-records/export-tasks/${taskId}`)
+  return data
+}
+
+export async function downloadProofreadingExportTask(taskId: string) {
+  return http.get<Blob>(`/file-records/export-tasks/${taskId}/download`, { responseType: 'blob' })
 }

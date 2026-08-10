@@ -22,7 +22,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, case, func, literal, or_
+from sqlalchemy import and_, case, exists, func, literal, or_, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, aliased, object_session
 
@@ -43,6 +43,7 @@ from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models import (
     AssignmentEvent,
+    DocumentAlignmentPair,
     DocumentStatisticsReport,
     DocumentStatisticsReportItem,
     FileAssignment,
@@ -62,6 +63,7 @@ from app.models import (
     PretranslationRun,
     PretranslationTask,
     ProjectWorkflowStep,
+    ProofreadingBatch,
     ProofreadingSegmentBaseline,
     Segment,
     SegmentQAIssue,
@@ -74,6 +76,8 @@ from app.models import (
     TermBase,
     TermEntry,
     TranslationMemory,
+    TranslationReviewReport,
+    TranslationReviewReportItem,
     User,
 )
 from app.services.adapters import (
@@ -123,6 +127,8 @@ from app.services.document_statistics import (
     normalize_document_statistics,
     serialize_document_statistics,
 )
+from app.services.document_alignment.service import merge_alignment_pair_range
+from app.services.document_alignment.segments import TRANSLATION_ONLY_SOURCE_LABEL
 from app.services.document_match_analysis import (
     DocumentMatchSegment,
     compute_document_match_analysis,
@@ -11287,6 +11293,29 @@ def _apply_segment_scope_filter(query, scope: str):
             func.coalesce(Segment.target_text, "")
             != func.coalesce(ProofreadingSegmentBaseline.original_target_text, ""),
         )
+    if normalized_scope == "proofreading_failed":
+        latest_report_id = (
+            select(TranslationReviewReport.id)
+            .where(
+                TranslationReviewReport.proofreading_batch_id
+                == ProofreadingSegmentBaseline.batch_id,
+            )
+            .order_by(TranslationReviewReport.created_at.desc())
+            .limit(1)
+            .correlate(ProofreadingSegmentBaseline)
+            .scalar_subquery()
+        )
+        has_latest_generation_error = exists(
+            select(1).where(
+                TranslationReviewReportItem.segment_id == Segment.id,
+                TranslationReviewReportItem.report_id == latest_report_id,
+                TranslationReviewReportItem.category_key == "generation_error",
+            )
+        )
+        return query.join(
+            ProofreadingSegmentBaseline,
+            ProofreadingSegmentBaseline.segment_id == Segment.id,
+        ).filter(has_latest_generation_error)
     return query
 
 
@@ -15293,11 +15322,24 @@ def merge_segment(
     if first_seg.id == second_seg.id:
         raise HTTPException(status_code=400, detail="不能将句段与自身合并。")
 
+    # 双文档校对的每个对齐项天然可能来自不同段落或表格单元格，但人工合并仍必须保证全文相邻。
+    document_pair_batch: ProofreadingBatch | None = None
+    parse_options = _get_file_record_document_parse_options(file_record)
+    proofreading_batch_id = str(parse_options.get("proofreading_batch_id") or "").strip()
+    if parse_options.get("alignment_mode") == "document_pair" and proofreading_batch_id:
+        try:
+            candidate_batch = db.get(ProofreadingBatch, UUID(proofreading_batch_id))
+        except (TypeError, ValueError):
+            candidate_batch = None
+        if candidate_batch is not None and candidate_batch.batch_kind == "document_pair":
+            document_pair_batch = candidate_batch
+
     # DWG/DXF 文件允许跨 block 合并（CAD 图纸中相邻实体可能是独立 block）
     file_ext = (file_record.filename or "").lower().rsplit(".", 1)[-1] if file_record.filename else ""
     is_cad_file = file_ext in ("dwg", "dxf")
+    allow_cross_block = is_cad_file or document_pair_batch is not None
 
-    if not is_cad_file:
+    if not allow_cross_block:
         if not _segments_in_same_merge_block(first_seg, second_seg):
             raise HTTPException(status_code=400, detail="只能合并同一区块内相邻的句段。")
 
@@ -15314,11 +15356,75 @@ def merge_segment(
         raise HTTPException(status_code=400, detail="普通文档只能合并前后相邻的句段。")
 
     # 合并文本
-    separator = "" if _is_cjk_text(first_seg.source_text) else " "
-    merged_source = first_seg.source_text.rstrip() + separator + second_seg.source_text.lstrip()
+    use_document_pair_separator = document_pair_batch is not None
+    source_separator = "\n" if use_document_pair_separator else "" if _is_cjk_text(first_seg.source_text) else " "
+    target_separator = "\n" if use_document_pair_separator else "" if _is_cjk_text(first_seg.target_text) else " "
+    merged_source = first_seg.source_text.rstrip() + source_separator + second_seg.source_text.lstrip()
     merged_target = ""
     if (first_seg.target_text or "").strip() or (second_seg.target_text or "").strip():
-        merged_target = (first_seg.target_text or "").rstrip() + separator + (second_seg.target_text or "").lstrip()
+        merged_target = (first_seg.target_text or "").rstrip() + target_separator + (second_seg.target_text or "").lstrip()
+
+    # 已确认的双文档批次必须同步合并底层配对和基线，否则导出预检会把被删句段重新补齐。
+    if document_pair_batch is not None:
+        try:
+            first_metadata = json.loads(first_seg.segment_metadata or "{}")
+            second_metadata = json.loads(second_seg.segment_metadata or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="双文档句段缺少有效的对齐元数据，无法安全合并。") from exc
+        first_pair_id = first_metadata.get("alignment_pair_id")
+        second_pair_id = second_metadata.get("alignment_pair_id")
+        if not first_pair_id or not second_pair_id:
+            raise HTTPException(status_code=400, detail="双文档句段缺少配对标识，无法安全合并。")
+        try:
+            merged_pair = merge_alignment_pair_range(
+                db,
+                document_pair_batch.id,
+                [UUID(str(first_pair_id)), UUID(str(second_pair_id))],
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        first_baseline = db.query(ProofreadingSegmentBaseline).filter_by(segment_id=first_seg.id).first()
+        second_baseline = db.query(ProofreadingSegmentBaseline).filter_by(segment_id=second_seg.id).first()
+        if first_baseline is not None and second_baseline is not None:
+            first_baseline.original_target_text = "\n".join(
+                value for value in (
+                    first_baseline.original_target_text.strip(),
+                    second_baseline.original_target_text.strip(),
+                ) if value
+            )
+            db.delete(second_baseline)
+        elif second_baseline is not None:
+            second_baseline.segment_id = first_seg.id
+            first_baseline = second_baseline
+        if first_baseline is not None:
+            first_baseline.row_index = merged_pair.pair_order
+            first_baseline.source_cell_ref = f"S{merged_pair.pair_order}"
+            first_baseline.target_cell_ref = f"T{merged_pair.pair_order}"
+
+        src_indices = json.loads(merged_pair.src_indices or "[]")
+        tgt_indices = json.loads(merged_pair.tgt_indices or "[]")
+        merged_metadata = {
+            **first_metadata,
+            "proofreading_batch_id": str(document_pair_batch.id),
+            "alignment_pair_id": str(merged_pair.id),
+            "alignment_pair_order": merged_pair.pair_order,
+            "src_indices": src_indices,
+            "tgt_indices": tgt_indices,
+            "translation_only": not bool(src_indices),
+            "confidence": merged_pair.confidence,
+            "method": merged_pair.method,
+            "manual_merged": True,
+        }
+        first_seg.segment_metadata = json.dumps(merged_metadata, ensure_ascii=False)
+        first_seg.block_type = merged_pair.block_type
+        first_seg.block_index = merged_pair.block_index
+        first_seg.row_index = merged_pair.row_index
+        first_seg.cell_index = merged_pair.cell_index
+        merged_source = merged_pair.source_text or TRANSLATION_ONLY_SOURCE_LABEL
+        document_pair_batch.total_segments = db.query(DocumentAlignmentPair).filter_by(
+            batch_id=document_pair_batch.id,
+        ).count()
 
     # 对于 CAD 文件，保存合并信息到 metadata（用于导出时清空被合并的实体）
     if is_cad_file:

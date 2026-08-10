@@ -280,7 +280,8 @@ AI_translation_system12312/
 | `POST` | `/api/projects/{project_id}/proofreading-batches` | 基于预览令牌和列映射创建校对批次，按目标语言生成 FileRecord/Segment 与基线 |
 | `GET` | `/api/projects/{project_id}/proofreading-batches` | 项目下校对批次列表 |
 | `GET` | `/api/proofreading-batches/{batch_id}` | 批次详情（含列绑定与统计） |
-| `POST` | `/api/proofreading-batches/{batch_id}/generate` | 排队 LLM 校对（后台任务） |
+| `POST` | `/api/proofreading-batches/{batch_id}/generate` | 排队 LLM 校对（后台任务；支持提示词与模型选择，不走 TM/词汇表） |
+| `POST` | `/api/proofreading-batches/{batch_id}/cancel` | 取消进行中的 LLM 校对（`queued` 立即结束；`running` 协作退出，已写入句段保留） |
 | `POST` | `/api/proofreading-batches/{batch_id}/exports` | 排队合并 Excel 生成（后台任务） |
 | `GET` | `/api/proofreading-batches/{batch_id}/exports/latest` | 下载合并后的校对版 Excel |
 | `GET` | `/api/file-records/{file_record_id}/proofreading-baselines` | 工作台读取该文件的校对基线（原译文、单元格引用），用于校对前后对比 |

@@ -172,6 +172,14 @@ EXPLICIT_FORMAT_RUN_PROPERTIES = {
     "dstrike",
     "vertAlign",
 }
+WORD_RUN_PROPERTY_ORDER = (
+    "rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps",
+    "strike", "dstrike", "outline", "shadow", "emboss", "imprint", "noProof",
+    "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern",
+    "position", "sz", "szCs", "highlight", "u", "effect", "bdr", "shd",
+    "fitText", "vertAlign", "rtl", "cs", "em", "lang", "eastAsianLayout",
+    "specVanish", "oMath", "rPrChange",
+)
 
 
 @dataclass(frozen=True)
@@ -534,11 +542,7 @@ def export_bilingual_docx_with_layout(
             order=order,
         )
 
-    _localize_numbering_definitions(
-        package,
-        target_language=target_language,
-        strategy=document_parse_options.get("docx_numbering_localization"),
-    )
+    # 双语版必须保持源文编号定义不变；目标副本会移除 numPr，并直接使用句段中的目标编号文本。
     if document_parse_options.get("clean_format"):
         _clean_story_formatting(stories)
     if not document_parse_options.get("preserve_hyperlinks", True):
@@ -2889,7 +2893,40 @@ def _collect_cell_group_tokens(
 def _clone_bilingual_paragraph(paragraph: ET.Element) -> ET.Element:
     clone = deepcopy(paragraph)
     _remove_paragraph_section_properties(clone)
+    _remove_paragraph_numbering_properties(clone)
+    _sanitize_bilingual_clone(clone)
     return clone
+
+
+def _sanitize_bilingual_clone(paragraph: ET.Element) -> None:
+    """移除复制后会造成 OOXML 标识冲突或重复对象的节点。"""
+    removable_names = {
+        "bookmarkStart", "bookmarkEnd",
+        "commentRangeStart", "commentRangeEnd", "commentReference",
+        "moveFromRangeStart", "moveFromRangeEnd", "moveToRangeStart", "moveToRangeEnd",
+        "customXmlInsRangeStart", "customXmlInsRangeEnd",
+        "customXmlDelRangeStart", "customXmlDelRangeEnd",
+        "customXmlMoveFromRangeStart", "customXmlMoveFromRangeEnd",
+        "customXmlMoveToRangeStart", "customXmlMoveToRangeEnd",
+        "permStart", "permEnd", "proofErr",
+        "footnoteReference", "endnoteReference",
+        "drawing", "pict", "object",
+    }
+
+    def clean(parent: ET.Element) -> None:
+        for attribute_name in list(parent.attrib):
+            if _local_name(attribute_name) in {"paraId", "textId"}:
+                parent.attrib.pop(attribute_name, None)
+        for child in list(parent):
+            if _local_name(child.tag) in removable_names:
+                parent.remove(child)
+                continue
+            clean(child)
+
+    clean(paragraph)
+    for sdt_properties in paragraph.iter(_qn("w", "sdtPr")):
+        for identifier in list(sdt_properties.findall("w:id", NS)):
+            sdt_properties.remove(identifier)
 
 
 def _remove_paragraph_section_properties(paragraph: ET.Element) -> None:
@@ -2898,6 +2935,14 @@ def _remove_paragraph_section_properties(paragraph: ET.Element) -> None:
         return
     for section_properties in list(paragraph_properties.findall("w:sectPr", NS)):
         paragraph_properties.remove(section_properties)
+
+
+def _remove_paragraph_numbering_properties(paragraph: ET.Element) -> None:
+    paragraph_properties = paragraph.find("w:pPr", NS)
+    if paragraph_properties is None:
+        return
+    for numbering_properties in list(paragraph_properties.findall("w:numPr", NS)):
+        paragraph_properties.remove(numbering_properties)
 
 
 def _insert_cloned_blocks(
@@ -3495,29 +3540,20 @@ def _clear_explicit_format_run_properties(run_properties: ET.Element) -> None:
 
 def _set_run_property(run_properties: ET.Element, prop_name: str) -> None:
     """设置 run 属性（如 bold, italic, strike）"""
-    prop = run_properties.find(f"w:{prop_name}", NS)
-    if prop is None:
-        prop = ET.Element(_qn("w", prop_name))
-        run_properties.append(prop)
+    prop = _upsert_ordered_run_property(run_properties, prop_name)
     # 确保属性启用（移除 val="false" 如果存在）
     prop.attrib.pop(_qn("w", "val"), None)
 
 
 def _set_run_underline(run_properties: ET.Element) -> None:
     """设置下划线"""
-    underline = run_properties.find("w:u", NS)
-    if underline is None:
-        underline = ET.Element(_qn("w", "u"))
-        run_properties.append(underline)
+    underline = _upsert_ordered_run_property(run_properties, "u")
     underline.set(_qn("w", "val"), "single")
 
 
 def _set_run_vertical_align(run_properties: ET.Element, align_type: str) -> None:
     """设置垂直对齐（上标/下标）"""
-    vert_align = run_properties.find("w:vertAlign", NS)
-    if vert_align is None:
-        vert_align = ET.Element(_qn("w", "vertAlign"))
-        run_properties.append(vert_align)
+    vert_align = _upsert_ordered_run_property(run_properties, "vertAlign")
     vert_align.set(_qn("w", "val"), align_type)
 
 
@@ -3731,10 +3767,7 @@ def _apply_word_run_font(run_element: ET.Element) -> None:
         run_properties = ET.Element(_qn("w", "rPr"))
         run_element.insert(0, run_properties)
 
-    fonts = run_properties.find("w:rFonts", NS)
-    if fonts is None:
-        fonts = ET.Element(_qn("w", "rFonts"))
-        run_properties.insert(0, fonts)
+    fonts = _upsert_ordered_run_property(run_properties, "rFonts")
 
     for attr_name in ("ascii", "hAnsi", "cs", "eastAsia"):
         fonts.set(_qn("w", attr_name), EXPORT_FONT_FAMILY)
@@ -3864,6 +3897,18 @@ def _upsert_ordered_word_property(
             break
     parent.insert(insert_at, element)
     return element
+
+
+def _upsert_ordered_run_property(parent: ET.Element, property_name: str) -> ET.Element:
+    try:
+        property_index = WORD_RUN_PROPERTY_ORDER.index(property_name)
+    except ValueError:
+        property_index = len(WORD_RUN_PROPERTY_ORDER) - 1
+    return _upsert_ordered_word_property(
+        parent,
+        property_name,
+        before=WORD_RUN_PROPERTY_ORDER[property_index + 1:],
+    )
 
 
 def _apply_drawingml_paragraph_rtl(paragraph: ET.Element, language: str) -> None:

@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { Bot, CheckCircle2, Download, ExternalLink, FileSpreadsheet, Loader2, MessageSquareText, Play, Upload } from 'lucide-vue-next'
+import { Bot, CheckCircle2, Download, ExternalLink, FileSpreadsheet, FileText, Loader2, MessageSquareText, Pause, Play, Upload } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import {
+  cancelProofreadingBatch,
   createProofreadingBatch,
   downloadProofreadingBatchExport,
   exportProofreadingBatch,
@@ -19,6 +20,7 @@ import {
 import { getLanguageLabel, languageOptions } from '../constants/languages'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import DocumentAlignmentEditor from './DocumentAlignmentEditor.vue'
+import Modal from './base/Modal.vue'
 
 const props = defineProps<{ projectId: string }>()
 const emit = defineEmits<{ refreshProject: [] }>()
@@ -54,15 +56,34 @@ const batches = ref<ProofreadingBatch[]>([])
 const busy = ref(false)
 const actionBatchId = ref('')
 const errorMessage = ref('')
+const selectedImportMode = ref<'document_pair' | 'xlsx_columns' | null>(null)
+const showAlignmentDialog = ref(false)
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
+const ACTIVE_GENERATE_STATUSES = new Set(['aligning', 'queued', 'running', 'canceling'])
+const CONFIGURABLE_STATUSES = new Set(['ready', 'partial_failed', 'failed', 'canceled'])
+
 const hasRunningBatch = computed(() => batches.value.some((item) => (
-  ['aligning', 'queued', 'running'].includes(item.status) || ['queued', 'running'].includes(item.export_status)
+  ACTIVE_GENERATE_STATUSES.has(item.status) || ['queued', 'running'].includes(item.export_status)
 )))
 const canCreate = computed(() => {
   if (!preview.value || !sourceLanguage.value) return false
   return buildMappings().some((mapping) => mapping.targets.length > 0)
 })
+
+function canConfigureBatch(batch: ProofreadingBatch) {
+  return CONFIGURABLE_STATUSES.has(batch.status)
+}
+
+function isBatchGenerating(batch: ProofreadingBatch) {
+  return ACTIVE_GENERATE_STATUSES.has(batch.status)
+}
+
+function startButtonLabel(batch: ProofreadingBatch) {
+  if (batch.status === 'canceled') return '重新开始校对'
+  if (batch.status === 'ready') return '开始 LLM 校对'
+  return '重试失败项'
+}
 
 function generationDraft(batch: ProofreadingBatch) {
   if (!generationDrafts[batch.id]) {
@@ -219,6 +240,20 @@ async function startGeneration(batch: ProofreadingBatch) {
   }
 }
 
+async function stopGeneration(batch: ProofreadingBatch) {
+  actionBatchId.value = batch.id
+  errorMessage.value = ''
+  try {
+    const latest = await cancelProofreadingBatch(batch.id)
+    batches.value = batches.value.map((item) => item.id === latest.id ? latest : item)
+    startPolling()
+  } catch (error) {
+    errorMessage.value = errorText(error, '取消校对失败。')
+  } finally {
+    actionBatchId.value = ''
+  }
+}
+
 async function downloadBatch(batch: ProofreadingBatch) {
   actionBatchId.value = batch.id
   errorMessage.value = ''
@@ -262,9 +297,46 @@ function startPolling() {
 
 function statusLabel(status: ProofreadingBatch['status']) {
   return ({
-    aligning: '对齐中', draft: '待确认对齐', ready: '待生成', queued: '排队中', running: '校对中', completed: '已完成',
-    partial_failed: '部分失败', failed: '失败', canceled: '已取消',
+    aligning: '对齐中',
+    draft: '待确认对齐',
+    ready: '待生成',
+    queued: '排队中',
+    running: '校对中',
+    canceling: '取消中',
+    completed: '已完成',
+    partial_failed: '部分失败',
+    failed: '失败',
+    canceled: '已取消',
   } as Record<string, string>)[status] || status
+}
+
+function statusTone(status: ProofreadingBatch['status']) {
+  if (status === 'completed') return 'is-success'
+  if (status === 'partial_failed' || status === 'failed') return 'is-danger'
+  if (status === 'canceled' || status === 'canceling') return 'is-muted'
+  if (ACTIVE_GENERATE_STATUSES.has(status)) return 'is-running'
+  return 'is-ready'
+}
+
+function batchKindLabel(batch: ProofreadingBatch) {
+  return batch.batch_kind === 'document_pair' ? '双文档' : '表格列'
+}
+
+function selectImportMode(mode: 'document_pair' | 'xlsx_columns') {
+  if (mode === 'document_pair') {
+    selectedImportMode.value = mode
+    showAlignmentDialog.value = true
+    errorMessage.value = ''
+    return
+  }
+  selectedImportMode.value = selectedImportMode.value === mode ? null : mode
+  showAlignmentDialog.value = false
+  errorMessage.value = ''
+}
+
+async function handleAlignmentRefresh() {
+  await refreshBatches()
+  emit('refreshProject')
 }
 
 onMounted(async () => {
@@ -279,155 +351,320 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="proofreading-panel">
-    <DocumentAlignmentEditor :project-id="projectId" @refresh="refreshBatches" @open-workbench="openWorkbench" />
-    <div class="proofreading-panel__head">
-      <div>
-        <div class="section-title section-title--tight">多语种 Excel 校对</div>
-        <p class="panel-subtitle">上传原文与多语种译文表，映射列后按语言生成统一校对版。</p>
-      </div>
-      <label class="button button--primary">
-        <Upload :size="14" />
-        选择 .xlsx
-        <input ref="fileInput" class="sr-only" type="file" accept=".xlsx" :disabled="busy" @change="handleFileChange">
-      </label>
-    </div>
-
-    <p v-if="busy && !preview" class="proofreading-panel__notice"><Loader2 class="lucide-spin" :size="16" />正在读取工作簿…</p>
-    <p v-if="errorMessage" class="form-message is-error">{{ errorMessage }}</p>
-
-    <div v-if="preview" class="proofreading-mapping">
-      <div class="proofreading-mapping__top">
-        <span><FileSpreadsheet :size="16" />{{ preview.filename }}</span>
-        <label class="field proofreading-source-language">
-          <span class="field__label">原文语言</span>
-          <select v-model="sourceLanguage" class="field__control">
-            <option v-for="language in languageOptions" :key="language.code" :value="language.code">{{ language.label }}</option>
-          </select>
-        </label>
+    <div class="proofreading-import">
+      <div class="proofreading-import__head">
+        <div>
+          <div class="section-title section-title--tight">导入校对资料</div>
+          <p class="panel-subtitle">先选择资料形态。两种方式创建的内容都会进入下方“校对语言任务”。</p>
+        </div>
       </div>
 
-      <article v-for="sheet in preview.sheets" :key="sheet.sheet_index" class="proofreading-sheet" :class="{ 'is-blocked': !sheet.supported }">
-        <div class="proofreading-sheet__head">
-          <label><input v-model="sheetDrafts[sheet.sheet_index].enabled" type="checkbox" :disabled="!sheet.supported"> {{ sheet.name }}</label>
-          <span>{{ sheet.max_row }} 行 × {{ sheet.max_column }} 列</span>
-        </div>
-        <p v-if="!sheet.supported" class="form-message is-error">暂不能安全处理：{{ sheet.blocked_reasons.join('；') }}</p>
-        <div v-else-if="sheetDrafts[sheet.sheet_index].enabled" class="proofreading-sheet__settings">
-          <label class="field">
-            <span class="field__label">表头行</span>
-            <input v-model.number="sheetDrafts[sheet.sheet_index].headerRow" class="field__control" type="number" min="1" :max="sheet.max_row">
-          </label>
-          <label class="field">
-            <span class="field__label">原文列</span>
-            <select v-model.number="sheetDrafts[sheet.sheet_index].sourceColumn" class="field__control">
-              <option v-for="column in sheet.columns" :key="column.index" :value="column.index">{{ column.letter }} · {{ mappedHeader(sheet, column.index) }}</option>
-            </select>
-          </label>
-          <div class="proofreading-targets">
-            <div class="field__label">译文列与目标语言</div>
-            <label v-for="column in sheet.columns.filter((item) => item.index !== sheetDrafts[sheet.sheet_index].sourceColumn)" :key="column.index" class="proofreading-target-row">
-              <input v-model="sheetDrafts[sheet.sheet_index].targets[column.index].enabled" type="checkbox">
-              <span class="proofreading-target-row__name">{{ column.letter }} · {{ mappedHeader(sheet, column.index) }}</span>
-              <select v-model="sheetDrafts[sheet.sheet_index].targets[column.index].language" class="field__control" :disabled="!sheetDrafts[sheet.sheet_index].targets[column.index].enabled">
-                <option value="" disabled>选择目标语言</option>
-                <option v-for="language in languageOptions" :key="language.code" :value="language.code" :disabled="language.code === sourceLanguage">{{ language.label }}</option>
-              </select>
-              <small>{{ column.samples.filter(Boolean).slice(0, 2).join(' / ') || '空列' }}</small>
-            </label>
-          </div>
-        </div>
-      </article>
-
-      <div class="proofreading-mapping__actions">
-        <span>空原文将跳过；空译文只统计，不自动补译。</span>
-        <button class="button button--primary" type="button" :disabled="busy || !canCreate" @click="submitMapping">
-          <Loader2 v-if="busy" class="lucide-spin" :size="14" /><CheckCircle2 v-else :size="14" />创建校对批次
+      <div class="proofreading-import__modes" role="group" aria-label="校对资料导入模式">
+        <button
+          class="proofreading-import-mode"
+          :class="{ 'is-active': selectedImportMode === 'document_pair' }"
+          type="button"
+          data-testid="proofreading-import-document-pair"
+          @click="selectImportMode('document_pair')"
+        >
+          <span class="proofreading-import-mode__icon"><FileText :size="22" /></span>
+          <span class="proofreading-import-mode__copy">
+            <strong>原文 + 译文两个文档</strong>
+            <small>分别上传原文与译文，系统自动解析并对齐句段，确认后生成一个语言任务。</small>
+            <em>支持 DOC、DOCX、TXT</em>
+          </span>
+        </button>
+        <button
+          class="proofreading-import-mode"
+          :class="{ 'is-active': selectedImportMode === 'xlsx_columns' }"
+          type="button"
+          data-testid="proofreading-import-spreadsheet"
+          @click="selectImportMode('xlsx_columns')"
+        >
+          <span class="proofreading-import-mode__icon"><FileSpreadsheet :size="22" /></span>
+          <span class="proofreading-import-mode__copy">
+            <strong>原文列 + 译文列的表格</strong>
+            <small>上传一个工作簿并映射原文列、译文列；每个目标语言生成一个语言任务。</small>
+            <em>支持 XLSX</em>
+          </span>
         </button>
       </div>
     </div>
 
-    <div v-if="batches.length" class="proofreading-batches">
-      <article v-for="batch in batches" :key="batch.id" class="proofreading-batch">
-        <div class="proofreading-batch__main">
-          <strong>{{ batch.filename }}</strong>
-          <span>{{ statusLabel(batch.status) }} · {{ batch.progress }}%</span>
-          <div class="progress-bar"><div class="progress-bar__track"><div class="progress-bar__fill" :style="{ width: `${batch.progress}%` }" /></div></div>
-          <small>共 {{ batch.total_segments }} 条，修改 {{ batch.changed_segments }}，缺失 {{ batch.skipped_segments }}，失败 {{ batch.failed_segments }}</small>
-          <small v-if="batch.error_message" class="is-error">{{ batch.error_message }}</small>
-          <small v-if="batch.export_error_message" class="is-error">导出失败：{{ batch.export_error_message }}</small>
+    <div v-if="selectedImportMode === 'xlsx_columns'" class="proofreading-section proofreading-import-workspace">
+      <div class="proofreading-panel__head">
+        <div>
+          <div class="section-title section-title--tight">表格列映射</div>
+          <p class="panel-subtitle">选择工作簿后确认原文列、译文列及目标语言。</p>
         </div>
-        <div class="proofreading-batch__languages">
-          <button v-for="binding in batch.bindings" :key="binding.id" class="button" type="button" @click="openWorkbench(binding.file_record_id)">
-            {{ getLanguageLabel(binding.target_language) }} · {{ binding.sheet_name }} <ExternalLink :size="12" />
-          </button>
-        </div>
-        <section
-          v-if="['ready', 'partial_failed', 'failed'].includes(batch.status)"
-          class="proofreading-generation-config"
-          aria-label="LLM 校对设置"
-        >
-          <div class="proofreading-generation-config__head">
-            <strong><Bot :size="16" />LLM 校对设置</strong>
-            <small v-if="batchActualModel(batch)">上次实际使用：{{ batchActualModel(batch) }}</small>
-          </div>
-          <div class="proofreading-generation-config__fields">
-            <label class="field">
-              <span class="field__label">模型提供方</span>
-              <select
-                v-model="generationDraft(batch).provider"
-                class="field__control"
-                @change="handleProviderChange(batch)"
-              >
-                <option value="auto">自动（优先 DeepSeek，失败回退）</option>
-                <option value="deepseek">DeepSeek</option>
-                <option value="openrouter">OpenRouter</option>
-              </select>
-            </label>
-            <label class="field">
-              <span class="field__label">校对模型</span>
-              <select
-                v-model="generationDraft(batch).model"
-                class="field__control"
-                :disabled="generationDraft(batch).provider === 'auto'"
-              >
-                <option v-if="generationDraft(batch).provider === 'auto'" value="">自动选择默认模型</option>
-                <option v-if="generationDraft(batch).provider === 'deepseek'" value="deepseek-chat">DeepSeek Chat</option>
-                <option v-if="generationDraft(batch).provider === 'openrouter'" value="google/gemini-3-flash-preview">Gemini 3 Flash Preview</option>
-              </select>
-            </label>
-          </div>
-          <p class="proofreading-generation-config__hint">
-            {{ providerDescription(generationDraft(batch).provider) }}
-          </p>
-          <label class="field proofreading-generation-config__prompt">
-            <span class="field__label"><MessageSquareText :size="14" />本批次校对提示词</span>
-            <textarea
-              v-model="generationDraft(batch).userInstructions"
-              class="field__control"
-              rows="3"
-              maxlength="12000"
-              placeholder="例如：统一车载诊断术语；保持缩写不变；语气简洁；不要改写法规编号。该内容会追加到系统和项目校对规则中。"
-            />
-            <small>明确写出本批次特有要求；留空时使用系统默认规则和项目翻译规则。</small>
+        <label class="button button--primary">
+          <Upload :size="14" />
+          选择 .xlsx
+          <input ref="fileInput" class="sr-only" type="file" accept=".xlsx" :disabled="busy" @change="handleFileChange">
+        </label>
+      </div>
+
+      <p v-if="busy && !preview" class="proofreading-panel__notice"><Loader2 class="lucide-spin" :size="16" />正在读取工作簿…</p>
+      <p v-if="errorMessage" class="form-message is-error">{{ errorMessage }}</p>
+
+      <div v-if="preview" class="proofreading-mapping">
+        <div class="proofreading-mapping__top">
+          <span><FileSpreadsheet :size="16" />{{ preview.filename }}</span>
+          <label class="field proofreading-source-language">
+            <span class="field__label">原文语言</span>
+            <select v-model="sourceLanguage" class="field__control">
+              <option v-for="language in languageOptions" :key="language.code" :value="language.code">{{ language.label }}</option>
+            </select>
           </label>
-        </section>
-        <div class="proofreading-batch__actions">
-          <button v-if="['ready', 'partial_failed', 'failed'].includes(batch.status)" class="button button--primary" type="button" :disabled="Boolean(actionBatchId)" @click="startGeneration(batch)">
-            <Loader2 v-if="actionBatchId === batch.id" class="lucide-spin" :size="14" /><Play v-else :size="14" />{{ batch.status === 'ready' ? '开始 LLM 校对' : '重试失败项' }}
-          </button>
-          <button class="button" type="button" :disabled="Boolean(actionBatchId) || batch.status === 'ready' || ['queued', 'running'].includes(batch.status) || ['queued', 'running'].includes(batch.export_status)" @click="downloadBatch(batch)">
-            <Loader2 v-if="['queued', 'running'].includes(batch.export_status)" class="lucide-spin" :size="14" />
-            <Download v-else :size="14" />
-            {{ batch.export_status === 'completed' ? '下载合并 Excel' : (['queued', 'running'].includes(batch.export_status) ? `生成中 ${batch.export_progress}%` : '生成合并 Excel') }}
+        </div>
+
+        <article v-for="sheet in preview.sheets" :key="sheet.sheet_index" class="proofreading-sheet" :class="{ 'is-blocked': !sheet.supported }">
+          <div class="proofreading-sheet__head">
+            <label><input v-model="sheetDrafts[sheet.sheet_index].enabled" type="checkbox" :disabled="!sheet.supported"> {{ sheet.name }}</label>
+            <span>{{ sheet.max_row }} 行 × {{ sheet.max_column }} 列</span>
+          </div>
+          <p v-if="!sheet.supported" class="form-message is-error">暂不能安全处理：{{ sheet.blocked_reasons.join('；') }}</p>
+          <div v-else-if="sheetDrafts[sheet.sheet_index].enabled" class="proofreading-sheet__settings">
+            <label class="field">
+              <span class="field__label">表头行</span>
+              <input v-model.number="sheetDrafts[sheet.sheet_index].headerRow" class="field__control" type="number" min="1" :max="sheet.max_row">
+            </label>
+            <label class="field">
+              <span class="field__label">原文列</span>
+              <select v-model.number="sheetDrafts[sheet.sheet_index].sourceColumn" class="field__control">
+                <option v-for="column in sheet.columns" :key="column.index" :value="column.index">{{ column.letter }} · {{ mappedHeader(sheet, column.index) }}</option>
+              </select>
+            </label>
+            <div class="proofreading-targets">
+              <div class="field__label">译文列与目标语言</div>
+              <label v-for="column in sheet.columns.filter((item) => item.index !== sheetDrafts[sheet.sheet_index].sourceColumn)" :key="column.index" class="proofreading-target-row">
+                <input v-model="sheetDrafts[sheet.sheet_index].targets[column.index].enabled" type="checkbox">
+                <span class="proofreading-target-row__name">{{ column.letter }} · {{ mappedHeader(sheet, column.index) }}</span>
+                <select v-model="sheetDrafts[sheet.sheet_index].targets[column.index].language" class="field__control" :disabled="!sheetDrafts[sheet.sheet_index].targets[column.index].enabled">
+                  <option value="" disabled>选择目标语言</option>
+                  <option v-for="language in languageOptions" :key="language.code" :value="language.code" :disabled="language.code === sourceLanguage">{{ language.label }}</option>
+                </select>
+                <small>{{ column.samples.filter(Boolean).slice(0, 2).join(' / ') || '空列' }}</small>
+              </label>
+            </div>
+          </div>
+        </article>
+
+        <div class="proofreading-mapping__actions">
+          <span>空原文将跳过；空译文只统计，不自动补译。</span>
+          <button class="button button--primary" type="button" :disabled="busy || !canCreate" @click="submitMapping">
+            <Loader2 v-if="busy" class="lucide-spin" :size="14" /><CheckCircle2 v-else :size="14" />创建校对批次
           </button>
         </div>
-      </article>
+      </div>
     </div>
+
+    <div class="proofreading-task-section">
+      <div class="proofreading-task-section__head">
+        <div>
+          <div class="section-title section-title--tight">导入批次</div>
+          <p class="panel-subtitle">这里展示资料处理和生成进度；生成后的文件统一显示在下方语言任务表格。</p>
+        </div>
+        <span class="proofreading-task-section__count">{{ batches.length }} 个批次</span>
+      </div>
+
+      <div v-if="batches.length" class="proofreading-batches">
+        <article v-for="batch in batches" :key="batch.id" class="proofreading-batch">
+          <div class="proofreading-batch__header">
+            <div class="proofreading-batch__title">
+              <strong>{{ batch.filename }}</strong>
+              <span class="proofreading-batch__kind" :class="`is-${batch.batch_kind || 'xlsx_columns'}`">{{ batchKindLabel(batch) }}</span>
+              <span class="proofreading-batch__badge" :class="statusTone(batch.status)">{{ statusLabel(batch.status) }}</span>
+            </div>
+            <span class="proofreading-batch__percent">{{ batch.progress }}%</span>
+          </div>
+
+          <div class="proofreading-batch__progress">
+            <div class="progress-bar"><div class="progress-bar__track"><div class="progress-bar__fill" :style="{ width: `${batch.progress}%` }" /></div></div>
+            <p v-if="batch.message" class="proofreading-batch__message">{{ batch.message }}</p>
+            <small>共 {{ batch.total_segments }} 条，修改 {{ batch.changed_segments }}，缺失 {{ batch.skipped_segments }}，失败 {{ batch.failed_segments }}</small>
+            <small v-if="batch.error_message" class="is-error">{{ batch.error_message }}</small>
+            <small v-if="batch.export_error_message" class="is-error">导出失败：{{ batch.export_error_message }}</small>
+          </div>
+
+          <div v-if="batch.bindings.length" class="proofreading-batch__languages">
+            <div class="proofreading-batch__languages-label">语言任务</div>
+            <div class="proofreading-batch__language-list">
+              <button
+                v-for="binding in batch.bindings"
+                :key="binding.id"
+                class="proofreading-batch__language-chip"
+                type="button"
+                @click="openWorkbench(binding.file_record_id)"
+              >
+                <span>{{ getLanguageLabel(binding.target_language) }}</span>
+                <span class="proofreading-batch__language-sheet">{{ binding.sheet_name }}</span>
+                <ExternalLink :size="12" />
+              </button>
+            </div>
+          </div>
+
+          <section
+            v-if="canConfigureBatch(batch)"
+            class="proofreading-generation-config"
+            aria-label="LLM 校对设置"
+          >
+            <div class="proofreading-generation-config__head">
+              <strong><Bot :size="16" />LLM 校对设置</strong>
+              <small v-if="batchActualModel(batch)">上次实际使用：{{ batchActualModel(batch) }}</small>
+            </div>
+            <div class="proofreading-generation-config__fields">
+              <label class="field">
+                <span class="field__label">模型提供方</span>
+                <select
+                  v-model="generationDraft(batch).provider"
+                  class="field__control"
+                  @change="handleProviderChange(batch)"
+                >
+                  <option value="auto">自动（优先 DeepSeek，失败回退）</option>
+                  <option value="deepseek">DeepSeek</option>
+                  <option value="openrouter">OpenRouter</option>
+                </select>
+              </label>
+              <label class="field">
+                <span class="field__label">校对模型</span>
+                <select
+                  v-model="generationDraft(batch).model"
+                  class="field__control"
+                  :disabled="generationDraft(batch).provider === 'auto'"
+                >
+                  <option v-if="generationDraft(batch).provider === 'auto'" value="">自动选择默认模型</option>
+                  <option v-if="generationDraft(batch).provider === 'deepseek'" value="deepseek-chat">DeepSeek Chat</option>
+                  <option v-if="generationDraft(batch).provider === 'openrouter'" value="google/gemini-3-flash-preview">Gemini 3 Flash Preview</option>
+                </select>
+              </label>
+            </div>
+            <p class="proofreading-generation-config__hint">
+              {{ providerDescription(generationDraft(batch).provider) }}
+            </p>
+            <label class="field proofreading-generation-config__prompt">
+              <span class="field__label"><MessageSquareText :size="14" />本批次校对提示词</span>
+              <textarea
+                v-model="generationDraft(batch).userInstructions"
+                class="field__control"
+                rows="4"
+                maxlength="12000"
+                placeholder="例如：统一车载诊断术语；保持缩写不变；语气简洁；不要改写法规编号。该内容会追加到系统和项目校对规则中。"
+              />
+              <small>直接调用 LLM 校对，不使用 TM / 词汇表。留空时使用系统默认规则和项目翻译规则。</small>
+            </label>
+          </section>
+
+          <div class="proofreading-batch__actions">
+            <button
+              v-if="batch.batch_kind === 'document_pair' && ['aligning', 'canceling', 'draft'].includes(batch.alignment_status || '')"
+              class="button button--primary"
+              type="button"
+              @click="selectImportMode('document_pair')"
+            >
+              <FileText :size="14" />
+              {{ batch.alignment_status === 'draft' ? '查看并确认对齐' : '查看对齐进度' }}
+            </button>
+            <button
+              v-if="canConfigureBatch(batch)"
+              class="button button--primary"
+              type="button"
+              :disabled="Boolean(actionBatchId)"
+              @click="startGeneration(batch)"
+            >
+              <Loader2 v-if="actionBatchId === batch.id" class="lucide-spin" :size="14" />
+              <Play v-else :size="14" />
+              {{ startButtonLabel(batch) }}
+            </button>
+            <button
+              v-if="isBatchGenerating(batch)"
+              class="button button--danger"
+              type="button"
+              :disabled="Boolean(actionBatchId) || batch.status === 'canceling'"
+              @click="stopGeneration(batch)"
+            >
+              <Loader2 v-if="actionBatchId === batch.id || batch.status === 'canceling'" class="lucide-spin" :size="14" />
+              <Pause v-else :size="14" />
+              {{ batch.status === 'canceling' ? '取消中…' : '暂停' }}
+            </button>
+            <button
+              class="button"
+              type="button"
+              :disabled="Boolean(actionBatchId) || batch.status === 'ready' || isBatchGenerating(batch) || ['queued', 'running'].includes(batch.export_status)"
+              @click="downloadBatch(batch)"
+            >
+              <Loader2 v-if="['queued', 'running'].includes(batch.export_status)" class="lucide-spin" :size="14" />
+              <Download v-else :size="14" />
+              {{ batch.export_status === 'completed' ? '下载合并 Excel' : (['queued', 'running'].includes(batch.export_status) ? `生成中 ${batch.export_progress}%` : '生成合并 Excel') }}
+            </button>
+          </div>
+        </article>
+      </div>
+      <div v-else class="proofreading-task-empty">
+        <FileText :size="24" />
+        <strong>还没有校对语言任务</strong>
+        <span>请从上方选择一种导入方式开始。</span>
+      </div>
+    </div>
+
+    <Modal
+      :open="showAlignmentDialog"
+      title="双文档对齐校对"
+      description="为控制大文档内存占用，窗口仅加载开头 20 条和最多 80 条低置信度配对；完整结果可导出 CSV。"
+      width="min(1180px, calc(100vw - 32px))"
+      @close="showAlignmentDialog = false"
+    >
+      <DocumentAlignmentEditor
+        v-if="showAlignmentDialog"
+        :project-id="projectId"
+        compact
+        @refresh="handleAlignmentRefresh"
+        @open-workbench="openWorkbench"
+      />
+    </Modal>
   </section>
 </template>
 
 <style scoped>
-.proofreading-panel { display: grid; gap: 16px; }
+.proofreading-panel { display: grid; gap: 18px; }
+.proofreading-section { display: grid; gap: 14px; }
+.proofreading-import { display: grid; gap: 14px; }
+.proofreading-import__head, .proofreading-task-section__head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.proofreading-import__modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.proofreading-import-mode {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: #fff;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
+}
+.proofreading-import-mode:hover { border-color: rgba(15, 118, 110, .42); box-shadow: 0 6px 18px rgba(15, 23, 42, .06); }
+.proofreading-import-mode.is-active { border-color: var(--brand); background: rgba(240, 253, 250, .8); box-shadow: 0 0 0 2px rgba(15, 118, 110, .1); }
+.proofreading-import-mode__icon { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 10px; background: #eef8f5; color: var(--brand); }
+.proofreading-import-mode__copy { display: grid; gap: 5px; }
+.proofreading-import-mode__copy strong { font-size: 15px; }
+.proofreading-import-mode__copy small { color: var(--ink-500); line-height: 1.55; }
+.proofreading-import-mode__copy em { color: var(--brand); font-size: 11px; font-style: normal; font-weight: 700; }
+.proofreading-import-workspace {
+  padding: 14px;
+  border: 1px solid rgba(15, 118, 110, .2);
+  border-radius: 12px;
+  background: #f8fbfa;
+}
+.proofreading-task-section { display: grid; gap: 12px; padding-top: 16px; border-top: 1px solid var(--line-soft); }
+.proofreading-task-section__count { flex: 0 0 auto; color: var(--ink-500); font-size: 12px; }
+.proofreading-task-empty { display: grid; place-items: center; gap: 6px; padding: 28px; border: 1px dashed var(--line); border-radius: 10px; color: var(--ink-500); text-align: center; }
+.proofreading-task-empty strong { color: var(--ink-700); }
+.proofreading-task-empty span { font-size: 12px; }
+.proofreading-batch__kind { display: inline-flex; padding: 2px 7px; border-radius: 999px; background: #eef2ff; color: #4338ca; font-size: 11px; font-weight: 700; }
+.proofreading-batch__kind.is-document_pair { background: #fff7ed; color: #c2410c; }
+.proofreading-batch__kind.is-xlsx_columns { background: #ecfdf5; color: #047857; }
 .proofreading-panel__head, .proofreading-mapping__top, .proofreading-mapping__actions, .proofreading-sheet__head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .proofreading-panel__head input { display: none; }
 .proofreading-panel__notice { display: flex; align-items: center; gap: 8px; color: var(--ink-600); }
@@ -443,24 +680,89 @@ onBeforeUnmount(() => {
 .proofreading-target-row { display: grid; grid-template-columns: 18px minmax(130px, 1fr) minmax(180px, 0.8fr); gap: 8px; align-items: center; }
 .proofreading-target-row small { grid-column: 2 / 4; overflow: hidden; color: var(--ink-500); text-overflow: ellipsis; white-space: nowrap; }
 .proofreading-mapping__actions > span { color: var(--ink-500); font-size: 12px; }
-.proofreading-batch { display: grid; grid-template-columns: minmax(240px, 0.8fr) minmax(260px, 1.2fr) auto; align-items: start; gap: 14px 18px; padding: 16px; border: 1px solid var(--line-soft); border-radius: 10px; background: #fff; }
-.proofreading-batch__main { display: grid; min-width: 250px; gap: 5px; }
-.proofreading-batch__main > span, .proofreading-batch__main small { color: var(--ink-500); }
-.proofreading-batch__languages { display: flex; flex: 1; flex-wrap: wrap; gap: 6px; }
-.proofreading-batch__actions { display: flex; gap: 8px; }
-.proofreading-generation-config { grid-column: 1 / -1; display: grid; gap: 10px; padding: 14px; border: 1px solid rgba(37, 99, 235, 0.2); border-radius: 9px; background: linear-gradient(135deg, rgba(239, 246, 255, 0.95), rgba(248, 250, 252, 0.96)); }
+.proofreading-batch {
+  display: grid;
+  gap: 14px;
+  padding: 16px 18px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: #fff;
+}
+.proofreading-batch__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.proofreading-batch__title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.proofreading-batch__title strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.proofreading-batch__badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  background: #eef2f7;
+  color: #475569;
+}
+.proofreading-batch__badge.is-ready { background: #eef2f7; color: #475569; }
+.proofreading-batch__badge.is-running { background: #e0f2fe; color: #0369a1; }
+.proofreading-batch__badge.is-success { background: #dcfce7; color: #15803d; }
+.proofreading-batch__badge.is-danger { background: #fee2e2; color: #b91c1c; }
+.proofreading-batch__badge.is-muted { background: #f1f5f9; color: #64748b; }
+.proofreading-batch__percent { color: var(--ink-500); font-size: 13px; font-variant-numeric: tabular-nums; }
+.proofreading-batch__progress { display: grid; gap: 6px; }
+.proofreading-batch__progress small { color: var(--ink-500); }
+.proofreading-batch__message { margin: 0; color: var(--ink-600); font-size: 13px; }
+.proofreading-batch__languages { display: grid; gap: 8px; }
+.proofreading-batch__languages-label { color: var(--ink-500); font-size: 12px; font-weight: 600; }
+.proofreading-batch__language-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.proofreading-batch__language-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: #f8fafc;
+  color: var(--ink-700, #334155);
+  font-size: 13px;
+  cursor: pointer;
+}
+.proofreading-batch__language-chip:hover { border-color: #94a3b8; background: #fff; }
+.proofreading-batch__language-sheet { color: var(--ink-500); }
+.proofreading-batch__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.proofreading-generation-config {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid rgba(15, 118, 110, 0.18);
+  border-radius: 9px;
+  background: linear-gradient(135deg, rgba(240, 253, 250, 0.95), rgba(248, 250, 252, 0.96));
+}
 .proofreading-generation-config__head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .proofreading-generation-config__head strong, .proofreading-generation-config__prompt .field__label { display: inline-flex; align-items: center; gap: 6px; }
 .proofreading-generation-config__head small { color: #475569; }
 .proofreading-generation-config__fields { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 12px; }
 .proofreading-generation-config__hint { margin: -3px 0 0; color: #475569; font-size: 12px; }
-.proofreading-generation-config__prompt textarea { min-height: 82px; resize: vertical; line-height: 1.5; }
+.proofreading-generation-config__prompt textarea { min-height: 96px; resize: vertical; line-height: 1.5; }
 .proofreading-generation-config__prompt small { color: #64748b; }
 .is-error { color: var(--danger-600, #b42318) !important; }
 @media (max-width: 980px) {
+  .proofreading-import__modes { grid-template-columns: 1fr; }
   .proofreading-sheet__settings { grid-template-columns: 1fr; }
-  .proofreading-batch { grid-template-columns: 1fr; }
-  .proofreading-generation-config { grid-column: 1; }
   .proofreading-generation-config__fields { grid-template-columns: 1fr; }
 }
 </style>

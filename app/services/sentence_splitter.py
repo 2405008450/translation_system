@@ -28,6 +28,9 @@ NUMBER_DOT_PATTERN = re.compile(r'\d$')
 SINGLE_LETTER_PATTERN = re.compile(r'^[A-Z]$')
 # 匹配罗马数字序号（i. ii. iii. iv. v. vi. vii. viii. ix. x. 等）
 ROMAN_NUMERAL_PATTERN = re.compile(r'^[ivxlcdm]+$', re.IGNORECASE)
+# 多段首字母缩写，如 C.J.、C.J.B.H.、U.S.。这些句点属于缩写本身，
+# 即使后面紧跟方括号引用或大写单词也不能切句。
+INITIALISM_PATTERN = re.compile(r'^(?:[A-Za-z]\.)+[A-Za-z]$')
 
 
 @dataclass(frozen=True)
@@ -160,6 +163,28 @@ def _is_sentence_ending_dot(text: str, dot_index: int) -> bool:
     
     # 检查是否是单个大写字母（如 A. B. 或人名首字母 J. K.）
     if SINGLE_LETTER_PATTERN.match(word_before_dot):
+        return False
+
+    # 检查多段首字母缩写（最终句点本身不包含在 word_before_dot 中）。
+    if INITIALISM_PATTERN.match(word_before_dot):
+        # 法规/文件引用中的 C.J. [2023] 属于名称内部缩写；而 C.V. PROPERTY
+        # 或 U.S.A. – ... 在现有文档中承担真实句界，需要结合后续字符判断。
+        if (
+            dot_index + 2 < text_length
+            and text[dot_index + 1].isalpha()
+            and text[dot_index + 2] == "."
+        ):
+            return False
+        next_non_space = dot_index + 1
+        while next_non_space < text_length and text[next_non_space].isspace():
+            next_non_space += 1
+        if next_non_space >= text_length:
+            return True
+        following = text[next_non_space]
+        if following in "([（【[":
+            return False
+        if following.isupper() or following in "-–—":
+            return True
         return False
     
     # 检查是否是罗马数字序号（如 i. ii. iii. iv. 等）

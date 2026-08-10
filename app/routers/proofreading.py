@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -34,6 +35,7 @@ from app.services.import_task_storage import (
 )
 from app.services.proofreading import (
     create_batch_from_workbook,
+    get_latest_generation_error_segment_ids,
     load_exported_batch,
     preview_workbook,
     run_generate_batch,
@@ -41,6 +43,9 @@ from app.services.proofreading import (
     serialize_batch,
 )
 from app.services.llm_service import LLMConfigurationError, validate_provider_choice
+from app.services.document_alignment.segments import ensure_document_pair_segments_complete
+from app.services.document_alignment.export import build_export_readiness
+from app.services.file_export_queue import queue_file_export
 
 router = APIRouter()
 
@@ -67,6 +72,17 @@ class ProofreadingGenerateRequest(BaseModel):
     provider: Literal["auto", "deepseek", "openrouter"] = "auto"
     model: str | None = None
     user_instructions: str = Field(default="", max_length=12000)
+    retry_scope: Literal["all", "failed_only"] = "all"
+
+
+class ProofreadingExportTaskRequest(BaseModel):
+    format: Literal[
+        "proofreading_docx_layout",
+        "proofreading_docx_ordered",
+        "proofreading_audit_xlsx",
+        "proofreading_xlsx_original",
+    ]
+    acknowledge_warnings: bool = False
 
 
 def _get_project_or_404(db: Session, project_id: UUID) -> Project:
@@ -188,11 +204,17 @@ def generate_proofreading_batch(
     current_user: User = Depends(require_business_manager),
 ):
     batch = _get_batch_or_404(db, batch_id)
-    if batch.status in {"queued", "running"}:
+    if batch.status in {"queued", "running", "canceling"}:
         raise HTTPException(status_code=409, detail="当前校对批次正在运行。")
+    if batch.status not in {"ready", "partial_failed", "failed", "canceled"}:
+        raise HTTPException(status_code=409, detail=f"当前状态（{batch.status}）不可启动校对。")
+    ensure_document_pair_segments_complete(db, batch)
     provider = payload.provider
     model = (payload.model or "").strip() or None
     user_instructions = payload.user_instructions.strip()
+    retry_scope = payload.retry_scope
+    if retry_scope == "failed_only" and not get_latest_generation_error_segment_ids(db, batch.id):
+        raise HTTPException(status_code=409, detail="当前批次没有可重试的生成失败项。")
     try:
         validate_provider_choice(provider=provider, model_override=model)
     except LLMConfigurationError as exc:
@@ -207,8 +229,10 @@ def generate_proofreading_batch(
         "provider": provider,
         "model": model or "",
         "user_instructions": user_instructions,
+        "retry_scope": retry_scope,
     }
     batch.config_json = json.dumps(batch_config, ensure_ascii=False)
+    batch.cancel_requested = False
     batch.status = "queued"
     batch.progress = 0
     batch.message = "校对任务已排队。"
@@ -218,6 +242,7 @@ def generate_proofreading_batch(
     batch.export_error_message = ""
     batch.export_filename = ""
     batch.export_path = ""
+    batch.finished_at = None
     db.commit()
     background_tasks.add_task(
         run_generate_batch,
@@ -226,8 +251,30 @@ def generate_proofreading_batch(
         provider,
         model,
         user_instructions,
+        retry_scope,
     )
     return {"batch_id": str(batch.id), "status": "queued"}
+
+
+@router.post("/proofreading-batches/{batch_id}/cancel")
+def cancel_proofreading_batch(
+    batch_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    batch = _get_batch_or_404(db, batch_id)
+    if batch.status not in {"queued", "running", "canceling"}:
+        raise HTTPException(status_code=409, detail="当前校对批次不在运行中，无法取消。")
+    batch.cancel_requested = True
+    batch.message = "正在取消校对。"
+    if batch.status == "queued":
+        batch.status = "canceled"
+        batch.message = "校对已取消。"
+        batch.finished_at = batch.finished_at or datetime.now(timezone.utc).replace(tzinfo=None)
+    else:
+        batch.status = "canceling"
+    db.commit()
+    return serialize_batch(db, batch)
 
 
 @router.post("/proofreading-batches/{batch_id}/exports")
@@ -238,7 +285,7 @@ def export_proofreading_batch(
     _: User = Depends(require_business_manager),
 ):
     batch = _get_batch_or_404(db, batch_id)
-    if batch.status in {"ready", "queued", "running"}:
+    if batch.status in {"ready", "queued", "running", "canceling"}:
         raise HTTPException(status_code=409, detail="请先完成 LLM 校对，再生成合并 Excel。")
     if batch.export_status in {"queued", "running"}:
         raise HTTPException(status_code=409, detail="校对版 Excel 正在生成。")
@@ -248,6 +295,51 @@ def export_proofreading_batch(
     db.commit()
     background_tasks.add_task(run_export_batch, batch.id)
     return {"batch_id": str(batch.id), "export_status": "queued"}
+
+
+@router.get("/proofreading-batches/{batch_id}/export-readiness")
+def get_proofreading_export_readiness(
+    batch_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    batch = _get_batch_or_404(db, batch_id)
+    readiness = build_export_readiness(db, batch)
+    db.commit()
+    return readiness
+
+
+@router.post("/proofreading-batches/{batch_id}/export-tasks")
+def create_proofreading_export_task(
+    batch_id: UUID,
+    payload: ProofreadingExportTaskRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_business_manager),
+):
+    batch = _get_batch_or_404(db, batch_id)
+    if batch.status in {"queued", "running", "canceling"}:
+        raise HTTPException(status_code=409, detail="请先结束当前 LLM 校对任务再导出。")
+    readiness = build_export_readiness(db, batch)
+    if payload.format not in readiness["available_formats"]:
+        raise HTTPException(status_code=400, detail="当前校对批次不支持所选导出格式。")
+    if readiness["has_warnings"] and not payload.acknowledge_warnings:
+        raise HTTPException(status_code=409, detail={
+            "message": "导出内容仍有未确认或待处理项目。",
+            "readiness": readiness,
+        })
+    binding = db.query(ProofreadingColumnBinding).filter_by(batch_id=batch.id).order_by(
+        ProofreadingColumnBinding.sheet_index,
+    ).first()
+    if binding is None:
+        raise HTTPException(status_code=400, detail="校对批次没有可导出的文件绑定。")
+    db.commit()
+    task = queue_file_export(
+        db,
+        file_record_id=binding.file_record_id,
+        export_type=payload.format,
+        current_user=current_user,
+    )
+    return JSONResponse(status_code=202, content=task)
 
 
 @router.get("/proofreading-batches/{batch_id}/exports/latest")
@@ -286,6 +378,16 @@ def get_file_proofreading_baselines(
         ).first()
         if not assigned:
             raise HTTPException(status_code=404, detail="任务不存在或未分配给当前用户。")
+    binding = db.query(ProofreadingColumnBinding).filter(
+        ProofreadingColumnBinding.file_record_id == file_record_id,
+    ).first()
+    # 兼容由旧后端进程生成的双文档任务：进入工作台时幂等补齐所有纯增译项，
+    # 确保“有译文、无原文”的内容不会因历史物化逻辑而永久丢失。
+    if binding is not None:
+        batch = db.get(ProofreadingBatch, binding.batch_id)
+        if batch is not None and batch.batch_kind == "document_pair":
+            ensure_document_pair_segments_complete(db, batch)
+            db.commit()
     rows = (
         db.query(ProofreadingSegmentBaseline, Segment)
         .join(Segment, Segment.id == ProofreadingSegmentBaseline.segment_id)
@@ -293,9 +395,6 @@ def get_file_proofreading_baselines(
         .order_by(Segment.display_index)
         .all()
     )
-    binding = db.query(ProofreadingColumnBinding).filter(
-        ProofreadingColumnBinding.file_record_id == file_record_id,
-    ).first()
     is_proofreading = binding is not None
     proofreading_context = None
     review_items_by_segment: dict[UUID, TranslationReviewReportItem] = {}
@@ -349,6 +448,7 @@ def get_file_proofreading_baselines(
         )
         proofreading_context = {
             "batch_id": str(binding.batch_id),
+            "batch_kind": getattr(batch, "batch_kind", "xlsx_columns") if batch else "xlsx_columns",
             "batch_status": batch.status if batch else "",
             "sheet_name": binding.sheet_name,
             "target_language": binding.target_language,
@@ -357,6 +457,7 @@ def get_file_proofreading_baselines(
             "user_instructions": str(generation.get("user_instructions") or ""),
             "actual_provider": str(actual_provider or ""),
             "actual_model": str(actual_model or ""),
+            "failed_segments": int(batch.failed_segments or 0) if batch else 0,
         }
     return {
         "is_proofreading": is_proofreading,

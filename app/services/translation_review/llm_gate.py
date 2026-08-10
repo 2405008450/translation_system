@@ -17,6 +17,7 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
+from weakref import WeakKeyDictionary
 
 from app.config import get_settings
 
@@ -52,24 +53,28 @@ class _TokenBucket:
             self._tokens = max(self._tokens - 1.0, 0)
 
 
-_semaphore: asyncio.Semaphore | None = None
-_token_bucket: _TokenBucket | None = None
+_semaphores: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = WeakKeyDictionary()
+_token_buckets: WeakKeyDictionary[asyncio.AbstractEventLoop, _TokenBucket] = WeakKeyDictionary()
 
 
 def _get_semaphore() -> asyncio.Semaphore:
-    global _semaphore  # noqa: PLW0603
-    if _semaphore is None:
+    loop = asyncio.get_running_loop()
+    semaphore = _semaphores.get(loop)
+    if semaphore is None:
         config = get_settings()
-        _semaphore = asyncio.Semaphore(max(1, config.translation_review_max_concurrency))
-    return _semaphore
+        semaphore = asyncio.Semaphore(max(1, config.translation_review_max_concurrency))
+        _semaphores[loop] = semaphore
+    return semaphore
 
 
 def _get_token_bucket() -> _TokenBucket:
-    global _token_bucket  # noqa: PLW0603
-    if _token_bucket is None:
+    loop = asyncio.get_running_loop()
+    token_bucket = _token_buckets.get(loop)
+    if token_bucket is None:
         config = get_settings()
-        _token_bucket = _TokenBucket(max(1, config.translation_review_requests_per_minute))
-    return _token_bucket
+        token_bucket = _TokenBucket(max(1, config.translation_review_requests_per_minute))
+        _token_buckets[loop] = token_bucket
+    return token_bucket
 
 
 @asynccontextmanager

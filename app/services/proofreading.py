@@ -62,6 +62,10 @@ PROOFREADING_SOURCE = "llm_review"
 IMPORTED_TRANSLATION_SOURCE = "imported_translation"
 
 
+class ProofreadingCanceled(Exception):
+    """Raised when a proofreading batch cancel has been requested."""
+
+
 def _load_batch_config(batch: ProofreadingBatch) -> dict[str, Any]:
     try:
         value = json.loads(batch.config_json or "{}")
@@ -72,6 +76,64 @@ def _load_batch_config(batch: ProofreadingBatch) -> dict[str, Any]:
 
 def _utcnow_naive() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _batch_cancel_requested(db: Session, batch_id: UUID) -> bool:
+    row = (
+        db.query(ProofreadingBatch.cancel_requested, ProofreadingBatch.status)
+        .filter(ProofreadingBatch.id == batch_id)
+        .first()
+    )
+    if row is None:
+        return True
+    cancel_requested, status = row
+    return bool(cancel_requested) or status in {"canceled", "canceling"}
+
+
+def _refresh_batch_change_stats(db: Session, batch: ProofreadingBatch) -> None:
+    current_rows = (
+        db.query(ProofreadingSegmentBaseline, Segment)
+        .join(Segment, Segment.id == ProofreadingSegmentBaseline.segment_id)
+        .filter(ProofreadingSegmentBaseline.batch_id == batch.id)
+        .all()
+    )
+    batch.changed_segments = sum(
+        1
+        for baseline, segment in current_rows
+        if (segment.target_text or "") != (baseline.original_target_text or "")
+    )
+
+
+def _finalize_canceled_batch(
+    db: Session,
+    batch: ProofreadingBatch,
+    *,
+    report: TranslationReviewReport | None = None,
+    file_ids: list[UUID] | None = None,
+    failed_count: int = 0,
+    checked_count: int = 0,
+    changed_count: int = 0,
+    category_counts: dict[str, int] | None = None,
+) -> None:
+    for file_id in file_ids or []:
+        sync_file_record_status(db, file_id)
+    _refresh_batch_change_stats(db, batch)
+    batch.failed_segments = failed_count
+    batch.status = "canceled"
+    batch.message = "校对已取消。"
+    batch.finished_at = _utcnow_naive()
+    if report is not None:
+        report.total_segments = checked_count
+        report.checked_segments = checked_count
+        report.issue_count = changed_count + failed_count
+        report.active_issue_count = failed_count
+        report.applied_count = changed_count
+        report.category_counts = json.dumps(dict(category_counts or {}), ensure_ascii=False)
+        report.enabled_categories = json.dumps(sorted(category_counts or {}), ensure_ascii=False)
+        report.failed_categories = json.dumps(["generation_error"] if failed_count else [])
+        report.status = "canceled"
+        report.finished_at = _utcnow_naive()
+    db.commit()
 
 
 _HEADER_LANGUAGE_HINTS: dict[str, str] = {
@@ -585,9 +647,13 @@ def _build_prompt(
                 "\n  TM 参考（仅供参考，不得直接覆盖现有译文）："
                 f"\n    - {tm_reference['source_text']} → {tm_reference['target_text']}"
             )
+        source_label = (
+            "（译文侧新增，无对应原文；只检查目标语表达，不判断翻译准确性）"
+            if group.get("translation_only") else group["source_text"]
+        )
         items.append(
             f"[{seq}] <sid={group['sid']}>\n"
-            f"  原文：{group['source_text']}\n"
+            f"  原文：{source_label}\n"
             f"  现有译文候选：\n{variants}{references}"
         )
     rules = rules_text.strip() or "准确、自然、简洁；保留数字、占位符、标签和专有名词；同一原文必须输出同一译文。"
@@ -600,6 +666,8 @@ def _build_prompt(
         "字段：seq、sid、reviewed_target_text、changed、reason、category、confidence。"
         "reason 必须使用简体中文，便于中文审校人员复核；category 使用简短的问题类别。"
         "confidence 只能是 high/medium/low。不得省略任何输入项。\n\n"
+        "对于标记为‘译文侧新增、无对应原文’的项目，只校对目标语语法、术语、流畅度和格式，"
+        "不得补写、删减或声称核验了翻译准确性。\n\n"
         + "\n\n".join(items)
     )
 
@@ -678,6 +746,31 @@ async def _review_group_batch(
     raise ValueError(last_error)
 
 
+def get_latest_generation_error_segment_ids(db: Session, batch_id: UUID) -> set[UUID]:
+    """返回批次最新一轮校对中仍然生成失败的句段。"""
+    latest_report = (
+        db.query(TranslationReviewReport)
+        .filter(TranslationReviewReport.proofreading_batch_id == batch_id)
+        .order_by(TranslationReviewReport.created_at.desc())
+        .first()
+    )
+    if latest_report is None:
+        return set()
+    return {
+        segment_id
+        for (segment_id,) in (
+            db.query(TranslationReviewReportItem.segment_id)
+            .filter(
+                TranslationReviewReportItem.report_id == latest_report.id,
+                TranslationReviewReportItem.category_key == "generation_error",
+                TranslationReviewReportItem.segment_id.is_not(None),
+            )
+            .all()
+        )
+        if segment_id is not None
+    }
+
+
 async def generate_batch(
     db: Session,
     batch: ProofreadingBatch,
@@ -686,12 +779,23 @@ async def generate_batch(
     provider: str = "auto",
     model: str | None = None,
     user_instructions: str = "",
+    retry_scope: str = "all",
 ) -> None:
+    if _batch_cancel_requested(db, batch.id):
+        _finalize_canceled_batch(db, batch)
+        return
+
     batch.status = "running"
     batch.progress = 1
     batch.message = "正在整理重复原文。"
     batch.error_message = ""
     db.commit()
+
+    failed_segment_ids = (
+        get_latest_generation_error_segment_ids(db, batch.id)
+        if retry_scope == "failed_only"
+        else set()
+    )
 
     bindings = (
         db.query(ProofreadingColumnBinding)
@@ -715,6 +819,9 @@ async def generate_batch(
         category_counts="{}",
         file_counts="{}",
         failed_categories="[]",
+        # 显式记录微秒级时间，避免数据库 transaction timestamp 让连续重试并列，
+        # 从而错误地把上一轮失败报告识别为“最新一轮”。
+        created_at=_utcnow_naive(),
     )
     db.add(report)
     db.flush()
@@ -732,6 +839,18 @@ async def generate_batch(
     total_groups = 0
     grouped_by_language: dict[str, list[dict[str, Any]]] = {}
     for target_language, language_bindings in bindings_by_language.items():
+        if _batch_cancel_requested(db, batch.id):
+            _finalize_canceled_batch(
+                db,
+                batch,
+                report=report,
+                file_ids=file_ids,
+                failed_count=failed_count,
+                checked_count=checked_count,
+                changed_count=changed_count,
+                category_counts=category_counts,
+            )
+            return
         binding_ids = [binding.id for binding in language_bindings]
         rows = (
             db.query(ProofreadingSegmentBaseline, Segment)
@@ -742,14 +861,21 @@ async def generate_batch(
         )
         groups_by_hash: dict[str, dict[str, Any]] = {}
         for baseline, segment in rows:
+            if retry_scope == "failed_only" and segment.id not in failed_segment_ids:
+                continue
             if not normalize_text(baseline.original_target_text) or segment.status == "confirmed":
                 continue
             source_hash = segment.source_hash or build_source_hash(segment.source_text)
+            try:
+                segment_metadata = json.loads(segment.segment_metadata or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                segment_metadata = {}
             group = groups_by_hash.setdefault(source_hash, {
                 "sid": str(segment.id),
                 "source_text": segment.source_text,
                 "variants": [],
                 "segments": [],
+                "translation_only": bool(segment_metadata.get("translation_only")),
             })
             if baseline.original_target_text not in group["variants"]:
                 group["variants"].append(baseline.original_target_text)
@@ -770,6 +896,18 @@ async def generate_batch(
     processed_groups = 0
     for target_language, groups in grouped_by_language.items():
         for packed in _pack_groups(groups):
+            if _batch_cancel_requested(db, batch.id):
+                _finalize_canceled_batch(
+                    db,
+                    batch,
+                    report=report,
+                    file_ids=file_ids,
+                    failed_count=failed_count,
+                    checked_count=checked_count,
+                    changed_count=changed_count,
+                    category_counts=category_counts,
+                )
+                return
             try:
                 results, actual_provider, actual_model = await _review_group_batch(
                     packed,
@@ -893,17 +1031,7 @@ async def generate_batch(
 
     for file_id in file_ids:
         sync_file_record_status(db, file_id)
-    current_rows = (
-        db.query(ProofreadingSegmentBaseline, Segment)
-        .join(Segment, Segment.id == ProofreadingSegmentBaseline.segment_id)
-        .filter(ProofreadingSegmentBaseline.batch_id == batch.id)
-        .all()
-    )
-    batch.changed_segments = sum(
-        1
-        for baseline, segment in current_rows
-        if (segment.target_text or "") != (baseline.original_target_text or "")
-    )
+    _refresh_batch_change_stats(db, batch)
     batch.failed_segments = failed_count
     batch.progress = 100
     batch.status = "partial_failed" if failed_count else "completed"
@@ -934,10 +1062,14 @@ def run_generate_batch(
     provider: str,
     model: str | None,
     user_instructions: str = "",
+    retry_scope: str = "all",
 ) -> None:
     with SessionLocal() as db:
         batch = db.query(ProofreadingBatch).filter(ProofreadingBatch.id == batch_id).first()
         if not batch:
+            return
+        if _batch_cancel_requested(db, batch.id):
+            _finalize_canceled_batch(db, batch)
             return
         current_user = db.query(User).filter(User.id == current_user_id).first() if current_user_id else None
         try:
@@ -948,11 +1080,19 @@ def run_generate_batch(
                 provider=provider,
                 model=model,
                 user_instructions=user_instructions,
+                retry_scope=retry_scope,
             ))
+        except ProofreadingCanceled:
+            batch = db.query(ProofreadingBatch).filter(ProofreadingBatch.id == batch_id).first()
+            if batch and batch.status not in {"canceled"}:
+                _finalize_canceled_batch(db, batch)
         except Exception as exc:  # noqa: BLE001
             db.rollback()
             batch = db.query(ProofreadingBatch).filter(ProofreadingBatch.id == batch_id).first()
             if batch:
+                if getattr(batch, "cancel_requested", False) or batch.status in {"canceling", "canceled"}:
+                    _finalize_canceled_batch(db, batch)
+                    return
                 batch.status = "failed"
                 batch.error_message = str(exc)
                 batch.message = "校对失败。"
@@ -1122,6 +1262,7 @@ def serialize_batch(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
         "progress": batch.progress,
         "message": batch.message,
         "error_message": batch.error_message,
+        "cancel_requested": bool(getattr(batch, "cancel_requested", False)),
         "total_segments": batch.total_segments,
         "changed_segments": batch.changed_segments,
         "skipped_segments": batch.skipped_segments,

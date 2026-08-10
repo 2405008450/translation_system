@@ -83,10 +83,16 @@ import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { http } from '../api/http'
 import { queryOnlineTerms, type OnlineTermSource } from '../api/onlineTerms'
 import {
+  createProofreadingExportTask,
   downloadProofreadingBatchExport,
+  downloadProofreadingExportTask,
   exportProofreadingBatch,
+  generateProofreadingBatch,
   getProofreadingBatch,
+  getProofreadingExportReadiness,
+  getProofreadingExportTask,
   type ProofreadingBatch,
+  type ProofreadingExportFormat,
 } from '../api/proofreading'
 import {
   createMergeViewQAResult,
@@ -187,7 +193,7 @@ type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes' | 'refer
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
-type SegmentDisplayScope = 'all' | 'project_sync_only' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'pending_confirmation' | 'confirmed_only' | 'empty_target' | 'proofreading_changed'
+type SegmentDisplayScope = 'all' | 'project_sync_only' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'pending_confirmation' | 'confirmed_only' | 'empty_target' | 'proofreading_changed' | 'proofreading_failed'
 type RevisionMenuKind = 'track' | 'accept' | 'reject'
 type ResourceSearchMode = 'exact' | 'fuzzy'
 type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
@@ -296,6 +302,7 @@ type ProofreadingBaselineResponse = {
   is_proofreading: boolean
   proofreading_context: {
     batch_id: string
+    batch_kind: 'xlsx_columns' | 'document_pair'
     batch_status: string
     sheet_name: string
     target_language: string
@@ -304,6 +311,7 @@ type ProofreadingBaselineResponse = {
     user_instructions: string
     actual_provider: string
     actual_model: string
+    failed_segments: number
   } | null
   items: Array<{
     segment_id: string
@@ -409,6 +417,24 @@ const proofreadingDiffVisible = ref(getInitialProofreadingRevisionVisible())
 const proofreadingExporting = ref(false)
 const proofreadingExportProgress = ref(0)
 const proofreadingExportStatus = ref<ProofreadingBatch['export_status']>('idle')
+const showProofreadingExportMenu = ref(false)
+type ProofreadingProvider = 'auto' | 'deepseek' | 'openrouter'
+type ProofreadingRetryScope = 'all' | 'failed_only'
+const showProofreadingGenerateDialog = ref(false)
+const proofreadingGenerating = ref(false)
+const proofreadingGenerateError = ref('')
+const proofreadingGenerationDraft = reactive<{
+  provider: ProofreadingProvider
+  model: string
+  userInstructions: string
+  retryScope: ProofreadingRetryScope
+}>({
+  provider: 'auto',
+  model: '',
+  userInstructions: '',
+  retryScope: 'all',
+})
+let proofreadingGenerationPollTimer: number | null = null
 const hasProofreadingBaselines = computed(() => Object.keys(proofreadingBaselines.value).length > 0)
 const proofreadingChangedCount = computed(() => segmentStore.segments.filter((segment) => {
   const original = proofreadingBaselines.value[segment.id]
@@ -439,6 +465,114 @@ const proofreadingExportButtonLabel = computed(() => {
   }
   return proofreadingExportStatus.value === 'completed' ? '下载中' : '生成中'
 })
+const canStartProofreadingGeneration = computed(() => (
+  ['ready', 'partial_failed', 'failed', 'canceled'].includes(proofreadingContext.value?.batch_status || '')
+))
+const proofreadingGenerationButtonLabel = computed(() => {
+  const status = proofreadingContext.value?.batch_status || ''
+  if (status === 'canceled') return '重新开始校对'
+  if (status === 'partial_failed' || status === 'failed') return '重试 LLM 校对'
+  if (status === 'queued' || status === 'running' || status === 'canceling') return 'LLM 校对中'
+  return '开始 LLM 校对'
+})
+
+function handleProofreadingProviderChange() {
+  proofreadingGenerationDraft.model = proofreadingGenerationDraft.provider === 'deepseek'
+    ? 'deepseek-chat'
+    : proofreadingGenerationDraft.provider === 'openrouter'
+      ? 'google/gemini-3-flash-preview'
+      : ''
+}
+
+function proofreadingProviderDescription(provider: ProofreadingProvider) {
+  if (provider === 'deepseek') return '固定使用 DeepSeek Chat，不自动切换其他提供方。'
+  if (provider === 'openrouter') return '通过 OpenRouter 使用指定模型。'
+  return '自动模式优先 DeepSeek Chat；请求失败时回退到 OpenRouter。'
+}
+
+function openProofreadingGenerateDialog() {
+  const context = proofreadingContext.value
+  if (!context || !canStartProofreadingGeneration.value) return
+  proofreadingGenerationDraft.provider = ['auto', 'deepseek', 'openrouter'].includes(context.provider)
+    ? context.provider as ProofreadingProvider
+    : 'auto'
+  proofreadingGenerationDraft.model = context.model || ''
+  proofreadingGenerationDraft.userInstructions = context.user_instructions || ''
+  proofreadingGenerationDraft.retryScope = context.failed_segments > 0 ? 'failed_only' : 'all'
+  proofreadingGenerateError.value = ''
+  showProofreadingGenerateDialog.value = true
+}
+
+function clearProofreadingGenerationPollTimer() {
+  if (proofreadingGenerationPollTimer !== null) {
+    window.clearTimeout(proofreadingGenerationPollTimer)
+    proofreadingGenerationPollTimer = null
+  }
+}
+
+async function pollProofreadingGeneration(batchId: string) {
+  clearProofreadingGenerationPollTimer()
+  try {
+    const batch = await getProofreadingBatch(batchId)
+    if (proofreadingContext.value?.batch_id === batchId) {
+      proofreadingContext.value.batch_status = batch.status
+      proofreadingContext.value.failed_segments = batch.failed_segments
+    }
+    if (['queued', 'running', 'canceling'].includes(batch.status)) {
+      proofreadingGenerationPollTimer = window.setTimeout(() => {
+        void pollProofreadingGeneration(batchId)
+      }, 2000)
+      return
+    }
+    const fileRecordId = activeWorkbenchFileId.value || props.id
+    if (fileRecordId) {
+      await loadProofreadingBaselines(fileRecordId)
+    }
+    if (batch.status === 'completed') {
+      toast.success('LLM 校对已完成')
+    } else if (batch.status === 'partial_failed') {
+      toast.warn('LLM 校对已完成，但部分句段生成失败')
+    } else if (batch.status === 'failed') {
+      pageError.value = batch.error_message || 'LLM 校对失败，请调整设置后重试。'
+    }
+  } catch {
+    // 轮询失败不打断当前编辑，稍后继续刷新批次状态。
+    proofreadingGenerationPollTimer = window.setTimeout(() => {
+      void pollProofreadingGeneration(batchId)
+    }, 3000)
+  }
+}
+
+async function submitProofreadingGeneration() {
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId || proofreadingGenerating.value) return
+  proofreadingGenerating.value = true
+  proofreadingGenerateError.value = ''
+  try {
+    if (!await saveNow()) {
+      throw new Error('当前编辑尚未保存，已取消生成。')
+    }
+    await generateProofreadingBatch(batchId, {
+      provider: proofreadingGenerationDraft.provider,
+      model: proofreadingGenerationDraft.model || undefined,
+      user_instructions: proofreadingGenerationDraft.userInstructions.trim(),
+      retry_scope: proofreadingGenerationDraft.retryScope,
+    })
+    if (proofreadingContext.value) {
+      proofreadingContext.value.batch_status = 'queued'
+      proofreadingContext.value.provider = proofreadingGenerationDraft.provider
+      proofreadingContext.value.model = proofreadingGenerationDraft.model
+      proofreadingContext.value.user_instructions = proofreadingGenerationDraft.userInstructions.trim()
+    }
+    showProofreadingGenerateDialog.value = false
+    toast.success('LLM 校对任务已开始')
+    void pollProofreadingGeneration(batchId)
+  } catch (error) {
+    proofreadingGenerateError.value = getErrorMessage(error, '启动 LLM 校对失败。')
+  } finally {
+    proofreadingGenerating.value = false
+  }
+}
 
 function proofreadingOriginalTarget(segment: Segment) {
   return proofreadingBaselines.value[segment.id] ?? null
@@ -535,7 +669,9 @@ async function exportProofreadingWorkbook() {
   proofreadingExportProgress.value = 0
   pageError.value = ''
   try {
-    await saveNow()
+    if (!await saveNow()) {
+      throw new Error('当前编辑尚未保存，已取消导出。')
+    }
     let batch = await getProofreadingBatch(batchId)
     syncProofreadingExportState(batch)
 
@@ -569,6 +705,99 @@ async function exportProofreadingWorkbook() {
     toast.success('校对版 Excel 已导出')
   } catch (error) {
     pageError.value = getErrorMessage(error, '导出校对版 Excel 失败。')
+  } finally {
+    proofreadingExporting.value = false
+  }
+}
+
+const proofreadingExportChoices = computed<Array<{
+  format: ProofreadingExportFormat
+  name: string
+  description: string
+}>>(() => (
+  proofreadingContext.value?.batch_kind === 'document_pair'
+    ? [
+        {
+          format: 'proofreading_docx_layout',
+          name: '双语 Word（保留源排版）',
+          description: '原文在前、译文在后；完整性门禁失败时自动回退顺序版。',
+        },
+        {
+          format: 'proofreading_docx_ordered',
+          name: '双语 Word（顺序优先）',
+          description: '按原文句段顺序稳定输出，不复刻复杂表格版式。',
+        },
+        {
+          format: 'proofreading_audit_xlsx',
+          name: '校对审计 Excel',
+          description: '包含原译文、校对后译文、确认状态和对齐信息。',
+        },
+      ]
+    : [
+        {
+          format: 'proofreading_xlsx_original',
+          name: '校对版 Excel',
+          description: '保留工作簿、工作表和原始行序，在译文旁插入校对列。',
+        },
+      ]
+))
+
+async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId || proofreadingExporting.value) return
+  showProofreadingExportMenu.value = false
+  proofreadingExporting.value = true
+  proofreadingExportProgress.value = 0
+  pageError.value = ''
+  try {
+    if (!await saveNow()) {
+      throw new Error('当前编辑尚未保存，已取消导出。')
+    }
+    const readiness = await getProofreadingExportReadiness(batchId)
+    let acknowledgeWarnings = false
+    if (readiness.has_warnings) {
+      acknowledgeWarnings = await confirm({
+        title: '校对版仍有待处理内容',
+        message: [
+          `总计 ${readiness.total} 条，未确认 ${readiness.unconfirmed} 条。`,
+          `缺译 ${readiness.missing_translation} 条，增译 ${readiness.translation_only} 条，`,
+          `其中未校对增译 ${readiness.translation_only_unreviewed} 条，LLM 失败 ${readiness.llm_failed} 条。`,
+          '仍然导出时，缺译会被明确标记。',
+        ].join(''),
+        confirmText: '仍然导出',
+        cancelText: '返回检查',
+      })
+      if (!acknowledgeWarnings) return
+    }
+    let task = await createProofreadingExportTask(batchId, format, acknowledgeWarnings)
+    proofreadingExportStatus.value = task.status
+    proofreadingExportProgress.value = Number(task.progress || 0)
+    for (let attempt = 0; ['queued', 'running'].includes(task.status) && attempt < 240; attempt += 1) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 1500))
+      task = await getProofreadingExportTask(task.task_id)
+      proofreadingExportStatus.value = task.status
+      proofreadingExportProgress.value = Number(task.progress || 0)
+    }
+    if (task.status === 'failed') throw new Error(task.error || task.message || '导出失败。')
+    if (task.status !== 'completed') throw new Error('导出超时，请稍后重试。')
+    const response = await downloadProofreadingExportTask(task.task_id)
+    const filename = resolveDownloadFilename(
+      response.headers['content-disposition'],
+      task.filename || '双语校对版',
+    )
+    downloadBlob(response.data, filename)
+    const successMessage = format === 'proofreading_docx_layout'
+      ? filename.includes('顺序优先')
+        ? '原排版校验未通过，已自动导出顺序优先 Word'
+        : '已导出双语 Word（保留源排版）'
+      : format === 'proofreading_docx_ordered'
+        ? '已导出双语 Word（顺序优先）'
+        : format === 'proofreading_audit_xlsx'
+          ? '已导出校对审计 Excel'
+          : '已导出校对版 Excel（保留原工作簿）'
+    toast.success(successMessage)
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '导出校对版失败。')
   } finally {
     proofreadingExporting.value = false
   }
@@ -2494,8 +2723,9 @@ const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; 
     { value: 'confirmed_only', label: '已确认译文' },
     { value: 'empty_target', label: '空译文' },
     { value: 'proofreading_changed', label: '仅显示已修改' },
+    { value: 'proofreading_failed', label: '仅显示生成失败' },
   ]
-  const proofreadingScopes: SegmentDisplayScope[] = ['all', 'proofreading_changed', 'pending_confirmation', 'confirmed_only']
+  const proofreadingScopes: SegmentDisplayScope[] = ['all', 'proofreading_failed', 'proofreading_changed', 'pending_confirmation', 'confirmed_only']
   return isProofreadingWorkbench.value
     ? options.filter((option) => proofreadingScopes.includes(option.value))
     : options.filter((option) => option.value !== 'proofreading_changed')
@@ -2566,11 +2796,14 @@ function matchesSegmentDisplayScope(segment: Segment) {
     const originalTarget = proofreadingBaselines.value[segment.id]
     return originalTarget !== undefined && (segment.target_text || '') !== originalTarget
   }
+  if (segmentDisplayScope.value === 'proofreading_failed') {
+    return proofreadingReviewItems.value[segment.id]?.category === 'generation_error'
+  }
   return true
 }
 
 const editorSegments = computed(() => (
-  segmentDisplayScope.value === 'proofreading_changed'
+  ['proofreading_changed', 'proofreading_failed'].includes(segmentDisplayScope.value)
     ? segmentStore.segments.filter(matchesSegmentDisplayScope)
     : segmentStore.segments
 ))
@@ -6417,6 +6650,10 @@ const isCadFile = computed(() => {
   return ext === '.dwg' || ext === '.dxf'
 })
 
+const isDocumentPairProofreading = computed(() => (
+  isProofreadingWorkbench.value && proofreadingContext.value?.batch_kind === 'document_pair'
+))
+
 // 切换激活句段时清除光标缓存
 watch(() => segmentStore.activeSentenceId, () => {
   lastSourceCaretOffset.value = null
@@ -6455,17 +6692,15 @@ function handleSegmentClick(sentenceId: string, event: MouseEvent) {
     return
   }
 
-  if (event.ctrlKey || event.metaKey) {
-    const next = new Set(selectedSentenceIds.value)
-    if (next.has(sentenceId)) {
-      next.delete(sentenceId)
-    } else {
-      next.add(sentenceId)
-    }
-    selectedSentenceIds.value = next
-    segmentSelectionAnchorId.value = sentenceId
-    segmentStore.setActiveSentence(sentenceId)
+  const next = new Set(selectedSentenceIds.value)
+  if (next.has(sentenceId)) {
+    next.delete(sentenceId)
+  } else {
+    next.add(sentenceId)
   }
+  selectedSentenceIds.value = next
+  segmentSelectionAnchorId.value = sentenceId
+  segmentStore.setActiveSentence(sentenceId)
 }
 
 /**
@@ -6547,7 +6782,7 @@ const canMergeSegment = computed(() => {
   return (
     orderedSelectedMergeSegments.value.length >= 2
     && selectedMergeSegmentsCanWrite.value
-    && (isCadFile.value || selectedMergeSegmentsInSameBlock.value)
+    && (isCadFile.value || isDocumentPairProofreading.value || selectedMergeSegmentsInSameBlock.value)
     && selectedMergeSegmentsAreAdjacent.value
   )
 })
@@ -6559,7 +6794,7 @@ const mergeSegmentButtonTitle = computed(() => {
   if (!selectedMergeSegmentsCanWrite.value) {
     return t('workbench.messages.mergeReadonly')
   }
-  if (!isCadFile.value && !selectedMergeSegmentsInSameBlock.value) {
+  if (!isCadFile.value && !isDocumentPairProofreading.value && !selectedMergeSegmentsInSameBlock.value) {
     return t('workbench.messages.mergeDifferentBlock')
   }
   if (!selectedMergeSegmentsAreAdjacent.value) {
@@ -6619,7 +6854,7 @@ async function handleMergeSegment() {
   // CAD 文件（DWG/DXF）：允许跨 block 合并，不检查相邻性
   // 其他格式：必须同一 block
   const first = orderedSegments[0]
-  if (!isCadFile.value) {
+  if (!isCadFile.value && !isDocumentPairProofreading.value) {
     const notSameBlock = orderedSegments.some((segment) => !isSameMergeBlock(segment, first))
     if (notSameBlock) {
       toast.warn({ message: t('workbench.messages.mergeDifferentBlock') })
@@ -6830,6 +7065,7 @@ function closeAllMenus() {
 function closeRibbonMenus() {
   closeAllMenus()
   showExportMenu.value = false
+  showProofreadingExportMenu.value = false
   openConfirmMenu.value = false
   openRevisionMenu.value = null
 }
@@ -7698,18 +7934,20 @@ function handleIssueSaved(_marker: IssueMarker) {
 
 async function saveNow() {
   if (manualSaving.value) {
-    return
+    return false
   }
   pageError.value = ''
   manualSaving.value = true
   try {
     const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
-      return
+      return false
     }
     toast.success(t('workbench.messages.synced'))
+    return true
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.save'))
+    return false
   } finally {
     manualSaving.value = false
   }
@@ -7959,6 +8197,7 @@ function handleClickOutside(event: MouseEvent) {
   const target = event.target as HTMLElement
   if (!target.closest('.export-dropdown')) {
     showExportMenu.value = false
+    showProofreadingExportMenu.value = false
   }
 
   if (
@@ -8385,6 +8624,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('fullscreenchange', handleWorkbenchFullscreenChange)
   removeAiCapabilityMenuListeners()
   clearExportPollTimer()
+  clearProofreadingGenerationPollTimer()
   commentStore.stopPolling()
 })
 
@@ -8428,17 +8668,48 @@ onBeforeRouteLeave(async () => {
             <Save v-else :size="15" />
             <span>{{ manualSaving ? '保存中' : '保存' }}</span>
           </button>
+          <div class="export-dropdown">
+            <button
+              class="workbench-ribbon__top-action"
+              data-testid="proofreading-export-button"
+              type="button"
+              :disabled="manualSaving || proofreadingExporting || !proofreadingContext?.batch_id"
+              title="保存当前编辑并选择校对版导出格式"
+              @click.stop="showProofreadingExportMenu = !showProofreadingExportMenu"
+            >
+              <Loader2 v-if="proofreadingExporting" class="lucide-spin" :size="15" />
+              <Download v-else :size="15" />
+              <span>{{ proofreadingExportButtonLabel }}</span>
+              <ChevronDown :size="12" />
+            </button>
+            <div v-if="showProofreadingExportMenu" class="export-dropdown__menu">
+              <div class="export-dropdown__group">
+                <div class="export-dropdown__group-title">选择导出格式</div>
+                <button
+                  v-for="choice in proofreadingExportChoices"
+                  :key="choice.format"
+                  class="export-dropdown__item"
+                  type="button"
+                  :disabled="proofreadingExporting"
+                  @click="void exportProofreadingWithFormat(choice.format)"
+                >
+                  <span class="export-dropdown__item-name">{{ choice.name }}</span>
+                  <span class="export-dropdown__item-desc">{{ choice.description }}</span>
+                </button>
+              </div>
+            </div>
+          </div>
           <button
             class="workbench-ribbon__top-action"
-            data-testid="proofreading-export-button"
+            data-testid="proofreading-generate-button"
             type="button"
-            :disabled="manualSaving || proofreadingExporting || !proofreadingContext?.batch_id"
-            title="保存当前编辑并导出包含全部语言校对列的 Excel"
-            @click="void exportProofreadingWorkbook()"
+            :disabled="!canStartProofreadingGeneration || proofreadingGenerating"
+            :title="canStartProofreadingGeneration ? '配置提示词并调用 LLM 生成校对建议' : proofreadingGenerationButtonLabel"
+            @click="openProofreadingGenerateDialog"
           >
-            <Loader2 v-if="proofreadingExporting" class="lucide-spin" :size="15" />
-            <Download v-else :size="15" />
-            <span>{{ proofreadingExportButtonLabel }}</span>
+            <Loader2 v-if="proofreadingGenerating || ['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')" class="lucide-spin" :size="15" />
+            <Bot v-else :size="15" />
+            <span>{{ proofreadingGenerationButtonLabel }}</span>
           </button>
           <button class="workbench-ribbon__top-action" type="button" title="撤回当前句段的编辑" @click="undoActiveSegmentEdit">
             <Undo2 :size="15" /><span>撤回</span>
@@ -8468,6 +8739,19 @@ onBeforeRouteLeave(async () => {
             <span>{{ workbenchFullscreenLabel }}</span>
           </button>
         </div>
+      </div>
+
+      <div
+        v-if="proofreadingExporting"
+        class="proofreading-workbench-toolbar__export-progress"
+        role="progressbar"
+        aria-label="校对版导出进度"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        :aria-valuenow="Math.round(proofreadingExportProgress)"
+      >
+        <span :style="{ width: `${Math.max(2, proofreadingExportProgress)}%` }" />
+        <strong>{{ Math.round(proofreadingExportProgress) }}%</strong>
       </div>
 
       <div class="proofreading-workbench-toolbar__info-strip">
@@ -10378,6 +10662,7 @@ onBeforeRouteLeave(async () => {
                       @toggle-project-sync="toggleProjectSegmentSync"
                       @apply-partial-revision="handleApplyPartialRevision"
                       @ctrl-click="handleSegmentClick"
+                      @toggle-selection="handleSegmentClick"
                     />
                   </div>
                 </template>
@@ -11975,6 +12260,101 @@ onBeforeRouteLeave(async () => {
     />
 
     <Modal
+      :open="showProofreadingGenerateDialog"
+      title="LLM 校对设置"
+      description="调整本次校对使用的模型和临时提示词。"
+      width="min(640px, calc(100vw - 32px))"
+      :close-on-overlay="!proofreadingGenerating"
+      :close-on-esc="!proofreadingGenerating"
+      @close="showProofreadingGenerateDialog = false"
+    >
+      <div class="proofreading-generate-dialog">
+        <div class="proofreading-generate-dialog__fields">
+          <label class="field">
+            <span class="field__label">模型提供方</span>
+            <select
+              v-model="proofreadingGenerationDraft.provider"
+              class="field__control"
+              :disabled="proofreadingGenerating"
+              @change="handleProofreadingProviderChange"
+            >
+              <option value="auto">自动（优先 DeepSeek，失败回退）</option>
+              <option value="deepseek">DeepSeek</option>
+              <option value="openrouter">OpenRouter</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field__label">校对模型</span>
+            <select
+              v-model="proofreadingGenerationDraft.model"
+              class="field__control"
+              :disabled="proofreadingGenerating || proofreadingGenerationDraft.provider === 'auto'"
+            >
+              <option v-if="proofreadingGenerationDraft.provider === 'auto'" value="">自动选择默认模型</option>
+              <option v-if="proofreadingGenerationDraft.provider === 'deepseek'" value="deepseek-chat">DeepSeek Chat</option>
+              <option v-if="proofreadingGenerationDraft.provider === 'openrouter'" value="google/gemini-3-flash-preview">Gemini 3 Flash Preview</option>
+            </select>
+          </label>
+        </div>
+        <p class="proofreading-generate-dialog__hint">
+          {{ proofreadingProviderDescription(proofreadingGenerationDraft.provider) }}
+        </p>
+        <fieldset class="proofreading-generate-dialog__scope" :disabled="proofreadingGenerating">
+          <legend>校对范围</legend>
+          <label class="proofreading-generate-dialog__scope-option">
+            <input v-model="proofreadingGenerationDraft.retryScope" type="radio" value="all">
+            <span>
+              <strong>全部可校对句段</strong>
+              <small>重新处理当前批次中所有尚未确认的句段。</small>
+            </span>
+          </label>
+          <label
+            class="proofreading-generate-dialog__scope-option"
+            :class="{ 'is-disabled': !proofreadingContext?.failed_segments }"
+          >
+            <input
+              v-model="proofreadingGenerationDraft.retryScope"
+              type="radio"
+              value="failed_only"
+              :disabled="!proofreadingContext?.failed_segments"
+            >
+            <span>
+              <strong>仅重试生成失败项</strong>
+              <small v-if="proofreadingContext?.failed_segments">
+                仅提交最新一轮失败的 {{ proofreadingContext.failed_segments }} 个句段，已成功内容不会重复调用。
+              </small>
+              <small v-else>当前没有可重试的生成失败项。</small>
+            </span>
+          </label>
+        </fieldset>
+        <label class="field proofreading-generate-dialog__prompt">
+          <span class="field__label">本批次校对提示词</span>
+          <textarea
+            v-model="proofreadingGenerationDraft.userInstructions"
+            class="field__control"
+            rows="6"
+            maxlength="12000"
+            :disabled="proofreadingGenerating"
+            placeholder="例如：统一金融术语；保留机构英文全称；语气正式简洁；不要改写法规编号。"
+          />
+          <small>提示词会追加到系统和项目校对规则中；此流程直接调用 LLM，不使用 TM / 词汇表。</small>
+        </label>
+        <p v-if="proofreadingGenerateError" class="form-message is-error">{{ proofreadingGenerateError }}</p>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="proofreadingGenerating" @click="showProofreadingGenerateDialog = false">
+          取消
+        </button>
+        <button class="button button--primary" type="button" :disabled="proofreadingGenerating" @click="void submitProofreadingGeneration()">
+          <Loader2 v-if="proofreadingGenerating" class="lucide-spin" :size="14" />
+          <Bot v-else :size="14" />
+          {{ proofreadingGenerating ? '正在启动' : '开始 LLM 校对' }}
+        </button>
+      </template>
+    </Modal>
+
+    <Modal
       :open="showQualityQAAdjustDialog"
       title="质量保证调整"
       width="min(560px, calc(100vw - 32px))"
@@ -12530,6 +12910,31 @@ onBeforeRouteLeave(async () => {
   min-height: 38px;
 }
 
+.proofreading-workbench-toolbar__export-progress {
+  position: relative;
+  height: 4px;
+  overflow: visible;
+  background: #dfe9e6;
+}
+
+.proofreading-workbench-toolbar__export-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: 0 999px 999px 0;
+  background: var(--brand-700, #0d7a68);
+  transition: width 0.2s ease;
+}
+
+.proofreading-workbench-toolbar__export-progress > strong {
+  position: absolute;
+  top: 5px;
+  right: 8px;
+  z-index: 1;
+  color: #52635e;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
 .proofreading-workbench-toolbar__back {
   display: inline-flex;
   align-items: center;
@@ -12612,6 +13017,85 @@ onBeforeRouteLeave(async () => {
   margin-left: auto;
   color: #6b7d85;
   white-space: nowrap;
+}
+
+.proofreading-generate-dialog {
+  display: grid;
+  gap: 14px;
+}
+
+.proofreading-generate-dialog__fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.proofreading-generate-dialog__hint,
+.proofreading-generate-dialog__prompt small {
+  margin: 0;
+  color: #65767d;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.proofreading-generate-dialog__scope {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+}
+
+.proofreading-generate-dialog__scope legend {
+  padding: 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.proofreading-generate-dialog__scope-option {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 9px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.proofreading-generate-dialog__scope-option:hover {
+  background: var(--color-surface-hover);
+}
+
+.proofreading-generate-dialog__scope-option.is-disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.proofreading-generate-dialog__scope-option span {
+  display: grid;
+  gap: 3px;
+}
+
+.proofreading-generate-dialog__scope-option small {
+  color: var(--color-text-muted);
+  line-height: 1.45;
+}
+
+.proofreading-generate-dialog__prompt {
+  display: grid;
+  gap: 7px;
+}
+
+.proofreading-generate-dialog__prompt textarea {
+  min-height: 140px;
+  resize: vertical;
+  line-height: 1.6;
+}
+
+@media (max-width: 640px) {
+  .proofreading-generate-dialog__fields {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 1280px) {

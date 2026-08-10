@@ -2859,6 +2859,7 @@ class ProofreadingBatch(Base):
     progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
     error_message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     total_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     changed_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     skipped_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))

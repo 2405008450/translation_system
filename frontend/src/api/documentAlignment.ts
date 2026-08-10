@@ -1,3 +1,5 @@
+import axios from 'axios'
+
 import { http } from './http'
 import type { ProofreadingBatch } from './proofreading'
 
@@ -43,14 +45,43 @@ export async function createDocumentAlignmentBatch(projectId: string, payload: {
   target_language: string
   granularity: 'sentence' | 'paragraph'
   use_llm_for_hard_blocks: boolean
+  full_review: boolean
 }) {
   const { data } = await http.post<ProofreadingBatch>(`/projects/${projectId}/document-alignment-batches`, payload)
   return data
 }
 
-export async function listAlignmentPairs(batchId: string) {
-  const { data } = await http.get<{ items: AlignmentPair[]; total: number }>(`/proofreading-batches/${batchId}/alignment-pairs`, { params: { page_size: 500 } })
+export async function listAlignmentPairs(batchId: string, params: {
+  page?: number
+  page_size?: number
+  confidence_level?: AlignmentPair['confidence_level']
+} = {}) {
+  const { data } = await http.get<{ items: AlignmentPair[]; total: number }>(`/proofreading-batches/${batchId}/alignment-pairs`, {
+    params: { page: 1, page_size: 100, ...params },
+  })
   return data
+}
+
+const ALIGNMENT_OPENING_PREVIEW_LIMIT = 20
+const ALIGNMENT_LOW_CONFIDENCE_LIMIT = 80
+
+/**
+ * 项目页只预览开头和低置信度配对，严格限制返回与渲染数量，避免大文档占满内存。
+ */
+export async function listAlignmentPreviewPairs(batchId: string) {
+  const [opening, lowConfidence] = await Promise.all([
+    listAlignmentPairs(batchId, { page_size: ALIGNMENT_OPENING_PREVIEW_LIMIT }),
+    listAlignmentPairs(batchId, { page_size: ALIGNMENT_LOW_CONFIDENCE_LIMIT, confidence_level: 'low' }),
+  ])
+  const uniquePairs = new Map<string, AlignmentPair>()
+  for (const pair of [...opening.items, ...lowConfidence.items]) uniquePairs.set(pair.id, pair)
+  return {
+    items: [...uniquePairs.values()].sort((left, right) => left.pair_order - right.pair_order),
+    total: opening.total,
+    low_confidence_total: lowConfidence.total,
+    opening_limit: ALIGNMENT_OPENING_PREVIEW_LIMIT,
+    low_confidence_limit: ALIGNMENT_LOW_CONFIDENCE_LIMIT,
+  }
 }
 
 export async function patchAlignmentPair(pairId: string, payload: Partial<Pick<AlignmentPair, 'src_indices' | 'tgt_indices' | 'locked'>>) {
@@ -68,7 +99,34 @@ export async function splitAlignmentPair(batchId: string, pair: AlignmentPair) {
 }
 
 export async function mergeAlignmentPairs(batchId: string, firstId: string, secondId: string) {
-  await http.post(`/proofreading-batches/${batchId}/alignment-pairs/merge`, { first_pair_id: firstId, second_pair_id: secondId })
+  await mergeAlignmentPairRange(batchId, [firstId, secondId])
+}
+
+export async function mergeAlignmentPairRange(batchId: string, pairIds: string[]) {
+  try {
+    const { data } = await http.post<AlignmentPair>(`/proofreading-batches/${batchId}/alignment-pairs/merge`, {
+      pair_ids: pairIds,
+    })
+    return data
+  } catch (error) {
+    // 兼容尚未重启的旧后端：旧接口只接受 first_pair_id/second_pair_id。
+    // 新请求在进入业务逻辑前即返回 422，因此可以安全降级为连续两两合并。
+    if (!axios.isAxiosError(error) || error.response?.status !== 422 || pairIds.length < 2) throw error
+    let merged: AlignmentPair | null = null
+    for (let index = 1; index < pairIds.length; index += 1) {
+      const response = await http.post<AlignmentPair>(`/proofreading-batches/${batchId}/alignment-pairs/merge`, {
+        first_pair_id: pairIds[0],
+        second_pair_id: pairIds[index],
+      })
+      merged = response.data
+    }
+    // 旧接口不会自动锁定人工合并结果，补一次锁定避免后续重跑覆盖。
+    if (merged && !merged.locked) {
+      merged = await patchAlignmentPair(merged.id, { locked: true })
+    }
+    if (!merged) throw error
+    return merged
+  }
 }
 
 export async function shiftAlignmentBoundary(batchId: string, pairId: string, direction: 'next_into_current' | 'current_into_next') {
@@ -77,6 +135,15 @@ export async function shiftAlignmentBoundary(batchId: string, pairId: string, di
 
 export async function rerunAlignment(batchId: string) {
   await http.post(`/proofreading-batches/${batchId}/alignment/rerun`)
+}
+
+export async function cancelAlignment(batchId: string) {
+  const { data } = await http.post<ProofreadingBatch>(`/proofreading-batches/${batchId}/alignment/cancel`)
+  return data
+}
+
+export async function downloadAlignmentCsv(batchId: string) {
+  return http.get<Blob>(`/proofreading-batches/${batchId}/alignment/export.csv`, { responseType: 'blob' })
 }
 
 export async function confirmAlignment(batchId: string) {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Copy, CornerDownLeft, Link2, Link2Off } from 'lucide-vue-next'
+import { CheckSquare2, Copy, CornerDownLeft, Link2, Link2Off, Square } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from 'vue'
 
 import InteractiveDiffText from './InteractiveDiffText.vue'
@@ -92,6 +92,7 @@ const emit = defineEmits<{
   copySourceToTarget: [sentenceId: string]
   applyPartialRevision: [revisionId: string, newText: string]
   ctrlClick: [sentenceId: string, event: MouseEvent]
+  toggleSelection: [sentenceId: string, event: MouseEvent]
   toggleProjectSync: [sentenceId: string, disabled: boolean]
 }>()
 
@@ -2939,6 +2940,18 @@ watch(
     <div class="segment-row__meta">
       <span class="segment-row__index">{{ index + 1 }}</span>
       <button
+        class="segment-row__selection-toggle"
+        type="button"
+        :class="{ 'is-selected': selected }"
+        :title="selected ? '取消选择句段' : '选择句段；按住 Shift 可连续选择'"
+        :aria-label="selected ? '取消选择句段' : '选择句段'"
+        :aria-pressed="selected"
+        @click.stop="emit('toggleSelection', segmentKey, $event)"
+      >
+        <CheckSquare2 v-if="selected" :size="15" aria-hidden="true" />
+        <Square v-else :size="15" aria-hidden="true" />
+      </button>
+      <button
         v-if="showProjectSyncToggle"
         class="segment-row__sync-toggle"
         :class="{ 'is-disabled-sync': segment.project_sync_disabled }"
@@ -3220,6 +3233,25 @@ watch(
   outline: 2px solid rgba(13, 122, 104, 0.45);
   outline-offset: -2px;
   border-radius: 4px;
+}
+
+.segment-row__selection-toggle {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  place-items: center;
+  color: var(--ink-400);
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.segment-row__selection-toggle:hover,
+.segment-row__selection-toggle.is-selected {
+  color: var(--brand);
+  background: rgba(13, 122, 104, 0.1);
 }
 
 .segment-row__cell--original-target {

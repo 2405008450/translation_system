@@ -651,6 +651,7 @@ REQUIRED_SCHEMA = {
         "source_language",
         "status",
         "progress",
+        "cancel_requested",
         "export_status",
         "export_progress",
         "export_path",
@@ -3714,6 +3715,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 progress INTEGER NOT NULL DEFAULT 0,
                 message TEXT NOT NULL DEFAULT '',
                 error_message TEXT NOT NULL DEFAULT '',
+                cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
                 total_segments INTEGER NOT NULL DEFAULT 0,
                 changed_segments INTEGER NOT NULL DEFAULT 0,
                 skipped_segments INTEGER NOT NULL DEFAULT 0,
@@ -3760,6 +3762,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS proofreading_batches
             ADD COLUMN IF NOT EXISTS alignment_status VARCHAR(20) NOT NULL DEFAULT 'not_applicable'
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE
             """,
             f"""
             CREATE TABLE IF NOT EXISTS proofreading_column_bindings (

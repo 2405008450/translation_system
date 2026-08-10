@@ -71,6 +71,28 @@ class Settings(BaseSettings):
     reference_llm_api_key: str | None = None
     reference_llm_model: str = "google/gemini-3.5-flash"
     reference_llm_base_url: str = "https://openrouter.ai/api/v1"
+    # 双文档对齐的可选跨语言语义证据。未配置或调用失败时自动退回纯程序 DP。
+    alignment_embedding_enabled: bool = False
+    alignment_embedding_api_key: str | None = None
+    alignment_embedding_base_url: str | None = None
+    alignment_embedding_model: str = "google/gemini-embedding-2"
+    alignment_embedding_timeout_seconds: float = 30.0
+    alignment_embedding_dimensions: int | None = 768
+    alignment_embedding_batch_size: int = 100
+    alignment_embedding_concurrency: int = 2
+    alignment_embedding_window_blocks: int = 32
+    alignment_llm_refinement_enabled: bool = True
+    # 向量候选完成后，将全部键值对分块交给指定 LLM 做边界复核。
+    alignment_llm_full_review_enabled: bool = False
+    alignment_llm_full_review_model: str = "google/gemini-3-flash-preview"
+    alignment_llm_full_review_max_pairs: int = 28
+    alignment_llm_full_review_max_chars: int = 18000
+    alignment_llm_full_review_table_max_pairs: int = 24
+    alignment_llm_full_review_table_max_chars: int = 9000
+    alignment_llm_full_review_overlap_pairs: int = 2
+    alignment_llm_full_review_retry_min_pairs: int = 4
+    alignment_llm_full_review_max_output_tokens: int = 4096
+    alignment_llm_full_review_concurrency: int = 4
     # 样式标记专检：AI 自动标注默认使用的 provider/model；留空 model 时沿用
     # request_chat_completion 的通用默认（DEEPSEEK_MODEL / OPENROUTER_MODEL）。
     # 前端设置面板若显式选择模型会覆盖此处配置。

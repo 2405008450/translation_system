@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import Counter
 
 from .parser import AlignUnit
@@ -43,3 +44,49 @@ def punctuation_features(text: str) -> dict[str, int | str]:
         "brackets": sum(text.count(ch) for ch in "()（）[]【】"),
         "quotes": sum(text.count(ch) for ch in "\"'“”‘’"),
     }
+
+
+def comparable_text(value: str) -> str:
+    """用于精确锚点的保守归一化，不翻译、不改写原文。"""
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return re.sub(r"[\W_]+", "", normalized, flags=re.UNICODE)
+
+
+def has_structure_conflict(source: list[AlignUnit], target: list[AlignUnit]) -> bool:
+    """判断结构类型是否真的冲突，不比较两份独立 DOCX 的物理行列坐标。"""
+    source_table = [unit for unit in source if unit.block_type == "table_cell"]
+    target_table = [unit for unit in target if unit.block_type == "table_cell"]
+    if bool(source_table) != bool(target_table):
+        return True
+    if not source_table:
+        return False
+    # 一个候选内部混入正文和表格，或跨越多张表，才属于可靠的结构冲突。
+    if len(source_table) != len(source) or len(target_table) != len(target):
+        return True
+    source_tables = {unit.block_index for unit in source_table}
+    target_tables = {unit.block_index for unit in target_table}
+    return len(source_tables) > 1 or len(target_tables) > 1
+
+
+_FIELD_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "stock_code": (
+        re.compile(r"证券代码|股票代码"), re.compile(r"\bstock\s*(?:code|symbol)\b", re.I),
+        re.compile(r"\bsecurities\s*code\b", re.I),
+    ),
+    "announcement_no": (
+        re.compile(r"公告编号|公告号"), re.compile(r"\bannouncement\s*(?:no\.?|number)\b", re.I),
+    ),
+    "announcement_date": (
+        re.compile(r"公告时间|公告日期"), re.compile(r"\bannouncement\s*date\b", re.I),
+    ),
+    "report_title": (
+        re.compile(r"年度报告(?:全文)?"), re.compile(r"\b(?:full\s+text\s+of\s+)?\d{4}\s+annual\s+report\b", re.I),
+    ),
+}
+
+
+def classify_field(text: str) -> str:
+    for field_type, patterns in _FIELD_PATTERNS.items():
+        if any(pattern.search(text) for pattern in patterns):
+            return field_type
+    return ""

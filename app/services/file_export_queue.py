@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import mimetypes
 import time
@@ -50,6 +51,12 @@ FILE_EXPORT_TASK_TTL_SECONDS = 24 * 60 * 60
 FILE_EXPORT_POLL_INTERVAL_SECONDS = 0.3
 FILE_EXPORT_WAIT_TIMEOUT_SECONDS = 30 * 60
 LANGUAGE_TAGGED_EXPORT_TYPES = {"tmx", "xliff", "xliff2"}
+PROOFREADING_EXPORT_TYPES = {
+    "proofreading_docx_layout",
+    "proofreading_docx_ordered",
+    "proofreading_audit_xlsx",
+    "proofreading_xlsx_original",
+}
 
 _FILE_EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="file-export")
 _SCHEMA_READY = False
@@ -471,6 +478,58 @@ def build_file_record_exported_file(
     raw_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
     export_filename = _resolve_export_filename(file_record, source_filename)
+
+    if export_type in PROOFREADING_EXPORT_TYPES:
+        from app.models import ProofreadingBatch, ProofreadingColumnBinding
+        from app.services.document_alignment.export import (
+            export_document_pair_xlsx,
+            export_layout_bilingual_docx,
+            export_ordered_bilingual_docx,
+        )
+        from app.services.proofreading import export_batch_xlsx
+
+        batch_id = None
+        try:
+            parse_options = json.loads(file_record.document_parse_options or "{}")
+            batch_id = parse_options.get("proofreading_batch_id") if isinstance(parse_options, dict) else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            batch_id = None
+        batch = db.get(ProofreadingBatch, UUID(str(batch_id))) if batch_id else None
+        if batch is None:
+            batch = db.query(ProofreadingBatch).join(
+                ProofreadingColumnBinding,
+                ProofreadingColumnBinding.batch_id == ProofreadingBatch.id,
+            ).filter(ProofreadingColumnBinding.file_record_id == file_record.id).order_by(
+                ProofreadingBatch.created_at.desc(),
+            ).first()
+        if batch is None:
+            raise ValueError("当前文件没有可导出的校对批次。")
+
+        if export_type == "proofreading_docx_layout":
+            content, filename, _ = export_layout_bilingual_docx(db, batch)
+            return _GenericExportedFile(
+                content=content,
+                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                filename=filename,
+            )
+        if export_type == "proofreading_docx_ordered":
+            content, filename = export_ordered_bilingual_docx(db, batch)
+            return _GenericExportedFile(
+                content=content,
+                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                filename=filename,
+            )
+        if export_type == "proofreading_audit_xlsx":
+            if batch.batch_kind != "document_pair":
+                raise ValueError("审计 Excel 仅用于双文档校对批次。")
+            content, filename = export_document_pair_xlsx(db, batch)
+        else:
+            content, filename = export_batch_xlsx(db, batch)
+        return _GenericExportedFile(
+            content=content,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=filename,
+        )
 
     if export_type == "source":
         if raw_bytes is None:

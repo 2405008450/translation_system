@@ -94,6 +94,7 @@ interface EditableWorkflowStep {
 
 type ProjectDeadlineScope = '' | 'overdue' | 'due_soon' | 'no_deadline'
 type ProjectFileCountScope = '' | 'has_files' | 'no_files'
+type ProjectSegmentSort = '' | 'asc' | 'desc'
 
 interface ProjectFilters {
   status: string
@@ -103,6 +104,7 @@ interface ProjectFilters {
   creator: string
   deadline_scope: ProjectDeadlineScope
   file_count_scope: ProjectFileCountScope
+  segment_sort: ProjectSegmentSort
   created_from: string
   created_to: string
   deadline_from: string
@@ -203,6 +205,7 @@ function defaultProjectFilters(): ProjectFilters {
     creator: '',
     deadline_scope: '',
     file_count_scope: '',
+    segment_sort: '',
     created_from: '',
     created_to: '',
     deadline_from: '',
@@ -231,6 +234,11 @@ const fileCountScopeOptions: SelectOption[] = [
   { value: '', label: '全部文件数量' },
   { value: 'has_files', label: '已有文件' },
   { value: 'no_files', label: '暂无文件' },
+]
+const segmentSortOptions: SelectOption[] = [
+  { value: '', label: '默认排序' },
+  { value: 'desc', label: '总句段数：从多到少' },
+  { value: 'asc', label: '总句段数：从少到多' },
 ]
 const activeProjectFilterCount = computed(() => getActiveProjectFilterCount(projectFilters))
 const hasActiveProjectFilters = computed(() => activeProjectFilterCount.value > 0)
@@ -292,6 +300,9 @@ const projectFilterTags = computed(() => {
   }
   if (projectFilters.file_count_scope) {
     tags.push(getOptionLabel(fileCountScopeOptions, projectFilters.file_count_scope))
+  }
+  if (projectFilters.segment_sort) {
+    tags.push(getOptionLabel(segmentSortOptions, projectFilters.segment_sort))
   }
   const createdRange = formatDateRangeLabel(projectFilters.created_from, projectFilters.created_to)
   if (createdRange) {
@@ -414,6 +425,7 @@ function getActiveProjectFilterCount(filters: ProjectFilters) {
     filters.creator,
     filters.deadline_scope,
     filters.file_count_scope,
+    filters.segment_sort,
   ].filter(Boolean).length
   const rangeCount = [
     filters.created_from || filters.created_to,
@@ -431,6 +443,7 @@ function copyProjectFilters(source: ProjectFilters, target: ProjectFilters) {
     creator: source.creator,
     deadline_scope: source.deadline_scope,
     file_count_scope: source.file_count_scope,
+    segment_sort: source.segment_sort,
     created_from: source.created_from,
     created_to: source.created_to,
     deadline_from: source.deadline_from,
@@ -555,20 +568,25 @@ function getProjectSortValue(project: ProjectItem, key: string) {
   if (key === 'open_issue_count') {
     return Number(project.open_issue_count || 0)
   }
+  if (key === 'total_segments') {
+    return Number(project.total_segments || 0)
+  }
   return String((project as unknown as Record<string, unknown>)[key] ?? '')
 }
 
 function sortProjectRows(items: ProjectItem[]) {
-  if (!sortKey.value) {
+  const activeSortKey = projectFilters.segment_sort ? 'total_segments' : sortKey.value
+  const activeSortOrder = projectFilters.segment_sort || sortOrder.value
+  if (!activeSortKey) {
     return items
   }
   return [...items].sort((left, right) => {
-    const leftValue = getProjectSortValue(left, sortKey.value)
-    const rightValue = getProjectSortValue(right, sortKey.value)
+    const leftValue = getProjectSortValue(left, activeSortKey)
+    const rightValue = getProjectSortValue(right, activeSortKey)
     const result = typeof leftValue === 'number' && typeof rightValue === 'number'
       ? leftValue - rightValue
       : String(leftValue).localeCompare(String(rightValue), 'zh-CN')
-    return sortOrder.value === 'asc' ? result : -result
+    return activeSortOrder === 'asc' ? result : -result
   })
 }
 
@@ -1305,6 +1323,15 @@ onBeforeUnmount(() => {
                   <span>文件数量</span>
                   <select v-model="filterDraft.file_count_scope" class="field__control">
                     <option v-for="option in fileCountScopeOptions" :key="option.value" :value="option.value">
+                      {{ option.label }}
+                    </option>
+                  </select>
+                </label>
+
+                <label class="project-filter-dialog__field">
+                  <span>总句段数排序</span>
+                  <select v-model="filterDraft.segment_sort" class="field__control">
+                    <option v-for="option in segmentSortOptions" :key="option.value" :value="option.value">
                       {{ option.label }}
                     </option>
                   </select>

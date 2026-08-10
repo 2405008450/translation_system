@@ -7157,10 +7157,6 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <section v-if="activeTab === 'files' && project.workflow_template_id === 'proofread' && project.can_manage" class="panel pd-files-panel">
-        <ProofreadingPanel :project-id="project.id" @refresh-project="loadProject" />
-      </section>
-
       <section v-if="activeTab === 'files'" class="panel pd-files-panel">
         <div class="pd-panel-head">
           <div class="pd-panel-head__copy">
@@ -7178,6 +7174,12 @@ onBeforeUnmount(() => {
             </p>
           </div>
         </div>
+
+        <ProofreadingPanel
+          v-if="project.workflow_template_id === 'proofread' && project.can_manage"
+          :project-id="project.id"
+          @refresh-project="loadProject"
+        />
 
         <div class="table-toolbar pd-toolbar">
           <div class="table-toolbar__left pd-toolbar__left">

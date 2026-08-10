@@ -4,9 +4,11 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -14,9 +16,10 @@ from app.auth import require_business_manager
 from app.database import get_db
 from app.models import DocumentAlignmentPair, ProofreadingBatch, Project, User
 from app.services.document_alignment.segments import materialize_alignment
+from app.services.document_alignment.export import export_alignment_csv as build_alignment_csv
 from app.services.document_alignment.service import (
     create_alignment_batch, preview_document_pair, refresh_pair_text,
-    run_alignment_batch, serialize_pair, validate_pair_integrity,
+    merge_alignment_pair_range, run_alignment_batch, serialize_pair, validate_pair_integrity,
 )
 from app.services.import_task_storage import (
     cleanup_import_task_staging, get_import_task_staging_dir, stage_import_file_streams,
@@ -32,6 +35,7 @@ class AlignmentBatchCreate(BaseModel):
     target_language: str
     granularity: Literal["sentence", "paragraph"] = "sentence"
     use_llm_for_hard_blocks: bool = False
+    full_review: bool = True
 
 
 class PairPatch(BaseModel):
@@ -47,8 +51,9 @@ class PairSplit(BaseModel):
 
 
 class PairMerge(BaseModel):
-    first_pair_id: UUID
-    second_pair_id: UUID
+    first_pair_id: UUID | None = None
+    second_pair_id: UUID | None = None
+    pair_ids: list[UUID] = Field(default_factory=list, max_length=100)
 
 
 class BoundaryShift(BaseModel):
@@ -126,6 +131,7 @@ def create_batch(
             target_bytes=target_bytes, target_filename=target_name,
             source_language=payload.source_language, target_language=payload.target_language,
             granularity=payload.granularity, use_llm_for_hard_blocks=payload.use_llm_for_hard_blocks,
+            full_review=payload.full_review,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -137,7 +143,7 @@ def create_batch(
 
 @router.get("/proofreading-batches/{batch_id}/alignment-pairs")
 def list_pairs(
-    batch_id: UUID, page: int = Query(1, ge=1), page_size: int = Query(100, ge=1, le=500),
+    batch_id: UUID, page: int = Query(1, ge=1), page_size: int = Query(100, ge=1, le=100),
     confidence_level: str | None = None, only_unlocked: bool = False,
     db: Session = Depends(get_db), _: User = Depends(require_business_manager),
 ):
@@ -213,17 +219,17 @@ def split_pair(batch_id: UUID, payload: PairSplit, db: Session = Depends(get_db)
 @router.post("/proofreading-batches/{batch_id}/alignment-pairs/merge")
 def merge_pairs(batch_id: UUID, payload: PairMerge, db: Session = Depends(get_db), _: User = Depends(require_business_manager)):
     _batch(db, batch_id)
-    first, second = db.get(DocumentAlignmentPair, payload.first_pair_id), db.get(DocumentAlignmentPair, payload.second_pair_id)
-    if not first or not second or first.batch_id != batch_id or second.batch_id != batch_id or second.pair_order != first.pair_order + 1:
-        raise HTTPException(400, "只能合并同批次的相邻配对。")
-    first.src_indices = json.dumps(json.loads(first.src_indices) + json.loads(second.src_indices))
-    first.tgt_indices = json.dumps(json.loads(first.tgt_indices) + json.loads(second.tgt_indices))
-    db.delete(second)
-    db.flush()
-    refresh_pair_text(db, first)
-    validate_pair_integrity(db, batch_id)
-    db.commit()
-    return serialize_pair(first)
+    pair_ids = payload.pair_ids
+    if not pair_ids and payload.first_pair_id and payload.second_pair_id:
+        pair_ids = [payload.first_pair_id, payload.second_pair_id]
+    try:
+        merged = merge_alignment_pair_range(db, batch_id, pair_ids)
+        db.commit()
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    db.refresh(merged)
+    return serialize_pair(merged)
 
 
 @router.post("/proofreading-batches/{batch_id}/alignment-pairs/shift-boundary")
@@ -253,10 +259,53 @@ def shift_boundary(batch_id: UUID, payload: BoundaryShift, db: Session = Depends
 @router.post("/proofreading-batches/{batch_id}/alignment/rerun")
 def rerun(batch_id: UUID, background_tasks: BackgroundTasks, db: Session = Depends(get_db), _: User = Depends(require_business_manager)):
     batch = _batch(db, batch_id)
+    if batch.alignment_status in {"aligning", "canceling"}:
+        raise HTTPException(409, "当前双文档对齐任务仍在运行。")
     batch.alignment_status = "aligning"; batch.status = "aligning"; batch.progress = 0
+    batch.message = "正在准备向量对齐窗口…"
+    batch.error_message = ""
+    batch.cancel_requested = False
+    batch.finished_at = None
     db.commit()
     background_tasks.add_task(run_alignment_batch, batch.id)
     return {"batch_id": str(batch.id), "alignment_status": "aligning"}
+
+
+@router.post("/proofreading-batches/{batch_id}/alignment/cancel")
+def cancel_alignment(
+    batch_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    batch = _batch(db, batch_id)
+    if batch.alignment_status not in {"aligning", "canceling"}:
+        raise HTTPException(409, "当前双文档对齐任务不在运行中。")
+    batch.cancel_requested = True
+    batch.alignment_status = "canceling"
+    batch.status = "canceling"
+    batch.message = "正在终止双文档对齐；当前远端请求结束后停止。"
+    db.commit()
+    return serialize_batch(db, batch)
+
+
+@router.get("/proofreading-batches/{batch_id}/alignment/export.csv")
+def export_alignment_csv(
+    batch_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    batch = _batch(db, batch_id)
+    if batch.alignment_status not in {"draft", "confirmed"}:
+        raise HTTPException(409, "请等待对齐草稿生成完成后再导出 CSV。")
+    pairs = (
+        db.query(DocumentAlignmentPair)
+        .filter(DocumentAlignmentPair.batch_id == batch.id)
+        .order_by(DocumentAlignmentPair.pair_order)
+        .all()
+    )
+    filename = f"{Path(batch.filename).stem}_原文译文对照.csv"
+    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"}
+    return StreamingResponse(iter([build_alignment_csv(pairs)]), media_type="text/csv; charset=utf-8", headers=headers)
 
 
 @router.post("/proofreading-batches/{batch_id}/alignment/confirm")
