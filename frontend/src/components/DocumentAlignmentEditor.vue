@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { Check, ChevronDown, ChevronUp, Download, Lock, Merge, RefreshCw, Scissors, Square, Upload } from 'lucide-vue-next'
+import { ArrowRight, Check, ChevronDown, ChevronUp, Download, FileText, Lock, Merge, RefreshCw, Scissors, Square, Upload } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 import {
@@ -271,21 +271,60 @@ onBeforeUnmount(() => { window.removeEventListener('keydown', onKeydown); if (po
 </script>
 
 <template>
-  <section class="alignment-editor">
+  <section class="alignment-editor" :class="{ 'is-compact': compact }">
     <header v-if="!compact"><div><strong>双文档对齐校对</strong><p>分别上传原文与译文，系统解析结构并生成句段对齐草稿。</p></div></header>
     <p v-if="error" class="form-message is-error">{{ error }}</p>
     <div v-if="!pairs.length" class="alignment-upload">
-      <label class="file-pick"><Upload :size="15" />原文文档<input type="file" accept=".doc,.docx,.txt" @change="selectFile('source', $event)"><small>{{ sourceFile?.name || '未选择' }}</small></label>
-      <label class="file-pick"><Upload :size="15" />译文文档<input type="file" accept=".doc,.docx,.txt" @change="selectFile('target', $event)"><small>{{ targetFile?.name || '未选择' }}</small></label>
-      <button class="button" :disabled="busy || !sourceFile || !targetFile" @click="makePreview">解析预览</button>
-      <template v-if="preview">
-        <span>{{ preview.source.unit_count }} 个原文单元 ↔ {{ preview.target.unit_count }} 个译文单元</span>
-        <select v-model="sourceLanguage" class="field__control"><option v-for="item in languageOptions" :key="item.code" :value="item.code">{{ item.label }}</option></select>
-        <select v-model="targetLanguage" class="field__control"><option v-for="item in languageOptions" :key="item.code" :value="item.code">{{ item.label }}</option></select>
-        <select v-model="granularity" class="field__control"><option value="sentence">句粒度（默认）</option><option value="paragraph">段落粒度</option></select>
+      <div class="alignment-upload__head">
+        <span class="alignment-upload__head-icon"><Upload :size="20" /></span>
+        <div>
+          <strong>上传需要校对的两个文档</strong>
+          <p>点击下方卡片，依次选择原文和对应译文。</p>
+        </div>
+      </div>
+
+      <div class="alignment-upload__files">
+        <label class="file-pick" :class="{ 'is-selected': sourceFile }">
+          <input type="file" accept=".doc,.docx,.txt" @change="selectFile('source', $event)">
+          <span class="file-pick__step">1</span>
+          <span class="file-pick__icon"><Check v-if="sourceFile" :size="22" /><FileText v-else :size="22" /></span>
+          <span class="file-pick__copy">
+            <strong>选择原文文档</strong>
+            <small :title="sourceFile?.name">{{ sourceFile?.name || '点击此处浏览文件' }}</small>
+          </span>
+          <span class="file-pick__action">{{ sourceFile ? '重新选择' : '选择文件' }}</span>
+        </label>
+
+        <span class="alignment-upload__direction" aria-hidden="true"><ArrowRight :size="20" /></span>
+
+        <label class="file-pick" :class="{ 'is-selected': targetFile }">
+          <input type="file" accept=".doc,.docx,.txt" @change="selectFile('target', $event)">
+          <span class="file-pick__step">2</span>
+          <span class="file-pick__icon"><Check v-if="targetFile" :size="22" /><FileText v-else :size="22" /></span>
+          <span class="file-pick__copy">
+            <strong>选择译文文档</strong>
+            <small :title="targetFile?.name">{{ targetFile?.name || '点击此处浏览文件' }}</small>
+          </span>
+          <span class="file-pick__action">{{ targetFile ? '重新选择' : '选择文件' }}</span>
+        </label>
+      </div>
+
+      <div class="alignment-upload__actions">
+        <span>支持 DOC、DOCX、TXT · 单个文件最大以系统配置为准</span>
+        <button class="button button--primary alignment-upload__preview-button" :disabled="busy || !sourceFile || !targetFile" @click="makePreview">
+          解析并预览
+          <ArrowRight :size="16" />
+        </button>
+      </div>
+
+      <div v-if="preview" class="alignment-preview-config">
+        <strong>{{ preview.source.unit_count }} 个原文单元 ↔ {{ preview.target.unit_count }} 个译文单元</strong>
+        <select v-model="sourceLanguage" class="field__control" aria-label="原文语言"><option v-for="item in languageOptions" :key="item.code" :value="item.code">{{ item.label }}</option></select>
+        <select v-model="targetLanguage" class="field__control" aria-label="译文语言"><option v-for="item in languageOptions" :key="item.code" :value="item.code">{{ item.label }}</option></select>
+        <select v-model="granularity" class="field__control" aria-label="对齐粒度"><option value="sentence">句粒度（默认）</option><option value="paragraph">段落粒度</option></select>
         <label><input v-model="fullReview" type="checkbox">全量 Gemini 边界复核（推荐）</label>
         <button class="button button--primary" :disabled="busy || sourceLanguage === targetLanguage" @click="createBatch">生成对齐草稿</button>
-      </template>
+      </div>
       <div v-if="busy && batchId" class="alignment-running" role="status" aria-live="polite">
         <div class="alignment-running__head"><span>{{ message || '正在对齐…' }}</span><strong>{{ alignmentProgress }}%</strong></div>
         <progress :value="alignmentProgress" max="100" />
@@ -331,20 +370,50 @@ onBeforeUnmount(() => { window.removeEventListener('keydown', onKeydown); if (po
 
 <style scoped>
 .alignment-editor { display: grid; gap: 12px; min-height: 0; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.alignment-editor.is-compact { padding: 0; border: 0; border-radius: 0; }
 .alignment-editor header p, .alignment-row p { margin: 4px 0 0; }
-.alignment-upload, .alignment-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.alignment-upload { display: grid; gap: 16px; padding: 20px; border: 1px solid rgba(15, 118, 110, .22); border-radius: 12px; background: linear-gradient(135deg, rgba(240, 253, 250, .86), rgba(248, 250, 252, .96)); }
+.alignment-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.alignment-upload__head { display: flex; align-items: center; gap: 12px; }
+.alignment-upload__head-icon { display: grid; flex: 0 0 auto; width: 42px; height: 42px; place-items: center; border-radius: 11px; background: var(--brand); color: #fff; box-shadow: 0 8px 20px rgba(15, 118, 110, .2); }
+.alignment-upload__head strong { color: var(--ink-900, #0f172a); font-size: 17px; }
+.alignment-upload__head p { margin: 3px 0 0; color: var(--ink-500); font-size: 13px; }
+.alignment-upload__files { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: stretch; gap: 12px; }
+.alignment-upload__direction { display: grid; place-items: center; color: var(--brand); }
+.alignment-upload__actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.alignment-upload__actions > span { color: var(--ink-500); font-size: 12px; }
+.alignment-upload__preview-button { min-width: 170px; justify-content: center; }
+.alignment-preview-config { display: grid; grid-template-columns: minmax(200px, 1fr) repeat(3, minmax(150px, .65fr)); align-items: center; gap: 10px; padding-top: 14px; border-top: 1px solid rgba(15, 118, 110, .18); }
+.alignment-preview-config > label { grid-column: 1 / -2; }
 .alignment-progress { display: inline-flex; align-items: center; gap: 8px; color: var(--ink-500); }
 .alignment-progress progress { width: 120px; }
 .alignment-preview-limit { flex: 1 1 100%; color: var(--ink-500); }
 .alignment-running { display: grid; grid-template-columns: minmax(240px, 1fr) auto; align-items: center; gap: 8px 12px; width: 100%; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); }
 .alignment-running__head { grid-column: 1 / -1; display: flex; justify-content: space-between; gap: 16px; }
 .alignment-running progress { width: 100%; height: 12px; }
-.file-pick { display: grid; grid-template-columns: auto auto; gap: 4px 8px; padding: 10px; border: 1px dashed var(--line); border-radius: 8px; cursor: pointer; }
-.file-pick input { display: none; }.file-pick small { grid-column: 1 / -1; color: var(--ink-500); }
+.file-pick { position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 96px; padding: 16px 16px 16px 20px; border: 2px dashed rgba(15, 118, 110, .38); border-radius: 12px; background: #fff; cursor: pointer; transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease; }
+.file-pick:hover { border-color: var(--brand); box-shadow: 0 10px 24px rgba(15, 23, 42, .08); transform: translateY(-1px); }
+.file-pick.is-selected { border-style: solid; border-color: var(--brand); background: rgba(236, 253, 245, .72); }
+.file-pick input { display: none; }
+.file-pick__step { position: absolute; top: 8px; left: 8px; display: grid; width: 20px; height: 20px; place-items: center; border-radius: 999px; background: var(--brand); color: #fff; font-size: 11px; font-weight: 800; }
+.file-pick__icon { display: grid; width: 46px; height: 46px; place-items: center; border-radius: 10px; background: #e7f6f2; color: var(--brand); }
+.file-pick.is-selected .file-pick__icon { background: var(--brand); color: #fff; }
+.file-pick__copy { display: grid; gap: 5px; min-width: 0; }
+.file-pick__copy strong { color: var(--ink-800, #1e293b); font-size: 15px; }
+.file-pick__copy small { overflow: hidden; color: var(--ink-500); text-overflow: ellipsis; white-space: nowrap; }
+.file-pick__action { padding: 6px 9px; border: 1px solid rgba(15, 118, 110, .24); border-radius: 7px; color: var(--brand); font-size: 12px; font-weight: 700; white-space: nowrap; }
 .alignment-grid { display: grid; max-height: min(620px, calc(100vh - 290px)); overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
 .alignment-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 68px minmax(0, 1fr); gap: 12px; padding: 12px 12px 12px 40px; text-align: left; color: inherit; background: transparent; border: 0; border-bottom: 1px solid var(--line); cursor: pointer; }
 .alignment-row.is-active { outline: 2px solid var(--brand); outline-offset: -2px; }.alignment-row.is-selected { box-shadow: inset 4px 0 var(--brand); }.alignment-row.is-low { background: #fff4e5; }.alignment-row.is-high { background: #f2fbf5; }
 .alignment-row__select { position: absolute; inset-inline-start: 14px; top: 18px; display: grid; place-items: center; cursor: pointer; }
 .alignment-row__select input { width: 16px; height: 16px; accent-color: var(--brand); cursor: pointer; }
 .alignment-state { display: grid; place-content: center; text-align: center; border-inline: 1px solid var(--line); }.alignment-state small { display: block; }.alignment-reason { max-width: 64px; color: var(--ink-500); font-size: 10px; line-height: 1.2; }
+@media (max-width: 760px) {
+  .alignment-upload { padding: 14px; }
+  .alignment-upload__files { grid-template-columns: 1fr; }
+  .alignment-upload__direction { transform: rotate(90deg); }
+  .alignment-upload__actions { align-items: stretch; flex-direction: column; }
+  .alignment-preview-config { grid-template-columns: 1fr; }
+  .alignment-preview-config > label { grid-column: auto; }
+}
 </style>

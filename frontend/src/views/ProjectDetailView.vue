@@ -414,7 +414,8 @@ const router = useRouter()
 const toast = useToast()
 const { t } = useI18n()
 
-const loading = ref(false)
+// 首次渲染即进入加载态，避免项目类型返回前短暂显示通用项目布局。
+const loading = ref(true)
 const deleting = ref(false)
 const duplicating = ref(false)
 const creatingEnglishVariantCopy = ref(false)
@@ -5701,7 +5702,11 @@ onBeforeUnmount(() => {
     </main>
   </div>
 
-  <div v-else class="content-stack pd-layout workbench-page">
+  <div
+    v-else
+    class="content-stack pd-layout workbench-page"
+    :class="{ 'is-project-mode-pending': loading && !project }"
+  >
     <section class="panel pd-hero">
       <div class="pd-hero__main">
         <div class="pd-hero__left">
@@ -5753,7 +5758,7 @@ onBeforeUnmount(() => {
 
     <p v-if="pageError" class="form-message is-error">{{ pageError }}</p>
 
-    <section v-if="loading && !project" class="panel">
+    <section v-if="loading && !project" class="panel pd-route-loading">
       <div class="empty-state">
         <Loader2 class="lucide-spin" :size="32" />
         {{ t('projectDetail.loading') }}
@@ -9033,6 +9038,12 @@ onBeforeUnmount(() => {
   outline: 1px solid #d7dde0;
 }
 
+.pd-layout.is-project-mode-pending > :not(.pd-route-loading) {
+  display: none !important;
+}
+.pd-route-loading {
+  min-height: min(420px, 55vh);
+}
 .pd-layout {
   align-content: start;
   align-items: start;

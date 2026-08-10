@@ -503,6 +503,10 @@ export interface Segment {
   row_index?: number | null
   cell_index?: number | null
   sequence_index?: number | null
+  /** 双文档校对底层配对信息，用于跨 block 的人工错位合并。 */
+  alignment_pair_id?: string | null
+  alignment_pair_order?: number | null
+  alignment_translation_only?: boolean
   workflow_step_id?: string | null
   workflow_step_name?: string | null
   workflow_step_order?: number | null

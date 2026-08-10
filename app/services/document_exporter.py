@@ -14,6 +14,7 @@ from pathlib import Path
 import logging
 import os
 import re
+import unicodedata
 from typing import Any
 from zipfile import ZipFile
 from xml.etree import ElementTree as ET
@@ -1284,6 +1285,35 @@ def _export_bilingual_table(
             )
 
 
+def _table_cell_has_only_numeric_or_math_content(segments: Iterable[ExportSegment]) -> bool:
+    """判断表格单元格是否只包含无需重复展示的数字、标点或数学内容。"""
+    segment_list = list(segments)
+    if not segment_list:
+        return False
+
+    combined_source = "\n".join(segment.source_text for segment in segment_list)
+    visible_source = MATH_PLACEHOLDER_RE.sub("", combined_source)
+    has_numeric_or_symbol_content = any(segment.math_placeholders for segment in segment_list)
+
+    for character in visible_source:
+        if character.isspace():
+            continue
+        category = unicodedata.category(character)
+        if category == "Cf":
+            # 忽略零宽字符、方向控制符等不可见格式字符。
+            continue
+        if category.startswith("N") or category.startswith("P"):
+            has_numeric_or_symbol_content = True
+            continue
+        if category in {"Sm", "Sc"} or character in {"°", "℃", "℉"}:
+            has_numeric_or_symbol_content = True
+            continue
+        # 任意语言文字、拉丁变量、单位、缩写或其他可见内容都必须保留对照译文。
+        return False
+
+    return has_numeric_or_symbol_content
+
+
 def _export_table(
     table: ET.Element,
     story: StoryPart,
@@ -1537,6 +1567,11 @@ def _export_bilingual_table_cell(
         (_resolve_segment_block_type(story.kind, "table_cell"), block_index, row_index, cell_index),
         [],
     )
+    exportable_cell_segments = (
+        []
+        if _table_cell_has_only_numeric_or_math_content(cell_segments)
+        else cell_segments
+    )
     segment_cursor = 0
     paragraph_buffer: list[CellParagraphTokens] = []
 
@@ -1549,7 +1584,7 @@ def _export_bilingual_table_cell(
         buffer_sentence_count = sum(sentence_count for _, sentence_count in paragraph_groups)
         buffer_tokens = _cell_paragraph_group_tokens(paragraph_buffer)
         buffer_segments, buffer_consumed_count = _take_segments_matching_token_source(
-            cell_segments,
+            exportable_cell_segments,
             segment_cursor,
             buffer_tokens,
             buffer_sentence_count,
@@ -1578,13 +1613,14 @@ def _export_bilingual_table_cell(
             paragraph_buffer = []
             return
 
+        pending_target_groups: list[tuple[list[CellParagraphTokens], list[ET.Element]]] = []
         for paragraph_group, sentence_count in paragraph_groups:
             if sentence_count == 0:
                 continue
 
             target_tokens = _cell_paragraph_group_tokens(paragraph_group)
             group_segments, consumed_count = _take_segments_matching_token_source(
-                cell_segments,
+                exportable_cell_segments,
                 segment_cursor,
                 target_tokens,
                 sentence_count,
@@ -1606,12 +1642,36 @@ def _export_bilingual_table_cell(
                 segments=group_segments,
                 keep_source_when_empty=False,
             )
-            _insert_cloned_table_cell_paragraphs(
-                cell=cell,
-                paragraph_group=paragraph_group,
-                target_paragraphs=target_paragraphs,
-                order=order,
-            )
+            pending_target_groups.append((paragraph_group, target_paragraphs))
+
+        if pending_target_groups:
+            buffer_parents = [
+                item.parent if item.parent is not None else cell
+                for item in paragraph_buffer
+            ]
+            first_parent = buffer_parents[0]
+            if all(parent is first_parent for parent in buffer_parents):
+                # 同一表格单元格里的双语内容应按完整语言块排列：
+                # 先保留全部原文段落，再统一追加全部译文段落，避免译文穿插到原文中间。
+                _insert_cloned_blocks(
+                    parent=first_parent,
+                    anchors=[item.paragraph for item in paragraph_buffer],
+                    clones=[
+                        clone
+                        for _, target_paragraphs in pending_target_groups
+                        for clone in target_paragraphs
+                    ],
+                    order=order,
+                )
+            else:
+                # SDT / customXml 等跨父节点结构无法安全整块移动，继续按各自父节点就地插入。
+                for paragraph_group, target_paragraphs in pending_target_groups:
+                    _insert_cloned_table_cell_paragraphs(
+                        cell=cell,
+                        paragraph_group=paragraph_group,
+                        target_paragraphs=target_paragraphs,
+                        order=order,
+                    )
 
         paragraph_buffer = []
 

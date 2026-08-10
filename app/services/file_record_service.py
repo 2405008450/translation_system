@@ -54,6 +54,14 @@ SEGMENT_ORDERING = (
     Segment.sentence_id.asc(),
 )
 
+# 双文档校对的 block/row/cell 分别来自原文和译文两份独立文档，不能互相比较。
+# 其唯一权威顺序是对齐物化时写入的 sequence_index（即 alignment pair order）。
+DOCUMENT_PAIR_SEGMENT_ORDERING = (
+    case((Segment.sequence_index >= 0, 0), else_=1).asc(),
+    Segment.sequence_index.asc(),
+    Segment.sentence_id.asc(),
+)
+
 PPTX_SEGMENT_ORDERING = (
     case((Segment.sequence_index >= 0, 0), else_=1).asc(),
     Segment.sequence_index.asc(),
@@ -199,6 +207,14 @@ def _count_confirmed_segments(items: list[dict]) -> int:
 
 
 def get_segment_ordering_for_file_record(file_record: FileRecord | None):
+    if file_record is not None:
+        raw_options = file_record.document_parse_options
+        try:
+            parse_options = json.loads(raw_options or "{}") if isinstance(raw_options, str) else raw_options or {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parse_options = {}
+        if isinstance(parse_options, dict) and parse_options.get("alignment_mode") == "document_pair":
+            return DOCUMENT_PAIR_SEGMENT_ORDERING
     if file_record is not None and Path(file_record.filename or "").suffix.lower() == ".pptx":
         return PPTX_SEGMENT_ORDERING
     return SEGMENT_ORDERING

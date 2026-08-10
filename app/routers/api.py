@@ -128,7 +128,10 @@ from app.services.document_statistics import (
     serialize_document_statistics,
 )
 from app.services.document_alignment.service import merge_alignment_pair_range
-from app.services.document_alignment.segments import TRANSLATION_ONLY_SOURCE_LABEL
+from app.services.document_alignment.segments import (
+    TRANSLATION_ONLY_SOURCE_LABEL,
+    ensure_document_pair_segments_complete,
+)
 from app.services.document_match_analysis import (
     DocumentMatchSegment,
     compute_document_match_analysis,
@@ -11086,6 +11089,21 @@ def _serialize_workbench_segment(
                 writable_workflow_assignments,
             )
         )
+    alignment_pair_id = None
+    alignment_pair_order = None
+    alignment_translation_only = False
+    try:
+        alignment_metadata = json.loads(seg.segment_metadata or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        alignment_metadata = {}
+    if isinstance(alignment_metadata, dict):
+        raw_alignment_pair_id = alignment_metadata.get("alignment_pair_id")
+        raw_alignment_pair_order = alignment_metadata.get("alignment_pair_order")
+        alignment_pair_id = str(raw_alignment_pair_id) if raw_alignment_pair_id else None
+        if isinstance(raw_alignment_pair_order, int) and not isinstance(raw_alignment_pair_order, bool):
+            alignment_pair_order = raw_alignment_pair_order
+        alignment_translation_only = bool(alignment_metadata.get("translation_only"))
+
     payload = {
         "id": str(seg.id),
         "sentence_id": seg.sentence_id,
@@ -11120,6 +11138,11 @@ def _serialize_workbench_segment(
         "row_index": seg.row_index,
         "cell_index": seg.cell_index,
         "sequence_index": seg.sequence_index,
+        # 双文档校对人工纠偏时，前端必须按底层配对顺序判断相邻，不能依赖
+        # block/row/cell 或筛选后的可见顺序。
+        "alignment_pair_id": alignment_pair_id,
+        "alignment_pair_order": alignment_pair_order,
+        "alignment_translation_only": alignment_translation_only,
         "workflow_step_id": str(resolved_workflow_step_id) if resolved_workflow_step_id else None,
         "workflow_step_name": workflow_step.name if workflow_step else "翻译",
         "workflow_step_order": int(workflow_step.sort_order or 0) if workflow_step else 0,
@@ -11285,6 +11308,16 @@ def _apply_segment_scope_filter(query, scope: str):
         )
     if normalized_scope == "empty_target":
         return query.filter(func.coalesce(Segment.target_text, "") == "")
+    if normalized_scope == "proofreading_translation_only":
+        # 双文档校对中的“增译”没有对应原文，物化时使用固定占位文本。
+        # 这里在数据库侧筛选，确保分页、计数和跨页跳转都只针对增译句段。
+        return query.filter(Segment.source_text == TRANSLATION_ONLY_SOURCE_LABEL)
+    if normalized_scope == "proofreading_missing_translation":
+        # 双文档校对中的“漏译”（导出报告称“缺译”）表现为有原文但译文为空。
+        return query.filter(
+            Segment.source_text != TRANSLATION_ONLY_SOURCE_LABEL,
+            func.coalesce(Segment.target_text, "") == "",
+        )
     if normalized_scope == "proofreading_changed":
         return query.join(
             ProofreadingSegmentBaseline,
@@ -15350,9 +15383,9 @@ def merge_segment(
     second_position = sequence_positions.get(second_seg.id)
     if first_position is None or second_position is None:
         raise HTTPException(status_code=404, detail="待合并片段不存在。")
-    if second_position <= first_position:
+    if document_pair_batch is None and second_position <= first_position:
         raise HTTPException(status_code=400, detail="请按文档从上到下的顺序合并句段。")
-    if not is_cad_file and second_position != first_position + 1:
+    if document_pair_batch is None and not is_cad_file and second_position != first_position + 1:
         raise HTTPException(status_code=400, detail="普通文档只能合并前后相邻的句段。")
 
     # 合并文本
@@ -15376,10 +15409,22 @@ def merge_segment(
         if not first_pair_id or not second_pair_id:
             raise HTTPException(status_code=400, detail="双文档句段缺少配对标识，无法安全合并。")
         try:
+            first_pair_uuid = UUID(str(first_pair_id))
+            second_pair_uuid = UUID(str(second_pair_id))
+            selected_pairs = db.query(DocumentAlignmentPair).filter(
+                DocumentAlignmentPair.batch_id == document_pair_batch.id,
+                DocumentAlignmentPair.id.in_([first_pair_uuid, second_pair_uuid]),
+            ).order_by(DocumentAlignmentPair.pair_order).all()
+            if len(selected_pairs) != 2:
+                raise ValueError("部分待合并配对不存在或不属于当前校对批次。")
+            if selected_pairs[0].id != first_pair_uuid or selected_pairs[1].id != second_pair_uuid:
+                raise ValueError("请按校对对齐顺序从上到下选择句段。")
+            if selected_pairs[1].pair_order != selected_pairs[0].pair_order + 1:
+                raise ValueError("只能合并校对对齐序列中前后相邻的句段。")
             merged_pair = merge_alignment_pair_range(
                 db,
                 document_pair_batch.id,
-                [UUID(str(first_pair_id)), UUID(str(second_pair_id))],
+                [first_pair_uuid, second_pair_uuid],
             )
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -15553,6 +15598,10 @@ def merge_segment(
     )
 
     db.flush()
+    if document_pair_batch is not None:
+        # merge_alignment_pair_range 会压紧底层 pair_order；同步刷新所有剩余句段的
+        # alignment_pair_order 与 sequence/display 顺序，避免下一次人工合并仍拿到旧序号。
+        ensure_document_pair_segments_complete(db, document_pair_batch)
     refresh_segment_display_indexes(db, file_record)
     sync_file_record_status(db, file_record_id)
     db.commit()

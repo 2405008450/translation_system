@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { Bot, CheckCircle2, Download, ExternalLink, FileSpreadsheet, FileText, Loader2, MessageSquareText, Pause, Play, Upload } from 'lucide-vue-next'
+import { Bot, CheckCircle2, ChevronDown, Download, ExternalLink, FileSpreadsheet, FileText, Loader2, MessageSquareText, Pause, Play, Settings2, Upload } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
@@ -58,6 +58,7 @@ const actionBatchId = ref('')
 const errorMessage = ref('')
 const selectedImportMode = ref<'document_pair' | 'xlsx_columns' | null>(null)
 const showAlignmentDialog = ref(false)
+const expandedBatchIds = ref(new Set<string>())
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 const ACTIVE_GENERATE_STATUSES = new Set(['aligning', 'queued', 'running', 'canceling'])
@@ -73,6 +74,17 @@ const canCreate = computed(() => {
 
 function canConfigureBatch(batch: ProofreadingBatch) {
   return CONFIGURABLE_STATUSES.has(batch.status)
+}
+
+function isBatchExpanded(batchId: string) {
+  return expandedBatchIds.value.has(batchId)
+}
+
+function toggleBatchSettings(batchId: string) {
+  const next = new Set(expandedBatchIds.value)
+  if (next.has(batchId)) next.delete(batchId)
+  else next.add(batchId)
+  expandedBatchIds.value = next
 }
 
 function isBatchGenerating(batch: ProofreadingBatch) {
@@ -353,9 +365,10 @@ onBeforeUnmount(() => {
   <section class="proofreading-panel">
     <div class="proofreading-import">
       <div class="proofreading-import__head">
-        <div>
+        <div class="proofreading-import__intro">
+          <span class="proofreading-import__eyebrow"><Upload :size="14" />新增资料</span>
           <div class="section-title section-title--tight">导入校对资料</div>
-          <p class="panel-subtitle">先选择资料形态。两种方式创建的内容都会进入下方“校对语言任务”。</p>
+          <p class="panel-subtitle">选择资料结构，导入后统一进入语言任务。</p>
         </div>
       </div>
 
@@ -370,9 +383,10 @@ onBeforeUnmount(() => {
           <span class="proofreading-import-mode__icon"><FileText :size="22" /></span>
           <span class="proofreading-import-mode__copy">
             <strong>原文 + 译文两个文档</strong>
-            <small>分别上传原文与译文，系统自动解析并对齐句段，确认后生成一个语言任务。</small>
+            <small>分别上传两个文档，自动解析并对齐句段。</small>
             <em>支持 DOC、DOCX、TXT</em>
           </span>
+          <ChevronDown class="proofreading-import-mode__arrow" :size="16" />
         </button>
         <button
           class="proofreading-import-mode"
@@ -384,9 +398,10 @@ onBeforeUnmount(() => {
           <span class="proofreading-import-mode__icon"><FileSpreadsheet :size="22" /></span>
           <span class="proofreading-import-mode__copy">
             <strong>原文列 + 译文列的表格</strong>
-            <small>上传一个工作簿并映射原文列、译文列；每个目标语言生成一个语言任务。</small>
+            <small>上传工作簿，映射原文列、译文列与语言。</small>
             <em>支持 XLSX</em>
           </span>
+          <ChevronDown class="proofreading-import-mode__arrow" :size="16" />
         </button>
       </div>
     </div>
@@ -476,36 +491,98 @@ onBeforeUnmount(() => {
               <span class="proofreading-batch__kind" :class="`is-${batch.batch_kind || 'xlsx_columns'}`">{{ batchKindLabel(batch) }}</span>
               <span class="proofreading-batch__badge" :class="statusTone(batch.status)">{{ statusLabel(batch.status) }}</span>
             </div>
+            <small class="proofreading-batch__stats">
+              <span>共 {{ batch.total_segments }} 条</span>
+              <span>修改 {{ batch.changed_segments }}</span>
+              <span>缺失 {{ batch.skipped_segments }}</span>
+              <span :class="{ 'is-error': batch.failed_segments > 0 }">失败 {{ batch.failed_segments }}</span>
+            </small>
             <span class="proofreading-batch__percent">{{ batch.progress }}%</span>
           </div>
 
           <div class="proofreading-batch__progress">
             <div class="progress-bar"><div class="progress-bar__track"><div class="progress-bar__fill" :style="{ width: `${batch.progress}%` }" /></div></div>
-            <p v-if="batch.message" class="proofreading-batch__message">{{ batch.message }}</p>
-            <small>共 {{ batch.total_segments }} 条，修改 {{ batch.changed_segments }}，缺失 {{ batch.skipped_segments }}，失败 {{ batch.failed_segments }}</small>
-            <small v-if="batch.error_message" class="is-error">{{ batch.error_message }}</small>
-            <small v-if="batch.export_error_message" class="is-error">导出失败：{{ batch.export_error_message }}</small>
           </div>
 
-          <div v-if="batch.bindings.length" class="proofreading-batch__languages">
-            <div class="proofreading-batch__languages-label">语言任务</div>
-            <div class="proofreading-batch__language-list">
+          <div class="proofreading-batch__footer">
+            <div class="proofreading-batch__context">
+              <p v-if="batch.message" class="proofreading-batch__message" :title="batch.message">{{ batch.message }}</p>
+              <div v-if="batch.bindings.length" class="proofreading-batch__language-list" aria-label="语言任务">
+                <button
+                  v-for="binding in batch.bindings"
+                  :key="binding.id"
+                  class="proofreading-batch__language-chip"
+                  type="button"
+                  @click="openWorkbench(binding.file_record_id)"
+                >
+                  <span>{{ getLanguageLabel(binding.target_language) }}</span>
+                  <span class="proofreading-batch__language-sheet">{{ binding.sheet_name }}</span>
+                  <ExternalLink :size="12" />
+                </button>
+              </div>
+            </div>
+
+            <div class="proofreading-batch__actions">
               <button
-                v-for="binding in batch.bindings"
-                :key="binding.id"
-                class="proofreading-batch__language-chip"
+                v-if="canConfigureBatch(batch)"
+                class="button proofreading-batch__settings-toggle"
                 type="button"
-                @click="openWorkbench(binding.file_record_id)"
+                :aria-expanded="isBatchExpanded(batch.id)"
+                @click="toggleBatchSettings(batch.id)"
               >
-                <span>{{ getLanguageLabel(binding.target_language) }}</span>
-                <span class="proofreading-batch__language-sheet">{{ binding.sheet_name }}</span>
-                <ExternalLink :size="12" />
+                <Settings2 :size="14" />
+                校对设置
+                <ChevronDown :size="14" :class="{ 'is-rotated': isBatchExpanded(batch.id) }" />
+              </button>
+              <button
+                v-if="batch.batch_kind === 'document_pair' && ['aligning', 'canceling', 'draft'].includes(batch.alignment_status || '')"
+                class="button button--primary"
+                type="button"
+                @click="selectImportMode('document_pair')"
+              >
+                <FileText :size="14" />
+                {{ batch.alignment_status === 'draft' ? '查看并确认对齐' : '查看对齐进度' }}
+              </button>
+              <button
+                v-if="canConfigureBatch(batch)"
+                class="button button--primary"
+                type="button"
+                :disabled="Boolean(actionBatchId)"
+                @click="startGeneration(batch)"
+              >
+                <Loader2 v-if="actionBatchId === batch.id" class="lucide-spin" :size="14" />
+                <Play v-else :size="14" />
+                {{ startButtonLabel(batch) }}
+              </button>
+              <button
+                v-if="isBatchGenerating(batch)"
+                class="button button--danger"
+                type="button"
+                :disabled="Boolean(actionBatchId) || batch.status === 'canceling'"
+                @click="stopGeneration(batch)"
+              >
+                <Loader2 v-if="actionBatchId === batch.id || batch.status === 'canceling'" class="lucide-spin" :size="14" />
+                <Pause v-else :size="14" />
+                {{ batch.status === 'canceling' ? '取消中…' : '暂停' }}
+              </button>
+              <button
+                class="button"
+                type="button"
+                :disabled="Boolean(actionBatchId) || batch.status === 'ready' || isBatchGenerating(batch) || ['queued', 'running'].includes(batch.export_status)"
+                @click="downloadBatch(batch)"
+              >
+                <Loader2 v-if="['queued', 'running'].includes(batch.export_status)" class="lucide-spin" :size="14" />
+                <Download v-else :size="14" />
+                {{ batch.export_status === 'completed' ? '下载合并 Excel' : (['queued', 'running'].includes(batch.export_status) ? `生成中 ${batch.export_progress}%` : '生成合并 Excel') }}
               </button>
             </div>
           </div>
 
+          <small v-if="batch.error_message" class="is-error proofreading-batch__error">{{ batch.error_message }}</small>
+          <small v-if="batch.export_error_message" class="is-error proofreading-batch__error">导出失败：{{ batch.export_error_message }}</small>
+
           <section
-            v-if="canConfigureBatch(batch)"
+            v-if="canConfigureBatch(batch) && isBatchExpanded(batch.id)"
             class="proofreading-generation-config"
             aria-label="LLM 校对设置"
           >
@@ -555,49 +632,6 @@ onBeforeUnmount(() => {
             </label>
           </section>
 
-          <div class="proofreading-batch__actions">
-            <button
-              v-if="batch.batch_kind === 'document_pair' && ['aligning', 'canceling', 'draft'].includes(batch.alignment_status || '')"
-              class="button button--primary"
-              type="button"
-              @click="selectImportMode('document_pair')"
-            >
-              <FileText :size="14" />
-              {{ batch.alignment_status === 'draft' ? '查看并确认对齐' : '查看对齐进度' }}
-            </button>
-            <button
-              v-if="canConfigureBatch(batch)"
-              class="button button--primary"
-              type="button"
-              :disabled="Boolean(actionBatchId)"
-              @click="startGeneration(batch)"
-            >
-              <Loader2 v-if="actionBatchId === batch.id" class="lucide-spin" :size="14" />
-              <Play v-else :size="14" />
-              {{ startButtonLabel(batch) }}
-            </button>
-            <button
-              v-if="isBatchGenerating(batch)"
-              class="button button--danger"
-              type="button"
-              :disabled="Boolean(actionBatchId) || batch.status === 'canceling'"
-              @click="stopGeneration(batch)"
-            >
-              <Loader2 v-if="actionBatchId === batch.id || batch.status === 'canceling'" class="lucide-spin" :size="14" />
-              <Pause v-else :size="14" />
-              {{ batch.status === 'canceling' ? '取消中…' : '暂停' }}
-            </button>
-            <button
-              class="button"
-              type="button"
-              :disabled="Boolean(actionBatchId) || batch.status === 'ready' || isBatchGenerating(batch) || ['queued', 'running'].includes(batch.export_status)"
-              @click="downloadBatch(batch)"
-            >
-              <Loader2 v-if="['queued', 'running'].includes(batch.export_status)" class="lucide-spin" :size="14" />
-              <Download v-else :size="14" />
-              {{ batch.export_status === 'completed' ? '下载合并 Excel' : (['queued', 'running'].includes(batch.export_status) ? `生成中 ${batch.export_progress}%` : '生成合并 Excel') }}
-            </button>
-          </div>
         </article>
       </div>
       <div v-else class="proofreading-task-empty">
@@ -628,14 +662,27 @@ onBeforeUnmount(() => {
 <style scoped>
 .proofreading-panel { display: grid; gap: 18px; }
 .proofreading-section { display: grid; gap: 14px; }
-.proofreading-import { display: grid; gap: 14px; }
+.proofreading-import {
+  display: grid;
+  grid-template-columns: minmax(220px, .55fr) minmax(520px, 1.45fr);
+  gap: 20px;
+  align-items: center;
+  padding: 16px 18px;
+  border: 1px solid rgba(15, 118, 110, .16);
+  border-radius: 12px;
+  background: linear-gradient(105deg, rgba(240, 253, 250, .8), rgba(248, 250, 252, .72));
+}
 .proofreading-import__head, .proofreading-task-section__head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.proofreading-import__intro { display: grid; gap: 4px; }
+.proofreading-import__eyebrow { display: inline-flex; align-items: center; gap: 5px; color: var(--brand); font-size: 11px; font-weight: 700; letter-spacing: .05em; }
+.proofreading-import__intro .panel-subtitle { margin-top: 1px; }
 .proofreading-import__modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .proofreading-import-mode {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 12px;
-  padding: 16px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 12px;
   border: 1px solid var(--line-soft);
   border-radius: 12px;
   background: #fff;
@@ -646,18 +693,22 @@ onBeforeUnmount(() => {
 }
 .proofreading-import-mode:hover { border-color: rgba(15, 118, 110, .42); box-shadow: 0 6px 18px rgba(15, 23, 42, .06); }
 .proofreading-import-mode.is-active { border-color: var(--brand); background: rgba(240, 253, 250, .8); box-shadow: 0 0 0 2px rgba(15, 118, 110, .1); }
-.proofreading-import-mode__icon { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 10px; background: #eef8f5; color: var(--brand); }
-.proofreading-import-mode__copy { display: grid; gap: 5px; }
+.proofreading-import-mode__icon { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 9px; background: #eef8f5; color: var(--brand); }
+.proofreading-import-mode__copy { display: grid; gap: 3px; min-width: 0; }
 .proofreading-import-mode__copy strong { font-size: 15px; }
-.proofreading-import-mode__copy small { color: var(--ink-500); line-height: 1.55; }
+.proofreading-import-mode__copy small { overflow: hidden; color: var(--ink-500); line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
 .proofreading-import-mode__copy em { color: var(--brand); font-size: 11px; font-style: normal; font-weight: 700; }
+.proofreading-import-mode__arrow { color: var(--ink-400, #94a3b8); transform: rotate(-90deg); transition: transform .16s ease; }
+.proofreading-import-mode.is-active .proofreading-import-mode__arrow { transform: rotate(0); }
 .proofreading-import-workspace {
   padding: 14px;
   border: 1px solid rgba(15, 118, 110, .2);
   border-radius: 12px;
   background: #f8fbfa;
 }
-.proofreading-task-section { display: grid; gap: 12px; padding-top: 16px; border-top: 1px solid var(--line-soft); }
+.proofreading-task-section { display: grid; gap: 8px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
+.proofreading-task-section__head > div { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+.proofreading-task-section__head .panel-subtitle { overflow: hidden; margin: 0; text-overflow: ellipsis; white-space: nowrap; }
 .proofreading-task-section__count { flex: 0 0 auto; color: var(--ink-500); font-size: 12px; }
 .proofreading-task-empty { display: grid; place-items: center; gap: 6px; padding: 28px; border: 1px dashed var(--line); border-radius: 10px; color: var(--ink-500); text-align: center; }
 .proofreading-task-empty strong { color: var(--ink-700); }
@@ -668,7 +719,7 @@ onBeforeUnmount(() => {
 .proofreading-panel__head, .proofreading-mapping__top, .proofreading-mapping__actions, .proofreading-sheet__head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .proofreading-panel__head input { display: none; }
 .proofreading-panel__notice { display: flex; align-items: center; gap: 8px; color: var(--ink-600); }
-.proofreading-mapping, .proofreading-batches { display: grid; gap: 12px; }
+.proofreading-mapping, .proofreading-batches { display: grid; gap: 8px; }
 .proofreading-mapping { padding: 16px; border: 1px solid var(--line-soft); border-radius: 10px; background: #fafcfb; }
 .proofreading-mapping__top > span { display: flex; align-items: center; gap: 8px; font-weight: 700; }
 .proofreading-source-language { width: min(280px, 45%); }
@@ -682,16 +733,16 @@ onBeforeUnmount(() => {
 .proofreading-mapping__actions > span { color: var(--ink-500); font-size: 12px; }
 .proofreading-batch {
   display: grid;
-  gap: 14px;
-  padding: 16px 18px;
+  gap: 7px;
+  padding: 10px 14px;
   border: 1px solid var(--line-soft);
   border-radius: 10px;
   background: #fff;
 }
 .proofreading-batch__header {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) auto auto;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
 }
 .proofreading-batch__title {
@@ -723,17 +774,20 @@ onBeforeUnmount(() => {
 .proofreading-batch__badge.is-danger { background: #fee2e2; color: #b91c1c; }
 .proofreading-batch__badge.is-muted { background: #f1f5f9; color: #64748b; }
 .proofreading-batch__percent { color: var(--ink-500); font-size: 13px; font-variant-numeric: tabular-nums; }
-.proofreading-batch__progress { display: grid; gap: 6px; }
+.proofreading-batch__progress { display: grid; }
+.proofreading-batch__progress .progress-bar__track { height: 6px; }
 .proofreading-batch__progress small { color: var(--ink-500); }
-.proofreading-batch__message { margin: 0; color: var(--ink-600); font-size: 13px; }
-.proofreading-batch__languages { display: grid; gap: 8px; }
-.proofreading-batch__languages-label { color: var(--ink-500); font-size: 12px; font-weight: 600; }
+.proofreading-batch__message { overflow: hidden; margin: 0; color: var(--ink-600); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.proofreading-batch__stats { display: inline-flex; flex: 0 0 auto; gap: 8px; color: var(--ink-500); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.proofreading-batch__stats span + span { padding-left: 10px; border-left: 1px solid var(--line-soft); }
+.proofreading-batch__footer { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.proofreading-batch__context { display: flex; flex: 1 1 auto; align-items: center; gap: 12px; min-width: 0; }
 .proofreading-batch__language-list { display: flex; flex-wrap: wrap; gap: 8px; }
 .proofreading-batch__language-chip {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 10px;
+  padding: 5px 9px;
   border: 1px solid var(--line-soft);
   border-radius: 8px;
   background: #f8fafc;
@@ -743,7 +797,11 @@ onBeforeUnmount(() => {
 }
 .proofreading-batch__language-chip:hover { border-color: #94a3b8; background: #fff; }
 .proofreading-batch__language-sheet { color: var(--ink-500); }
-.proofreading-batch__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.proofreading-batch__actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.proofreading-batch__actions .button { min-height: 32px; padding: 6px 10px; }
+.proofreading-batch__settings-toggle svg:last-child { transition: transform .16s ease; }
+.proofreading-batch__settings-toggle .is-rotated { transform: rotate(180deg); }
+.proofreading-batch__error { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .proofreading-generation-config {
   display: grid;
   gap: 10px;
@@ -761,8 +819,21 @@ onBeforeUnmount(() => {
 .proofreading-generation-config__prompt small { color: #64748b; }
 .is-error { color: var(--danger-600, #b42318) !important; }
 @media (max-width: 980px) {
+  .proofreading-import { grid-template-columns: 1fr; gap: 12px; }
   .proofreading-import__modes { grid-template-columns: 1fr; }
   .proofreading-sheet__settings { grid-template-columns: 1fr; }
   .proofreading-generation-config__fields { grid-template-columns: 1fr; }
+  .proofreading-batch__header { grid-template-columns: minmax(220px, 1fr) auto; }
+  .proofreading-batch__stats { grid-column: 1 / -1; grid-row: 2; }
+  .proofreading-batch__percent { grid-column: 2; grid-row: 1; }
+  .proofreading-batch__footer { align-items: flex-start; flex-direction: column; }
+  .proofreading-batch__actions { justify-content: flex-start; }
+}
+@media (max-width: 640px) {
+  .proofreading-import { padding: 14px; }
+  .proofreading-batch__stats { flex-wrap: wrap; gap: 5px 8px; }
+  .proofreading-batch__stats span + span { padding-left: 8px; }
+  .proofreading-batch__context { align-items: flex-start; flex-direction: column; }
+  .proofreading-batch__actions { width: 100%; }
 }
 </style>
