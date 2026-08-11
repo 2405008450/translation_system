@@ -170,6 +170,10 @@ const duplicateTemplates = ref<ProjectItem[]>([])
 const duplicateTemplateProjectId = ref('')
 const duplicateTemplateDetail = ref<ProjectDetailResponse | null>(null)
 const workflowTemplates = ref<WorkflowTemplate[]>([])
+const orderedWorkflowTemplates = computed(() => [
+  ...workflowTemplates.value.filter((template) => template.id !== 'proofread'),
+  ...workflowTemplates.value.filter((template) => template.id === 'proofread'),
+])
 const loadingWorkflowTemplates = ref(false)
 const showFilterDialog = ref(false)
 const loadingFilterOptions = ref(false)
@@ -1620,8 +1624,8 @@ onBeforeUnmount(() => {
             @change="handleWorkflowTemplateChange"
           >
             <option value="" disabled>{{ loadingWorkflowTemplates ? '模板加载中...' : '请选择工作流模板' }}</option>
-            <option v-for="template in workflowTemplates" :key="template.id" :value="template.id">
-              {{ template.name }}
+            <option v-for="template in orderedWorkflowTemplates" :key="template.id" :value="template.id">
+              {{ template.name }}{{ template.id === 'proofread' ? '（最新）' : '' }}
             </option>
           </select>
         </label>

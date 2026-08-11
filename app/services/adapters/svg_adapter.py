@@ -16,6 +16,12 @@ from app.services.adapters.models import (
     ParseResult,
 )
 from app.services.adapters.segment_extractor import extract_segments
+from app.services.adapters.svg_text_units import (
+    collect_text_slots,
+    group_logical_text_units,
+    is_simulated_vertical_unit,
+    unit_source_text,
+)
 
 
 # SVG 命名空间
@@ -100,41 +106,27 @@ class SvgAdapter(FormatAdapter):
         """
         nodes = []
         
-        # 查找所有 text 元素（支持带命名空间和不带命名空间）
-        text_elements = root.xpath(
-            "//svg:text | //text",
-            namespaces=NSMAP
-        )
-        
-        unit_index = 0
         tree = root.getroottree()
-        for text_index, text_elem in enumerate(text_elements):
-            for owner, slot_kind, text in self._iter_text_slots(text_elem):
-                node = self._build_text_node(
-                    owner=owner,
-                    slot_kind=slot_kind,
-                    text=text,
-                    text_element=text_elem,
-                    text_index=text_index,
-                    unit_index=unit_index,
-                    node_path=tree.getpath(owner),
-                )
-                nodes.append(node)
-                unit_index += 1
+        logical_units = group_logical_text_units(collect_text_slots(root))
+        for unit_index, unit in enumerate(logical_units):
+            first = unit[0]
+            node = self._build_text_node(
+                owner=first.owner,
+                slot_kind=first.slot_kind,
+                text=unit_source_text(unit),
+                text_element=first.text_element,
+                text_index=first.text_index,
+                unit_index=unit_index,
+                node_path=tree.getpath(first.owner),
+            )
+            if len(unit) > 1:
+                node.metadata["svg_slot_count"] = len(unit)
+                node.metadata["svg_node_paths"] = [tree.getpath(slot.owner) for slot in unit]
+            if is_simulated_vertical_unit(unit):
+                node.metadata["svg_simulated_vertical"] = True
+            nodes.append(node)
         
         return nodes
-
-    def _iter_text_slots(
-        self,
-        text_element: etree._Element,
-    ):
-        """按 XML 文档顺序枚举 ``text`` 内的实际文本槽位。"""
-        if text_element.text and text_element.text.strip():
-            yield text_element, "text", text_element.text
-        for child in text_element:
-            yield from self._iter_text_slots(child)
-            if child.tail and child.tail.strip():
-                yield child, "tail", child.tail
 
     def _build_text_node(
         self,
