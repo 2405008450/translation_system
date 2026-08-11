@@ -244,6 +244,7 @@ export interface DocumentParseOptions {
   translate_code_blocks: boolean
   extract_links: boolean
   skip_non_translatable: boolean
+  enable_spatial_merge: boolean
   xml_inline_elements_no_split: boolean
   custom_parse_config: boolean
   translate_idml_comments: boolean
@@ -516,6 +517,10 @@ export interface Segment {
   /** 合并视图聚合读取时附带：句段所属文件 id 与文件名 */
   file_record_id?: string
   filename?: string
+  /** DWG/DXF 空间合并信心分数 (0-1)。<0.7 通常需要人工复核。仅合并句段有此字段。 */
+  merge_confidence?: number | null
+  /** 该句段是否由 DWG/DXF 空间合并生成，携带多个原始实体 */
+  is_merged?: boolean | null
 }
 
 export type SegmentQAIssueSeverity = 'low' | 'medium' | 'high'
@@ -587,6 +592,24 @@ export type WorkbenchQAResultRuleKey =
   | 'repeated_punctuation'
   | 'extra_space_after_punctuation'
   | 'missing_space_after_punctuation'
+  | 'punctuation_leading_extra_space'
+  | 'punctuation_leading_missing_space'
+  | 'multiple_spaces'
+  | 'segment_trailing_extra_space'
+  | 'consecutive_duplicate_words'
+  | 'source_target_initial_case_mismatch'
+  | 'target_word_multiple_upper_initials'
+  | 'source_target_same_word_case_mismatch'
+  | 'source_target_identical'
+  | 'target_word_count_exceeds_source'
+  | 'target_word_count_below_source'
+  | 'source_target_word_count_gap_too_large'
+  | 'number_mismatch'
+  | 'parameter_mismatch'
+  | 'email_mismatch'
+  | 'link_mismatch'
+  | 'special_symbol_mismatch'
+  | 'context_translation_mismatch'
   | 'target_without_tag'
   | 'target_tag_missing'
   | 'unmatched_closing_tag'
@@ -1208,6 +1231,7 @@ export interface QualityQASettingsResponse {
     rules: Record<string, {
       enabled: boolean
       case_sensitive?: boolean
+      threshold?: number
     }>
     spelling_grammar: {
       enabled: boolean

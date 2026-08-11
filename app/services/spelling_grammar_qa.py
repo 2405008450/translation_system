@@ -34,6 +34,33 @@ QA_RULE_ENDING_PUNCTUATION_MISMATCH = "ending_punctuation_mismatch"
 QA_RULE_REPEATED_PUNCTUATION = "repeated_punctuation"
 QA_RULE_EXTRA_SPACE_AFTER_PUNCTUATION = "extra_space_after_punctuation"
 QA_RULE_MISSING_SPACE_AFTER_PUNCTUATION = "missing_space_after_punctuation"
+QA_RULE_PUNCTUATION_LEADING_EXTRA_SPACE = "punctuation_leading_extra_space"
+QA_RULE_PUNCTUATION_LEADING_MISSING_SPACE = "punctuation_leading_missing_space"
+QA_RULE_MULTIPLE_SPACES = "multiple_spaces"
+QA_RULE_SEGMENT_TRAILING_EXTRA_SPACE = "segment_trailing_extra_space"
+QA_RULE_CONSECUTIVE_DUPLICATE_WORDS = "consecutive_duplicate_words"
+QA_RULE_SOURCE_TARGET_INITIAL_CASE_MISMATCH = "source_target_initial_case_mismatch"
+QA_RULE_TARGET_WORD_MULTIPLE_UPPER_INITIALS = "target_word_multiple_upper_initials"
+QA_RULE_SOURCE_TARGET_SAME_WORD_CASE_MISMATCH = "source_target_same_word_case_mismatch"
+QA_RULE_SOURCE_TARGET_IDENTICAL = "source_target_identical"
+QA_RULE_TARGET_WORD_COUNT_EXCEEDS_SOURCE = "target_word_count_exceeds_source"
+QA_RULE_TARGET_WORD_COUNT_BELOW_SOURCE = "target_word_count_below_source"
+QA_RULE_SOURCE_TARGET_WORD_COUNT_GAP_TOO_LARGE = "source_target_word_count_gap_too_large"
+QA_RULE_NUMBER_MISMATCH = "number_mismatch"
+QA_RULE_PARAMETER_MISMATCH = "parameter_mismatch"
+QA_RULE_EMAIL_MISMATCH = "email_mismatch"
+QA_RULE_LINK_MISMATCH = "link_mismatch"
+QA_RULE_SPECIAL_SYMBOL_MISMATCH = "special_symbol_mismatch"
+QA_RULE_CONTEXT_TRANSLATION_MISMATCH = "context_translation_mismatch"
+
+# 允许 threshold 数值参数的规则 → 默认百分比阈值。
+QUALITY_QA_RULE_THRESHOLD_DEFAULTS: dict[str, int] = {
+    QA_RULE_TARGET_WORD_COUNT_EXCEEDS_SOURCE: 50,
+    QA_RULE_TARGET_WORD_COUNT_BELOW_SOURCE: 50,
+    QA_RULE_SOURCE_TARGET_WORD_COUNT_GAP_TOO_LARGE: 50,
+}
+QUALITY_QA_THRESHOLD_MIN = 1
+QUALITY_QA_THRESHOLD_MAX = 500
 QA_ISSUE_STATUS_OPEN = "open"
 QA_ISSUE_STATUS_IGNORED = "ignored"
 QA_ISSUE_STATUS_RESOLVED = "resolved"
@@ -52,11 +79,38 @@ QUALITY_QA_RULE_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {"key": QA_RULE_REPEATED_PUNCTUATION, "default_enabled": False},
     {"key": QA_RULE_EXTRA_SPACE_AFTER_PUNCTUATION, "default_enabled": False},
     {"key": QA_RULE_MISSING_SPACE_AFTER_PUNCTUATION, "default_enabled": False},
+    {"key": QA_RULE_PUNCTUATION_LEADING_EXTRA_SPACE, "default_enabled": False},
+    {"key": QA_RULE_PUNCTUATION_LEADING_MISSING_SPACE, "default_enabled": False},
+    {"key": QA_RULE_MULTIPLE_SPACES, "default_enabled": False},
+    {"key": QA_RULE_SEGMENT_TRAILING_EXTRA_SPACE, "default_enabled": False},
+    {"key": QA_RULE_CONSECUTIVE_DUPLICATE_WORDS, "default_enabled": False},
+    {"key": QA_RULE_SOURCE_TARGET_INITIAL_CASE_MISMATCH, "default_enabled": False},
+    {"key": QA_RULE_TARGET_WORD_MULTIPLE_UPPER_INITIALS, "default_enabled": False},
+    {"key": QA_RULE_SOURCE_TARGET_SAME_WORD_CASE_MISMATCH, "default_enabled": False},
+    {"key": QA_RULE_SOURCE_TARGET_IDENTICAL, "default_enabled": False},
+    {"key": QA_RULE_TARGET_WORD_COUNT_EXCEEDS_SOURCE, "default_enabled": False},
+    {"key": QA_RULE_TARGET_WORD_COUNT_BELOW_SOURCE, "default_enabled": False},
+    {"key": QA_RULE_SOURCE_TARGET_WORD_COUNT_GAP_TOO_LARGE, "default_enabled": False},
+    {"key": QA_RULE_NUMBER_MISMATCH, "default_enabled": False},
+    {"key": QA_RULE_PARAMETER_MISMATCH, "default_enabled": False},
+    {"key": QA_RULE_EMAIL_MISMATCH, "default_enabled": False},
+    {"key": QA_RULE_LINK_MISMATCH, "default_enabled": False},
+    {"key": QA_RULE_SPECIAL_SYMBOL_MISMATCH, "default_enabled": False},
+    {"key": QA_RULE_CONTEXT_TRANSLATION_MISMATCH, "default_enabled": False},
 )
+
+def _build_default_rule_entry(rule_key: str, default_enabled: bool) -> dict[str, Any]:
+    entry: dict[str, Any] = {"enabled": bool(default_enabled)}
+    if rule_key in QUALITY_QA_RULE_THRESHOLD_DEFAULTS:
+        entry["threshold"] = int(QUALITY_QA_RULE_THRESHOLD_DEFAULTS[rule_key])
+    return entry
+
 
 DEFAULT_QUALITY_QA_SETTINGS: dict[str, Any] = {
     "rules": {
-        str(rule["key"]): {"enabled": bool(rule["default_enabled"])}
+        str(rule["key"]): _build_default_rule_entry(
+            str(rule["key"]), bool(rule["default_enabled"])
+        )
         for rule in QUALITY_QA_RULE_DEFINITIONS
     },
     "spelling_grammar": {
@@ -156,6 +210,24 @@ def _normalize_rule_enabled(raw: Any, fallback: bool) -> bool:
     return fallback
 
 
+def _normalize_rule_threshold(raw: Any, fallback: int) -> int:
+    """限制 threshold 到 [QUALITY_QA_THRESHOLD_MIN, QUALITY_QA_THRESHOLD_MAX] 范围。"""
+    value: Any = None
+    if isinstance(raw, dict):
+        value = raw.get("threshold")
+    if value is None:
+        return int(fallback)
+    try:
+        parsed = int(round(float(value)))
+    except (TypeError, ValueError):
+        return int(fallback)
+    if parsed < QUALITY_QA_THRESHOLD_MIN:
+        return QUALITY_QA_THRESHOLD_MIN
+    if parsed > QUALITY_QA_THRESHOLD_MAX:
+        return QUALITY_QA_THRESHOLD_MAX
+    return parsed
+
+
 def normalize_quality_qa_settings(raw: Any) -> dict[str, Any]:
     settings = _clone_default_quality_qa_settings()
     if isinstance(raw, str):
@@ -182,6 +254,14 @@ def normalize_quality_qa_settings(raw: Any) -> dict[str, Any]:
                 rules.get(key),
                 bool(settings["rules"][key]["enabled"]),
             )
+            if key in QUALITY_QA_RULE_THRESHOLD_DEFAULTS:
+                settings["rules"][key]["threshold"] = _normalize_rule_threshold(
+                    rules.get(key),
+                    int(settings["rules"][key].get(
+                        "threshold", QUALITY_QA_RULE_THRESHOLD_DEFAULTS[key]
+                    )),
+                )
+
         term_inconsistency = rules.get(QA_RULE_TERM_INCONSISTENCY)
         if isinstance(term_inconsistency, dict):
             settings["rules"][QA_RULE_TERM_INCONSISTENCY]["case_sensitive"] = bool(
@@ -198,8 +278,50 @@ def load_quality_qa_settings(project: Project | None) -> dict[str, Any]:
     return normalize_quality_qa_settings(getattr(project, "quality_qa_settings", None))
 
 
+def _merge_rule_entry(baseline: dict[str, Any], incoming: Any) -> dict[str, Any]:
+    """浅合并单条规则设置，未提交的字段沿用 baseline。"""
+    merged: dict[str, Any] = dict(baseline)
+    if isinstance(incoming, dict):
+        for key in ("enabled", "threshold"):
+            if key in incoming:
+                merged[key] = incoming[key]
+    elif isinstance(incoming, bool):
+        merged["enabled"] = incoming
+    return merged
+
+
 def store_quality_qa_settings(project: Project, settings: Any) -> dict[str, Any]:
-    normalized = normalize_quality_qa_settings(settings)
+    """保存 QA 设置：以当前持久化的值为 baseline 合并新值，保留未提交的字段。"""
+    current = load_quality_qa_settings(project)
+    incoming: Any = settings
+    if isinstance(incoming, str):
+        try:
+            incoming = json.loads(incoming or "{}")
+        except json.JSONDecodeError:
+            incoming = {}
+    if not isinstance(incoming, dict):
+        incoming = {}
+
+    merged: dict[str, Any] = {
+        "spelling_grammar": {
+            **(current.get("spelling_grammar") or {}),
+            **(
+                incoming.get("spelling_grammar")
+                if isinstance(incoming.get("spelling_grammar"), dict)
+                else {}
+            ),
+        },
+        "rules": {},
+    }
+    baseline_rules = current.get("rules") or {}
+    incoming_rules = incoming.get("rules") if isinstance(incoming.get("rules"), dict) else {}
+    for key, base_value in baseline_rules.items():
+        merged["rules"][key] = _merge_rule_entry(
+            base_value if isinstance(base_value, dict) else {},
+            incoming_rules.get(key),
+        )
+
+    normalized = normalize_quality_qa_settings(merged)
     project.quality_qa_settings = json.dumps(normalized, ensure_ascii=False)
     return normalized
 

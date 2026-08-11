@@ -159,8 +159,43 @@ class Settings(BaseSettings):
     # DWG 专用：替换 SHX 字体的 TrueType 字体名称
     dwg_unicode_font_name: str = "Arial"
     # DWG 专用：启用空间聚类合并（将同一行的多个 TEXT 实体合并为语义完整的句子）
-    # 默认关闭，每个实体独立提取
-    dwg_enable_spatial_merge: bool = False
+    dwg_enable_spatial_merge: bool = True
+    # DWG 空间合并：语义边界检测（句号 + 大写/中文开头等判断成新一句）
+    dwg_enable_semantic_break: bool = True
+    # DWG 空间合并：L4 逻辑分组硬门槛（同 style、字高一致、同 tag/INSERT 才可合并）
+    dwg_enable_logical_grouping: bool = True
+    # DWG 空间合并：允许字高差异比例（超过则视为不同文本流），默认 30%
+    # 中英文混排下"数字/字母比中文小 20%"极常见，10% 会导致同一行完全断开
+    dwg_height_ratio_tolerance: float = 0.30
+    # DWG 空间合并：段落续行的 y 间距上限（× avg 字高）。有 L2 网格线阻挡后可放宽到 3.0
+    dwg_next_line_gap_factor: float = 3.0
+    # DWG 空间合并 L1：按打分贪心合并（拒绝"桥接式误合"），默认开启
+    dwg_enable_greedy_merge: bool = True
+    # DWG 空间合并 L1：弱边分数下限，低于该分的边不参与合并
+    dwg_min_edge_score: float = 0.15
+    # DWG 空间合并 L3：bbox IoU 超过此值直接拒（防重叠标注误合），默认 0.5
+    dwg_iou_split_threshold: float = 0.5
+    # DWG 空间合并 L5：用 Gemini Flash 对低置信度合并做语义复核
+    dwg_llm_verify_enabled: bool = True
+    dwg_llm_verify_min_confidence: float = 0.40
+    dwg_llm_verify_max_confidence: float = 0.70
+    # 单次调用最多校验多少句，超过则截断（成本兜底）
+    dwg_llm_verify_max_items: int = 60
+    dwg_llm_verify_model: str = "google/gemini-2.5-flash"
+    dwg_llm_verify_provider: str = "openrouter"
+    # DWG 空间合并 L6：GPT-5 Mini 对局部候选区域做结构化语义分组
+    dwg_llm_layout_enabled: bool = True
+    # 两个碎片（如序号+正文）也必须进入判断；区域过大则预先切成局部窗口
+    dwg_llm_layout_min_bucket: int = 2
+    dwg_llm_layout_max_bucket: int = 30
+    dwg_llm_layout_concurrency: int = 3
+    dwg_llm_layout_model: str = "openai/gpt-5-mini"
+    dwg_llm_layout_provider: str = "openrouter"
+    # DWG 空间合并诊断：竖线/管道分隔的正则片段列表，命中则 dump 该实体及其邻居
+    # 例如 DWG_DEBUG_TEXT_PATTERNS="JZ3|DN150|316L"
+    dwg_debug_text_patterns: str = ""
+    # DWG 空间合并诊断：命中时把整组写到该 JSONL 文件（一组一行），空则只走日志
+    dwg_debug_dump_file: str = ""
     tm_vector_enabled: bool = True
     tm_vector_dimensions: int = 128
     tm_vector_candidate_limit: int = 6
