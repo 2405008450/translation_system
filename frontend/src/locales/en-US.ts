@@ -698,7 +698,7 @@ const overrides = {
     messages: {
       uploading: 'Uploading and processing... {percent}%',
       britishCopyCreated: 'Created "{name}": {changed} segments changed with {replacements} replacements.',
-      englishVariantCopyCreated: 'Created "{name}": {changed} segments changed with {replacements} replacements.',
+      englishVariantCopyCreated: 'Created "{name}": {changed} segments changed with {replacements} replacements and {reviews} DeepSeek V4 Pro reviews.',
       startUpload: 'Upload and process',
       startUploadCount: 'Upload and create {count} tasks',
     },

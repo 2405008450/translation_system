@@ -919,7 +919,7 @@ export default {
       startUploadCount: '上传并生成 {count} 个任务',
       duplicated: '已创建副本“{name}”。',
       britishCopyCreated: '已生成“{name}”：变更 {changed} 个句段，共替换 {replacements} 处。',
-      englishVariantCopyCreated: '已生成“{name}”：变更 {changed} 个句段，共替换 {replacements} 处。',
+      englishVariantCopyCreated: '已生成“{name}”：变更 {changed} 个句段，共替换 {replacements} 处，DeepSeek V4 Pro 判定 {reviews} 处。',
       deleteConfirm: '确定删除“{name}”吗？删除后无法恢复。',
       deleted: '项目“{name}”已删除。',
       deleteProjectConfirm: '确定删除项目“{name}”吗？删除后无法恢复。',

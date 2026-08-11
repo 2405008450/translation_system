@@ -236,6 +236,7 @@ interface EnglishVariantCopyResponse {
     processed_segments: number
     changed_segments: number
     replacement_count: number
+    llm_review_count: number
   }
 }
 
@@ -5338,6 +5339,7 @@ async function createEnglishVariantCopy() {
       name: data.file.filename,
       changed: data.summary.changed_segments,
       replacements: data.summary.replacement_count,
+      reviews: data.summary.llm_review_count,
     }))
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.englishVariantCopy'))

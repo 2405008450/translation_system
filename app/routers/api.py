@@ -12924,6 +12924,7 @@ def _create_english_variant_copy_task_response(
             "unsupported_language_pair": 422,
             "active_operation": 409,
             "empty_translation": 409,
+            "semantic_review_failed": 503,
         }[exc.code]
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except Exception:
@@ -12951,6 +12952,7 @@ def _create_english_variant_copy_task_response(
             "processed_segments": result.summary.processed_segments,
             "changed_segments": result.summary.changed_segments,
             "replacement_count": result.summary.replacement_count,
+            "llm_review_count": result.summary.llm_review_count,
         },
     }
 

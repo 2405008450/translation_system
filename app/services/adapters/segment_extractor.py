@@ -80,9 +80,13 @@ class SegmentExtractor:
                     "MULTILEADER", "ACAD_TABLE", "MERGED_TEXT"
                 )
                 
-                if is_cad_entity:
-                    # CAD 实体：整体作为一个句段，不自动分割
-                    # 用户可以在工作台手动分割或合并
+                preserve_as_single_segment = bool(
+                    node.metadata.get("preserve_as_single_segment", False)
+                )
+
+                if is_cad_entity or preserve_as_single_segment:
+                    # CAD 实体和需要精确回写的结构化文本槽位整体作为一个句段，
+                    # 避免断句后多个译文无法安全写回同一个源节点。
                     segment = self._create_segment(
                         source_text=self._normalize_text(text),
                         display_text=text,

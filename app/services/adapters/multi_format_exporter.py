@@ -309,7 +309,11 @@ class MultiFormatExporter:
         elif extension == ".svg":
             from app.services.adapters.svg_exporter import SvgExporter
 
-            content = SvgExporter().export(original_bytes, text_map)
+            svg_translations = {
+                **text_map,
+                **translation_maps["segment_id"],
+            }
+            content, _warnings = SvgExporter().export(original_bytes, svg_translations)
         elif extension == ".pptx":
             from app.services.adapters.pptx_exporter import PptxExporter
 
