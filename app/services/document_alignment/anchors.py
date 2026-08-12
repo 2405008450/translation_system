@@ -32,7 +32,12 @@ def _best_monotonic_chain(candidates: list[tuple[int, int, str, int]]) -> list[t
     return result
 
 
-def _candidate_anchors(src: list[AlignUnit], tgt: list[AlignUnit]) -> list[tuple[int, int, str]]:
+def _candidate_anchors(
+    src: list[AlignUnit],
+    tgt: list[AlignUnit],
+    *,
+    include_structure: bool = True,
+) -> list[tuple[int, int, str]]:
     candidates: list[tuple[int, int, str, int]] = []
 
     src_exact = Counter(comparable_text(unit.text) for unit in src if comparable_text(unit.text))
@@ -76,10 +81,11 @@ def _candidate_anchors(src: list[AlignUnit], tgt: list[AlignUnit]) -> list[tuple
                 continue
             candidates.append((si, ti, f"anchor_field_{field_type}", 105))
 
-    src_headings = [i for i, unit in enumerate(src) if unit.is_heading]
-    tgt_headings = [i for i, unit in enumerate(tgt) if unit.is_heading]
-    if src_headings and len(src_headings) == len(tgt_headings):
-        candidates.extend((i, j, "anchor_heading", 55) for i, j in zip(src_headings, tgt_headings))
+    if include_structure:
+        src_headings = [i for i, unit in enumerate(src) if unit.is_heading]
+        tgt_headings = [i for i, unit in enumerate(tgt) if unit.is_heading]
+        if src_headings and len(src_headings) == len(tgt_headings):
+            candidates.extend((i, j, "anchor_heading", 55) for i, j in zip(src_headings, tgt_headings))
 
     return _best_monotonic_chain(candidates)
 
@@ -284,6 +290,7 @@ def _match_table_ordinals(
 
 def _point_anchor_blocks(
     src: list[AlignUnit], tgt: list[AlignUnit], src_offset: int, tgt_offset: int,
+    *, group_structural_parents: bool = True, include_structure_anchors: bool = True,
 ) -> list[tuple[slice, slice, str]]:
     def parent_slice(units: list[AlignUnit], index: int) -> slice:
         unit = units[index]
@@ -302,12 +309,12 @@ def _point_anchor_blocks(
             end += 1
         return slice(start, end)
 
-    anchors = _candidate_anchors(src, tgt)
+    anchors = _candidate_anchors(src, tgt, include_structure=include_structure_anchors)
     blocks: list[tuple[slice, slice, str]] = []
     si = sj = 0
     for ai, aj, kind in anchors:
         src_parent, tgt_parent = parent_slice(src, ai), parent_slice(tgt, aj)
-        compatible_parent = (
+        compatible_parent = group_structural_parents and (
             src[ai].block_type == tgt[aj].block_type
             and src[ai].block_type in {"paragraph", "heading"}
         )
@@ -333,6 +340,22 @@ def _point_anchor_blocks(
         src_offset + len(src), tgt_offset + len(tgt), "tail",
     ))
     return blocks
+
+
+def build_order_blocks(src: list[AlignUnit], tgt: list[AlignUnit]) -> list[tuple[slice, slice, str]]:
+    """仅按全文先后顺序和文本锚点切窗，不把 Word 版式当作对齐边界。
+
+    文档结构仍保存在单元元数据中，供最终导出时恢复版式；自动对齐阶段只使用
+    单调文本锚点和长度窗口，避免表格行列、段落块差异把正确译文锁进错误区域。
+    """
+    return _point_anchor_blocks(
+        src,
+        tgt,
+        0,
+        0,
+        group_structural_parents=False,
+        include_structure_anchors=False,
+    )
 
 
 def _split_window(si: int, sj: int, ei: int, ej: int, kind: str) -> list[tuple[slice, slice, str]]:

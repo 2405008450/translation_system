@@ -36,6 +36,7 @@ class AlignmentBatchCreate(BaseModel):
     granularity: Literal["sentence", "paragraph"] = "sentence"
     use_llm_for_hard_blocks: bool = False
     full_review: bool = True
+    alignment_strategy: Literal["order_first", "structure_aware"] = "order_first"
 
 
 class PairPatch(BaseModel):
@@ -131,7 +132,7 @@ def create_batch(
             target_bytes=target_bytes, target_filename=target_name,
             source_language=payload.source_language, target_language=payload.target_language,
             granularity=payload.granularity, use_llm_for_hard_blocks=payload.use_llm_for_hard_blocks,
-            full_review=payload.full_review,
+            full_review=payload.full_review, alignment_strategy=payload.alignment_strategy,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc

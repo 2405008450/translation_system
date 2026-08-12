@@ -46,6 +46,7 @@ export async function createDocumentAlignmentBatch(projectId: string, payload: {
   granularity: 'sentence' | 'paragraph'
   use_llm_for_hard_blocks: boolean
   full_review: boolean
+  alignment_strategy: 'order_first' | 'structure_aware'
 }) {
   const { data } = await http.post<ProofreadingBatch>(`/projects/${projectId}/document-alignment-batches`, payload)
   return data

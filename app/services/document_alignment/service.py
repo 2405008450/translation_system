@@ -16,7 +16,7 @@ from app.database import SessionLocal
 from app.models import DocumentAlignmentPair, DocumentAlignmentUnit, ProofreadingBatch, Project, User
 from app.services.language_pairs import normalize_language_code, require_language_pair
 
-from .anchors import build_anchor_blocks
+from .anchors import build_anchor_blocks, build_order_blocks
 from .dp import AlignPair, SemanticSimilarity, align_block
 from .features import has_structure_conflict
 from .llm_boundary import needs_llm_refinement, refine_hard_block
@@ -48,6 +48,7 @@ def _language_ratio(source_language: str, target_language: str) -> float:
 
 def _calibrate_pair_confidence(
     pair: AlignPair, src: list[AlignUnit], tgt: list[AlignUnit], lang_ratio: float,
+    *, use_structure_evidence: bool = True,
 ) -> None:
     """置信度表示完整边界可信度，而不只是路径稳定或主题相关。"""
     src_map, tgt_map = {unit.index: unit for unit in src}, {unit.index: unit for unit in tgt}
@@ -62,7 +63,7 @@ def _calibrate_pair_confidence(
     if source_numbers and target_numbers and not source_numbers.intersection(target_numbers):
         pair.confidence = min(pair.confidence, 0.44)
         reasons.append("数字集合互不相交")
-    if has_structure_conflict(source, target):
+    if use_structure_evidence and has_structure_conflict(source, target):
         pair.confidence = min(pair.confidence, 0.44)
         reasons.append("父级结构不一致")
     source_length = sum(unit.char_len for unit in source)
@@ -118,12 +119,15 @@ def create_alignment_batch(
     source_bytes: bytes, source_filename: str, target_bytes: bytes, target_filename: str,
     source_language: str, target_language: str, granularity: str = "sentence",
     use_llm_for_hard_blocks: bool = False, full_review: bool = True,
+    alignment_strategy: str = "order_first",
 ) -> ProofreadingBatch:
     if project.workflow_template_id != "proofread":
         raise ValueError("只有“校对”工作流项目可以创建双文档对齐批次。")
     source_language = normalize_language_code(source_language, field_label="源语言") or ""
     target_language = normalize_language_code(target_language, field_label="目标语言") or ""
     require_language_pair(source_language, target_language)
+    if alignment_strategy not in {"order_first", "structure_aware"}:
+        raise ValueError("不支持的对齐策略。")
     src_units = parse_side(source_bytes, source_filename, granularity)
     tgt_units = parse_side(target_bytes, target_filename, granularity)
     if not src_units and not tgt_units:
@@ -137,6 +141,7 @@ def create_alignment_batch(
         config_json=json.dumps({
             "granularity": granularity, "target_filename": target_filename,
             "use_llm_for_hard_blocks": use_llm_for_hard_blocks,
+            "alignment_strategy": alignment_strategy,
             # 双文档入口默认使用已经通过超长表格文档验证的 V6 全量复核链路。
             # 这是批次级快照，避免部署环境的全局开关改变历史批次行为。
             "full_review": full_review,
@@ -193,7 +198,12 @@ async def _compute_pairs(
     except Exception as exc:  # 语义服务永远不能阻断确定性主路径。
         logger.warning("alignment embedding unavailable; fallback to deterministic DP: %s", exc)
         semantic_scorer = None
-    blocks = build_anchor_blocks(src, tgt)
+    alignment_strategy = str(config.get("alignment_strategy") or "order_first")
+    blocks = (
+        build_anchor_blocks(src, tgt)
+        if alignment_strategy == "structure_aware"
+        else build_order_blocks(src, tgt)
+    )
     group_size = max(1, settings.alignment_embedding_window_blocks)
     if full_review_enabled:
         # 全量复核最终需要保留全部单元向量；扩大预取组可充分利用 embedding 批量接口，
@@ -259,7 +269,13 @@ async def _compute_pairs(
                         semantic_similarity=semantic, lang_ratio=ratio,
                     )
             for pair in pairs:
-                _calibrate_pair_confidence(pair, block_src, block_tgt, ratio)
+                _calibrate_pair_confidence(
+                    pair,
+                    block_src,
+                    block_tgt,
+                    ratio,
+                    use_structure_evidence=alignment_strategy == "structure_aware",
+                )
             result.extend(pairs)
             if progress_callback is not None:
                 progress_callback(
