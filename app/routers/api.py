@@ -288,6 +288,17 @@ from app.services.local_qa import (
     check_segments_local_qa,
     run_local_qa_for_segment_ids,
 )
+from app.services.qa_auto_fix import (
+    SAFE_QA_AUTO_FIX_RULE_KEYS,
+    apply_qa_auto_fixes,
+    build_qa_auto_fix_preview,
+)
+from app.services.qa_safe_process import (
+    QASafeProcessProblem,
+    apply_reviewed_qa_suggestion,
+    build_qa_review_suggestions,
+    verify_qa_review_candidate,
+)
 from app.services.file_export_queue import (
     build_file_export_download_response,
     get_file_export_task,
@@ -2542,6 +2553,28 @@ class TermQAReportItemsIgnoreRequest(BaseModel):
 class WorkbenchQAResultItemsIgnoreRequest(BaseModel):
     item_ids: list[str] = Field(default_factory=list)
     ignored: bool = True
+
+
+class WorkbenchQAResultItemsFixRequest(BaseModel):
+    item_ids: list[str] = Field(default_factory=list)
+
+
+class WorkbenchQAReviewApplyItem(BaseModel):
+    candidate_id: str
+    item_ids: list[str] = Field(default_factory=list)
+    segment_id: UUID
+    expected_target_hash: str
+    expected_target_html_hash: str
+    suggested_target_text: str
+    suggested_target_html: str | None = None
+    ai_provider: str | None = None
+    ai_model: str | None = None
+    review_expires_at: int
+    review_token: str
+
+
+class WorkbenchQAReviewApplyRequest(BaseModel):
+    candidates: list[WorkbenchQAReviewApplyItem] = Field(default_factory=list)
 
 
 class SpellingGrammarQASettingsRequest(BaseModel):
@@ -6949,6 +6982,7 @@ def _load_workbench_segment_qa_issue_items(
         serialized = serialize_segment_qa_issue(issue)
         replacements = serialized.get("replacements") or []
         suggestion = "；".join(str(value) for value in replacements[:5])
+        fix_preview = build_qa_auto_fix_preview(issue, segment)
         ignored_by_name = None
         if issue.ignored_by_id:
             ignored_by = getattr(issue, "ignored_by", None)
@@ -6971,6 +7005,7 @@ def _load_workbench_segment_qa_issue_items(
             "message": issue.short_message or issue.message or rule_label,
             "detail": issue.message,
             "suggestion": suggestion,
+            **fix_preview,
             "source_term": "",
             "expected_target_term": "",
             "term_base_name": "",
@@ -7022,6 +7057,12 @@ def _serialize_workbench_term_qa_item(
         "message": message,
         "detail": message,
         "suggestion": item.expected_target_term,
+        "can_auto_fix": False,
+        "fixed_target_text": "",
+        "fix_offset": None,
+        "fix_length": None,
+        "fix_replacement": "",
+        "fix_unavailable_reason": "该问题需要人工确认",
         "source_term": item.source_term,
         "expected_target_term": item.expected_target_term,
         "term_base_name": item.term_base_name,
@@ -8132,6 +8173,276 @@ def set_workbench_qa_result_items_ignored(
     return {
         "updated_count": updated_count,
         "ignored": payload.ignored,
+    }
+
+
+@router.post("/qa-result-items/apply-fixes")
+async def apply_workbench_qa_result_item_fixes(
+    payload: WorkbenchQAResultItemsFixRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """安全处理 QA：确定性问题直接修改，其余问题只生成待审核 AI 建议。"""
+    if not payload.item_ids:
+        raise HTTPException(status_code=400, detail="请选择要处理的 QA 问题。")
+
+    segment_issue_ids, term_item_ids = _parse_workbench_qa_item_ids(payload.item_ids)
+    issues = (
+        db.query(SegmentQAIssue)
+        .filter(SegmentQAIssue.id.in_(segment_issue_ids))
+        .all()
+        if segment_issue_ids
+        else []
+    )
+    term_items = (
+        db.query(TermQAReportItem)
+        .filter(TermQAReportItem.id.in_(term_item_ids))
+        .all()
+        if term_item_ids
+        else []
+    )
+    if len(issues) != len(segment_issue_ids) or len(term_items) != len(term_item_ids):
+        raise HTTPException(status_code=404, detail="部分 QA 问题不存在。")
+
+    for issue in issues:
+        _require_segment_qa_issue_write_access(db, issue, current_user)
+        file_record = issue.file_record or db.get(FileRecord, issue.file_record_id)
+        segment = issue.segment or db.get(Segment, issue.segment_id)
+        if file_record is None or segment is None:
+            raise HTTPException(status_code=404, detail="QA 问题对应句段不存在。")
+        _require_segment_work_access(db, file_record, segment, current_user)
+    for item in term_items:
+        _require_term_qa_item_write_access(db, item, current_user)
+        segment = item.segment or (db.get(Segment, item.segment_id) if item.segment_id else None)
+        file_record = item.file_record or db.get(FileRecord, item.file_record_id)
+        if file_record is not None and segment is not None:
+            _require_segment_work_access(db, file_record, segment, current_user)
+
+    auto_issues = [
+        issue
+        for issue in issues
+        if issue.status == QA_ISSUE_STATUS_OPEN
+        and issue.rule_key in SAFE_QA_AUTO_FIX_RULE_KEYS
+    ]
+    if auto_issues:
+        auto_result = apply_qa_auto_fixes(db, auto_issues, current_user).to_dict()
+    else:
+        auto_result = {
+            "applied_count": 0,
+            "applied_issue_ids": [],
+            "skipped_count": 0,
+            "skipped": [],
+            "updated_segment_count": 0,
+            "updated_segment_ids": [],
+        }
+    applied_issue_ids = set(auto_result["applied_issue_ids"])
+    auto_skipped_by_issue = {
+        str(item.get("issue_id")): str(item.get("reason") or "确定性修改未通过安全校验")
+        for item in auto_result.get("skipped", [])
+        if item.get("issue_id")
+    }
+
+    problems: list[QASafeProcessProblem] = []
+    manual_items: list[dict[str, Any]] = []
+    for issue in issues:
+        if str(issue.id) in applied_issue_ids:
+            continue
+        db.refresh(issue)
+        if issue.status != QA_ISSUE_STATUS_OPEN:
+            continue
+        skipped_reason = auto_skipped_by_issue.get(str(issue.id))
+        if skipped_reason:
+            manual_items.append({
+                "item_ids": [f"{WORKBENCH_QA_ITEM_PREFIX_SEGMENT}{issue.id}"],
+                "segment_id": str(issue.segment_id),
+                "sentence_id": issue.sentence_id,
+                "reason": skipped_reason,
+                "ai_suggested_target_text": "",
+            })
+            continue
+        segment = db.get(Segment, issue.segment_id)
+        if segment is None:
+            manual_items.append({
+                "item_ids": [f"{WORKBENCH_QA_ITEM_PREFIX_SEGMENT}{issue.id}"],
+                "segment_id": str(issue.segment_id),
+                "sentence_id": issue.sentence_id,
+                "reason": "对应句段不存在",
+                "ai_suggested_target_text": "",
+            })
+            continue
+        try:
+            replacements = json.loads(issue.replacements or "[]")
+        except (TypeError, ValueError):
+            replacements = []
+        suggestion = "；".join(str(value) for value in replacements[:5]) if isinstance(replacements, list) else ""
+        problems.append(QASafeProcessProblem(
+            item_id=f"{WORKBENCH_QA_ITEM_PREFIX_SEGMENT}{issue.id}",
+            segment_id=issue.segment_id,
+            rule_key=issue.rule_key,
+            rule_label=WORKBENCH_QA_RULE_LABELS.get(issue.rule_key, issue.rule_key),
+            message=issue.message or issue.short_message or "",
+            suggestion=suggestion,
+        ))
+
+    for item in term_items:
+        if item.ignored_at is not None:
+            continue
+        if item.segment_id is None or db.get(Segment, item.segment_id) is None:
+            manual_items.append({
+                "item_ids": [f"{WORKBENCH_QA_ITEM_PREFIX_TERM}{item.id}"],
+                "segment_id": str(item.segment_id) if item.segment_id else "",
+                "sentence_id": item.sentence_id,
+                "reason": "对应句段不存在",
+                "ai_suggested_target_text": "",
+            })
+            continue
+        problems.append(QASafeProcessProblem(
+            item_id=f"{WORKBENCH_QA_ITEM_PREFIX_TERM}{item.id}",
+            segment_id=item.segment_id,
+            rule_key=QA_RULE_TERM_INCONSISTENCY,
+            rule_label=WORKBENCH_QA_RULE_LABELS[QA_RULE_TERM_INCONSISTENCY],
+            message=f"术语“{item.source_term}”应译为“{item.expected_target_term}”。",
+            suggestion=item.expected_target_term,
+        ))
+
+    review_candidates, ai_manual_items = await build_qa_review_suggestions(
+        db,
+        problems,
+        current_user_id=current_user.id,
+    )
+    manual_items.extend(ai_manual_items)
+    return {
+        **auto_result,
+        "review_count": len(review_candidates),
+        "review_candidates": review_candidates,
+        "manual_count": len(manual_items),
+        "manual_items": manual_items,
+    }
+
+
+@router.post("/qa-result-items/apply-reviewed-fixes")
+def apply_workbench_qa_reviewed_fixes(
+    payload: WorkbenchQAReviewApplyRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """应用用户在审核界面明确接受的 AI 修改建议。"""
+    if not payload.candidates:
+        raise HTTPException(status_code=400, detail="请选择要应用的审核建议。")
+
+    applied_candidate_ids: list[str] = []
+    updated_segment_ids: list[str] = []
+    skipped: list[dict[str, str]] = []
+    seen_segment_ids: set[UUID] = set()
+
+    for candidate in payload.candidates:
+        candidate_payload = candidate.model_dump()
+        signature_ok, signature_reason = verify_qa_review_candidate(
+            candidate_payload,
+            user_id=current_user.id,
+            review_token=candidate.review_token,
+        )
+        if not signature_ok:
+            skipped.append({"candidate_id": candidate.candidate_id, "reason": signature_reason})
+            continue
+        if candidate.segment_id in seen_segment_ids:
+            skipped.append({"candidate_id": candidate.candidate_id, "reason": "同一句段存在重复审核建议"})
+            continue
+        seen_segment_ids.add(candidate.segment_id)
+        if not candidate.item_ids:
+            skipped.append({"candidate_id": candidate.candidate_id, "reason": "审核建议未关联 QA 问题"})
+            continue
+
+        segment_issue_ids, term_item_ids = _parse_workbench_qa_item_ids(candidate.item_ids)
+        issues = (
+            db.query(SegmentQAIssue)
+            .filter(SegmentQAIssue.id.in_(segment_issue_ids))
+            .with_for_update()
+            .populate_existing()
+            .all()
+            if segment_issue_ids
+            else []
+        )
+        term_items = (
+            db.query(TermQAReportItem)
+            .filter(TermQAReportItem.id.in_(term_item_ids))
+            .with_for_update()
+            .populate_existing()
+            .all()
+            if term_item_ids
+            else []
+        )
+        if len(issues) != len(segment_issue_ids) or len(term_items) != len(term_item_ids):
+            skipped.append({"candidate_id": candidate.candidate_id, "reason": "部分 QA 问题已不存在"})
+            continue
+        if any(issue.status != QA_ISSUE_STATUS_OPEN for issue in issues) or any(
+            item.ignored_at is not None for item in term_items
+        ):
+            skipped.append({"candidate_id": candidate.candidate_id, "reason": "部分 QA 问题已处理或已忽略"})
+            continue
+        if any(issue.segment_id != candidate.segment_id for issue in issues) or any(
+            item.segment_id != candidate.segment_id for item in term_items
+        ):
+            skipped.append({"candidate_id": candidate.candidate_id, "reason": "审核建议与 QA 句段不匹配"})
+            continue
+
+        segment = (
+            db.query(Segment)
+            .filter(Segment.id == candidate.segment_id)
+            .with_for_update()
+            .populate_existing()
+            .first()
+        )
+        if segment is None:
+            skipped.append({"candidate_id": candidate.candidate_id, "reason": "对应句段不存在"})
+            continue
+        file_record = segment.file_record or db.get(FileRecord, segment.file_record_id)
+        if file_record is None:
+            skipped.append({"candidate_id": candidate.candidate_id, "reason": "对应文件不存在"})
+            continue
+        for issue in issues:
+            _require_segment_qa_issue_write_access(db, issue, current_user)
+        for item in term_items:
+            _require_term_qa_item_write_access(db, item, current_user)
+        _require_segment_work_access(db, file_record, segment, current_user)
+
+        updated, reason = apply_reviewed_qa_suggestion(
+            db,
+            segment=segment,
+            expected_target_hash=candidate.expected_target_hash,
+            expected_target_html_hash=candidate.expected_target_html_hash,
+            suggested_target_text=candidate.suggested_target_text,
+            suggested_target_html=candidate.suggested_target_html,
+            ai_provider=candidate.ai_provider,
+            ai_model=candidate.ai_model,
+            current_user=current_user,
+        )
+        if updated is None:
+            skipped.append({"candidate_id": candidate.candidate_id, "reason": reason})
+            continue
+
+        now = datetime.now()
+        for issue in issues:
+            db.refresh(issue)
+            if issue.rule_key == QA_RULE_SPELLING_GRAMMAR:
+                issue.status = QA_ISSUE_STATUS_RESOLVED
+                issue.updated_at = now
+        for item in term_items:
+            expected_term = (item.expected_target_term or "").strip().casefold()
+            if expected_term and expected_term in candidate.suggested_target_text.casefold():
+                db.delete(item)
+        db.commit()
+
+        applied_candidate_ids.append(candidate.candidate_id)
+        updated_segment_ids.append(str(updated.id))
+
+    return {
+        "applied_count": len(applied_candidate_ids),
+        "applied_candidate_ids": applied_candidate_ids,
+        "updated_segment_count": len(set(updated_segment_ids)),
+        "updated_segment_ids": list(dict.fromkeys(updated_segment_ids)),
+        "skipped_count": len(skipped),
+        "skipped": skipped,
     }
 
 

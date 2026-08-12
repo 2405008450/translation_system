@@ -583,6 +583,12 @@ export interface WorkbenchQAResultItem {
   message: string
   detail: string
   suggestion: string
+  can_auto_fix: boolean
+  fixed_target_text: string
+  fix_offset: number | null
+  fix_length: number | null
+  fix_replacement: string
+  fix_unavailable_reason: string
   source_term: string
   expected_target_term: string
   term_base_name: string

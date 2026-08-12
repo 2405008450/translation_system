@@ -535,10 +535,20 @@ const saveToTMCollectionId = ref('')
 const saveToTMNewCollectionName = ref('')
 const termQAReport = ref<WorkbenchQAResult | null>(null)
 const loadingTermQAReport = ref(false)
+let termQAReportLoadRequestId = 0
+let termQAReportRefreshTimers: number[] = []
+const TERM_QA_REPORT_REFRESH_DELAYS_MS = [800, 3000] as const
 const generatingTermQAReport = ref(false)
 const downloadingTermQAReport = ref(false)
 const locatingTermQAReportItemId = ref<string | null>(null)
 const updatingTermQAIgnore = ref(false)
+const applyingTermQAFixes = ref(false)
+const termQAFixBusyItemId = ref<string | null>(null)
+const qaReviewCandidates = ref<QASafeReviewCandidate[]>([])
+const qaManualItems = ref<QASafeManualItem[]>([])
+const selectedQAReviewCandidateIds = ref<Set<string>>(new Set())
+const showQAReviewDialog = ref(false)
+const applyingQAReviewCandidates = ref(false)
 const selectedTermQAItemIds = ref<Set<string>>(new Set())
 const termQAReportPage = ref(1)
 type TermQAReportFilter = 'active' | 'ignored' | 'all'
@@ -1424,6 +1434,22 @@ const selectedTermQAReportItems = computed(() => (
 
 const selectedActiveTermQAReportItems = computed(() => (
   selectedTermQAReportItems.value.filter((item) => !item.ignored)
+))
+
+const termQASafeProcessTargets = computed(() => (
+  selectedActiveTermQAReportItems.value.length > 0
+    ? selectedActiveTermQAReportItems.value
+    : activeTermQAReportItems.value
+))
+
+const selectedQAReviewCandidates = computed(() => (
+  qaReviewCandidates.value.filter((candidate) => (
+    selectedQAReviewCandidateIds.value.has(candidate.candidate_id)
+  ))
+))
+
+const selectableQAReviewCandidateCount = computed(() => (
+  qaReviewCandidates.value.filter((candidate) => !candidate.apply_error).length
 ))
 
 const allActiveTermQAItemsSelected = computed(() => (
@@ -4226,8 +4252,8 @@ function shouldKeepLoadedQAResult(report: WorkbenchQAResult) {
   return report.items.length > 0 || Boolean(report.term_report_id)
 }
 
-async function loadLatestTermQAReport() {
-  if (loadingTermQAReport.value) {
+async function loadLatestTermQAReport(force = false) {
+  if (loadingTermQAReport.value && !force) {
     return
   }
   const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
@@ -4237,24 +4263,67 @@ async function loadLatestTermQAReport() {
   if (!isMergeWorkbench.value && !segmentStore.fileRecord) {
     return
   }
+  const requestId = ++termQAReportLoadRequestId
   loadingTermQAReport.value = true
   try {
+    let data: WorkbenchQAResult
     if (isMergeWorkbench.value) {
-      const data = await fetchMergeViewQAResult(mergeViewId)
-      setCurrentTermQAReport(shouldKeepLoadedQAResult(data) ? data : null)
-    } else if (segmentStore.fileRecord) {
-      const { data } = await http.get<WorkbenchQAResult>(
-        `/file-records/${segmentStore.fileRecord.id}/qa-results`,
+      data = await fetchMergeViewQAResult(mergeViewId)
+    } else {
+      const response = await http.get<WorkbenchQAResult>(
+        `/file-records/${segmentStore.fileRecord!.id}/qa-results`,
       )
+      data = response.data
+    }
+    if (requestId === termQAReportLoadRequestId) {
       setCurrentTermQAReport(shouldKeepLoadedQAResult(data) ? data : null)
     }
   } catch (error) {
-    console.error('Failed to load QA result:', error)
-    setCurrentTermQAReport(null)
+    if (requestId === termQAReportLoadRequestId) {
+      console.error('Failed to load QA result:', error)
+      setCurrentTermQAReport(null)
+    }
   } finally {
-    loadingTermQAReport.value = false
+    if (requestId === termQAReportLoadRequestId) {
+      loadingTermQAReport.value = false
+    }
   }
 }
+
+function clearTermQAReportRefreshTimers() {
+  for (const timerId of termQAReportRefreshTimers) {
+    window.clearTimeout(timerId)
+  }
+  termQAReportRefreshTimers = []
+}
+
+function scheduleTermQAReportRefreshAfterSync() {
+  clearTermQAReportRefreshTimers()
+  if (!termQAReport.value) {
+    return
+  }
+  for (const delay of TERM_QA_REPORT_REFRESH_DELAYS_MS) {
+    const timerId = window.setTimeout(() => {
+      termQAReportRefreshTimers = termQAReportRefreshTimers.filter((id) => id !== timerId)
+      if (termQAReport.value && !generatingTermQAReport.value) {
+        void loadLatestTermQAReport(true)
+      }
+    }, delay)
+    termQAReportRefreshTimers.push(timerId)
+  }
+}
+
+watch(
+  () => segmentStore.lastSyncedAt,
+  (syncedAt, previousSyncedAt) => {
+    if (!syncedAt || syncedAt === previousSyncedAt) {
+      return
+    }
+    // 句段保存后的本地 QA 在响应返回后异步执行；分两次刷新以同时覆盖
+    // 快速保存回显和稍后完成的问题重算，避免下方面板长期显示旧译文/旧问题。
+    scheduleTermQAReportRefreshAfterSync()
+  },
+)
 
 async function generateCurrentTermQAReport() {
   const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
@@ -4427,6 +4496,204 @@ async function ignoreSelectedTermQAReportItems() {
     selectedActiveTermQAReportItems.value.map((item) => item.id),
     true,
   )
+}
+
+interface QASafeReviewCandidate {
+  candidate_id: string
+  item_ids: string[]
+  segment_id: string
+  sentence_id: string
+  rule_labels: string[]
+  source_text: string
+  original_target_text: string
+  original_target_html: string
+  suggested_target_text: string
+  suggested_target_html: string
+  reason: string
+  expected_target_hash: string
+  expected_target_html_hash: string
+  ai_provider: string
+  ai_model: string
+  review_expires_at: number
+  review_token: string
+  apply_error?: string
+}
+
+interface QASafeManualItem {
+  item_ids: string[]
+  segment_id: string
+  sentence_id: string
+  reason: string
+  ai_suggested_target_text: string
+}
+
+interface WorkbenchQASafeProcessResponse {
+  applied_count: number
+  skipped_count: number
+  updated_segment_count: number
+  review_count: number
+  review_candidates: QASafeReviewCandidate[]
+  manual_count: number
+  manual_items: QASafeManualItem[]
+}
+
+interface WorkbenchQAReviewedFixResponse {
+  applied_count: number
+  applied_candidate_ids: string[]
+  skipped_count: number
+  skipped: Array<{ candidate_id: string; reason: string }>
+  updated_segment_count: number
+}
+
+function closeQAReviewDialog() {
+  if (applyingQAReviewCandidates.value) {
+    return
+  }
+  showQAReviewDialog.value = false
+}
+
+function setQAReviewCandidateSelected(candidateId: string, selected: boolean) {
+  const next = new Set(selectedQAReviewCandidateIds.value)
+  if (selected) {
+    next.add(candidateId)
+  } else {
+    next.delete(candidateId)
+  }
+  selectedQAReviewCandidateIds.value = next
+}
+
+function toggleAllQAReviewCandidates(selected: boolean) {
+  selectedQAReviewCandidateIds.value = selected
+    ? new Set(
+      qaReviewCandidates.value
+        .filter((candidate) => !candidate.apply_error)
+        .map((candidate) => candidate.candidate_id),
+    )
+    : new Set()
+}
+
+async function focusQAManualItem(item: QASafeManualItem) {
+  const reportItem = termQAReport.value?.items.find((candidate) => item.item_ids.includes(candidate.id))
+  if (!reportItem) {
+    toast.warn('对应 QA 条目已更新，请重新生成 QA 结果。')
+    return
+  }
+  showQAReviewDialog.value = false
+  await focusTermQAReportItem(reportItem)
+}
+
+async function applyTermQAFixes(items: WorkbenchQAResultItem[], busyItemId: string | null = null) {
+  if (applyingTermQAFixes.value || items.length === 0) {
+    return
+  }
+  applyingTermQAFixes.value = true
+  termQAFixBusyItemId.value = busyItemId
+  try {
+    const synced = await syncPendingWorkbenchEdits()
+    if (!synced) {
+      return
+    }
+    const { data } = await http.post<WorkbenchQASafeProcessResponse>(
+      '/qa-result-items/apply-fixes',
+      { item_ids: items.map((item) => item.id) },
+    )
+    await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize)
+    await loadLatestTermQAReport(true)
+
+    qaReviewCandidates.value = data.review_candidates || []
+    qaManualItems.value = data.manual_items || []
+    selectedQAReviewCandidateIds.value = new Set(
+      qaReviewCandidates.value
+        .filter((candidate) => candidate.suggested_target_text !== candidate.original_target_text)
+        .map((candidate) => candidate.candidate_id),
+    )
+    showQAReviewDialog.value = qaReviewCandidates.value.length > 0 || qaManualItems.value.length > 0
+
+    const summary = [
+      `已自动修改 ${data.applied_count} 条`,
+      `待审核 ${data.review_count} 个句段`,
+      `需人工处理 ${data.manual_count} 个句段`,
+    ].join('，')
+    toast.show({
+      tone: data.applied_count > 0 || data.review_count > 0 ? 'success' : 'warn',
+      title: 'QA 安全处理完成',
+      message: summary,
+    })
+  } catch (error) {
+    toast.error({
+      title: 'QA 处理失败',
+      message: getErrorMessage(error, '无法完成 QA 安全处理。'),
+    })
+  } finally {
+    applyingTermQAFixes.value = false
+    termQAFixBusyItemId.value = null
+  }
+}
+
+async function applySelectedQAReviewCandidates() {
+  const candidates = selectedQAReviewCandidates.value
+  if (applyingQAReviewCandidates.value || candidates.length === 0) {
+    return
+  }
+  applyingQAReviewCandidates.value = true
+  try {
+    const { data } = await http.post<WorkbenchQAReviewedFixResponse>(
+      '/qa-result-items/apply-reviewed-fixes',
+      {
+        candidates: candidates.map((candidate) => ({
+          candidate_id: candidate.candidate_id,
+          item_ids: candidate.item_ids,
+          segment_id: candidate.segment_id,
+          expected_target_hash: candidate.expected_target_hash,
+          expected_target_html_hash: candidate.expected_target_html_hash,
+          suggested_target_text: candidate.suggested_target_text,
+          suggested_target_html: candidate.suggested_target_html,
+          ai_provider: candidate.ai_provider,
+          ai_model: candidate.ai_model,
+          review_expires_at: candidate.review_expires_at,
+          review_token: candidate.review_token,
+        })),
+      },
+    )
+    const appliedIds = new Set(data.applied_candidate_ids || [])
+    const skippedById = new Map((data.skipped || []).map((item) => [item.candidate_id, item.reason]))
+    qaReviewCandidates.value = qaReviewCandidates.value
+      .filter((candidate) => !appliedIds.has(candidate.candidate_id))
+      .map((candidate) => ({
+        ...candidate,
+        apply_error: skippedById.get(candidate.candidate_id),
+      }))
+    selectedQAReviewCandidateIds.value = new Set(
+      [...selectedQAReviewCandidateIds.value].filter((id) => (
+        !appliedIds.has(id) && !skippedById.has(id)
+      )),
+    )
+    await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize)
+    await loadLatestTermQAReport(true)
+    if (qaReviewCandidates.value.length === 0 && qaManualItems.value.length === 0) {
+      showQAReviewDialog.value = false
+    }
+    toast.show({
+      tone: data.applied_count > 0 ? 'success' : 'warn',
+      title: data.applied_count > 0 ? '审核修改已应用' : '没有应用修改',
+      message: `已应用 ${data.applied_count} 个句段，跳过 ${data.skipped_count} 个。`,
+    })
+  } catch (error) {
+    toast.error({
+      title: '审核修改失败',
+      message: getErrorMessage(error, '无法应用审核后的 QA 建议。'),
+    })
+  } finally {
+    applyingQAReviewCandidates.value = false
+  }
+}
+
+async function applyAllTermQAFixes() {
+  await applyTermQAFixes(termQASafeProcessTargets.value)
+}
+
+async function applySingleTermQAFix(item: WorkbenchQAResultItem) {
+  await applyTermQAFixes([item], item.id)
 }
 
 async function loadWorkbenchQualityQASettings() {
@@ -7090,6 +7357,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   stopBottomDrawerResize?.()
   segmentEditorResizeObserver?.disconnect()
+  clearTermQAReportRefreshTimers()
   if (segmentEditorScrollbarFrame !== null) {
     window.cancelAnimationFrame(segmentEditorScrollbarFrame)
   }
@@ -9130,11 +9398,22 @@ onBeforeRouteLeave(async () => {
                       v-if="termQAReport"
                       class="button button--ghost term-qa-dialog__action-button"
                       type="button"
-                      :disabled="termQAReportFilter === 'ignored' || activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                      :disabled="termQAReportFilter === 'ignored' || activeTermQAReportItems.length === 0 || updatingTermQAIgnore || applyingTermQAFixes"
                       title="全选未忽略"
                       @click="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
                     >
                       {{ allActiveTermQAItemsSelected ? '取消' : '全选' }}
+                    </button>
+                    <button
+                      v-if="termQAReport"
+                      class="button button--ghost term-qa-dialog__action-button"
+                      type="button"
+                      :disabled="termQASafeProcessTargets.length === 0 || applyingTermQAFixes"
+                      :title="selectedTermQAReportItems.length ? '安全处理所选 QA 问题' : '安全处理全部待处理 QA 问题'"
+                      @click="void applyAllTermQAFixes()"
+                    >
+                      <Loader2 v-if="applyingTermQAFixes && !termQAFixBusyItemId" class="lucide-spin" :size="14" />
+                      一键处理{{ selectedTermQAReportItems.length ? ` ${termQASafeProcessTargets.length}` : '' }}
                     </button>
                     <button
                       v-if="termQAReport"
@@ -9207,7 +9486,7 @@ onBeforeRouteLeave(async () => {
                             <input
                               type="checkbox"
                               :checked="allActiveTermQAItemsSelected"
-                              :disabled="termQAReportFilter === 'ignored' || activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                              :disabled="termQAReportFilter === 'ignored' || activeTermQAReportItems.length === 0 || updatingTermQAIgnore || applyingTermQAFixes"
                               aria-label="全选未忽略 QA 问题"
                               title="全选未忽略"
                               @change="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
@@ -9217,7 +9496,7 @@ onBeforeRouteLeave(async () => {
                           <th v-if="isMergeWorkbench" class="term-qa-dialog__col-file">文件</th>
                           <th class="term-qa-dialog__col-type">类型</th>
                           <th>问题 / 建议</th>
-                          <th class="term-qa-dialog__col-target">当前译文</th>
+                          <th class="term-qa-dialog__col-target">当前 / 修正后译文</th>
                           <th class="term-qa-dialog__col-action">操作</th>
                         </tr>
                       </thead>
@@ -9240,7 +9519,7 @@ onBeforeRouteLeave(async () => {
                             <input
                               type="checkbox"
                               :checked="selectedTermQAItemIds.has(item.id)"
-                              :disabled="item.ignored"
+                              :disabled="item.ignored || applyingTermQAFixes"
                               aria-label="选择 QA 问题"
                               @click.stop
                               @change.stop="handleTermQAItemSelectionChange(item.id, $event)"
@@ -9277,18 +9556,36 @@ onBeforeRouteLeave(async () => {
                           <td
                             class="term-qa-dialog__cell-text"
                             :class="{ 'is-empty': !item.target_text }"
-                            :title="item.target_text || '未填写'"
-                          >{{ item.target_text || '未填写' }}</td>
+                            :title="item.can_auto_fix ? `修正后：${item.fixed_target_text}` : (item.target_text || '未填写')"
+                          >
+                            <div>{{ item.target_text || '未填写' }}</div>
+                            <div v-if="item.can_auto_fix" class="term-qa-dialog__issue-suggestion">
+                              修正后：{{ item.fixed_target_text }}
+                            </div>
+                          </td>
                           <td>
-                            <button
-                              class="button button--ghost term-qa-dialog__inline-action"
-                              type="button"
-                              :title="item.ignored ? '恢复该 QA 问题' : '忽略该 QA 问题'"
-                              :disabled="updatingTermQAIgnore"
-                              @click.stop="void setSingleTermQAReportItemIgnored(item, !item.ignored)"
-                            >
-                              {{ item.ignored ? '恢复' : '忽略' }}
-                            </button>
+                            <div class="term-qa-dialog__inline-actions">
+                              <button
+                                v-if="!item.ignored"
+                                class="button button--ghost term-qa-dialog__inline-action"
+                                type="button"
+                                :title="item.can_auto_fix ? '直接应用安全修改建议' : '生成 AI 修改建议并审核'"
+                                :disabled="applyingTermQAFixes"
+                                @click.stop="void applySingleTermQAFix(item)"
+                              >
+                                <Loader2 v-if="termQAFixBusyItemId === item.id" class="lucide-spin" :size="14" />
+                                {{ item.can_auto_fix ? '修改' : 'AI 辅助' }}
+                              </button>
+                              <button
+                                class="button button--ghost term-qa-dialog__inline-action"
+                                type="button"
+                                :title="item.ignored ? '恢复该 QA 问题' : '忽略该 QA 问题'"
+                                :disabled="updatingTermQAIgnore || applyingTermQAFixes"
+                                @click.stop="void setSingleTermQAReportItemIgnored(item, !item.ignored)"
+                              >
+                                {{ item.ignored ? '恢复' : '忽略' }}
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       </tbody>
@@ -10093,6 +10390,121 @@ onBeforeRouteLeave(async () => {
       @close="showExportStyleDialog = false"
       @save="saveExportStyleSettings"
     />
+
+    <Modal
+      :open="showQAReviewDialog"
+      title="QA 安全处理结果"
+      description="确定性问题已自动修改；AI 建议只有在你审核并确认后才会写入译文。"
+      width="min(960px, calc(100vw - 32px))"
+      :close-on-overlay="!applyingQAReviewCandidates"
+      :close-on-esc="!applyingQAReviewCandidates"
+      @close="closeQAReviewDialog"
+    >
+      <div class="qa-safe-review">
+        <section v-if="qaReviewCandidates.length" class="qa-safe-review__section">
+          <div class="qa-safe-review__section-header">
+            <div>
+              <strong>待审核建议 {{ qaReviewCandidates.length }}</strong>
+              <p class="hint-text">按句段合并显示，接受后会保留修订记录并重新执行本地 QA。</p>
+            </div>
+            <button
+              class="button button--ghost"
+              type="button"
+              :disabled="applyingQAReviewCandidates"
+              @click="toggleAllQAReviewCandidates(selectedQAReviewCandidates.length !== selectableQAReviewCandidateCount)"
+            >
+              {{ selectedQAReviewCandidates.length === selectableQAReviewCandidateCount ? '取消全选' : '全选' }}
+            </button>
+          </div>
+
+          <article
+            v-for="candidate in qaReviewCandidates"
+            :key="candidate.candidate_id"
+            class="qa-safe-review__candidate"
+          >
+            <label class="qa-safe-review__candidate-select">
+              <input
+                type="checkbox"
+                :checked="selectedQAReviewCandidateIds.has(candidate.candidate_id)"
+                :disabled="applyingQAReviewCandidates || Boolean(candidate.apply_error)"
+                @change="setQAReviewCandidateSelected(candidate.candidate_id, ($event.target as HTMLInputElement).checked)"
+              >
+              <span>句段 {{ formatTermQASegmentNumber(candidate.sentence_id) }}</span>
+              <span class="qa-safe-review__rules">{{ candidate.rule_labels.join('、') }}</span>
+            </label>
+            <div class="qa-safe-review__source">
+              <span>原文</span>
+              <p>{{ candidate.source_text }}</p>
+            </div>
+            <div class="qa-safe-review__diff">
+              <div>
+                <span>当前译文</span>
+                <p>{{ candidate.original_target_text || '未填写' }}</p>
+              </div>
+              <div class="is-suggested">
+                <span>AI 建议</span>
+                <p>{{ candidate.suggested_target_text }}</p>
+              </div>
+            </div>
+            <div
+              v-if="candidate.suggested_target_html && candidate.suggested_target_html !== candidate.original_target_html"
+              class="qa-safe-review__html-diff"
+            >
+              <span>格式标签变更（请重点审核）</span>
+              <code>{{ candidate.original_target_html || candidate.original_target_text }}</code>
+              <code class="is-suggested">{{ candidate.suggested_target_html }}</code>
+            </div>
+            <p class="qa-safe-review__reason">{{ candidate.reason }}</p>
+            <p v-if="candidate.apply_error" class="qa-safe-review__apply-error">
+              未应用：{{ candidate.apply_error }}。请重新运行一键处理。
+            </p>
+          </article>
+        </section>
+
+        <section v-if="qaManualItems.length" class="qa-safe-review__section">
+          <div class="qa-safe-review__section-header">
+            <div>
+              <strong>需要人工处理 {{ qaManualItems.length }}</strong>
+              <p class="hint-text">AI 无法生成可安全写入的方案，或建议无法保留当前富文本格式。</p>
+            </div>
+          </div>
+          <div class="qa-safe-review__manual-list">
+            <article v-for="item in qaManualItems" :key="`${item.segment_id}:${item.item_ids.join(',')}`" class="qa-safe-review__manual-item">
+              <div>
+                <strong>句段 {{ formatTermQASegmentNumber(item.sentence_id) }}</strong>
+                <p>{{ item.reason }}</p>
+                <p v-if="item.ai_suggested_target_text" class="qa-safe-review__manual-suggestion">
+                  AI 参考建议：{{ item.ai_suggested_target_text }}
+                </p>
+              </div>
+              <button class="button button--ghost" type="button" @click="void focusQAManualItem(item)">
+                前往修改
+              </button>
+            </article>
+          </div>
+        </section>
+
+        <div v-if="!qaReviewCandidates.length && !qaManualItems.length" class="empty-state">
+          没有需要审核或人工处理的 QA 问题。
+        </div>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="applyingQAReviewCandidates" @click="closeQAReviewDialog">
+          稍后处理
+        </button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="selectedQAReviewCandidates.length === 0 || applyingQAReviewCandidates"
+          @click="void applySelectedQAReviewCandidates()"
+        >
+          <Loader2 v-if="applyingQAReviewCandidates" class="lucide-spin" :size="14" />
+          <Check v-else :size="14" />
+          应用选中建议 {{ selectedQAReviewCandidates.length }}
+        </button>
+      </template>
+    </Modal>
 
     <Modal
       :open="showQualityQAAdjustDialog"
@@ -11703,6 +12115,156 @@ onBeforeRouteLeave(async () => {
   gap: 4px;
   margin-bottom: 8px;
   color: #9a5b12;
+}
+
+.qa-safe-review {
+  display: grid;
+  gap: 18px;
+  max-height: min(68vh, 720px);
+  overflow: auto;
+}
+
+.qa-safe-review__section {
+  display: grid;
+  gap: 10px;
+}
+
+.qa-safe-review__section-header,
+.qa-safe-review__candidate-select,
+.qa-safe-review__manual-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.qa-safe-review__section-header p,
+.qa-safe-review__manual-item p,
+.qa-safe-review__candidate p {
+  margin: 0;
+}
+
+.qa-safe-review__candidate {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border-color, #dbe3ea);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.qa-safe-review__candidate-select {
+  justify-content: flex-start;
+  color: #233941;
+  font-weight: 700;
+}
+
+.qa-safe-review__rules {
+  color: #637780;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.qa-safe-review__source,
+.qa-safe-review__diff > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.qa-safe-review__source > span,
+.qa-safe-review__diff span {
+  color: #637780;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.qa-safe-review__source p,
+.qa-safe-review__diff p {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #f6f8fa;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.qa-safe-review__diff {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.qa-safe-review__diff .is-suggested p {
+  background: #edf8f1;
+  box-shadow: inset 3px 0 0 #2f9e60;
+}
+
+.qa-safe-review__reason {
+  color: #52666f;
+  font-size: 12px;
+}
+
+.qa-safe-review__html-diff {
+  display: grid;
+  gap: 5px;
+  padding: 8px 10px;
+  border: 1px solid #e7c66a;
+  border-radius: 6px;
+  background: #fffaf0;
+}
+
+.qa-safe-review__html-diff > span {
+  color: #8a5a00;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.qa-safe-review__html-diff code {
+  display: block;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: #f3f4f6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.qa-safe-review__html-diff code.is-suggested {
+  background: #edf8f1;
+}
+
+.qa-safe-review__apply-error {
+  color: #b42318;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.qa-safe-review__manual-list {
+  display: grid;
+  gap: 8px;
+}
+
+.qa-safe-review__manual-item {
+  padding: 10px 12px;
+  border: 1px solid #ead8b4;
+  border-radius: 8px;
+  background: #fffaf0;
+}
+
+.qa-safe-review__manual-item > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.qa-safe-review__manual-suggestion {
+  color: #637780;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 720px) {
+  .qa-safe-review__diff {
+    grid-template-columns: 1fr;
+  }
 }
 
 .term-qa-dialog__table-wrap {

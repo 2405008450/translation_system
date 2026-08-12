@@ -1030,12 +1030,19 @@ def update_segment_by_sentence_id(
     llm_model: str | None = None,
     track_revision: bool = True,
     confirm: bool = False,
+    *,
+    segment_id: UUID | None = None,
+    commit: bool = True,
 ) -> Segment | None:
-    segment = (
-        db.query(Segment)
-        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
-        .first()
-    )
+    query = db.query(Segment)
+    if segment_id is not None:
+        query = query.filter(Segment.id == segment_id, Segment.file_record_id == file_record_id)
+    else:
+        query = query.filter(
+            Segment.file_record_id == file_record_id,
+            Segment.sentence_id == sentence_id,
+        )
+    segment = query.first()
     if not segment:
         return None
 
@@ -1080,8 +1087,11 @@ def update_segment_by_sentence_id(
     )
 
     sync_file_record_status(db, segment.file_record_id)
-    db.commit()
-    db.refresh(segment)
+    if commit:
+        db.commit()
+        db.refresh(segment)
+    else:
+        db.flush()
     return segment
 
 
