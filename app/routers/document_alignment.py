@@ -10,16 +10,21 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.auth import require_business_manager
 from app.database import get_db
 from app.models import DocumentAlignmentPair, ProofreadingBatch, Project, User
-from app.services.document_alignment.segments import materialize_alignment
 from app.services.document_alignment.export import export_alignment_csv as build_alignment_csv
+from app.services.document_alignment.segments import (
+    ensure_document_pair_segments_complete,
+    materialize_alignment,
+)
 from app.services.document_alignment.service import (
     create_alignment_batch, preview_document_pair, refresh_pair_text,
-    merge_alignment_pair_range, run_alignment_batch, serialize_pair, validate_pair_integrity,
+    merge_alignment_pair_range, replace_alignment_pair_range,
+    run_alignment_batch, serialize_pair, validate_pair_integrity,
 )
 from app.services.import_task_storage import (
     cleanup_import_task_staging, get_import_task_staging_dir, stage_import_file_streams,
@@ -36,13 +41,18 @@ class AlignmentBatchCreate(BaseModel):
     granularity: Literal["sentence", "paragraph"] = "sentence"
     use_llm_for_hard_blocks: bool = False
     full_review: bool = True
-    alignment_strategy: Literal["order_first", "structure_aware"] = "order_first"
+    alignment_strategy: Literal["hierarchical_llm", "order_first", "structure_aware"] = "order_first"
 
 
 class PairPatch(BaseModel):
     src_indices: list[int] | None = None
     tgt_indices: list[int] | None = None
     locked: bool | None = None
+
+
+class PairTextPatch(BaseModel):
+    source_text: str | None = None
+    target_text: str | None = None
 
 
 class PairSplit(BaseModel):
@@ -61,6 +71,18 @@ class BoundaryShift(BaseModel):
     pair_id: UUID
     side: Literal["source", "target"]
     direction: Literal["next_into_current", "current_into_next"]
+
+
+class PairReplacement(BaseModel):
+    src_indices: list[int] = Field(default_factory=list)
+    tgt_indices: list[int] = Field(default_factory=list)
+    locked: bool = True
+
+
+class PairRangeReplace(BaseModel):
+    start_order: int = Field(ge=0)
+    delete_count: int = Field(ge=0, le=100)
+    replacements: list[PairReplacement] = Field(default_factory=list, max_length=100)
 
 
 def _project(db: Session, project_id: UUID) -> Project:
@@ -146,6 +168,7 @@ def create_batch(
 def list_pairs(
     batch_id: UUID, page: int = Query(1, ge=1), page_size: int = Query(100, ge=1, le=100),
     confidence_level: str | None = None, only_unlocked: bool = False,
+    q: str | None = Query(None, max_length=200),
     db: Session = Depends(get_db), _: User = Depends(require_business_manager),
 ):
     batch = _batch(db, batch_id)
@@ -154,6 +177,14 @@ def list_pairs(
         query = query.filter(DocumentAlignmentPair.confidence_level == confidence_level)
     if only_unlocked:
         query = query.filter(DocumentAlignmentPair.locked.is_(False))
+    keyword = (q or "").strip()
+    if keyword:
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        query = query.filter(or_(
+            DocumentAlignmentPair.source_text.ilike(pattern, escape="\\"),
+            DocumentAlignmentPair.target_text.ilike(pattern, escape="\\"),
+        ))
     total = query.count()
     rows = query.order_by(DocumentAlignmentPair.pair_order).offset((page - 1) * page_size).limit(page_size).all()
     return {"items": [serialize_pair(row) for row in rows], "total": total, "page": page, "page_size": page_size}
@@ -178,6 +209,48 @@ def patch_pair(pair_id: UUID, payload: PairPatch, db: Session = Depends(get_db),
     except ValueError as exc:
         db.rollback()
         raise HTTPException(400, str(exc)) from exc
+    return serialize_pair(pair)
+
+
+@router.patch("/alignment-pairs/{pair_id}/text")
+def patch_pair_text(
+    pair_id: UUID,
+    payload: PairTextPatch,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    """保存对齐阶段的人工文本修订，并同步到后续校对工作台基线。"""
+    pair = db.get(DocumentAlignmentPair, pair_id)
+    if not pair:
+        raise HTTPException(404, "配对不存在。")
+    batch = _batch(db, pair.batch_id)
+    if batch.alignment_status not in {"draft", "confirmed"}:
+        raise HTTPException(409, "当前对齐结果不可编辑。")
+    changed_fields = payload.model_fields_set
+    if not changed_fields.intersection({"source_text", "target_text"}):
+        raise HTTPException(400, "请提供需要修改的原文或译文。")
+    try:
+        features = json.loads(pair.features or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        features = {}
+    if not isinstance(features, dict):
+        features = {}
+    if "source_text" in changed_fields:
+        pair.source_text = payload.source_text or ""
+        features["manual_source_text"] = pair.source_text
+    if "target_text" in changed_fields:
+        pair.target_text = payload.target_text or ""
+        features["manual_target_text"] = pair.target_text
+    features["manual_text_edit"] = True
+    pair.features = json.dumps(features, ensure_ascii=False)
+    pair.method = "manual"
+    pair.locked = True
+    pair.confidence = 1.0
+    pair.confidence_level = "high"
+    if batch.alignment_status == "confirmed":
+        ensure_document_pair_segments_complete(db, batch, refresh_existing=True)
+    db.commit()
+    db.refresh(pair)
     return serialize_pair(pair)
 
 
@@ -235,7 +308,7 @@ def merge_pairs(batch_id: UUID, payload: PairMerge, db: Session = Depends(get_db
 
 @router.post("/proofreading-batches/{batch_id}/alignment-pairs/shift-boundary")
 def shift_boundary(batch_id: UUID, payload: BoundaryShift, db: Session = Depends(get_db), _: User = Depends(require_business_manager)):
-    _batch(db, batch_id)
+    batch = _batch(db, batch_id)
     current = db.get(DocumentAlignmentPair, payload.pair_id)
     if not current or current.batch_id != batch_id:
         raise HTTPException(404, "配对不存在。")
@@ -253,8 +326,38 @@ def shift_boundary(batch_id: UUID, payload: BoundaryShift, db: Session = Depends
     setattr(current, field, json.dumps(left)); setattr(nxt, field, json.dumps(right))
     refresh_pair_text(db, current); refresh_pair_text(db, nxt)
     validate_pair_integrity(db, batch_id)
+    if batch.alignment_status == "confirmed":
+        ensure_document_pair_segments_complete(db, batch, refresh_existing=True)
     db.commit()
     return {"items": [serialize_pair(current), serialize_pair(nxt)]}
+
+
+@router.post("/proofreading-batches/{batch_id}/alignment-pairs/replace-range")
+def replace_pair_range(
+    batch_id: UUID,
+    payload: PairRangeReplace,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    """替换连续配对区间；同一接口同时支撑人工调整、撤回和重做。"""
+    batch = _batch(db, batch_id)
+    if batch.alignment_status not in {"draft", "confirmed"}:
+        raise HTTPException(409, "当前对齐结果不可调整。")
+    try:
+        rows = replace_alignment_pair_range(
+            db,
+            batch_id,
+            payload.start_order,
+            payload.delete_count,
+            [item.model_dump() for item in payload.replacements],
+        )
+        if batch.alignment_status == "confirmed":
+            ensure_document_pair_segments_complete(db, batch, refresh_existing=True)
+        db.commit()
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    return {"items": [serialize_pair(row) for row in rows]}
 
 
 @router.post("/proofreading-batches/{batch_id}/alignment/rerun")
@@ -263,7 +366,7 @@ def rerun(batch_id: UUID, background_tasks: BackgroundTasks, db: Session = Depen
     if batch.alignment_status in {"aligning", "canceling"}:
         raise HTTPException(409, "当前双文档对齐任务仍在运行。")
     batch.alignment_status = "aligning"; batch.status = "aligning"; batch.progress = 0
-    batch.message = "正在准备向量对齐窗口…"
+    batch.message = "正在准备文档对齐窗口…"
     batch.error_message = ""
     batch.cancel_requested = False
     batch.finished_at = None

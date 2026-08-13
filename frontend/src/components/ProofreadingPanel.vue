@@ -19,8 +19,6 @@ import {
 } from '../api/proofreading'
 import { getLanguageLabel, languageOptions } from '../constants/languages'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
-import DocumentAlignmentEditor from './DocumentAlignmentEditor.vue'
-import Modal from './base/Modal.vue'
 
 const props = defineProps<{ projectId: string }>()
 const emit = defineEmits<{ refreshProject: [] }>()
@@ -57,7 +55,6 @@ const busy = ref(false)
 const actionBatchId = ref('')
 const errorMessage = ref('')
 const selectedImportMode = ref<'document_pair' | 'xlsx_columns' | null>(null)
-const showAlignmentDialog = ref(false)
 const expandedBatchIds = ref(new Set<string>())
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
@@ -336,19 +333,24 @@ function batchKindLabel(batch: ProofreadingBatch) {
 
 function selectImportMode(mode: 'document_pair' | 'xlsx_columns') {
   if (mode === 'document_pair') {
-    selectedImportMode.value = mode
-    showAlignmentDialog.value = true
-    errorMessage.value = ''
+    void router.push({ name: 'document-alignment', params: { id: props.projectId } })
     return
   }
   selectedImportMode.value = selectedImportMode.value === mode ? null : mode
-  showAlignmentDialog.value = false
   errorMessage.value = ''
 }
 
-async function handleAlignmentRefresh() {
-  await refreshBatches()
-  emit('refreshProject')
+function openDocumentPairBatch(batch: ProofreadingBatch) {
+  const fileRecordId = batch.bindings[0]?.file_record_id
+  if (batch.alignment_status === 'confirmed' && fileRecordId) {
+    void router.push({
+      name: 'workbench-focus',
+      params: { id: fileRecordId },
+      query: { from: 'project', pid: props.projectId, mode: 'alignment' },
+    })
+    return
+  }
+  void router.push({ name: 'document-alignment', params: { id: props.projectId } })
 }
 
 onMounted(async () => {
@@ -386,7 +388,7 @@ onBeforeUnmount(() => {
             <small>分别上传两个文档，自动解析并对齐句段。</small>
             <em>支持 DOC、DOCX、TXT</em>
           </span>
-          <ChevronDown class="proofreading-import-mode__arrow" :size="16" />
+          <ExternalLink class="proofreading-import-mode__arrow" :size="16" />
         </button>
         <button
           class="proofreading-import-mode"
@@ -535,13 +537,13 @@ onBeforeUnmount(() => {
                 <ChevronDown :size="14" :class="{ 'is-rotated': isBatchExpanded(batch.id) }" />
               </button>
               <button
-                v-if="batch.batch_kind === 'document_pair' && ['aligning', 'canceling', 'draft'].includes(batch.alignment_status || '')"
+                v-if="batch.batch_kind === 'document_pair' && ['aligning', 'canceling', 'draft', 'confirmed'].includes(batch.alignment_status || '')"
                 class="button button--primary"
                 type="button"
-                @click="selectImportMode('document_pair')"
+                @click="openDocumentPairBatch(batch)"
               >
                 <FileText :size="14" />
-                {{ batch.alignment_status === 'draft' ? '查看并确认对齐' : '查看对齐进度' }}
+                {{ ['draft', 'confirmed'].includes(batch.alignment_status || '') ? '进入对齐工作台' : '查看对齐进度' }}
               </button>
               <button
                 v-if="canConfigureBatch(batch)"
@@ -641,21 +643,6 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <Modal
-      :open="showAlignmentDialog"
-      title="双文档对齐校对"
-      description="为控制大文档内存占用，窗口仅加载开头 20 条和最多 80 条低置信度配对；完整结果可导出 CSV。"
-      width="min(1180px, calc(100vw - 32px))"
-      @close="showAlignmentDialog = false"
-    >
-      <DocumentAlignmentEditor
-        v-if="showAlignmentDialog"
-        :project-id="projectId"
-        compact
-        @refresh="handleAlignmentRefresh"
-        @open-workbench="openWorkbench"
-      />
-    </Modal>
   </section>
 </template>
 

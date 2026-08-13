@@ -236,6 +236,7 @@ async def refine_hard_block(
     review_context: str = "",
     max_output_tokens: int | None = None,
     refinement_outcome: dict[str, str] | None = None,
+    accept_validated_candidate: bool = False,
 ) -> list[AlignPair]:
     system = (
         "你是文本对齐工具。只输出 JSON 对象，格式为 {\"pairs\":[{\"s\":[0],\"t\":[0]}]}。"
@@ -319,7 +320,7 @@ async def refine_hard_block(
                     "llm_model": completion.model,
                 },
             ) for source, target in parsed]
-            if _accept_llm_candidate(
+            if accept_validated_candidate or _accept_llm_candidate(
                 candidate, fallback, src, tgt, semantic_similarity, lang_ratio,
             ):
                 if _pair_mapping_signature(candidate) == _pair_mapping_signature(fallback):

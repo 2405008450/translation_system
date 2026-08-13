@@ -2,22 +2,24 @@
 import axios from 'axios'
 import {
   ArrowLeft, ArrowRight, Check, ChevronDown, ChevronUp, Download, FileText,
-  Lock, Merge, RefreshCw, Scissors, Square, Upload,
+  Lock, Merge, Plus, Redo2, RefreshCw, Scissors, Search, Square, Trash2, Undo2, Upload, X,
 } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 
 import {
   cancelAlignment, confirmAlignment, createDocumentAlignmentBatch, downloadAlignmentCsv,
-  listAlignmentPairs, mergeAlignmentPairRange, mergeAlignmentPairs, patchAlignmentPair,
-  previewDocumentAlignment, rerunAlignment, shiftAlignmentBoundary, splitAlignmentPair,
-  type AlignmentPair, type AlignmentPreview,
+  listAlignmentPairs, patchAlignmentPair, previewDocumentAlignment,
+  replaceAlignmentPairRange, rerunAlignment,
+  type AlignmentPair, type AlignmentPairReplacement, type AlignmentPreview,
 } from '../api/documentAlignment'
 import { getProofreadingBatch, listProofreadingBatches } from '../api/proofreading'
 import { languageOptions } from '../constants/languages'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
 const props = defineProps<{ projectId: string; compact?: boolean }>()
-const emit = defineEmits<{ refresh: []; openWorkbench: [fileRecordId: string] }>()
+const emit = defineEmits<{ refresh: [] }>()
+const router = useRouter()
 
 const sourceFile = ref<File | null>(null)
 const targetFile = ref<File | null>(null)
@@ -26,7 +28,7 @@ const sourceLanguage = ref('zh-CN')
 const targetLanguage = ref('en-US')
 const granularity = ref<'sentence' | 'paragraph'>('sentence')
 const fullReview = ref(true)
-const alignmentStrategy = ref<'order_first' | 'structure_aware'>('order_first')
+const alignmentStrategy = ref<'hierarchical_llm' | 'order_first' | 'structure_aware'>('order_first')
 
 const batchId = ref('')
 const pairs = ref<AlignmentPair[]>([])
@@ -34,6 +36,9 @@ const activeIndex = ref(0)
 const pairPage = ref(1)
 const pairPageSize = 100
 const pairFilter = ref<'all' | 'low'>('all')
+const searchKeyword = ref('')
+const appliedSearchKeyword = ref('')
+const searchOpen = ref(false)
 const pairTotal = ref(0)
 const lowConfidenceTotal = ref(0)
 const busy = ref(false)
@@ -42,6 +47,14 @@ const message = ref('')
 const error = ref('')
 const selectedPairIds = ref<Set<string>>(new Set())
 const selectionAnchorPairId = ref<string | null>(null)
+interface AlignmentEditCommand {
+  startOrder: number
+  before: AlignmentPairReplacement[]
+  after: AlignmentPairReplacement[]
+  label: string
+}
+const undoStack = ref<AlignmentEditCommand[]>([])
+const redoStack = ref<AlignmentEditCommand[]>([])
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 const activePair = computed(() => pairs.value[activeIndex.value])
@@ -63,6 +76,26 @@ const canMergeSelected = computed(() => {
   if (selected.length < 2 || selected.length !== selectedPairIds.value.size) return false
   return selected.every((pair, index) => index === 0 || pair.pair_order === selected[index - 1].pair_order + 1)
 })
+const canEditStructure = computed(() => pairFilter.value === 'all' && !busy.value)
+const canDeleteCurrent = computed(() => Boolean(
+  activePair.value && !activePair.value.src_indices.length && !activePair.value.tgt_indices.length,
+))
+
+function pairReplacement(pair: AlignmentPair): AlignmentPairReplacement {
+  return {
+    src_indices: [...pair.src_indices],
+    tgt_indices: [...pair.tgt_indices],
+    locked: pair.locked,
+  }
+}
+
+function cloneReplacements(items: AlignmentPairReplacement[]) {
+  return items.map(item => ({
+    src_indices: [...item.src_indices],
+    tgt_indices: [...item.tgt_indices],
+    locked: item.locked,
+  }))
+}
 
 function errorText(value: unknown) {
   return axios.isAxiosError(value)
@@ -95,6 +128,8 @@ async function createBatch() {
   busy.value = true
   error.value = ''
   message.value = '正在生成对齐草稿…'
+  undoStack.value = []
+  redoStack.value = []
   try {
     const batch = await createDocumentAlignmentBatch(props.projectId, {
       preview_token: preview.value.preview_token,
@@ -151,6 +186,7 @@ async function reloadPairs() {
       page: pairPage.value,
       page_size: pairPageSize,
       confidence_level: pairFilter.value === 'low' ? 'low' : undefined,
+      q: appliedSearchKeyword.value || undefined,
     }),
     listAlignmentPairs(batchId.value, { page: 1, page_size: 1, confidence_level: 'low' }),
   ])
@@ -185,6 +221,23 @@ async function setPairFilter(filter: 'all' | 'low') {
   await reloadPairs()
 }
 
+async function applySearch() {
+  appliedSearchKeyword.value = searchKeyword.value.trim()
+  pairPage.value = 1
+  activeIndex.value = 0
+  selectedPairIds.value = new Set()
+  await reloadPairs()
+}
+
+async function clearSearch() {
+  searchKeyword.value = ''
+  appliedSearchKeyword.value = ''
+  searchOpen.value = false
+  pairPage.value = 1
+  activeIndex.value = 0
+  await reloadPairs()
+}
+
 function togglePairSelection(pair: AlignmentPair, event: MouseEvent) {
   if (event.shiftKey && selectionAnchorPairId.value) {
     const anchorIndex = pairs.value.findIndex(item => item.id === selectionAnchorPairId.value)
@@ -211,18 +264,63 @@ async function toggleLock() {
   await reloadPairs()
 }
 
+async function executeEdit(
+  startOrder: number,
+  before: AlignmentPairReplacement[],
+  after: AlignmentPairReplacement[],
+  label: string,
+) {
+  busy.value = true
+  error.value = ''
+  try {
+    await replaceAlignmentPairRange(batchId.value, {
+      start_order: startOrder,
+      delete_count: before.length,
+      replacements: after,
+    })
+    undoStack.value.push({
+      startOrder,
+      before: cloneReplacements(before),
+      after: cloneReplacements(after),
+      label,
+    })
+    if (undoStack.value.length > 50) undoStack.value.shift()
+    redoStack.value = []
+    selectedPairIds.value = new Set()
+    selectionAnchorPairId.value = null
+    await reloadPairs()
+    const localIndex = pairs.value.findIndex(pair => pair.pair_order === startOrder)
+    if (localIndex >= 0) activeIndex.value = localIndex
+    message.value = `${label}完成，已自动保存。`
+  } catch (value) {
+    error.value = errorText(value)
+  } finally {
+    busy.value = false
+  }
+}
+
 async function splitCurrent() {
-  if (!activePair.value || activePair.value.src_indices.length + activePair.value.tgt_indices.length < 3) return
-  await splitAlignmentPair(batchId.value, activePair.value)
-  await reloadPairs()
+  const current = activePair.value
+  if (!current || !canEditStructure.value || current.src_indices.length + current.tgt_indices.length < 3) return
+  const srcAt = Math.ceil(current.src_indices.length / 2)
+  const tgtAt = Math.ceil(current.tgt_indices.length / 2)
+  const after = [
+    { src_indices: current.src_indices.slice(0, srcAt), tgt_indices: current.tgt_indices.slice(0, tgtAt), locked: true },
+    { src_indices: current.src_indices.slice(srcAt), tgt_indices: current.tgt_indices.slice(tgtAt), locked: true },
+  ]
+  if (after.some(item => !item.src_indices.length && !item.tgt_indices.length)) return
+  await executeEdit(current.pair_order, [pairReplacement(current)], after, '拆分')
 }
 
 async function mergeNext() {
   const current = activePair.value
   const next = pairs.value[activeIndex.value + 1]
-  if (!current || !next || next.pair_order !== current.pair_order + 1) return
-  await mergeAlignmentPairs(batchId.value, current.id, next.id)
-  await reloadPairs()
+  if (!current || !next || !canEditStructure.value || next.pair_order !== current.pair_order + 1) return
+  await executeEdit(current.pair_order, [pairReplacement(current), pairReplacement(next)], [{
+    src_indices: [...current.src_indices, ...next.src_indices],
+    tgt_indices: [...current.tgt_indices, ...next.tgt_indices],
+    locked: true,
+  }], '合并')
 }
 
 async function mergeSelected() {
@@ -231,11 +329,12 @@ async function mergeSelected() {
   error.value = ''
   try {
     const selected = orderedSelectedPairs.value
-    await mergeAlignmentPairRange(batchId.value, selected.map(pair => pair.id))
-    selectedPairIds.value = new Set()
-    selectionAnchorPairId.value = null
-    await reloadPairs()
-    message.value = `已合并 ${selected.length} 个连续配对，并自动锁定结果。`
+    const merged: AlignmentPairReplacement = {
+      src_indices: selected.flatMap(pair => pair.src_indices),
+      tgt_indices: selected.flatMap(pair => pair.tgt_indices),
+      locked: true,
+    }
+    await executeEdit(selected[0].pair_order, selected.map(pairReplacement), [merged], `合并 ${selected.length} 项`)
   } catch (value) {
     error.value = errorText(value)
   } finally {
@@ -243,13 +342,80 @@ async function mergeSelected() {
   }
 }
 
-async function shift(direction: 'next_into_current' | 'current_into_next') {
-  if (!activePair.value) return
+async function shift(side: 'source' | 'target', direction: 'next_into_current' | 'current_into_next') {
+  const current = activePair.value
+  const next = pairs.value[activeIndex.value + 1]
+  if (!current || !next || !canEditStructure.value || next.pair_order !== current.pair_order + 1) return
+  const before = [pairReplacement(current), pairReplacement(next)]
+  const after = cloneReplacements(before)
+  const field = side === 'source' ? 'src_indices' : 'tgt_indices'
+  if (direction === 'next_into_current') {
+    const value = after[1][field].shift()
+    if (value == null) return
+    after[0][field].push(value)
+  } else {
+    const value = after[0][field].pop()
+    if (value == null) return
+    after[1][field].unshift(value)
+  }
+  const sideLabel = side === 'source' ? '原文' : '译文'
+  const directionLabel = direction === 'next_into_current' ? '上移' : '下移'
+  await executeEdit(current.pair_order, before, after, `${sideLabel}${directionLabel}`)
+}
+
+async function insertEmptyPair() {
+  const current = activePair.value
+  if (!current || !canEditStructure.value) return
+  await executeEdit(current.pair_order + 1, [], [{ src_indices: [], tgt_indices: [], locked: true }], '插入空行')
+}
+
+async function deleteEmptyPair() {
+  const current = activePair.value
+  if (!current || !canEditStructure.value || !canDeleteCurrent.value) return
+  await executeEdit(current.pair_order, [pairReplacement(current)], [], '删除空行')
+}
+
+async function undoEdit() {
+  const command = undoStack.value.pop()
+  if (!command || busy.value) return
+  busy.value = true
+  error.value = ''
   try {
-    await shiftAlignmentBoundary(batchId.value, activePair.value.id, direction)
+    await replaceAlignmentPairRange(batchId.value, {
+      start_order: command.startOrder,
+      delete_count: command.after.length,
+      replacements: command.before,
+    })
+    redoStack.value.push(command)
     await reloadPairs()
+    message.value = `已撤回：${command.label}`
   } catch (value) {
+    undoStack.value.push(command)
     error.value = errorText(value)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function redoEdit() {
+  const command = redoStack.value.pop()
+  if (!command || busy.value) return
+  busy.value = true
+  error.value = ''
+  try {
+    await replaceAlignmentPairRange(batchId.value, {
+      start_order: command.startOrder,
+      delete_count: command.before.length,
+      replacements: command.after,
+    })
+    undoStack.value.push(command)
+    await reloadPairs()
+    message.value = `已重做：${command.label}`
+  } catch (value) {
+    redoStack.value.push(command)
+    error.value = errorText(value)
+  } finally {
+    busy.value = false
   }
 }
 
@@ -283,6 +449,8 @@ async function rerun() {
   busy.value = true
   alignmentProgress.value = 0
   message.value = '正在准备顺序对齐窗口…'
+  undoStack.value = []
+  redoStack.value = []
   await rerunAlignment(batchId.value)
   pollAlignment()
 }
@@ -310,13 +478,18 @@ async function exportCsv() {
   }
 }
 
-async function confirm() {
-  if (!batchId.value) return
+async function openAlignmentWorkbench() {
+  if (!batchId.value || busy.value) return
   busy.value = true
+  error.value = ''
   try {
     const result = await confirmAlignment(batchId.value)
     emit('refresh')
-    emit('openWorkbench', result.file_record_id)
+    await router.push({
+      name: 'workbench-focus',
+      params: { id: result.file_record_id },
+      query: { from: 'project', pid: props.projectId, mode: 'alignment' },
+    })
   } catch (value) {
     error.value = errorText(value)
   } finally {
@@ -326,14 +499,18 @@ async function confirm() {
 
 function onKeydown(event: KeyboardEvent) {
   if (!pairs.value.length || event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return
-  if (event.key.toLowerCase() === 'j') jumpSuspicious(1)
+  if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'z') {
+    event.preventDefault(); void undoEdit()
+  } else if ((event.ctrlKey || event.metaKey) && (event.key.toLowerCase() === 'y' || event.shiftKey && event.key.toLowerCase() === 'z')) {
+    event.preventDefault(); void redoEdit()
+  } else if (event.key.toLowerCase() === 'j') jumpSuspicious(1)
   else if (event.key.toLowerCase() === 'k') jumpSuspicious(-1)
   else if (event.code === 'Space') { event.preventDefault(); void toggleLock() }
   else if (event.altKey && event.key.toLowerCase() === 'm') { event.preventDefault(); void mergeNext() }
   else if (event.altKey && event.key.toLowerCase() === 's') { event.preventDefault(); void splitCurrent() }
   else if (event.altKey && event.key.toLowerCase() === 'r') { event.preventDefault(); void rerun() }
-  else if (event.altKey && event.key === 'ArrowDown') { event.preventDefault(); void shift('next_into_current') }
-  else if (event.altKey && event.key === 'ArrowUp') { event.preventDefault(); void shift('current_into_next') }
+  else if (event.altKey && event.key === 'ArrowDown') { event.preventDefault(); void shift('target', 'current_into_next') }
+  else if (event.altKey && event.key === 'ArrowUp') { event.preventDefault(); void shift('target', 'next_into_current') }
 }
 
 window.addEventListener('keydown', onKeydown)
@@ -357,8 +534,8 @@ onBeforeUnmount(() => {
   <section class="alignment-editor" :class="{ 'is-compact': compact }">
     <header v-if="!compact">
       <div>
-        <strong>双文档顺序对齐</strong>
-        <p>先按原文、译文从前到后的顺序生成完整语料，再人工调整一对多、多对一和漏译/增译。</p>
+        <strong>双文档分块对齐</strong>
+        <p>先对应段落与表格粗块，再在块内自动拆分和配对句段；疑难结果仍可人工微调。</p>
       </div>
     </header>
 
@@ -369,7 +546,7 @@ onBeforeUnmount(() => {
         <span class="alignment-upload__head-icon"><Upload :size="20" /></span>
         <div>
           <strong>上传需要校对的两个文档</strong>
-          <p>依次选择原文和译文。Word 版式只用于导出恢复，不决定自动配对边界。</p>
+          <p>依次选择原文和译文。系统会识别段落、表格、重复页眉页脚和页码。</p>
         </div>
       </div>
 
@@ -408,6 +585,10 @@ onBeforeUnmount(() => {
 
       <div v-if="preview" class="alignment-preview-config">
         <strong>{{ preview.source.unit_count }} 个原文单元 → {{ preview.target.unit_count }} 个译文单元</strong>
+        <span>
+          原文 {{ preview.source.paragraph_count }} 个段落块 / {{ preview.source.table_count }} 张表，
+          译文 {{ preview.target.paragraph_count }} 个段落块 / {{ preview.target.table_count }} 张表
+        </span>
         <select v-model="sourceLanguage" class="field__control" aria-label="原文语言">
           <option v-for="item in languageOptions" :key="item.code" :value="item.code">{{ item.label }}</option>
         </select>
@@ -419,10 +600,11 @@ onBeforeUnmount(() => {
           <option value="paragraph">段落粒度</option>
         </select>
         <select v-model="alignmentStrategy" class="field__control" aria-label="对齐策略">
-          <option value="order_first">顺序优先（推荐）</option>
+          <option value="order_first">全文顺序优先（当前稳定版）</option>
+          <option value="hierarchical_llm">分块 + LLM（实验版）</option>
           <option value="structure_aware">结构辅助（旧方式）</option>
         </select>
-        <label><input v-model="fullReview" type="checkbox"> 启用 Gemini 全量边界复核</label>
+        <label><input v-model="fullReview" type="checkbox"> 启用 Gemini 块内拆分与配对</label>
         <button class="button button--primary" :disabled="busy || sourceLanguage === targetLanguage" @click="createBatch">生成完整对齐草稿</button>
       </div>
 
@@ -439,27 +621,40 @@ onBeforeUnmount(() => {
 
     <template v-else>
       <div class="alignment-toolbar">
-        <div class="alignment-toolbar__summary">
-          <strong>完整顺序视图</strong>
-          <small>{{ pairRangeLabel }} · 低置信度 {{ lowConfidenceTotal }} 条</small>
-        </div>
-        <button class="button" :class="{ 'is-active': pairFilter === 'all' }" @click="setPairFilter('all')">全部</button>
-        <button class="button" :class="{ 'is-active': pairFilter === 'low' }" @click="setPairFilter('low')">仅待复核</button>
-        <button class="button" :disabled="pairPage <= 1" @click="changePairPage(-1)"><ArrowLeft :size="14" />上一页</button>
-        <button class="button" :disabled="pairPage >= pairPageCount" @click="changePairPage(1)">下一页<ArrowRight :size="14" /></button>
-        <span class="alignment-toolbar__spacer" />
+        <button class="alignment-tool" :disabled="busy" title="导出当前完整对齐结果" @click="exportCsv"><Download :size="17" />导出</button>
+        <button class="alignment-tool" :disabled="busy" title="进入校对大屏样式的人工对齐工作台" @click="openAlignmentWorkbench"><ArrowRight :size="17" />进入对齐工作台</button>
+        <button class="alignment-tool" :disabled="busy" title="保留已锁定配对，重新对齐其余区间" @click="rerun"><RefreshCw :size="17" />对齐</button>
+        <span class="alignment-toolbar__divider" />
+        <button class="button" :disabled="busy || !undoStack.length" title="撤回上一次人工调整（Ctrl+Z）" @click="undoEdit"><Undo2 :size="14" />撤回</button>
+        <button class="button" :disabled="busy || !redoStack.length" title="重新执行已撤回的调整（Ctrl+Y）" @click="redoEdit"><Redo2 :size="14" />前进</button>
+        <span class="alignment-toolbar__divider" />
+        <button class="button" :disabled="!canEditStructure || !activePair || activePair.src_indices.length + activePair.tgt_indices.length < 3" @click="splitCurrent"><Scissors :size="14" />拆分</button>
+        <button class="button" :disabled="!canEditStructure || !canMergeNext" @click="mergeNext"><Merge :size="14" />合并下一项</button>
+        <button class="button" :disabled="!canEditStructure || !canMergeSelected" @click="mergeSelected"><Merge :size="14" />合并所选（{{ selectedPairIds.size }}）</button>
+        <span class="alignment-toolbar__divider" />
+        <button class="button" :disabled="!canEditStructure || !canMergeNext" title="把下一项开头的译文移入当前项" @click="shift('target', 'next_into_current')"><ChevronUp :size="14" />上移</button>
+        <button class="button" :disabled="!canEditStructure || !canMergeNext" title="把当前项末尾的译文移入下一项" @click="shift('target', 'current_into_next')"><ChevronDown :size="14" />下移</button>
+        <button class="button" :disabled="!canEditStructure || !canMergeNext" title="把下一项开头的原文移入当前项" @click="shift('source', 'next_into_current')"><ChevronUp :size="14" />原文上移</button>
+        <button class="button" :disabled="!canEditStructure || !canMergeNext" title="把当前项末尾的原文移入下一项" @click="shift('source', 'current_into_next')"><ChevronDown :size="14" />原文下移</button>
+        <span class="alignment-toolbar__divider" />
+        <button class="button" :disabled="!canEditStructure || !activePair" title="在当前项后插入一个空配对" @click="insertEmptyPair"><Plus :size="14" />插入</button>
+        <button class="button" :disabled="!canEditStructure || !canDeleteCurrent" title="仅允许删除没有内容的空配对" @click="deleteEmptyPair"><Trash2 :size="14" />删除</button>
+        <button class="button" @click="toggleLock"><Lock :size="14" />{{ activePair?.locked ? '解锁' : '锁定' }}</button>
+        <span class="alignment-toolbar__divider" />
+        <button class="button" :class="{ 'is-active': searchOpen }" title="在原文和译文中查找并定位，不修改客户文件内容" @click="searchOpen = !searchOpen"><Search :size="14" />查找定位</button>
+        <form v-if="searchOpen" class="alignment-search" @submit.prevent="applySearch">
+          <input v-model="searchKeyword" type="search" maxlength="200" placeholder="输入原文或译文" aria-label="查找原文或译文">
+          <button class="button" type="submit">查找</button>
+          <button class="button" type="button" title="清除查找" @click="clearSearch"><X :size="13" /></button>
+        </form>
+        <button class="button" :class="{ 'is-active': pairFilter === 'low' }" @click="setPairFilter(pairFilter === 'low' ? 'all' : 'low')">疑点 {{ lowConfidenceTotal }}</button>
         <button class="button" @click="jumpSuspicious(-1)"><ChevronUp :size="14" />上一疑点</button>
         <button class="button" @click="jumpSuspicious(1)"><ChevronDown :size="14" />下一疑点</button>
-        <button class="button" @click="toggleLock"><Lock :size="14" />{{ activePair?.locked ? '解锁' : '锁定' }}</button>
-        <button class="button" @click="splitCurrent"><Scissors :size="14" />拆分</button>
-        <button class="button" :disabled="busy || !canMergeNext" @click="mergeNext"><Merge :size="14" />合并下一项</button>
-        <button class="button" :disabled="busy || !canMergeSelected" @click="mergeSelected"><Merge :size="14" />合并所选（{{ selectedPairIds.size }}）</button>
-        <button class="button" :disabled="busy || !activePair" title="把下一项开头的译文移入当前项" @click="shift('next_into_current')"><ChevronDown :size="14" />下移边界</button>
-        <button class="button" :disabled="busy || !activePair" title="把当前项末尾的译文移入下一项" @click="shift('current_into_next')"><ChevronUp :size="14" />上移边界</button>
-        <button class="button" :disabled="busy" @click="rerun"><RefreshCw :size="14" />重跑未锁定区间</button>
         <button v-if="busy" class="button button--danger" @click="cancel"><Square :size="14" />终止任务</button>
-        <button class="button" :disabled="busy" @click="exportCsv"><Download :size="14" />导出 CSV</button>
-        <button class="button button--primary" :disabled="busy" @click="confirm"><Check :size="14" />确认并进入校对</button>
+        <span class="alignment-toolbar__spacer" />
+        <div class="alignment-toolbar__summary"><small>{{ pairRangeLabel }}</small></div>
+        <button class="button" :disabled="pairPage <= 1" title="上一页" @click="changePairPage(-1)"><ArrowLeft :size="14" /></button>
+        <button class="button" :disabled="pairPage >= pairPageCount" title="下一页" @click="changePairPage(1)"><ArrowRight :size="14" /></button>
       </div>
 
       <div class="alignment-grid">
@@ -524,10 +719,17 @@ onBeforeUnmount(() => {
 .file-pick__copy small { overflow: hidden; color: var(--ink-500); text-overflow: ellipsis; white-space: nowrap; }
 .file-pick__action { padding: 6px 9px; border: 1px solid rgba(15, 118, 110, .24); border-radius: 7px; color: var(--brand); font-size: 12px; font-weight: 700; white-space: nowrap; }
 .alignment-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-muted); }
-.alignment-toolbar__summary { display: grid; min-width: 210px; }
+.alignment-toolbar__summary { display: grid; white-space: nowrap; }
 .alignment-toolbar__summary small { color: var(--ink-500); }
 .alignment-toolbar__spacer { flex: 1 1 auto; }
+.alignment-toolbar__divider { width: 1px; align-self: stretch; margin: 1px 2px; background: var(--line); }
 .alignment-toolbar .button.is-active { border-color: var(--brand); background: rgba(15, 118, 110, .1); color: var(--brand); }
+.alignment-tool { display: inline-flex; align-items: center; gap: 5px; min-height: 34px; padding: 5px 8px; border: 0; background: transparent; color: #0878c9; cursor: pointer; font-weight: 700; white-space: nowrap; }
+.alignment-tool:hover:not(:disabled) { background: rgba(8, 120, 201, .08); }
+.alignment-tool:disabled { cursor: not-allowed; opacity: .45; }
+.alignment-search { display: inline-flex; align-items: center; gap: 5px; }
+.alignment-search input { width: 190px; height: 32px; padding: 5px 9px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: inherit; outline: none; }
+.alignment-search input:focus { border-color: var(--brand); box-shadow: 0 0 0 2px rgba(15, 118, 110, .12); }
 .alignment-grid { display: grid; max-height: min(660px, calc(100vh - 250px)); overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
 .alignment-grid__head { position: sticky; z-index: 2; top: 0; display: grid; grid-template-columns: 66px minmax(0, 1fr) 100px minmax(0, 1fr); gap: 12px; padding: 9px 12px; border-bottom: 1px solid var(--line); background: var(--surface-muted); color: var(--ink-500); font-size: 12px; font-weight: 700; }
 .alignment-row { position: relative; display: grid; grid-template-columns: 66px minmax(0, 1fr) 100px minmax(0, 1fr); gap: 12px; min-height: 76px; padding: 12px; text-align: left; color: inherit; background: transparent; border: 0; border-bottom: 1px solid var(--line); cursor: pointer; }

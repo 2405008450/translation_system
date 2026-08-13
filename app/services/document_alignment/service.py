@@ -6,7 +6,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -20,6 +20,10 @@ from .anchors import build_anchor_blocks, build_order_blocks
 from .dp import AlignPair, SemanticSimilarity, align_block
 from .features import has_structure_conflict
 from .llm_boundary import needs_llm_refinement, refine_hard_block
+from .hierarchical import (
+    build_hierarchical_seed_pairs, repair_adjacent_bilingual_gaps,
+    partition_running_matter, restore_running_matter_gaps,
+)
 from .parser import AlignUnit, parse_side
 from .semantic import build_semantic_scorer
 
@@ -104,7 +108,21 @@ def _structure_summary(units: list[AlignUnit], filename: str) -> dict:
     types: dict[str, int] = {}
     for unit in units:
         types[unit.block_type] = types.get(unit.block_type, 0) + 1
-    return {"filename": filename, "unit_count": len(units), "block_types": types, "character_count": sum(unit.char_len for unit in units)}
+    table_count = len({
+        unit.block_index for unit in units if unit.block_type == "table_cell"
+    })
+    paragraph_count = len({
+        (unit.block_type, unit.block_index) for unit in units
+        if unit.block_type != "table_cell"
+    })
+    return {
+        "filename": filename,
+        "unit_count": len(units),
+        "block_types": types,
+        "character_count": sum(unit.char_len for unit in units),
+        "paragraph_count": paragraph_count,
+        "table_count": table_count,
+    }
 
 
 def _source_cache_path(batch_id: UUID, filename: str) -> Path:
@@ -126,7 +144,7 @@ def create_alignment_batch(
     source_language = normalize_language_code(source_language, field_label="源语言") or ""
     target_language = normalize_language_code(target_language, field_label="目标语言") or ""
     require_language_pair(source_language, target_language)
-    if alignment_strategy not in {"order_first", "structure_aware"}:
+    if alignment_strategy not in {"hierarchical_llm", "order_first", "structure_aware"}:
         raise ValueError("不支持的对齐策略。")
     src_units = parse_side(source_bytes, source_filename, granularity)
     tgt_units = parse_side(target_bytes, target_filename, granularity)
@@ -177,6 +195,54 @@ def _orm_units(db: Session, batch_id: UUID, side: str) -> list[AlignUnit]:
 AlignmentProgress = Callable[[int, int, str], None]
 
 
+async def _compute_hierarchical_pairs(
+    batch: ProofreadingBatch, src: list[AlignUnit], tgt: list[AlignUnit], *,
+    ratio: float, config: dict, settings: Any,
+    progress_callback: AlignmentProgress | None,
+) -> list[AlignPair]:
+    """文档粗块先对应，再在块内执行 LLM 句段边界复核。"""
+    pairs, source_ignored, target_ignored = build_hierarchical_seed_pairs(
+        src, tgt, lang_ratio=ratio,
+    )
+    if progress_callback is not None:
+        progress_callback(1, 1, "结构分块预对齐")
+
+    full_review_enabled = bool(config.get("full_review", True))
+    if full_review_enabled and pairs:
+        pairs = await _review_all_alignment_pairs(
+            pairs, src, tgt, ratio,
+            model=str(config.get("full_review_model") or getattr(
+                settings, "alignment_llm_full_review_model",
+                "google/gemini-3-flash-preview",
+            )),
+            max_pairs=max(1, int(getattr(settings, "alignment_llm_full_review_max_pairs", 28))),
+            max_chars=max(1000, int(getattr(settings, "alignment_llm_full_review_max_chars", 18000))),
+            table_max_pairs=max(1, int(getattr(
+                settings, "alignment_llm_full_review_table_max_pairs", 24,
+            ))),
+            table_max_chars=max(1000, int(getattr(
+                settings, "alignment_llm_full_review_table_max_chars", 9000,
+            ))),
+            overlap_pairs=max(0, int(getattr(
+                settings, "alignment_llm_full_review_overlap_pairs", 2,
+            ))),
+            retry_min_pairs=max(2, int(getattr(
+                settings, "alignment_llm_full_review_retry_min_pairs", 4,
+            ))),
+            max_output_tokens=max(256, int(getattr(
+                settings, "alignment_llm_full_review_max_output_tokens", 4096,
+            ))),
+            concurrency=max(1, int(getattr(settings, "alignment_llm_full_review_concurrency", 4))),
+            semantic_similarity=None,
+            progress_callback=progress_callback,
+            accept_validated_candidate=True,
+        )
+    pairs = repair_adjacent_bilingual_gaps(pairs, src, tgt)
+    return restore_running_matter_gaps(
+        pairs, source_ignored, target_ignored,
+    )
+
+
 async def _compute_pairs(
     batch: ProofreadingBatch, src: list[AlignUnit], tgt: list[AlignUnit],
     progress_callback: AlignmentProgress | None = None,
@@ -184,21 +250,31 @@ async def _compute_pairs(
     config = json.loads(batch.config_json or "{}")
     ratio = _language_ratio(batch.source_language, batch.target_language)
     settings = get_settings()
+    # 历史批次没有该字段时继续走原有顺序策略；新建批次由 API 明确写入新默认值。
+    alignment_strategy = str(config.get("alignment_strategy") or "order_first")
+    if alignment_strategy == "hierarchical_llm":
+        return await _compute_hierarchical_pairs(
+            batch, src, tgt, ratio=ratio, config=config, settings=settings,
+            progress_callback=progress_callback,
+        )
+    # 页眉、页脚和独立页码不是正文译文，必须在所有策略进入 DP/LLM 前隔离；
+    # 完成后再按原始索引作为明确缺口插回，既保证完整性，也避免开头整体错位。
+    src, source_running_matter = partition_running_matter(src)
+    tgt, target_running_matter = partition_running_matter(tgt)
     full_review_enabled = bool(config.get(
         "full_review",
         getattr(settings, "alignment_llm_full_review_enabled", False),
     ))
-    use_llm = (
-        bool(config.get("use_llm_for_hard_blocks"))
-        or settings.alignment_llm_refinement_enabled
-    ) and not full_review_enabled
+    use_llm = bool(config.get(
+        "use_llm_for_hard_blocks",
+        settings.alignment_llm_refinement_enabled,
+    )) and not full_review_enabled
     semantic_scorer = None
     try:
         semantic_scorer = build_semantic_scorer(settings)
     except Exception as exc:  # 语义服务永远不能阻断确定性主路径。
         logger.warning("alignment embedding unavailable; fallback to deterministic DP: %s", exc)
         semantic_scorer = None
-    alignment_strategy = str(config.get("alignment_strategy") or "order_first")
     blocks = (
         build_anchor_blocks(src, tgt)
         if alignment_strategy == "structure_aware"
@@ -328,7 +404,9 @@ async def _compute_pairs(
                 semantic_scorer.clear()
     elif full_review_enabled and semantic_scorer is not None:
         semantic_scorer.clear()
-    return result
+    return restore_running_matter_gaps(
+        result, source_running_matter, target_running_matter,
+    )
 
 
 def _is_safe_review_boundary(pair: AlignPair) -> bool:
@@ -454,6 +532,7 @@ async def _review_all_alignment_pairs(
     concurrency: int = 1,
     semantic_similarity: SemanticSimilarity | None = None,
     progress_callback: AlignmentProgress | None = None,
+    accept_validated_candidate: bool = False,
 ) -> list[AlignPair]:
     """使用指定 Gemini 模型全量复核第一、二阶段产生的全部候选配对。"""
     src_map = {unit.index: unit for unit in src}
@@ -519,6 +598,7 @@ async def _review_all_alignment_pairs(
                 review_context=review_context(fallback),
                 max_output_tokens=max_output_tokens,
                 refinement_outcome=refinement_outcome,
+                accept_validated_candidate=accept_validated_candidate,
             )
         if not refinement_outcome:
             refinement_outcome["status"] = (
@@ -812,7 +892,15 @@ def _store_pairs(
             f" LLM 分块：接受 {accepted_chunks}，未调整 {unchanged_chunks}，"
             f"失败或拒绝 {failed_chunks}。"
         )
-    if fallback_pairs:
+    config = json.loads(batch.config_json or "{}")
+    hierarchical = config.get("alignment_strategy") == "hierarchical_llm"
+    if hierarchical:
+        batch.message = (
+            f"分块对齐完成：隔离页眉页脚/页码 "
+            f"{sum(pair.method == 'ignored_running_matter' for pair in pairs)} 组，"
+            f"LLM 复核 {llm_pairs} 个配对。{review_message}"
+        )
+    elif fallback_pairs:
         batch.message = (
             f"对齐完成，但有 {fallback_pairs} 个配对因向量服务失败而使用程序降级；"
             f"向量配对 {semantic_pairs} 个，LLM 复核 {llm_pairs} 个。{review_message}"
@@ -828,7 +916,7 @@ def _store_pairs(
 def _write_alignment_progress(batch_id: UUID, completed: int, total: int, phase: str) -> None:
     if phase == "LLM 全量复核":
         progress = min(95, 70 + round(completed * 25 / max(1, total)))
-    elif phase in {"向量预对齐", "程序预对齐"}:
+    elif phase in {"向量预对齐", "程序预对齐", "结构分块预对齐"}:
         progress = min(70, max(1, round(completed * 70 / max(1, total))))
     else:
         progress = min(95, max(1, round(completed * 95 / max(1, total))))
@@ -950,8 +1038,22 @@ def validate_pair_integrity(db: Session, batch_id: UUID) -> None:
 def refresh_pair_text(db: Session, pair: DocumentAlignmentPair) -> None:
     src = {unit.index: unit for unit in _orm_units(db, pair.batch_id, "source")}
     tgt = {unit.index: unit for unit in _orm_units(db, pair.batch_id, "target")}
-    pair.source_text = _join_text(json.loads(pair.src_indices or "[]"), src)
-    pair.target_text = _join_text(json.loads(pair.tgt_indices or "[]"), tgt)
+    try:
+        features = json.loads(pair.features or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        features = {}
+    if not isinstance(features, dict):
+        features = {}
+    pair.source_text = (
+        str(features["manual_source_text"])
+        if "manual_source_text" in features
+        else _join_text(json.loads(pair.src_indices or "[]"), src)
+    )
+    pair.target_text = (
+        str(features["manual_target_text"])
+        if "manual_target_text" in features
+        else _join_text(json.loads(pair.tgt_indices or "[]"), tgt)
+    )
     pair.method = "manual"
     pair.confidence = 1.0 if pair.locked else 0.8
     pair.confidence_level = "high"
@@ -1030,3 +1132,93 @@ def merge_alignment_pair_range(
     validate_pair_integrity(db, batch_id)
     db.flush()
     return first
+
+
+def replace_alignment_pair_range(
+    db: Session,
+    batch_id: UUID,
+    start_order: int,
+    delete_count: int,
+    replacements: list[dict[str, Any]],
+) -> list[DocumentAlignmentPair]:
+    """原子替换一段连续配对，供人工调整以及撤回/重做复用。"""
+    rows = db.query(DocumentAlignmentPair).filter_by(batch_id=batch_id).order_by(
+        DocumentAlignmentPair.pair_order,
+    ).all()
+    if start_order < 0 or start_order > len(rows):
+        raise ValueError("调整起点超出当前配对范围。")
+    if delete_count < 0 or start_order + delete_count > len(rows):
+        raise ValueError("待替换的配对范围无效。")
+    if delete_count > 100 or len(replacements) > 100:
+        raise ValueError("单次最多调整 100 个连续配对。")
+
+    normalized: list[dict[str, Any]] = []
+    for item in replacements:
+        src = item.get("src_indices", [])
+        tgt = item.get("tgt_indices", [])
+        if (
+            not isinstance(src, list) or not isinstance(tgt, list)
+            or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in [*src, *tgt])
+            or src != sorted(set(src)) or tgt != sorted(set(tgt))
+        ):
+            raise ValueError("人工调整中的原文或译文单元序号无效。")
+        normalized.append({
+            "src_indices": src,
+            "tgt_indices": tgt,
+            "locked": bool(item.get("locked", True)),
+        })
+
+    before = rows[:start_order]
+    removed = rows[start_order:start_order + delete_count]
+    after = rows[start_order + delete_count:]
+
+    # 先把保留行迁入负数序号空间，避免 PostgreSQL 唯一约束逐行检查时发生瞬时冲突。
+    for temporary, row in enumerate([*before, *after], start=1):
+        row.pair_order = -temporary
+    for row in removed:
+        db.delete(row)
+    db.flush()
+
+    created: list[DocumentAlignmentPair] = []
+    for offset, item in enumerate(normalized):
+        pair = DocumentAlignmentPair(
+            batch_id=batch_id,
+            pair_order=start_order + offset,
+            src_indices=json.dumps(item["src_indices"]),
+            tgt_indices=json.dumps(item["tgt_indices"]),
+            source_text="",
+            target_text="",
+            confidence=1.0 if item["locked"] else 0.8,
+            confidence_level="high",
+            method="manual",
+            features=json.dumps({"manual_adjustment": True}, ensure_ascii=False),
+            locked=item["locked"],
+        )
+        db.add(pair)
+        created.append(pair)
+    db.flush()
+
+    final_rows = [*before, *created, *after]
+    for order, row in enumerate(final_rows):
+        row.pair_order = order
+    db.flush()
+    for pair in created:
+        src_indices = json.loads(pair.src_indices or "[]")
+        tgt_indices = json.loads(pair.tgt_indices or "[]")
+        anchor_side = "source" if src_indices else "target"
+        anchor_index = src_indices[0] if src_indices else tgt_indices[0] if tgt_indices else None
+        if anchor_index is not None:
+            anchor = db.query(DocumentAlignmentUnit).filter_by(
+                batch_id=batch_id,
+                side=anchor_side,
+                unit_index=anchor_index,
+            ).first()
+            if anchor is not None:
+                pair.block_type = anchor.block_type
+                pair.block_index = anchor.block_index
+                pair.row_index = anchor.row_index
+                pair.cell_index = anchor.cell_index
+        refresh_pair_text(db, pair)
+    validate_pair_integrity(db, batch_id)
+    db.flush()
+    return created

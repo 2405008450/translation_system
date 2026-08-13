@@ -149,12 +149,10 @@ def build_proofreading_export_rows(
 def build_export_readiness(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
     rows, file_record = build_proofreading_export_rows(db, batch)
     available_formats = (
-        ["proofreading_docx_ordered", "proofreading_audit_xlsx"]
+        ["proofreading_audit_xlsx"]
         if batch.batch_kind == "document_pair"
         else ["proofreading_xlsx_original"]
     )
-    if batch.batch_kind == "document_pair" and file_record and Path(file_record.filename).suffix.lower() == ".docx":
-        available_formats.insert(0, "proofreading_docx_layout")
     return {
         "batch_id": str(batch.id),
         "total": len(rows),
@@ -214,43 +212,50 @@ def export_alignment_csv(pairs: list[DocumentAlignmentPair]) -> bytes:
 
 
 def export_document_pair_xlsx(db: Session, batch: ProofreadingBatch) -> tuple[bytes, str]:
-    rows, _ = build_proofreading_export_rows(db, batch)
+    """导出纯对齐结果，不读取或生成校对后译文。"""
+    pairs = db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(
+        DocumentAlignmentPair.pair_order,
+    ).all()
     workbook = Workbook()
     sheet = workbook.active
-    sheet.title = "双文档校对"
+    sheet.title = "双文档对齐"
     sheet.append([
-        "序号", "类型", "原文", "原译文", "校对后译文", "是否修改",
-        "确认状态", "LLM 状态", "置信度", "对齐方法",
+        "序号", "对齐状态", "原文", "译文", "置信等级", "置信度",
+        "对齐方法", "原文单元索引", "译文单元索引",
     ])
     for cell in sheet[1]:
         cell.font = Font(bold=True)
         cell.fill = PatternFill(fill_type="solid", fgColor="FFD9EAF7")
-    for row in rows:
+    for pair in pairs:
+        source_indices = json.loads(pair.src_indices or "[]")
+        target_indices = json.loads(pair.tgt_indices or "[]")
+        status = (
+            "原文无对应译文" if source_indices and not target_indices
+            else "译文无对应原文" if target_indices and not source_indices
+            else "低置信" if pair.confidence_level == "low"
+            else "建议复核" if pair.confidence_level == "medium"
+            else "已对齐"
+        )
         sheet.append([
-            row.order + 1, row.kind, row.source_text, row.original_target_text,
-            row.reviewed_target_text or MISSING_TRANSLATION_LABEL,
-            "是" if row.changed else "否", row.confirmation_status, row.llm_status,
-            row.confidence if row.confidence is not None else "", row.method,
+            pair.pair_order + 1, status, pair.source_text or "", pair.target_text or "",
+            pair.confidence_level, pair.confidence, pair.method,
+            ",".join(map(str, source_indices)), ",".join(map(str, target_indices)),
         ])
-        if row.changed:
-            cell = sheet.cell(row=sheet.max_row, column=5)
-            cell.font = Font(color="FF0563C1", bold=True)
-            cell.fill = PatternFill(fill_type="solid", fgColor="FFDDEBFF")
-        if row.kind == "缺译":
-            cell = sheet.cell(row=sheet.max_row, column=5)
+        if status in {"原文无对应译文", "译文无对应原文", "低置信"}:
+            cell = sheet.cell(row=sheet.max_row, column=2)
             cell.font = Font(color="FF9C0006", bold=True)
             cell.fill = PatternFill(fill_type="solid", fgColor="FFFFC7CE")
         for cell in sheet[sheet.max_row]:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = f"A1:J{sheet.max_row}"
+    sheet.auto_filter.ref = f"A1:I{sheet.max_row}"
     sheet.sheet_view.showGridLines = False
-    for column, width in zip("ABCDEFGHIJ", (9, 11, 45, 45, 45, 11, 12, 12, 12, 18)):
+    for column, width in zip("ABCDEFGHI", (9, 18, 48, 48, 12, 12, 20, 20, 20)):
         sheet.column_dimensions[column].width = width
     output = BytesIO()
     workbook.save(output)
     workbook.close()
-    return output.getvalue(), f"{Path(batch.filename).stem}_双文档校对版.xlsx"
+    return output.getvalue(), f"{Path(batch.filename).stem}_原文译文对齐表.xlsx"
 
 
 def export_ordered_bilingual_docx(

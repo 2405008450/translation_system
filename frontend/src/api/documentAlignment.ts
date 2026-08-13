@@ -8,6 +8,8 @@ export interface AlignmentPreviewSide {
   unit_count: number
   block_types: Record<string, number>
   character_count: number
+  paragraph_count: number
+  table_count: number
 }
 
 export interface AlignmentPreview {
@@ -46,7 +48,7 @@ export async function createDocumentAlignmentBatch(projectId: string, payload: {
   granularity: 'sentence' | 'paragraph'
   use_llm_for_hard_blocks: boolean
   full_review: boolean
-  alignment_strategy: 'order_first' | 'structure_aware'
+  alignment_strategy: 'hierarchical_llm' | 'order_first' | 'structure_aware'
 }) {
   const { data } = await http.post<ProofreadingBatch>(`/projects/${projectId}/document-alignment-batches`, payload)
   return data
@@ -56,6 +58,7 @@ export async function listAlignmentPairs(batchId: string, params: {
   page?: number
   page_size?: number
   confidence_level?: AlignmentPair['confidence_level']
+  q?: string
 } = {}) {
   const { data } = await http.get<{ items: AlignmentPair[]; total: number }>(`/proofreading-batches/${batchId}/alignment-pairs`, {
     params: { page: 1, page_size: 100, ...params },
@@ -134,6 +137,32 @@ export async function shiftAlignmentBoundary(batchId: string, pairId: string, di
   await http.post(`/proofreading-batches/${batchId}/alignment-pairs/shift-boundary`, { pair_id: pairId, side: 'target', direction })
 }
 
+export interface AlignmentPairReplacement {
+  src_indices: number[]
+  tgt_indices: number[]
+  locked: boolean
+}
+
+export async function replaceAlignmentPairRange(batchId: string, payload: {
+  start_order: number
+  delete_count: number
+  replacements: AlignmentPairReplacement[]
+}) {
+  const { data } = await http.post<{ items: AlignmentPair[] }>(
+    `/proofreading-batches/${batchId}/alignment-pairs/replace-range`,
+    payload,
+  )
+  return data
+}
+
+export async function updateAlignmentPairText(
+  pairId: string,
+  payload: { source_text?: string; target_text?: string },
+) {
+  const { data } = await http.patch<AlignmentPair>(`/alignment-pairs/${pairId}/text`, payload)
+  return data
+}
+
 export async function rerunAlignment(batchId: string) {
   await http.post(`/proofreading-batches/${batchId}/alignment/rerun`)
 }
@@ -143,11 +172,13 @@ export async function cancelAlignment(batchId: string) {
   return data
 }
 
-export async function downloadAlignmentCsv(batchId: string) {
-  return http.get<Blob>(`/proofreading-batches/${batchId}/alignment/export.csv`, { responseType: 'blob' })
+export async function confirmAlignment(batchId: string) {
+  const { data } = await http.post<{ batch: ProofreadingBatch; file_record_id: string }>(
+    `/proofreading-batches/${batchId}/alignment/confirm`,
+  )
+  return data
 }
 
-export async function confirmAlignment(batchId: string) {
-  const { data } = await http.post<{ file_record_id: string }>(`/proofreading-batches/${batchId}/alignment/confirm`)
-  return data
+export async function downloadAlignmentCsv(batchId: string) {
+  return http.get<Blob>(`/proofreading-batches/${batchId}/alignment/export.csv`, { responseType: 'blob' })
 }

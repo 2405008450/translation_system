@@ -59,7 +59,7 @@ def _create_pair_segment(
     source_hash_text = f"translation-only:{pair.id}" if translation_only else pair.source_text
     segment = Segment(
         file_record_id=file_record.id, workflow_step_id=workflow_step_id,
-        sentence_id=f"align-{pair.pair_order:05d}", source_text=source_text,
+        sentence_id=f"align-{pair.id}", source_text=source_text,
         source_hash=build_source_hash(source_hash_text), display_text=source_text,
         target_text=pair.target_text, status="none",
         source=IMPORTED_TRANSLATION_SOURCE if pair.target_text else "none",
@@ -80,7 +80,12 @@ def _create_pair_segment(
     return segment, baseline
 
 
-def ensure_document_pair_segments_complete(db: Session, batch: ProofreadingBatch) -> int:
+def ensure_document_pair_segments_complete(
+    db: Session,
+    batch: ProofreadingBatch,
+    *,
+    refresh_existing: bool = False,
+) -> int:
     """幂等补齐历史双文档批次中曾被跳过的增译，并恢复 pair_order 顺序。"""
     if batch.batch_kind != "document_pair" or batch.alignment_status != "confirmed":
         return 0
@@ -93,7 +98,8 @@ def ensure_document_pair_segments_complete(db: Session, batch: ProofreadingBatch
     baselines = db.query(ProofreadingSegmentBaseline).filter_by(batch_id=batch.id).all()
     segments_by_pair_id: dict[str, Segment] = {}
     baselines_by_segment = {item.segment_id: item for item in baselines}
-    for segment in db.query(Segment).filter_by(file_record_id=file_record.id).all():
+    existing_segments = db.query(Segment).filter_by(file_record_id=file_record.id).all()
+    for segment in existing_segments:
         try:
             metadata = json.loads(segment.segment_metadata or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -105,6 +111,21 @@ def ensure_document_pair_segments_complete(db: Session, batch: ProofreadingBatch
     pairs = db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(
         DocumentAlignmentPair.pair_order,
     ).all()
+    active_pair_ids = {str(pair.id) for pair in pairs}
+    if refresh_existing:
+        for segment in existing_segments:
+            try:
+                metadata = json.loads(segment.segment_metadata or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            pair_id = str(metadata.get("alignment_pair_id") or "")
+            if pair_id and pair_id not in active_pair_ids:
+                db.query(ProofreadingSegmentBaseline).filter_by(segment_id=segment.id).delete(
+                    synchronize_session=False,
+                )
+                db.delete(segment)
+                segments_by_pair_id.pop(pair_id, None)
+        db.flush()
     workflow_step_id = batch.project.workflow_steps[0].id if batch.project.workflow_steps else None
     added = 0
     ordered_segments: list[Segment] = []
@@ -120,7 +141,28 @@ def ensure_document_pair_segments_complete(db: Session, batch: ProofreadingBatch
         else:
             metadata = _pair_segment_metadata(batch, pair)
             segment.segment_metadata = json.dumps(metadata, ensure_ascii=False)
-            if metadata["translation_only"]:
+            if refresh_existing:
+                source_text = TRANSLATION_ONLY_SOURCE_LABEL if metadata["translation_only"] else pair.source_text
+                segment.source_text = source_text
+                segment.display_text = source_text
+                segment.source_hash = build_source_hash(
+                    f"translation-only:{pair.id}" if metadata["translation_only"] else pair.source_text,
+                )
+                segment.source_word_count = 0 if metadata["translation_only"] else count_source_words(pair.source_text)
+                existing_baseline = baselines_by_segment.get(segment.id)
+                # 对齐模式下句段尚未人工校对，可以随边界调整同步原始译文；
+                # 已经产生人工校对内容的历史任务必须保留 target_text。
+                if (
+                    segment.status != "confirmed"
+                    or existing_baseline is None
+                    or (segment.target_text or "") == (existing_baseline.original_target_text or "")
+                ):
+                    segment.target_text = pair.target_text
+                segment.block_type = pair.block_type
+                segment.block_index = pair.block_index
+                segment.row_index = pair.row_index
+                segment.cell_index = pair.cell_index
+            elif metadata["translation_only"]:
                 segment.source_text = TRANSLATION_ONLY_SOURCE_LABEL
                 segment.display_text = TRANSLATION_ONLY_SOURCE_LABEL
                 segment.source_hash = build_source_hash(f"translation-only:{pair.id}")
@@ -141,6 +183,10 @@ def ensure_document_pair_segments_complete(db: Session, batch: ProofreadingBatch
             db.add(baseline)
             baselines_by_segment[segment.id] = baseline
         baseline.row_index = pair.pair_order
+        if refresh_existing:
+            baseline.source_cell_ref = f"S{pair.pair_order}"
+            baseline.target_cell_ref = f"T{pair.pair_order}"
+            baseline.original_target_text = pair.target_text
     for sequence, segment in enumerate(ordered_segments):
         segment.sequence_index = sequence
         segment.display_index = sequence

@@ -49,6 +49,7 @@ const props = withDefaults(defineProps<{
   showProofreadingDiff?: boolean
   /** 校对工作台专用的 LLM 修改建议；非校对任务为 null。 */
   proofreadingSuggestion?: ProofreadingSuggestion | null
+  alignmentMode?: boolean
 }>(), {
   disabled: false,
   sourceEditing: false,
@@ -79,6 +80,7 @@ const props = withDefaults(defineProps<{
   originalTargetText: null,
   showProofreadingDiff: true,
   proofreadingSuggestion: null,
+  alignmentMode: false,
 })
 
 const emit = defineEmits<{
@@ -274,6 +276,12 @@ const isEmptyTarget = computed(() => {
   const targetText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
   return targetText.length === 0
 })
+const isAlignmentTranslationOnly = computed(() => (
+  props.alignmentMode && props.segment.alignment_translation_only === true
+))
+const isAlignmentMissingTranslation = computed(() => (
+  props.alignmentMode && !props.segment.alignment_translation_only && isEmptyTarget.value
+))
 const proofreadingTargetText = computed(() => (
   props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
 ))
@@ -2955,7 +2963,7 @@ watch(
 <template>
   <article
     class="segment-row"
-    :class="[statusClass, parityClass, { 'is-active': active, 'is-selected': selected, 'has-pending-revision': hasPendingRevision, 'is-empty-target': isEmptyTarget, 'is-proofreading-changed': isProofreadingChanged }]"
+    :class="[statusClass, parityClass, { 'is-active': active, 'is-selected': selected, 'has-pending-revision': hasPendingRevision, 'is-empty-target': isEmptyTarget, 'is-proofreading-changed': isProofreadingChanged, 'is-alignment-mode': alignmentMode, 'is-alignment-translation-only': isAlignmentTranslationOnly, 'is-alignment-missing-translation': isAlignmentMissingTranslation }]"
     :id="`segment-${segmentKey}`"
     data-testid="segment-row"
     :data-sentence-id="segmentKey"
@@ -2965,6 +2973,8 @@ watch(
   >
     <div class="segment-row__meta">
       <span class="segment-row__index">{{ index + 1 }}</span>
+      <span v-if="isAlignmentTranslationOnly" class="segment-row__alignment-issue-badge is-translation-only">增译</span>
+      <span v-else-if="isAlignmentMissingTranslation" class="segment-row__alignment-issue-badge is-missing">漏译</span>
       <button
         class="segment-row__selection-toggle"
         type="button"
@@ -3224,7 +3234,7 @@ watch(
       <span class="segment-row__suggestion-text">{{ proofreadingSuggestion.text }}</span>
     </div>
 
-    <div v-else class="segment-row__cell segment-row__cell--state" :title="stateCellTitle">
+    <div v-else-if="!alignmentMode" class="segment-row__cell segment-row__cell--state" :title="stateCellTitle">
       <span
         v-if="segment.status === 'confirmed' && !isProjectSynced"
         class="segment-row__confirm-mark"
@@ -3257,13 +3267,55 @@ watch(
       </span>
     </div>
 
-    <div v-if="proofreadingSuggestion === null" class="segment-row__cell segment-row__cell--workflow">
+    <div v-if="proofreadingSuggestion === null && !alignmentMode" class="segment-row__cell segment-row__cell--workflow">
       <span class="segment-row__workflow-label">{{ workflowLabel }}</span>
     </div>
   </article>
 </template>
 
 <style scoped>
+.segment-row.is-alignment-mode.is-alignment-translation-only {
+  --segment-row-bg: linear-gradient(90deg, #fff5d6 0%, #fffaf0 48%, #fffdf7 100%);
+  --segment-row-border: #e1b955;
+  --segment-row-accent: #c48708;
+  --segment-meta-bg: #ffedb7;
+  --segment-source-bg: #fff7df;
+  --segment-source-hover-bg: #ffefbd;
+  --segment-target-bg: #fffaf0;
+}
+
+.segment-row.is-alignment-mode.is-alignment-missing-translation {
+  --segment-row-bg: linear-gradient(90deg, #ffe7e7 0%, #fff4f4 48%, #fffafa 100%);
+  --segment-row-border: #df8d8d;
+  --segment-row-accent: #c44747;
+  --segment-meta-bg: #ffd6d6;
+  --segment-source-bg: #ffeded;
+  --segment-source-hover-bg: #ffdddd;
+  --segment-target-bg: #fff3f3;
+}
+
+.segment-row__alignment-issue-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.segment-row__alignment-issue-badge.is-translation-only {
+  background: #d79000;
+  color: #fff;
+}
+
+.segment-row__alignment-issue-badge.is-missing {
+  background: #c44747;
+  color: #fff;
+}
+
 .segment-row.is-selected {
   background-color: rgba(13, 122, 104, 0.12);
   outline: 2px solid rgba(13, 122, 104, 0.45);

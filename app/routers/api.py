@@ -11146,6 +11146,8 @@ def _serialize_workbench_segment(
     alignment_pair_id = None
     alignment_pair_order = None
     alignment_translation_only = False
+    alignment_src_indices: list[int] = []
+    alignment_tgt_indices: list[int] = []
     try:
         alignment_metadata = json.loads(seg.segment_metadata or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -11157,6 +11159,12 @@ def _serialize_workbench_segment(
         if isinstance(raw_alignment_pair_order, int) and not isinstance(raw_alignment_pair_order, bool):
             alignment_pair_order = raw_alignment_pair_order
         alignment_translation_only = bool(alignment_metadata.get("translation_only"))
+        raw_src_indices = alignment_metadata.get("src_indices")
+        raw_tgt_indices = alignment_metadata.get("tgt_indices")
+        if isinstance(raw_src_indices, list):
+            alignment_src_indices = [value for value in raw_src_indices if isinstance(value, int) and not isinstance(value, bool)]
+        if isinstance(raw_tgt_indices, list):
+            alignment_tgt_indices = [value for value in raw_tgt_indices if isinstance(value, int) and not isinstance(value, bool)]
 
     payload = {
         "id": str(seg.id),
@@ -11197,6 +11205,8 @@ def _serialize_workbench_segment(
         "alignment_pair_id": alignment_pair_id,
         "alignment_pair_order": alignment_pair_order,
         "alignment_translation_only": alignment_translation_only,
+        "alignment_src_indices": alignment_src_indices,
+        "alignment_tgt_indices": alignment_tgt_indices,
         "workflow_step_id": str(resolved_workflow_step_id) if resolved_workflow_step_id else None,
         "workflow_step_name": workflow_step.name if workflow_step else "翻译",
         "workflow_step_order": int(workflow_step.sort_order or 0) if workflow_step else 0,
@@ -12751,6 +12761,7 @@ def get_file_record_next_unconfirmed_segment_position(
     after_sentence_id: str | None = None,
     page_size: int = 100,
     wrap: bool = True,
+    require_unconfirmed: bool = True,
     scope: str = "all",
     source_query: str | None = None,
     target_query: str | None = None,
@@ -12830,7 +12841,7 @@ def get_file_record_next_unconfirmed_segment_position(
     display_index_map = _get_segment_display_index_map(db, file_record_id, filtered_segments)
 
     def is_target_unconfirmed(item: Any) -> bool:
-        return getattr(item, "status", None) != "confirmed"
+        return not require_unconfirmed or getattr(item, "status", None) != "confirmed"
 
     def get_display_position(item: Any, fallback_index: int) -> int:
         return display_index_map.get(item.id, fallback_index) + 1
@@ -12852,7 +12863,7 @@ def get_file_record_next_unconfirmed_segment_position(
                 break
 
     if not row:
-        return {"target": None, "wrapped": False}
+        return {"target": None, "wrapped": False, "matched_count": 0}
 
     filtered_index = max(filtered_index, 0)
     display_position = get_display_position(row, filtered_index)
@@ -12868,6 +12879,11 @@ def get_file_record_next_unconfirmed_segment_position(
             "page_index": filtered_index % safe_page_size,
         },
         "wrapped": wrapped,
+        "matched_count": (
+            sum(1 for item in filtered_segments if is_target_unconfirmed(item))
+            if require_unconfirmed
+            else len(filtered_segments)
+        ),
     }
 
 

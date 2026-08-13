@@ -2159,7 +2159,14 @@ def _collect_inline_content(
             )
 
     if node.tag == _qn("w", "fldChar"):
-        _update_field_state(node, story.kind, parse_state)
+        field_text = _update_field_state(node, story.kind, parse_state)
+        if field_text:
+            return [InlineFragment(
+                display_text=field_text,
+                source_text=field_text,
+                css=inherited_css,
+                href=hyperlink,
+            )], [], []
         return [], [], []
 
     if node.tag == _qn("w", "instrText"):
@@ -2655,14 +2662,14 @@ def _update_field_state(
     node: ET.Element,
     story_kind: str,
     parse_state: InlineParseState,
-) -> None:
+) -> str | None:
     field_type = node.get(_qn("w", "fldCharType"))
     if field_type == "begin":
         parse_state.field_stack.append(TrackedField())
-        return
+        return None
 
     if not parse_state.field_stack:
-        return
+        return None
 
     current_field = parse_state.field_stack[-1]
     if field_type == "separate":
@@ -2675,10 +2682,37 @@ def _update_field_state(
         current_field.href = _resolve_internal_reference_field_target(instruction)
         if current_field.suppress_result:
             parse_state.suppressed_page_number_field = True
-        return
+        return None
 
     if field_type == "end":
-        parse_state.field_stack.pop()
+        completed_field = parse_state.field_stack.pop()
+        # 某些上市公司报告用宏按钮字段模拟复选框，没有 w:t 字段结果；
+        # Word 能显示，但普通文本提取器只会看到 instrText。这里将其物化为
+        # 稳定的可对齐文本，同时不影响具有 separate/result 的普通字段。
+        if completed_field.collecting_instruction:
+            return _checkbox_macro_field_text("".join(completed_field.instruction_parts))
+    return None
+
+
+def _checkbox_macro_field_text(instruction: str) -> str | None:
+    normalized = " ".join((instruction or "").split())
+    match = re.match(
+        r"^MACROBUTTON\s+SnrToggleCheckbox\s+(\S+)\s+(.+?)$",
+        normalized,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    raw_marker, label = match.groups()
+    marker = {
+        "ĄĖ": "√",
+        "Ąõ": "□",
+        "√": "√",
+        "□": "□",
+    }.get(raw_marker)
+    if marker is None:
+        return None
+    return f"{marker} {label.strip()} "
 
 
 def _should_suppress_page_number_field(instruction: str, story_kind: str) -> bool:

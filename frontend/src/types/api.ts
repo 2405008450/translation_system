@@ -508,6 +508,8 @@ export interface Segment {
   alignment_pair_id?: string | null
   alignment_pair_order?: number | null
   alignment_translation_only?: boolean
+  alignment_src_indices?: number[]
+  alignment_tgt_indices?: number[]
   workflow_step_id?: string | null
   workflow_step_name?: string | null
   workflow_step_order?: number | null
@@ -999,6 +1001,7 @@ export interface SegmentPositionResponse {
 export interface SegmentNextUnconfirmedPositionResponse {
   target: SegmentPositionResponse | null
   wrapped: boolean
+  matched_count?: number
 }
 
 /** 合并视图摘要（列表项） */

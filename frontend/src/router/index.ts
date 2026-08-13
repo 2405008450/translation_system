@@ -4,6 +4,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import AppLayout from '../views/AppLayout.vue'
 import AssignmentEventsView from '../views/AssignmentEventsView.vue'
+import DocumentAlignmentView from '../views/DocumentAlignmentView.vue'
 import GlossaryBaseEditView from '../views/GlossaryBaseEditView.vue'
 
 // 数据看板按需懒加载：naive-ui + echarts 体积较大，避免拖慢首屏
@@ -95,6 +96,19 @@ const router = createRouter({
         pageDescription: '在同一工作台按文件分区编辑多个文件',
         pageTitleKey: 'pages.workbench.title',
         pageDescriptionKey: 'pages.workbench.description',
+      },
+    },
+    {
+      path: '/projects/:id/alignment',
+      name: 'document-alignment',
+      component: DocumentAlignmentView,
+      props: true,
+      meta: {
+        requiresAuth: true,
+        navSection: 'projects',
+        pageTitle: '双文档对齐工作台',
+        pageDescription: '检查并微调原文与译文的对应边界',
+        hidePageHeader: true,
       },
     },
     {
