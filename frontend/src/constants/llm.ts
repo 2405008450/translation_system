@@ -17,6 +17,7 @@ export interface LLMModelOption {
 export const defaultLLMModelId = 'google/gemini-3-flash-preview'
 
 export const llmModelShortLabelMap: Record<string, string> = {
+  'google/gemini-3.7-flash': 'Gemini 3.7 Flash',
   'google/gemini-3.5-flash': 'Gemini 3.5',
   'google/gemini-3.1-pro-preview': 'Gemini 3.1 Pro',
   'google/gemini-3.1-flash-lite': 'Gemini 3.1 Lite',
@@ -32,6 +33,12 @@ export const llmModelShortLabelMap: Record<string, string> = {
 }
 
 export const llmModelOptions: LLMModelOption[] = [
+  {
+    id: 'google/gemini-3.7-flash',
+    name: 'Gemini 3.7 Flash',
+    family: 'gemini',
+    provider: 'openrouter',
+  },
   {
     id: defaultLLMModelId,
     name: 'Gemini 3 Flash Preview',

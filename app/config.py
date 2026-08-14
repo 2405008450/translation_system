@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     alignment_llm_refinement_enabled: bool = True
     # 向量候选完成后，将全部键值对分块交给指定 LLM 做边界复核。
     alignment_llm_full_review_enabled: bool = False
-    alignment_llm_full_review_model: str = "google/gemini-3-flash-preview"
+    alignment_llm_full_review_model: str = "google/gemini-3.7-flash"
     alignment_llm_full_review_max_pairs: int = 28
     alignment_llm_full_review_max_chars: int = 18000
     alignment_llm_full_review_table_max_pairs: int = 24

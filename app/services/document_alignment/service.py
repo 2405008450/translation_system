@@ -163,7 +163,7 @@ def create_alignment_batch(
             # 双文档入口默认使用已经通过超长表格文档验证的 V6 全量复核链路。
             # 这是批次级快照，避免部署环境的全局开关改变历史批次行为。
             "full_review": full_review,
-            "full_review_model": "google/gemini-3-flash-preview",
+            "full_review_model": get_settings().alignment_llm_full_review_model,
         }, ensure_ascii=False),
     )
     db.add(batch)
@@ -213,7 +213,7 @@ async def _compute_hierarchical_pairs(
             pairs, src, tgt, ratio,
             model=str(config.get("full_review_model") or getattr(
                 settings, "alignment_llm_full_review_model",
-                "google/gemini-3-flash-preview",
+                "google/gemini-3.7-flash",
             )),
             max_pairs=max(1, int(getattr(settings, "alignment_llm_full_review_max_pairs", 28))),
             max_chars=max(1000, int(getattr(settings, "alignment_llm_full_review_max_chars", 18000))),
@@ -374,7 +374,7 @@ async def _compute_pairs(
                 result, src, tgt, ratio,
                 model=str(config.get("full_review_model") or getattr(
                     settings, "alignment_llm_full_review_model",
-                    "google/gemini-3-flash-preview",
+                    "google/gemini-3.7-flash",
                 )),
                 max_pairs=max(1, int(getattr(settings, "alignment_llm_full_review_max_pairs", 28))),
                 max_chars=max(1000, int(getattr(settings, "alignment_llm_full_review_max_chars", 18000))),

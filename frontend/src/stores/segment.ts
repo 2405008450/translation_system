@@ -2530,15 +2530,16 @@ export const useSegmentStore = defineStore('segment', () => {
       if (!synced) {
         return 0
       }
-      const results = await Promise.all(
-        targetFileIds.map((fileId) =>
-          http.post<{ updated_count: number }>(
-            `/file-records/${fileId}/segments/confirmation`,
-            target === 'merge_view' ? { action } : payload,
-          ),
-        ),
-      )
-      const updatedCount = results.reduce((sum, result) => sum + Number(result.data.updated_count || 0), 0)
+      let updatedCount = 0
+      // 合并视图中的文件可能包含相同 source_hash。串行确认可避免多个事务同时
+      // upsert 同一批项目同步 outbox 记录，降低数据库锁竞争和死锁概率。
+      for (const fileId of targetFileIds) {
+        const { data } = await http.post<{ updated_count: number }>(
+          `/file-records/${fileId}/segments/confirmation`,
+          target === 'merge_view' ? { action } : payload,
+        )
+        updatedCount += Number(data.updated_count || 0)
+      }
       await refreshMergeViewDetail()
       await refreshMergeViewPage(resolveCurrentMergeQuery())
       return updatedCount
