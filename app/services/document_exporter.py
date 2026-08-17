@@ -39,9 +39,12 @@ from app.services.document_workspace import (
     _decode_symbol,
     _iter_chart_text_elements,
     _iter_block_nodes,
+    _iter_table_cells,
+    _iter_table_rows,
     _iter_related_chart_parts,
     _local_name,
     _normalize_segment_source_text,
+    _parse_checkbox_macro_field,
     _qn,
     _resolve_internal_reference_field_target,
     _resolve_paragraph_numbering_reference,
@@ -481,6 +484,10 @@ class TextToken:
     is_math: bool = False
     is_hyperlink: bool = False
     hyperlink_element: object | None = None
+    field_instruction_prefix: str | None = None
+    field_instruction_suffix: str = ""
+    field_instruction_extra_elements: list[ET.Element] = field(default_factory=list)
+    checkbox_marker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -493,6 +500,9 @@ class CellParagraphTokens:
 @dataclass
 class ExportTrackedField:
     instruction_parts: list[str] = field(default_factory=list)
+    instruction_elements: list[ET.Element] = field(default_factory=list)
+    instruction_runs: list[ET.Element | None] = field(default_factory=list)
+    instruction_containers: list[ET.Element | None] = field(default_factory=list)
     collecting_instruction: bool = True
     hyperlink_key: object | None = None
 
@@ -1270,8 +1280,8 @@ def _export_bilingual_table(
 ) -> None:
     block_index = next(block_counter)
 
-    for row_index, row in enumerate(table.findall("./w:tr", NS)):
-        for cell_index, cell in enumerate(row.findall("./w:tc", NS)):
+    for row_index, row in enumerate(_iter_table_rows(table)):
+        for cell_index, cell in enumerate(_iter_table_cells(row)):
             _export_bilingual_table_cell(
                 cell=cell,
                 story=story,
@@ -1323,8 +1333,8 @@ def _export_table(
 ) -> None:
     block_index = next(block_counter)
 
-    for row_index, row in enumerate(table.findall("./w:tr", NS)):
-        for cell_index, cell in enumerate(row.findall("./w:tc", NS)):
+    for row_index, row in enumerate(_iter_table_rows(table)):
+        for cell_index, cell in enumerate(_iter_table_cells(row)):
             _export_table_cell(
                 cell=cell,
                 story=story,
@@ -2049,12 +2059,40 @@ def _collect_inline_tokens(
         current_run_container = parent_element
 
     if node.tag == _qn("w", "fldChar"):
-        _update_export_field_state(node, active_field_stack)
-        return []
+        completed_field = _update_export_field_state(node, active_field_stack)
+        if completed_field is None:
+            return []
+        instruction = "".join(completed_field.instruction_parts)
+        checkbox = _parse_checkbox_macro_field(instruction)
+        if checkbox is None or not completed_field.instruction_elements:
+            return []
+        marker, label = checkbox
+        affixes = _split_checkbox_macro_instruction_affixes(instruction)
+        if affixes is None:
+            return []
+        prefix, suffix = affixes
+        return [
+            TextToken(
+                display_text=f"{marker} {label} ",
+                source_text=f"{marker} {label} ",
+                element=completed_field.instruction_elements[0],
+                run_element=completed_field.instruction_runs[0],
+                anchor_element=completed_field.instruction_runs[0],
+                container_element=completed_field.instruction_containers[0],
+                original_text=f"{marker} {label} ",
+                field_instruction_prefix=prefix,
+                field_instruction_suffix=suffix,
+                field_instruction_extra_elements=completed_field.instruction_elements[1:],
+                checkbox_marker=marker,
+            )
+        ]
 
     if node_name == "instrText":
         if active_field_stack and active_field_stack[-1].collecting_instruction:
             active_field_stack[-1].instruction_parts.append(node.text or "")
+            active_field_stack[-1].instruction_elements.append(node)
+            active_field_stack[-1].instruction_runs.append(current_run)
+            active_field_stack[-1].instruction_containers.append(current_run_container)
         return []
 
     field_hyperlink = _current_export_field_hyperlink(active_field_stack)
@@ -2152,24 +2190,36 @@ def _collect_inline_tokens(
 def _update_export_field_state(
     node: ET.Element,
     field_stack: list[ExportTrackedField],
-) -> None:
+) -> ExportTrackedField | None:
     field_type = node.get(_qn("w", "fldCharType"))
     if field_type == "begin":
         field_stack.append(ExportTrackedField())
-        return
+        return None
 
     if not field_stack:
-        return
+        return None
 
     current_field = field_stack[-1]
     if field_type == "separate":
         current_field.collecting_instruction = False
         if _resolve_internal_reference_field_target("".join(current_field.instruction_parts)):
             current_field.hyperlink_key = current_field
-        return
+        return None
 
     if field_type == "end":
-        field_stack.pop()
+        return field_stack.pop()
+    return None
+
+
+def _split_checkbox_macro_instruction_affixes(instruction: str) -> tuple[str, str] | None:
+    match = re.match(
+        r"^(\s*MACROBUTTON\s+SnrToggleCheckbox\s+)(.*?)(\s*)$",
+        instruction or "",
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    return match.group(1), match.group(3)
 
 
 def _current_export_field_hyperlink(field_stack: list[ExportTrackedField]) -> object | None:
@@ -3622,6 +3672,8 @@ def _queue_sentence_replacement(
     span: SentenceSpan,
     replacement: str,
 ) -> None:
+    if _queue_checkbox_macro_replacement(tokens, span, replacement):
+        return
     if _queue_sentence_replacement_preserving_hyperlink_scope(tokens, span, replacement):
         return
 
@@ -3648,6 +3700,44 @@ def _queue_sentence_replacement(
         replacement,
         structural_line_break_tokens=structural_line_break_tokens,
     )
+
+
+def _queue_checkbox_macro_replacement(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    replacement: str,
+) -> bool:
+    overlapping_tokens = [
+        token
+        for token in tokens
+        if token.start < span.end
+        and token.end > span.start
+        and normalize_text(
+            token.display_text[
+                max(span.start, token.start) - token.start:
+                min(span.end, token.end) - token.start
+            ]
+        )
+    ]
+    if not overlapping_tokens or any(token.checkbox_marker is None for token in overlapping_tokens):
+        return False
+
+    checkbox_matches = list(re.finditer(r"[√□]", replacement))
+    if len(checkbox_matches) != len(overlapping_tokens):
+        return False
+
+    replacement_parts: list[str] = []
+    for index, match in enumerate(checkbox_matches):
+        end = checkbox_matches[index + 1].start() if index + 1 < len(checkbox_matches) else len(replacement)
+        part = replacement[match.start():end].strip()
+        if not part:
+            return False
+        replacement_parts.append(f"{part} ")
+
+    for token, replacement_part in zip(overlapping_tokens, replacement_parts, strict=True):
+        token.edits.append((0, len(token.display_text), replacement_part))
+        token.apply_export_font = False
+    return True
 
 
 @dataclass(frozen=True)
@@ -3795,12 +3885,28 @@ def _apply_token_edits(tokens: list[TextToken]) -> None:
             text_value = f"{text_value[:start]}{replacement}{text_value[end:]}"
 
         text_value = _sanitize_xml_text(text_value)
-        token.element.text = text_value
-        if _needs_space_preserve(text_value):
+        if token.field_instruction_prefix is not None:
+            serialized_text = (
+                f"{token.field_instruction_prefix}"
+                f"{text_value.strip()}"
+                f"{token.field_instruction_suffix}"
+            )
+            for extra_element in token.field_instruction_extra_elements:
+                extra_element.text = ""
+                extra_element.attrib.pop(XML_SPACE_ATTR, None)
+        else:
+            serialized_text = text_value
+
+        token.element.text = serialized_text
+        if _needs_space_preserve(serialized_text):
             token.element.set(XML_SPACE_ATTR, "preserve")
         else:
             token.element.attrib.pop(XML_SPACE_ATTR, None)
-        if token.apply_export_font and token.run_element is not None:
+        if (
+            token.apply_export_font
+            and token.field_instruction_prefix is None
+            and token.run_element is not None
+        ):
             _apply_export_font(token.run_element)
 
 
