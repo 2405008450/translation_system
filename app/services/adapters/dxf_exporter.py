@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import re
+import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -1024,19 +1025,18 @@ class DxfExporter:
         from ezdxf import recover
         from ezdxf.lldxf.const import DXFError
 
+        # 优先直接读取二进制流，避免“大 bytes -> 大 str -> 大 bytes”的双重复制。
+        try:
+            doc, _ = recover.read(io.BytesIO(raw_bytes))
+            return doc
+        except Exception:  # noqa: BLE001 - 再按候选编码走兼容读取
+            pass
+
         for encoding in ("utf-8", "utf-8-sig", "cp1252", "gb18030", "iso-8859-1"):
             try:
                 text = raw_bytes.decode(encoding)
             except UnicodeDecodeError:
                 continue
-            stream = io.BytesIO(text.encode("utf-8"))
-            try:
-                doc, _ = recover.read(stream)
-                return doc
-            except DXFError:
-                pass
-            except Exception:  # noqa: BLE001
-                pass
             try:
                 return ezdxf.read(io.StringIO(text))
             except DXFError:
@@ -1045,9 +1045,16 @@ class DxfExporter:
 
     @staticmethod
     def _write_doc(doc) -> bytes:
-        buffer = io.StringIO()
-        doc.write(buffer)
-        return buffer.getvalue().encode("utf-8")
+        # StringIO 会同时保留完整 Unicode 字符串和最终 bytes，百 MB DXF 会产生很高峰值。
+        # 直接编码写入磁盘临时流，最终内存中只保留必须返回的一份 bytes。
+        with tempfile.TemporaryFile(mode="w+b") as buffer:
+            writer = io.TextIOWrapper(buffer, encoding="utf-8", newline="")
+            doc.write(writer)
+            writer.flush()
+            buffer.seek(0)
+            content = buffer.read()
+            writer.detach()
+            return content
 
     def _clear_entity_text(
         self,

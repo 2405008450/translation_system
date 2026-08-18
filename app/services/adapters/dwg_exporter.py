@@ -127,12 +127,26 @@ class DwgExporter:
             merged_text_info=merged_text_info,
             mtext_split_info=mtext_split_info,
         )
+        intermediate_size = len(dxf_bytes)
+        del dxf_bytes
 
         if not want_dwg:
+            logger.info(
+                "DWG 导出保留 DXF：源文件=%d bytes，中间 DXF=%d bytes，输出=%d bytes",
+                len(original_bytes),
+                intermediate_size,
+                len(translated_dxf),
+            )
             return DwgExportResult(content=translated_dxf, extension=".dxf", fallback_used=False)
 
         try:
             dwg_bytes = dxf_to_dwg(translated_dxf)
+            logger.info(
+                "DWG 导出完成：源文件=%d bytes，中间 DXF=%d bytes，输出 DWG=%d bytes",
+                len(original_bytes),
+                intermediate_size,
+                len(dwg_bytes),
+            )
             return DwgExportResult(content=dwg_bytes, extension=".dwg", fallback_used=False)
         except (DwgConverterUnavailable, DwgConverterError) as exc:
             logger.warning("DXF 回写 DWG 失败，降级返回 DXF：%s", exc)

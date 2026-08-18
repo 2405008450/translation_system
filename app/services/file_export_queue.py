@@ -313,7 +313,9 @@ def build_file_export_download_response(task: FileExportTask) -> FileResponse:
             "Content-Disposition": (
                 f'attachment; filename="{ascii_filename}"; '
                 f"filename*=UTF-8''{quoted_filename}"
-            )
+            ),
+            # FileResponse 本身会分块发送文件；同时禁止 Nginx 缓冲整个大文件响应。
+            "X-Accel-Buffering": "no",
         },
     )
 
@@ -408,46 +410,65 @@ def _resolve_file_record_export_language_pair(file_record: FileRecord) -> tuple[
 def _run_file_export_task(task_id: UUID) -> None:
     style_settings = _pop_style_settings(task_id)
     include_revision_marks = _pop_revision_mark_option(task_id)
+    temporary_output_path: Path | None = None
     try:
-        with SessionLocal() as db:
+        # 防止状态提交后读取 ORM 对象时隐式开启一个长期空闲事务。
+        with SessionLocal(expire_on_commit=False) as db:
             task = get_file_export_task(db, task_id)
             _set_file_export_task_status(db, task, "running", progress=5, message="导出任务开始处理。")
 
-            file_record = get_file_record_model(db, task.file_record_id)
+            file_record_id = task.file_record_id
+            export_type = task.export_type
+            created_by_id = task.created_by_id
+            export_task_id = task.id
+
+            file_record = get_file_record_model(db, file_record_id)
             if file_record is None:
                 raise ValueError("File record not found.")
 
             _set_file_export_task_status(db, task, "running", progress=20, message="正在读取文件和句段。")
             report_context = {
-                "file_record_id": task.file_record_id,
-                "export_task_id": task.id,
-                "created_by_id": task.created_by_id,
-                "export_type": task.export_type,
+                "file_record_id": file_record_id,
+                "export_task_id": export_task_id,
+                "created_by_id": created_by_id,
+                "export_type": export_type,
                 "filename": file_record.filename,
             }
             exported_file = build_file_record_exported_file(
                 db,
                 file_record,
-                task.export_type,
+                export_type,
                 style_settings=style_settings,
                 report_context=report_context,
                 include_revision_marks=include_revision_marks,
+                release_transaction_before_render=True,
             )
 
-            output_dir = _ensure_export_dir()
-            _cleanup_expired_export_files(output_dir)
-            suffix = Path(exported_file.filename).suffix or ".bin"
-            output_path = output_dir / f"{task.id}{suffix}"
-            output_path.write_bytes(exported_file.content)
+        output_dir = _ensure_export_dir()
+        _cleanup_expired_export_files(output_dir)
+        suffix = Path(exported_file.filename).suffix or ".bin"
+        output_path = output_dir / f"{task_id}{suffix}"
+        temporary_output_path = output_dir / f".{task_id}{suffix}.tmp"
+        temporary_output_path.write_bytes(exported_file.content)
+        temporary_output_path.replace(output_path)
+        temporary_output_path = None
+        size_bytes = output_path.stat().st_size
 
+        # 耗时导出完成后使用全新连接写回，不复用长任务开始前取得的连接。
+        with SessionLocal(expire_on_commit=False) as db:
+            task = db.query(FileExportTask).filter(FileExportTask.id == task_id).first()
+            if task is None:
+                raise ValueError("File export task not found.")
             task.result_path = str(output_path)
             task.filename = exported_file.filename
             task.media_type = exported_file.media_type
-            task.size_bytes = output_path.stat().st_size
+            task.size_bytes = size_bytes
             _set_file_export_task_status(db, task, "completed", progress=100, message="导出完成。")
     except Exception as exc:
         logger.exception("file export task failed task_id=%s", task_id)
-        with SessionLocal() as db:
+        if temporary_output_path is not None:
+            temporary_output_path.unlink(missing_ok=True)
+        with SessionLocal(expire_on_commit=False) as db:
             task = db.query(FileExportTask).filter(FileExportTask.id == task_id).first()
             if task is not None:
                 task.error = str(exc)
@@ -474,6 +495,7 @@ def build_file_record_exported_file(
     style_settings: dict[str, Any] | None = None,
     report_context: dict[str, Any] | None = None,
     include_revision_marks: bool = False,
+    release_transaction_before_render: bool = False,
 ):
     raw_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
@@ -560,6 +582,7 @@ def build_file_record_exported_file(
             else None
         )
         target_language = _resolve_file_record_target_language(file_record)
+        _release_read_transaction(db, enabled=release_transaction_before_render)
         exported_file = _apply_style_settings_to_export(
             export_translated_task_file(
                 raw_bytes=raw_bytes,
@@ -584,6 +607,7 @@ def build_file_record_exported_file(
     if export_type in BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS:
         if get_task_file_extension(source_filename) != ".docx":
             raise ValueError("Only DOCX source files support layout-preserving bilingual Word export.")
+        _release_read_transaction(db, enabled=release_transaction_before_render)
         return _apply_style_settings_to_export(
             export_bilingual_task_docx_with_layout(
                 raw_bytes=raw_bytes,
@@ -601,6 +625,7 @@ def build_file_record_exported_file(
     if export_type == "bilingual_excel_original":
         if get_task_file_extension(source_filename) != ".xlsx":
             raise ValueError("Only XLSX source files support original-format bilingual Excel export.")
+        _release_read_transaction(db, enabled=release_transaction_before_render)
         return export_bilingual_xlsx_task_file(
             raw_bytes=raw_bytes,
             filename=export_filename,
@@ -611,6 +636,7 @@ def build_file_record_exported_file(
     if export_type == BILINGUAL_PPTX_EXPORT_TYPE:
         if get_task_file_extension(source_filename) != ".pptx":
             raise ValueError("Only PPTX source files support original-format bilingual PPTX export.")
+        _release_read_transaction(db, enabled=release_transaction_before_render)
         return _apply_style_settings_to_export(
             export_bilingual_pptx_task_file(
                 raw_bytes=raw_bytes,
@@ -644,6 +670,7 @@ def build_file_record_exported_file(
         export_kwargs["source_lang"] = source_language
         export_kwargs["target_lang"] = target_language
 
+    _release_read_transaction(db, enabled=release_transaction_before_render)
     exported_bytes, media_type, export_filename = export_file(**export_kwargs)
     return _apply_style_settings_to_export(
         _GenericExportedFile(
@@ -767,6 +794,15 @@ class _GenericExportedFile:
         self.filename = filename
 
 
+def _release_read_transaction(db: Session, *, enabled: bool) -> None:
+    """在纯 CPU/文件导出前释放数据库连接，避免形成 idle in transaction。"""
+    if not enabled:
+        return
+    # 查询结果的模型列已经载入；先分离对象，再结束只读事务，后续导出不占连接池。
+    db.expunge_all()
+    db.rollback()
+
+
 def _set_file_export_task_status(
     db: Session,
     task: FileExportTask,
@@ -780,7 +816,6 @@ def _set_file_export_task_status(
     task.message = message
     task.updated_at = local_now()
     db.commit()
-    db.refresh(task)
 
 
 def _ensure_export_dir() -> Path:
