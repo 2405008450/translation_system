@@ -408,6 +408,7 @@ interface FileExportTask {
   error?: string | null
   filename?: string | null
   size_bytes?: number | null
+  requested_by_name?: string | null
 }
 const confirm = useConfirm()
 const authStore = useAuthStore()
@@ -7493,7 +7494,7 @@ onBeforeUnmount(() => {
                   >
                     <Loader2 v-if="loadingProjectExportOptions || exportingFileId" class="lucide-spin" :size="15" />
                     <Download v-else :size="15" />
-                    <span>{{ t('projectDetail.files.actions.export') }}</span>
+                    <span>{{ exportingFileId ? `导出 ${exportFileProgress}%` : t('projectDetail.files.actions.export') }}</span>
                     <ChevronDown :size="12" />
                   </button>
                   <div v-if="showProjectExportMenu" class="pd-export-menu" role="menu" @click.stop>

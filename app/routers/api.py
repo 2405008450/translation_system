@@ -13744,6 +13744,8 @@ def create_project_file_export_zip_task(
         project_id=project.id,
         project_name=getattr(project, "name", None) or getattr(project, "filename", None) or "项目",
         file_ids=[file_record.id for file_record in files],
+        requested_by_id=current_user.id,
+        requested_by_name=(current_user.nickname or current_user.username),
     )
     return JSONResponse(status_code=202, content=task)
 
