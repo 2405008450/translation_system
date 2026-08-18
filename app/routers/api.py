@@ -10250,7 +10250,11 @@ def compute_project_document_statistics(
         source_bytes = load_file_record_source(file_record)
         source_filename = get_file_record_source_filename(file_record)
         if source_bytes and Path(source_filename).suffix.lower() in SUPPORTED_EXTENSIONS:
-            statistics = compute_document_statistics(source_bytes, source_filename)
+            statistics = compute_document_statistics(
+                source_bytes,
+                source_filename,
+                options=_get_file_record_document_parse_options(file_record),
+            )
         else:
             statistics = unavailable_statistics
         normalized_statistics = normalize_document_statistics(statistics)

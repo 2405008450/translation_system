@@ -76,11 +76,15 @@ def compute_docx_statistics(raw_bytes: bytes) -> dict[str, Any]:
     return compute_word_document_statistics(raw_bytes, "source.docx")
 
 
-def compute_document_statistics(raw_bytes: bytes, filename: str) -> dict[str, Any]:
+def compute_document_statistics(
+    raw_bytes: bytes,
+    filename: str,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """根据文件类型计算文档统计，同时保持既有 Word 统计口径不变。"""
     suffix = Path(filename or "").suffix.lower()
     if suffix == ".pptx":
-        return compute_pptx_document_statistics(raw_bytes)
+        return compute_pptx_document_statistics(raw_bytes, options=options)
     if suffix == ".idml":
         return compute_idml_document_statistics(raw_bytes)
     if suffix in {".doc", ".docx"}:
@@ -113,8 +117,14 @@ def compute_word_document_statistics(raw_bytes: bytes, filename: str) -> dict[st
     )
 
 
-def compute_pptx_document_statistics(raw_bytes: bytes) -> dict[str, Any]:
-    """按 PPTX 形状文本 + Word 近似口径统计演示文稿。"""
+def compute_pptx_document_statistics(
+    raw_bytes: bytes,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """按 PPTX 实际可解析文本 + Word 近似口径统计演示文稿。"""
+    from app.services.document_workspace import normalize_document_parse_options
+
+    parse_options = normalize_document_parse_options(options)
     try:
         from pptx import Presentation
 
@@ -129,11 +139,9 @@ def compute_pptx_document_statistics(raw_bytes: bytes) -> dict[str, Any]:
             content_scope="unavailable",
         )
 
-    main_texts: list[str] = []
-    main_paragraphs = 0
-    main_lines = 0
-    notes_paragraphs = 0
-    notes_lines = 0
+    fallback_texts: list[str] = []
+    fallback_paragraphs = 0
+    fallback_lines = 0
     chart_count = 0
 
     for slide in presentation.slides:
@@ -141,31 +149,43 @@ def compute_pptx_document_statistics(raw_bytes: bytes) -> dict[str, Any]:
         for shape in _iter_ppt_shapes(slide.shapes):
             shape_texts, paragraph_count, line_count, shape_chart_count = _extract_ppt_shape_texts(shape)
             slide_texts.extend(shape_texts)
-            main_paragraphs += paragraph_count
-            main_lines += line_count
+            fallback_paragraphs += paragraph_count
+            fallback_lines += line_count
             chart_count += shape_chart_count
         if slide_texts:
-            main_texts.append("\n".join(slide_texts))
+            fallback_texts.append("\n".join(slide_texts))
 
-        notes_text, paragraph_count, line_count = _extract_ppt_notes_text(slide)
-        if notes_text:
-            notes_paragraphs += paragraph_count
-            notes_lines += line_count
+        if parse_options["pptx_translate_notes"]:
+            notes_text, paragraph_count, line_count = _extract_ppt_notes_text(slide)
+            if notes_text:
+                fallback_texts.append(notes_text)
+                fallback_paragraphs += paragraph_count
+                fallback_lines += line_count
 
-    metrics = _count_tool_word_like_texts(main_texts)
+    # 字数统计与句段编辑使用同一文本范围。PptxAdapter 还会覆盖 python-pptx
+    # 形状遍历无法取得的备注、批注、图表缓存文本和可选文档属性。
+    parser_texts = _extract_pptx_parser_texts(raw_bytes, parse_options)
+    if parser_texts is None:
+        counted_texts = fallback_texts
+        paragraph_count = fallback_paragraphs
+        line_count = fallback_lines
+        statistics_warnings = ["pptx_parser_text_fallback"]
+    else:
+        counted_texts = parser_texts
+        paragraph_count = len(parser_texts)
+        line_count = sum(_count_nonempty_text_lines(text) for text in parser_texts)
+        statistics_warnings = ["statistics_derived_from_pptx_parser_text_blocks"]
+
+    metrics = _count_tool_word_like_texts(counted_texts)
     image_count, linked_image_count = _count_pptx_image_references(raw_bytes)
     payload = _build_statistics_payload(
         source="pptx_word_like",
-        engine="python-pptx-word-like",
-        include_textboxes_footnotes_endnotes=False,
+        engine="pptx-parser-word-like",
+        include_textboxes_footnotes_endnotes=None,
         license_status=None,
-        statistics_profile="pptx_shape_word_approx",
-        content_scope="slides_shapes_tables_charts",
-        statistics_warnings=(
-            ["pptx_notes_excluded_from_word_count"]
-            if notes_paragraphs or notes_lines
-            else []
-        ),
+        statistics_profile="pptx_parser_word_approx",
+        content_scope="parser_translatable_text",
+        statistics_warnings=statistics_warnings,
     )
     payload.update(
         {
@@ -175,14 +195,38 @@ def compute_pptx_document_statistics(raw_bytes: bytes) -> dict[str, Any]:
             "asian_characters": metrics["asian_characters"],
             "characters": metrics["characters"],
             "characters_with_spaces": metrics["characters_with_spaces"],
-            "paragraphs": main_paragraphs + notes_paragraphs,
-            "lines": main_lines + notes_lines,
+            "paragraphs": paragraph_count,
+            "lines": line_count,
             "image_count": image_count,
             "linked_image_count": linked_image_count,
             "chart_count": chart_count,
         }
     )
     return payload
+
+
+def _extract_pptx_parser_texts(
+    raw_bytes: bytes,
+    options: dict[str, Any],
+) -> list[str] | None:
+    """提取与 PPTX 句段解析器范围一致的非空文本块。"""
+    try:
+        # 延迟导入，避免适配器注册阶段与统计服务形成循环依赖。
+        from app.services.adapters.pptx_adapter import PptxAdapter
+
+        result = PptxAdapter().parse_with_options(
+            raw_bytes,
+            filename="source.pptx",
+            options=options,
+        )
+    except Exception:
+        return None
+
+    return [
+        text.strip()
+        for text in _iter_adapter_node_texts(result.ast.nodes)
+        if text and text.strip()
+    ]
 
 
 def compute_idml_document_statistics(raw_bytes: bytes) -> dict[str, Any]:
