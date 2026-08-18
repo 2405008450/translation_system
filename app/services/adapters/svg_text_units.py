@@ -157,12 +157,21 @@ def _horizontal_sibling_run(slots: list[SvgTextSlot], start: int) -> list[SvgTex
             or etree.QName(slot.owner).localname != "text"
         ):
             break
+        # 只合并真正连续的文本兄弟节点。若中间夹有 rect/path 等图形元素，
+        # SVG 会按绘制顺序让这些元素覆盖前面的文本，不能把两侧文本写入首节点。
+        if previous_slot.owner.getnext() is not slot.owner:
+            break
         point = element_origin(slot.owner)
         if point is None or abs(point[1] - first_point[1]) > 2.0:
             break
         horizontal_gap = point[0] - previous_point[0]
+        font_size = _element_font_size(previous_slot.owner)
         max_adjacent_gap = min(
-            max(_rough_text_units(previous_slot.text) * 14.0 + 16.0, 32.0),
+            max(
+                _rough_text_units(previous_slot.text) * font_size
+                + max(font_size, 6.0),
+                16.0,
+            ),
             160.0,
         )
         if horizontal_gap <= 0 or horizontal_gap > max_adjacent_gap:
@@ -193,3 +202,13 @@ def _rough_text_units(text: str) -> float:
         else:
             units += 0.6
     return max(units, 1.0)
+
+
+def _element_font_size(element: etree._Element) -> float:
+    value = element.get("font-size", "")
+    style = element.get("style", "")
+    match = re.search(r"(?:^|;)\s*font-size\s*:\s*([-+0-9.]+)", style, re.I)
+    if match:
+        value = match.group(1)
+    match = re.search(r"[-+0-9.]+", value)
+    return max(float(match.group(0)), 1.0) if match else 10.0

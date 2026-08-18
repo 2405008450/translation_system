@@ -35,6 +35,10 @@ DITA_ELEMENT_MAP = {
     "li": NodeType.LIST_ITEM,
     "ul": NodeType.LIST,
     "ol": NodeType.LIST,
+    "dl": NodeType.LIST,
+    "dlentry": NodeType.LIST_ITEM,
+    "dt": NodeType.HEADING,
+    "dd": NodeType.PARAGRAPH,
     "table": NodeType.TABLE,
     "row": NodeType.TABLE_ROW,
     "entry": NodeType.TABLE_CELL,
@@ -57,6 +61,13 @@ INLINE_ELEMENTS = {
     "uicontrol", "menucascade", "wintitle",
     "xref", "link", "cite", "q", "term",
     "keyword", "apiname", "option", "parmname",
+}
+
+# 某些 Arbortext DITA 会把 term 直接放在结构容器下，作为后续列表或段落的
+# 小标题。此时 term 虽然通常是内联元素，但在当前上下文中必须独立成句。
+STANDALONE_TERM_PARENT_ELEMENTS = {
+    "topic", "concept", "task", "reference",
+    "body", "conbody", "taskbody", "refbody", "section",
 }
 
 
@@ -155,6 +166,8 @@ class DitaAdapter(FormatAdapter):
         
         # 获取节点类型
         node_type = DITA_ELEMENT_MAP.get(tag)
+        if node_type is None and self._is_standalone_term(element):
+            node_type = NodeType.PARAGRAPH
         
         if node_type:
             # 提取文本内容和内联标签
@@ -229,7 +242,7 @@ class DitaAdapter(FormatAdapter):
             
             child_tag = etree.QName(child).localname
             
-            if child_tag in INLINE_ELEMENTS:
+            if child_tag in INLINE_ELEMENTS and not self._is_standalone_term(child):
                 # 记录内联标签
                 start_pos = len("".join(text_parts))
                 child_text = self._get_all_text(child)
@@ -264,7 +277,7 @@ class DitaAdapter(FormatAdapter):
 
         tag = etree.QName(element).localname
         if tag in INLINE_ELEMENTS:
-            return False
+            return self._is_standalone_term(element)
         if tag in DITA_ELEMENT_MAP:
             return True
 
@@ -275,6 +288,25 @@ class DitaAdapter(FormatAdapter):
             if descendant_tag in DITA_ELEMENT_MAP:
                 return True
         return False
+
+    def _is_standalone_term(self, element: etree._Element) -> bool:
+        """判断 term 是否在当前上下文中充当独立的小标题。"""
+        if not isinstance(element.tag, str):
+            return False
+        if etree.QName(element).localname != "term":
+            return False
+
+        parent = element.getparent()
+        if parent is None or not isinstance(parent.tag, str):
+            return False
+
+        parent_tag = etree.QName(parent).localname
+        if parent_tag not in STANDALONE_TERM_PARENT_ELEMENTS:
+            return False
+
+        # ``<term>术语</term>后续正文`` 仍属于一个连续的内联语句；只有
+        # term 后面没有非空尾文本时，才按结构性小标题处理。
+        return not bool(element.tail and element.tail.strip())
 
     def _get_all_text(self, element: etree._Element) -> str:
         """获取元素及其所有子元素的文本

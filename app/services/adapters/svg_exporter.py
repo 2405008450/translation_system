@@ -164,6 +164,7 @@ class SvgExporter:
         rects = self._collect_rects(root)
         lines = self._collect_horizontal_lines(root)
         document_bounds = self._document_bounds(root)
+        rect_text_counts = self._count_text_elements_by_rect(root, rects, styles)
         warnings: List[dict] = []
         logical_member_ids: set[int] = set()
 
@@ -314,12 +315,29 @@ class SvgExporter:
                 max_height=max(font_size * 4.0, 30.0),
             )
             if rect is not None:
-                self._place_text_in_rect(
-                    owner,
-                    translated_text,
-                    rect,
-                    font_size,
-                )
+                if rect_text_counts.get(rect, 0) > 1:
+                    # 同一框体内存在多行文本时保留各自原始基线，避免每一行都被
+                    # 移到矩形中心而发生重叠；仅按右边界压缩过长译文。
+                    available_width = rect[0] + rect[2] - x - 3.0
+                    if available_width > 1.0:
+                        fitted_size = self._fit_font_size(
+                            translated_text,
+                            font_size,
+                            available_width,
+                        )
+                        if fitted_size < font_size - 0.05:
+                            self._set_inline_style(
+                                owner,
+                                "font-size",
+                                f"{fitted_size:.2f}px",
+                            )
+                else:
+                    self._place_text_in_rect(
+                        owner,
+                        translated_text,
+                        rect,
+                        font_size,
+                    )
                 continue
 
             available_width = self._nearby_line_width(lines, x, y, font_size)
@@ -500,6 +518,31 @@ class SvgExporter:
             if abs(y1 - y2) <= 0.5 and abs(x2 - x1) >= 4:
                 lines.append((min(x1, x2), max(x1, x2), (y1 + y2) / 2))
         return lines
+
+    def _count_text_elements_by_rect(
+        self,
+        root: etree._Element,
+        rects: list[tuple[float, float, float, float]],
+        styles: dict[str, dict[str, str]],
+    ) -> dict[tuple[float, float, float, float], int]:
+        """统计每个最小容器矩形内的可见文本行数。"""
+        counts: dict[tuple[float, float, float, float], int] = {}
+        for element in root.xpath("//*[local-name()='text']"):
+            if not "".join(element.itertext()).strip():
+                continue
+            origin = self._element_origin(element)
+            if origin is None:
+                continue
+            font_size = self._font_size(element, styles)
+            rect = self._find_containing_rect(
+                rects,
+                origin[0],
+                origin[1],
+                max_height=max(font_size * 4.0, 30.0),
+            )
+            if rect is not None:
+                counts[rect] = counts.get(rect, 0) + 1
+        return counts
 
     @staticmethod
     def _document_bounds(root: etree._Element) -> Optional[tuple[float, float, float, float]]:
