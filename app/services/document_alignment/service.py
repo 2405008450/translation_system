@@ -15,16 +15,17 @@ from app.config import get_settings
 from app.database import SessionLocal
 from app.models import DocumentAlignmentPair, DocumentAlignmentUnit, ProofreadingBatch, Project, User
 from app.services.language_pairs import normalize_language_code, require_language_pair
+from app.services.sentence_splitter import looks_like_numbered_heading
 
 from .anchors import build_anchor_blocks, build_order_blocks
-from .dp import AlignPair, SemanticSimilarity, align_block
-from .features import has_structure_conflict
+from .dp import AlignPair, BoundaryKey, SemanticSimilarity, _within_single_key, align_block
+from .features import crosses_heading_boundary, has_structure_conflict
 from .llm_boundary import needs_llm_refinement, refine_hard_block
 from .hierarchical import (
     build_hierarchical_seed_pairs, repair_adjacent_bilingual_gaps,
     partition_running_matter, restore_running_matter_gaps,
 )
-from .parser import AlignUnit, parse_side
+from .parser import AlignUnit, assign_table_boundary_keys, parse_side
 from .semantic import build_semantic_scorer
 
 logger = logging.getLogger(__name__)
@@ -184,15 +185,44 @@ def _orm_units(db: Session, batch_id: UUID, side: str) -> list[AlignUnit]:
     # 特征由权威提取器重新计算，units 表只保存人工编辑所需快照。
     from app.services.normalizer import normalize_text
     from app.services.number_check.normalizer_total import extract_numbers
-    return [AlignUnit(
-        index=row.unit_index, text=row.text, norm_text=normalize_text(row.text), para_index=row.para_index,
-        block_type=row.block_type, block_index=row.block_index, row_index=row.row_index, cell_index=row.cell_index,
-        numbering=row.numbering, char_len=max(1, len(normalize_text(row.text))), numbers=tuple(extract_numbers(row.text)),
-        is_heading=row.block_type == "heading",
-    ) for row in rows]
+    units = []
+    for row in rows:
+        inferred_heading = (
+            row.block_type in {"paragraph", "heading"}
+            and (row.block_type == "heading" or looks_like_numbered_heading(row.text))
+        )
+        units.append(AlignUnit(
+            index=row.unit_index, text=row.text, norm_text=normalize_text(row.text), para_index=row.para_index,
+            block_type="heading" if inferred_heading else row.block_type,
+            block_index=row.block_index, row_index=row.row_index, cell_index=row.cell_index,
+            numbering=row.numbering, char_len=max(1, len(normalize_text(row.text))),
+            numbers=tuple(extract_numbers(row.text)), is_heading=inferred_heading,
+        ))
+    return assign_table_boundary_keys(units)
 
 
 AlignmentProgress = Callable[[int, int, str], None]
+
+
+def _block_boundary_key(
+    source: list[AlignUnit], target: list[AlignUnit], *, enabled: bool = True,
+) -> tuple[BoundaryKey | None, str]:
+    """选择当前窗口的表格硬边界；表格结构严重不对称时退到行级。"""
+    if not enabled:
+        return None, ""
+    source_cells = {unit.cell_key for unit in source if unit.cell_key}
+    target_cells = {unit.cell_key for unit in target if unit.cell_key}
+    if not source_cells or not target_cells:
+        return None, ""
+    ratio = min(len(source_cells), len(target_cells)) / max(len(source_cells), len(target_cells))
+    scope = "row" if ratio < 0.5 else "cell"
+
+    def key(unit: AlignUnit) -> str:
+        if unit.block_type != "table_cell":
+            return ""
+        return unit.row_key if scope == "row" else unit.cell_key
+
+    return key, scope
 
 
 async def _compute_hierarchical_pairs(
@@ -269,6 +299,10 @@ async def _compute_pairs(
         "use_llm_for_hard_blocks",
         settings.alignment_llm_refinement_enabled,
     )) and not full_review_enabled
+    table_cell_boundary_enabled = bool(config.get(
+        "table_cell_boundary_enabled",
+        getattr(settings, "alignment_table_cell_boundary_enabled", True),
+    ))
     semantic_scorer = None
     try:
         semantic_scorer = build_semantic_scorer(settings)
@@ -302,10 +336,17 @@ async def _compute_pairs(
                 )
         for block_offset, (src_slice, tgt_slice, anchor_method) in enumerate(group):
             block_src, block_tgt = src[src_slice], tgt[tgt_slice]
+            boundary_key, boundary_scope = _block_boundary_key(
+                block_src, block_tgt, enabled=table_cell_boundary_enabled,
+            )
             pairs = align_block(
                 block_src, block_tgt, lang_ratio=ratio,
                 semantic_similarity=semantic,
+                boundary_key=boundary_key,
             )
+            if boundary_scope:
+                for pair in pairs:
+                    pair.features["boundary_scope"] = boundary_scope
             if semantic is None:
                 for pair in pairs:
                     pair.features["semantic_fallback"] = True
@@ -320,6 +361,7 @@ async def _compute_pairs(
                 reverse = align_block(
                     block_tgt, block_src, lang_ratio=1.0 / ratio,
                     semantic_similarity=reverse_semantic,
+                    boundary_key=boundary_key,
                 )
                 reverse_signatures = {
                     (tuple(pair.tgt_indices), tuple(pair.src_indices)) for pair in reverse
@@ -337,12 +379,16 @@ async def _compute_pairs(
                 if semantic is not None:
                     pairs = _repair_semantic_gaps(
                         pairs, block_src, block_tgt, semantic,
+                        boundary_key=boundary_key,
                     )
-                pairs = _repair_structural_table_gaps(pairs, block_src, block_tgt)
+                pairs = _repair_structural_table_gaps(
+                    pairs, block_src, block_tgt, boundary_key=boundary_key,
+                )
                 if use_llm and needs_llm_refinement(pairs):
                     pairs = await refine_hard_block(
                         block_src, block_tgt, pairs,
                         semantic_similarity=semantic, lang_ratio=ratio,
+                        boundary_key=boundary_key,
                     )
             for pair in pairs:
                 _calibrate_pair_confidence(
@@ -398,6 +444,7 @@ async def _compute_pairs(
                     semantic_scorer.similarity if semantic_scorer is not None else None
                 ),
                 progress_callback=progress_callback,
+                table_cell_boundary_enabled=table_cell_boundary_enabled,
             )
         finally:
             if semantic_scorer is not None:
@@ -533,6 +580,7 @@ async def _review_all_alignment_pairs(
     semantic_similarity: SemanticSimilarity | None = None,
     progress_callback: AlignmentProgress | None = None,
     accept_validated_candidate: bool = False,
+    table_cell_boundary_enabled: bool = True,
 ) -> list[AlignPair]:
     """使用指定 Gemini 模型全量复核第一、二阶段产生的全部候选配对。"""
     src_map = {unit.index: unit for unit in src}
@@ -587,6 +635,9 @@ async def _review_all_alignment_pairs(
         target_indices = sorted({index for pair in fallback for index in pair.tgt_indices})
         block_src = [src_map[index] for index in source_indices]
         block_tgt = [tgt_map[index] for index in target_indices]
+        boundary_key, _ = _block_boundary_key(
+            block_src, block_tgt, enabled=table_cell_boundary_enabled,
+        )
         refinement_outcome: dict[str, str] = {}
         async with semaphore:
             candidate = await refine_hard_block(
@@ -599,6 +650,7 @@ async def _review_all_alignment_pairs(
                 max_output_tokens=max_output_tokens,
                 refinement_outcome=refinement_outcome,
                 accept_validated_candidate=accept_validated_candidate,
+                boundary_key=boundary_key,
             )
         if not refinement_outcome:
             refinement_outcome["status"] = (
@@ -675,6 +727,7 @@ async def _review_all_alignment_pairs(
 
 def _repair_structural_table_gaps(
     pairs: list[AlignPair], src: list[AlignUnit], tgt: list[AlignUnit],
+    boundary_key: BoundaryKey | None = None,
 ) -> list[AlignPair]:
     """吸收同一表格单元格内被 DP 单独留下的标题或标签。
 
@@ -685,6 +738,9 @@ def _repair_structural_table_gaps(
     tgt_map = {unit.index: unit for unit in tgt}
 
     def table_parent(unit: AlignUnit) -> tuple[int, int | None, int | None] | None:
+        if boundary_key is not None:
+            value = boundary_key(unit)
+            return value if value else None
         if unit.block_type != "table_cell":
             return None
         return unit.block_index, unit.row_index, unit.cell_index
@@ -736,7 +792,7 @@ def _repair_structural_table_gaps(
 
 def _repair_semantic_gaps(
     pairs: list[AlignPair], src: list[AlignUnit], tgt: list[AlignUnit], semantic_similarity,
-    *, threshold: float = 0.76,
+    *, threshold: float = 0.76, boundary_key: BoundaryKey | None = None,
 ) -> list[AlignPair]:
     """只在相邻范围吸收高语义相似的孤立 gap，不允许跨过任何已有配对。"""
     src_map = {unit.index: unit for unit in src}
@@ -759,10 +815,18 @@ def _repair_semantic_gaps(
             run_src.extend(result[run_end].src_indices)
             run_tgt.extend(result[run_end].tgt_indices)
             run_end += 1
-        if run_src and run_tgt and len(run_src) <= 3 and len(run_tgt) <= 3:
+        run_source_units = [src_map[item] for item in run_src]
+        run_target_units = [tgt_map[item] for item in run_tgt]
+        if (
+            run_src and run_tgt and len(run_src) <= 3 and len(run_tgt) <= 3
+            and _within_single_key(run_source_units, boundary_key)
+            and _within_single_key(run_target_units, boundary_key)
+            and not crosses_heading_boundary(run_source_units)
+            and not crosses_heading_boundary(run_target_units)
+        ):
             score = semantic_similarity(
-                [src_map[item] for item in run_src],
-                [tgt_map[item] for item in run_tgt],
+                run_source_units,
+                run_target_units,
             )
             if score is not None and score >= threshold:
                 result[index:run_end] = [AlignPair(
@@ -796,6 +860,15 @@ def _repair_semantic_gaps(
             if is_source_gap and len(neighbor.src_indices) >= 3:
                 continue
             if is_target_gap and len(neighbor.tgt_indices) >= 3:
+                continue
+            combined_source = gap.src_indices + neighbor.src_indices
+            combined_target = gap.tgt_indices + neighbor.tgt_indices
+            if (
+                not _within_single_key([src_map[item] for item in combined_source], boundary_key)
+                or not _within_single_key([tgt_map[item] for item in combined_target], boundary_key)
+                or crosses_heading_boundary([src_map[item] for item in combined_source])
+                or crosses_heading_boundary([tgt_map[item] for item in combined_target])
+            ):
                 continue
             source_units = [src_map[item] for item in (gap.src_indices if is_source_gap else neighbor.src_indices)]
             target_units = [tgt_map[item] for item in (neighbor.tgt_indices if is_source_gap else gap.tgt_indices)]
@@ -833,6 +906,21 @@ def _join_text(indices: Iterable[int], units: dict[int, AlignUnit]) -> str:
     return "\n".join(units[index].text for index in indices if index in units)
 
 
+def _set_pair_cell_features(
+    features: dict[str, Any], src_indices: Iterable[int], tgt_indices: Iterable[int],
+    src: dict[int, AlignUnit], tgt: dict[int, AlignUnit],
+) -> None:
+    source_keys = list(dict.fromkeys(
+        src[index].cell_key for index in src_indices if index in src and src[index].cell_key
+    ))
+    target_keys = list(dict.fromkeys(
+        tgt[index].cell_key for index in tgt_indices if index in tgt and tgt[index].cell_key
+    ))
+    features["source_cell_keys"] = source_keys
+    features["target_cell_keys"] = target_keys
+    features["cross_cell"] = len(source_keys) > 1 or len(target_keys) > 1
+
+
 def _llm_review_chunk_outcomes(pairs: list[AlignPair]) -> dict[str, int]:
     """按 chunk 去重统计全量复核结果，避免一个分块内多行被重复计数。"""
     chunk_outcomes: dict[tuple[int, str], str] = {}
@@ -858,6 +946,7 @@ def _store_pairs(
     for order, pair in enumerate(pairs):
         first = src.get(pair.src_indices[0]) if pair.src_indices else tgt.get(pair.tgt_indices[0])
         signature = (tuple(pair.src_indices), tuple(pair.tgt_indices))
+        _set_pair_cell_features(pair.features, pair.src_indices, pair.tgt_indices, src, tgt)
         db.add(DocumentAlignmentPair(
             batch_id=batch.id, pair_order=order, src_indices=json.dumps(pair.src_indices), tgt_indices=json.dumps(pair.tgt_indices),
             source_text=_join_text(pair.src_indices, src), target_text=_join_text(pair.tgt_indices, tgt),
@@ -1044,16 +1133,20 @@ def refresh_pair_text(db: Session, pair: DocumentAlignmentPair) -> None:
         features = {}
     if not isinstance(features, dict):
         features = {}
+    src_indices = json.loads(pair.src_indices or "[]")
+    tgt_indices = json.loads(pair.tgt_indices or "[]")
     pair.source_text = (
         str(features["manual_source_text"])
         if "manual_source_text" in features
-        else _join_text(json.loads(pair.src_indices or "[]"), src)
+        else _join_text(src_indices, src)
     )
     pair.target_text = (
         str(features["manual_target_text"])
         if "manual_target_text" in features
-        else _join_text(json.loads(pair.tgt_indices or "[]"), tgt)
+        else _join_text(tgt_indices, tgt)
     )
+    _set_pair_cell_features(features, src_indices, tgt_indices, src, tgt)
+    pair.features = json.dumps(features, ensure_ascii=False)
     pair.method = "manual"
     pair.confidence = 1.0 if pair.locked else 0.8
     pair.confidence_level = "high"
@@ -1222,3 +1315,207 @@ def replace_alignment_pair_range(
     validate_pair_integrity(db, batch_id)
     db.flush()
     return created
+
+
+def _ordered_cell_groups(
+    indices: list[int], units: dict[int, AlignUnit],
+) -> list[tuple[str, list[int], set[str]]]:
+    groups: list[tuple[str, list[int], set[str]]] = []
+    for index in indices:
+        unit = units[index]
+        key = unit.cell_key
+        if groups and groups[-1][0] == key:
+            groups[-1][1].append(index)
+            groups[-1][2].update(unit.numbers)
+        else:
+            groups.append((key, [index], set(unit.numbers)))
+    return groups
+
+
+def _align_cell_groups(
+    source: list[tuple[str, list[int], set[str]]],
+    target: list[tuple[str, list[int], set[str]]],
+) -> list[dict[str, Any]]:
+    """用同键和数字强锚点对齐单元格组，其余内容按单调顺序产生 1:1 或 gap。"""
+    n, m = len(source), len(target)
+    inf = float("inf")
+    scores = [[inf] * (m + 1) for _ in range(n + 1)]
+    back: list[list[tuple[int, int, str] | None]] = [[None] * (m + 1) for _ in range(n + 1)]
+    scores[0][0] = 0.0
+
+    def match_cost(left: tuple[str, list[int], set[str]], right: tuple[str, list[int], set[str]]) -> float:
+        if left[0] and left[0] == right[0]:
+            return -20.0
+        if left[2] and left[2] == right[2]:
+            return -10.0
+        return 1.0
+
+    for i in range(n + 1):
+        for j in range(m + 1):
+            if scores[i][j] == inf:
+                continue
+            candidates: list[tuple[int, int, str, float]] = []
+            if i < n and j < m:
+                candidates.append((i + 1, j + 1, "pair", match_cost(source[i], target[j])))
+            if i < n:
+                candidates.append((i + 1, j, "source_gap", 2.0))
+            if j < m:
+                candidates.append((i, j + 1, "target_gap", 2.0))
+            for ni, nj, operation, cost in candidates:
+                candidate = scores[i][j] + cost
+                if candidate < scores[ni][nj]:
+                    scores[ni][nj] = candidate
+                    back[ni][nj] = (i, j, operation)
+
+    result: list[dict[str, Any]] = []
+    i, j = n, m
+    while i or j:
+        previous = back[i][j]
+        if previous is None:
+            raise RuntimeError("单元格拆分回溯失败。")
+        pi, pj, operation = previous
+        if operation == "pair":
+            result.append({"src_indices": source[pi][1], "tgt_indices": target[pj][1], "locked": True})
+        elif operation == "source_gap":
+            result.append({"src_indices": source[pi][1], "tgt_indices": [], "locked": True})
+        else:
+            result.append({"src_indices": [], "tgt_indices": target[pj][1], "locked": True})
+        i, j = pi, pj
+    result.reverse()
+    return result
+
+
+def split_alignment_pairs_by_cell(
+    db: Session, batch_id: UUID, pair_ids: Iterable[UUID] | None = None,
+) -> dict[str, int]:
+    """把已落库的同侧跨单元格配对原地拆开，无需数据库迁移。"""
+    source_units = {unit.index: unit for unit in _orm_units(db, batch_id, "source")}
+    target_units = {unit.index: unit for unit in _orm_units(db, batch_id, "target")}
+    requested = list(dict.fromkeys(pair_ids or []))
+    rows = db.query(DocumentAlignmentPair).filter_by(batch_id=batch_id).order_by(
+        DocumentAlignmentPair.pair_order,
+    ).all()
+    selected_ids = set(requested) if requested else {row.id for row in rows}
+    if requested and len({row.id for row in rows}.intersection(selected_ids)) != len(requested):
+        raise ValueError("部分待拆分配对不存在或不属于当前批次。")
+
+    specs: list[dict[str, Any]] = []
+    changed_pairs = created_pairs = 0
+    for row in rows:
+        source_indices = json.loads(row.src_indices or "[]")
+        target_indices = json.loads(row.tgt_indices or "[]")
+        source_groups = _ordered_cell_groups(source_indices, source_units)
+        target_groups = _ordered_cell_groups(target_indices, target_units)
+        source_keys = {key for key, _, _ in source_groups if key}
+        target_keys = {key for key, _, _ in target_groups if key}
+        if row.id not in selected_ids or (len(source_keys) <= 1 and len(target_keys) <= 1):
+            specs.append({
+                "row": row, "src_indices": source_indices, "tgt_indices": target_indices,
+                "locked": row.locked, "changed": False,
+            })
+            continue
+        replacements = _align_cell_groups(source_groups, target_groups)
+        changed_pairs += 1
+        created_pairs += len(replacements)
+        for offset, replacement in enumerate(replacements):
+            specs.append({
+                **replacement,
+                "row": row if offset == 0 else None,
+                "changed": True,
+            })
+
+    # 相邻两个互补 gap 若来自同一单元格，重新组成 1:1；这能修复跨配对形成的规则性错位链。
+    merged_gaps = 0
+    index = 0
+    while index + 1 < len(specs):
+            left, right = specs[index], specs[index + 1]
+            if not left["changed"] and not right["changed"]:
+                index += 1
+                continue
+            left_src, left_tgt = left["src_indices"], left["tgt_indices"]
+            right_src, right_tgt = right["src_indices"], right["tgt_indices"]
+            if left_src and not left_tgt and right_tgt and not right_src:
+                src_indices, tgt_indices = left_src, right_tgt
+            elif left_tgt and not left_src and right_src and not right_tgt:
+                src_indices, tgt_indices = right_src, left_tgt
+            else:
+                index += 1
+                continue
+            src_keys = {source_units[item].cell_key for item in src_indices if source_units[item].cell_key}
+            tgt_keys = {target_units[item].cell_key for item in tgt_indices if target_units[item].cell_key}
+            if len(src_keys) != 1 or src_keys != tgt_keys:
+                index += 1
+                continue
+            left.update({
+                "src_indices": sorted(src_indices),
+                "tgt_indices": sorted(tgt_indices),
+                "locked": True,
+                "changed": True,
+            })
+            specs.pop(index + 1)
+            merged_gaps += 1
+
+    if not changed_pairs:
+        return {"changed_pairs": 0, "created_pairs": 0, "merged_gaps": 0}
+
+    # PostgreSQL 会逐行检查唯一序号：先整体搬到负数空间，再一次性写回最终顺序。
+    for temporary, row in enumerate(rows, start=1):
+        row.pair_order = -temporary
+    db.flush()
+    retained_rows = {id(spec["row"]) for spec in specs if spec["row"] is not None}
+    for row in rows:
+        if id(row) not in retained_rows:
+            db.delete(row)
+    db.flush()
+
+    for order, spec in enumerate(specs):
+        row = spec["row"]
+        if row is None:
+            row = DocumentAlignmentPair(
+                batch_id=batch_id, pair_order=order,
+                src_indices="[]", tgt_indices="[]", source_text="", target_text="",
+                confidence=1.0, confidence_level="high", method="manual",
+                features="{}", locked=True,
+            )
+            db.add(row)
+            spec["row"] = row
+        row.pair_order = order
+        if not spec["changed"]:
+            continue
+        src_indices = spec["src_indices"]
+        tgt_indices = spec["tgt_indices"]
+        features: dict[str, Any] = {"manual_adjustment": True, "split_by_cell": True}
+        _set_pair_cell_features(features, src_indices, tgt_indices, source_units, target_units)
+        row.src_indices = json.dumps(src_indices)
+        row.tgt_indices = json.dumps(tgt_indices)
+        row.source_text = _join_text(src_indices, source_units)
+        row.target_text = _join_text(tgt_indices, target_units)
+        row.features = json.dumps(features, ensure_ascii=False)
+        row.locked = bool(spec["locked"])
+        row.method = "manual"
+        row.confidence = 1.0 if row.locked else 0.8
+        row.confidence_level = "high"
+        anchor = (
+            source_units.get(src_indices[0]) if src_indices
+            else target_units.get(tgt_indices[0]) if tgt_indices else None
+        )
+        if anchor is not None:
+            row.block_type = anchor.block_type
+            row.block_index = anchor.block_index
+            row.row_index = anchor.row_index
+            row.cell_index = anchor.cell_index
+
+    db.flush()
+    validate_pair_integrity(db, batch_id)
+    batch = db.get(ProofreadingBatch, batch_id)
+    if batch is not None:
+        batch.total_segments = len(specs)
+        batch.skipped_segments = sum(
+            bool(spec["src_indices"]) and not spec["tgt_indices"] for spec in specs
+        )
+
+    return {
+        "changed_pairs": changed_pairs,
+        "created_pairs": created_pairs,
+        "merged_gaps": merged_gaps,
+    }

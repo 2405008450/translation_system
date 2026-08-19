@@ -12,7 +12,8 @@ _NUMBER_PATTERNS = (
     (re.compile(r"^第(\d+)[章条节]", re.I), lambda m: f"c{m.group(1)}"),
     (re.compile(r"^chapter\s*([ivx\d]+)", re.I), lambda m: f"c{m.group(1).lower()}"),
     (re.compile(r"^article\s*(\d+)", re.I), lambda m: f"a{m.group(1)}"),
-    (re.compile(r"^(\d+)\.", re.I), lambda m: m.group(1)),
+    # 保留完整层级编号；1、1.1、1.2 必须是不同锚点，不能都退化成“1”。
+    (re.compile(r"^(\d+(?:\.\d+){0,5})(?:[.)）]|\s)", re.I), lambda m: m.group(1)),
     (re.compile(r"^[（(]([一二三四五六七八九十\d]+)[）)]", re.I), lambda m: _CN_NUMBERS.get(m.group(1), m.group(1))),
     (re.compile(r"^([一二三四五六七八九十]+)、", re.I), lambda m: _CN_NUMBERS.get(m.group(1), m.group(1))),
 )
@@ -29,6 +30,11 @@ def normalize_numbering(value: str) -> str:
 
 def unit_numbering(unit: AlignUnit) -> str:
     return normalize_numbering(unit.numbering) or normalize_numbering(unit.text)
+
+
+def crosses_heading_boundary(units: list[AlignUnit]) -> bool:
+    """标题是原子单元，不能与相邻正文或另一个标题合并成同一配对。"""
+    return len(units) > 1 and any(unit.is_heading for unit in units)
 
 
 def rare_numbers(units: list[AlignUnit]) -> set[str]:

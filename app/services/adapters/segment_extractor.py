@@ -145,7 +145,12 @@ class SegmentExtractor:
                     segments.append(segment)
                 else:
                     # 其他格式：按句子分割
-                    raw_sentences = self._split_sentences(text)
+                    raw_sentences = self._split_sentences(
+                        text,
+                        preserve_dotted_names=bool(
+                            (node.metadata or {}).get("preserve_dotted_names", False)
+                        ),
+                    )
                     layout_fragments = self._compute_layout_fragments(node, text, raw_sentences)
                     html_fragments = self._compute_source_html_fragments(node, text, raw_sentences)
                     format_map = (node.metadata or {}).get("source_layout_formats") or {}
@@ -277,7 +282,12 @@ class SegmentExtractor:
             return None
         return [tagged_fragment_to_html(fragment, format_map) for fragment in fragments]
 
-    def _split_sentences(self, text: str) -> List[Tuple[str, str, int, int]]:
+    def _split_sentences(
+        self,
+        text: str,
+        *,
+        preserve_dotted_names: bool = False,
+    ) -> List[Tuple[str, str, int, int]]:
         """将文本分割为句子
         
         Args:
@@ -290,6 +300,20 @@ class SegmentExtractor:
         """
         if not text:
             return []
+
+        if preserve_dotted_names:
+            from app.services.sentence_splitter import split_sentence_spans
+
+            spans = split_sentence_spans(text, preserve_dotted_names=True)
+            return [
+                (
+                    self._normalize_text(text[span.start:span.end]),
+                    text[span.start:span.end].strip(),
+                    span.start,
+                    span.end,
+                )
+                for span in spans
+            ]
         
         sentences: List[Tuple[str, str, int, int]] = []
         start = 0

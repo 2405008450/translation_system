@@ -31,6 +31,10 @@ def _pair_indices(value: str | None) -> list[int]:
 def _pair_segment_metadata(batch: ProofreadingBatch, pair: DocumentAlignmentPair) -> dict:
     src_indices = _pair_indices(pair.src_indices)
     tgt_indices = _pair_indices(pair.tgt_indices)
+    try:
+        features = json.loads(pair.features or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        features = {}
     return {
         "proofreading_batch_id": str(batch.id),
         "alignment_pair_id": str(pair.id),
@@ -40,6 +44,7 @@ def _pair_segment_metadata(batch: ProofreadingBatch, pair: DocumentAlignmentPair
         "translation_only": not src_indices,
         "confidence": pair.confidence,
         "method": pair.method,
+        "cross_cell": bool(features.get("cross_cell")) if isinstance(features, dict) else False,
     }
 
 

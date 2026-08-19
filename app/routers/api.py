@@ -11152,6 +11152,7 @@ def _serialize_workbench_segment(
     alignment_translation_only = False
     alignment_src_indices: list[int] = []
     alignment_tgt_indices: list[int] = []
+    alignment_cross_cell = False
     try:
         alignment_metadata = json.loads(seg.segment_metadata or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -11169,6 +11170,7 @@ def _serialize_workbench_segment(
             alignment_src_indices = [value for value in raw_src_indices if isinstance(value, int) and not isinstance(value, bool)]
         if isinstance(raw_tgt_indices, list):
             alignment_tgt_indices = [value for value in raw_tgt_indices if isinstance(value, int) and not isinstance(value, bool)]
+        alignment_cross_cell = bool(alignment_metadata.get("cross_cell"))
 
     payload = {
         "id": str(seg.id),
@@ -11211,6 +11213,7 @@ def _serialize_workbench_segment(
         "alignment_translation_only": alignment_translation_only,
         "alignment_src_indices": alignment_src_indices,
         "alignment_tgt_indices": alignment_tgt_indices,
+        "alignment_cross_cell": alignment_cross_cell,
         "workflow_step_id": str(resolved_workflow_step_id) if resolved_workflow_step_id else None,
         "workflow_step_name": workflow_step.name if workflow_step else "翻译",
         "workflow_step_order": int(workflow_step.sort_order or 0) if workflow_step else 0,

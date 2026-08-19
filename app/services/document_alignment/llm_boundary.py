@@ -6,8 +6,8 @@ from typing import Any
 from app.services.llm_service import LLMRequestError, request_chat_completion
 from app.services.translation_review.llm_gate import llm_gate
 
-from .dp import AlignPair, SemanticSimilarity
-from .features import has_structure_conflict
+from .dp import AlignPair, BoundaryKey, SemanticSimilarity, _within_single_key
+from .features import crosses_heading_boundary, has_structure_conflict
 from .parser import AlignUnit
 
 
@@ -37,7 +37,10 @@ def _classify_request_failure(exc: Exception) -> str:
     return "timeout" if any(marker in message for marker in timeout_markers) else "request_error"
 
 
-def _validate_index_response(payload: Any, src_count: int, tgt_count: int) -> list[tuple[list[int], list[int]]] | None:
+def _validate_index_response(
+    payload: Any, src_count: int, tgt_count: int, *,
+    src_keys: list[str] | None = None, tgt_keys: list[str] | None = None,
+) -> list[tuple[list[int], list[int]]] | None:
     if isinstance(payload, dict):
         payload = payload.get("pairs")
     if not isinstance(payload, list):
@@ -59,6 +62,10 @@ def _validate_index_response(payload: Any, src_count: int, tgt_count: int) -> li
         if source and source != list(range(min(source), max(source) + 1)):
             return None
         if target and target != list(range(min(target), max(target) + 1)):
+            return None
+        if src_keys is not None and len({src_keys[index] for index in source if src_keys[index]}) > 1:
+            return None
+        if tgt_keys is not None and len({tgt_keys[index] for index in target if tgt_keys[index]}) > 1:
             return None
         if used_src.intersection(source) or used_tgt.intersection(target):
             return None
@@ -185,7 +192,18 @@ def _accept_llm_candidate(
     candidate: list[AlignPair], fallback: list[AlignPair],
     src: list[AlignUnit], tgt: list[AlignUnit],
     semantic_similarity: SemanticSimilarity | None, lang_ratio: float,
+    boundary_key: BoundaryKey | None = None,
 ) -> bool:
+    src_map = {unit.index: unit for unit in src}
+    tgt_map = {unit.index: unit for unit in tgt}
+    if any(
+        not _within_single_key([src_map[index] for index in pair.src_indices], boundary_key)
+        or not _within_single_key([tgt_map[index] for index in pair.tgt_indices], boundary_key)
+        or crosses_heading_boundary([src_map[index] for index in pair.src_indices])
+        or crosses_heading_boundary([tgt_map[index] for index in pair.tgt_indices])
+        for pair in candidate
+    ):
+        return False
     if _has_semantic_adjacent_absorption(candidate, src, tgt, semantic_similarity):
         return False
     candidate_quality = _candidate_quality(candidate, src, tgt, semantic_similarity, lang_ratio)
@@ -237,18 +255,21 @@ async def refine_hard_block(
     max_output_tokens: int | None = None,
     refinement_outcome: dict[str, str] | None = None,
     accept_validated_candidate: bool = False,
+    boundary_key: BoundaryKey | None = None,
 ) -> list[AlignPair]:
     system = (
         "你是文本对齐工具。只输出 JSON 对象，格式为 {\"pairs\":[{\"s\":[0],\"t\":[0]}]}。"
         "绝对不要输出、复述或改写任何原文或译文；对象中不得出现 s、t、pairs 之外的字段。"
         "必须根据完整互译关系决定一对多、多对一或多对多，禁止因为序号相同就机械地一一配对。"
         "每一侧所有下标必须恰好出现一次，配对顺序必须同时保持源侧和目标侧单调递增。"
-        "表格行列元数据只描述各自文档结构，两侧物理行号不要求相等；但不得无证据跨越表格、逻辑行或单元格吞入相邻内容。"
+        "表格按键对齐：同一配对的源侧下标必须全部来自同一个非空单元格键，目标侧同理。"
+        "两侧键值本身不要求相等；遇到跨键内容宁可保留为漏译或增译，也禁止在同一侧跨键合并。"
     )
 
     def structure(unit: AlignUnit) -> str:
         if unit.block_type == "table_cell":
             return (
+                f"key={boundary_key(unit) if boundary_key else unit.cell_key or '-'},"
                 f"table={unit.block_index},row={unit.row_index},cell={unit.cell_index},"
                 f"parent={unit.parent_segment_id or '-'}"
             )
@@ -274,8 +295,9 @@ async def refine_hard_block(
         f"程序候选：{json.dumps({'pairs': fallback_payload}, ensure_ascii=False)}\n\n"
         "程序候选仅供参考；只有确实完整互译时才能放在同一配对中。"
         "不得把相邻段落的额外内容并入当前配对。漏译的 t 为空数组，增译的 s 为空数组。"
-        "译文的一个条目可能合并原文很多个段落，原文也可能合并多个译文条目；这种断句差异必须组成"
-        "大范围 N:1 或 1:N 配对，不得仅因条目数量不同就判为漏译或增译。只有对应内容确实不存在时才能使用空数组。"
+        "正文段落中，译文的一个条目可能合并原文多个段落，原文也可能合并多个译文条目；"
+        "这种 N:1 或 1:N 只适用于非表格正文。表格不同单元格之间不得用断句差异解释为合并。"
+        "只有对应内容确实不存在时才能使用空数组。"
         f"{review_instruction}"
         f"{review_context}"
         "只返回 JSON。"
@@ -302,7 +324,11 @@ async def refine_hard_block(
                     provider=completion.provider, model=completion.model,
                 )
                 continue
-            parsed = _validate_index_response(payload, len(src), len(tgt))
+            parsed = _validate_index_response(
+                payload, len(src), len(tgt),
+                src_keys=[boundary_key(unit) if boundary_key else "" for unit in src],
+                tgt_keys=[boundary_key(unit) if boundary_key else "" for unit in tgt],
+            )
             if parsed is None:
                 _set_refinement_outcome(
                     refinement_outcome, "invalid_json",
@@ -322,6 +348,7 @@ async def refine_hard_block(
             ) for source, target in parsed]
             if accept_validated_candidate or _accept_llm_candidate(
                 candidate, fallback, src, tgt, semantic_similarity, lang_ratio,
+                boundary_key=boundary_key,
             ):
                 if _pair_mapping_signature(candidate) == _pair_mapping_signature(fallback):
                     _set_refinement_outcome(

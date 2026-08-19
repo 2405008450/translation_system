@@ -282,6 +282,9 @@ const isAlignmentTranslationOnly = computed(() => (
 const isAlignmentMissingTranslation = computed(() => (
   props.alignmentMode && !props.segment.alignment_translation_only && isEmptyTarget.value
 ))
+const isAlignmentCrossCell = computed(() => (
+  props.alignmentMode && props.segment.alignment_cross_cell === true
+))
 const proofreadingTargetText = computed(() => (
   props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
 ))
@@ -2932,11 +2935,15 @@ watch(
 
 // 进入原文编辑模式时聚焦
 watch(
-  () => props.sourceEditing && props.active,
-  (shouldEdit) => {
+  () => [props.sourceEditing, props.active] as const,
+  ([shouldEdit, isActive], previousState) => {
+    const wasEditing = previousState?.[0] ?? false
     nextTick(() => {
       syncSourceEditorFromState(false)
-      if (shouldEdit) {
+      // 只在当前行真正“进入原文编辑模式”时自动聚焦原文。
+      // 对齐工作台会让 sourceEditing 始终为 true；此时点击未激活行的译文
+      // 只会改变 active，不能因此把浏览器刚落在译文上的焦点抢回原文。
+      if (shouldEdit && isActive && !wasEditing) {
         if (sourceEditorRef.value) {
           sourceEditorRef.value.focus()
           moveCursorToEnd(sourceEditorRef.value)
@@ -2975,6 +2982,7 @@ watch(
       <span class="segment-row__index">{{ index + 1 }}</span>
       <span v-if="isAlignmentTranslationOnly" class="segment-row__alignment-issue-badge is-translation-only">增译</span>
       <span v-else-if="isAlignmentMissingTranslation" class="segment-row__alignment-issue-badge is-missing">漏译</span>
+      <span v-if="isAlignmentCrossCell" class="segment-row__alignment-issue-badge is-cross-cell" title="同一侧包含多个表格单元格">跨格</span>
       <button
         class="segment-row__selection-toggle"
         type="button"
@@ -3313,6 +3321,11 @@ watch(
 
 .segment-row__alignment-issue-badge.is-missing {
   background: #c44747;
+  color: #fff;
+}
+
+.segment-row__alignment-issue-badge.is-cross-cell {
+  background: #8b5cf6;
   color: #fff;
 }
 

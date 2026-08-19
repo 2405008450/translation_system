@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     # 全局 fallback；实际单文件上限以各格式 adapter 的 FORMAT_SIZE_LIMITS 为准。
     upload_max_size_mb: int = 100
     upload_max_files_per_batch: int = 50
+    upload_max_files_per_selection: int = 200
     upload_max_total_size_mb: int = 500
     upload_max_expanded_files: int = 100
     default_similarity_threshold: float = 0.80
@@ -81,6 +82,9 @@ class Settings(BaseSettings):
     alignment_embedding_batch_size: int = 100
     alignment_embedding_concurrency: int = 2
     alignment_embedding_window_blocks: int = 32
+    # 表格单元格是对齐的硬边界；短单元格优先整格作为一个原子单元。
+    alignment_table_cell_boundary_enabled: bool = True
+    alignment_table_cell_atomic_max_chars: int = 60
     alignment_llm_refinement_enabled: bool = True
     # 向量候选完成后，将全部键值对分块交给指定 LLM 做边界复核。
     alignment_llm_full_review_enabled: bool = False

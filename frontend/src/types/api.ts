@@ -410,6 +410,7 @@ export interface UploadCapability {
 
 export interface UploadBatchLimits {
   max_files_per_batch: number
+  max_files_per_selection: number
   max_total_size_mb: number
   max_expanded_files: number
 }
@@ -510,6 +511,7 @@ export interface Segment {
   alignment_translation_only?: boolean
   alignment_src_indices?: number[]
   alignment_tgt_indices?: number[]
+  alignment_cross_cell?: boolean
   workflow_step_id?: string | null
   workflow_step_name?: string | null
   workflow_step_order?: number | null

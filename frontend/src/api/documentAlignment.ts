@@ -155,6 +155,17 @@ export async function replaceAlignmentPairRange(batchId: string, payload: {
   return data
 }
 
+export async function splitAlignmentPairsByCell(batchId: string, pairIds: string[] = []) {
+  const { data } = await http.post<{
+    changed_pairs: number
+    created_pairs: number
+    merged_gaps: number
+  }>(`/proofreading-batches/${batchId}/alignment-pairs/split-by-cell`, {
+    pair_ids: pairIds,
+  })
+  return data
+}
+
 export async function updateAlignmentPairText(
   pairId: string,
   payload: { source_text?: string; target_text?: string },

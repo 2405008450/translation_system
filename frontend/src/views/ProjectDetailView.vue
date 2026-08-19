@@ -75,6 +75,13 @@ import {
 } from '../utils/exportOptions'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import { matchesSearchKeyword, normalizeSearchKeyword, splitSearchKeywords } from '../utils/search'
+import {
+  buildUploadBatches,
+  calculateOverallUploadProgress,
+  getRemainingUploadFiles,
+  getUploadBatchCapacity,
+  isUploadSelectionWithinLimit,
+} from '../utils/uploadBatching'
 import type {
   AssignmentDraft,
   AssignmentFileRangeDraft,
@@ -442,6 +449,7 @@ const documentParseOptions = ref<DocumentParseOptions>({ ...DEFAULT_DOCUMENT_PAR
 const uploadCapabilities = ref<UploadCapability[]>([])
 const uploadLimits = ref<UploadBatchLimits>({
   max_files_per_batch: 50,
+  max_files_per_selection: 200,
   max_total_size_mb: 500,
   max_expanded_files: 100,
 })
@@ -1626,11 +1634,16 @@ const generatedUploadTaskCount = computed(() => (
   selectedFiles.value.length * effectiveUploadTargetLanguages.value.length
 ))
 const uploadGenerationValidationError = computed(() => {
-  if (generatedUploadTaskCount.value <= uploadLimits.value.max_expanded_files) {
+  const targetLanguageCount = effectiveUploadTargetLanguages.value.length
+  if (
+    selectedFiles.value.length === 0
+    || targetLanguageCount === 0
+    || getUploadBatchCapacity(uploadLimits.value, targetLanguageCount) > 0
+  ) {
     return ''
   }
-  return t('projectDetail.errors.tooManyGeneratedTasks', {
-    count: generatedUploadTaskCount.value,
+  return t('projectDetail.errors.tooManyTargetLanguages', {
+    count: targetLanguageCount,
     max: uploadLimits.value.max_expanded_files,
   })
 })
@@ -2358,8 +2371,8 @@ function validateSelectedUploadFiles(files: File[]): string {
   }
 
   const limits = uploadLimits.value
-  if (files.length > limits.max_files_per_batch) {
-    return t('projectDetail.errors.tooManyFiles', { max: limits.max_files_per_batch })
+  if (!isUploadSelectionWithinLimit(files.length, limits.max_files_per_selection)) {
+    return t('projectDetail.errors.tooManyFiles', { max: limits.max_files_per_selection })
   }
 
   let totalBytes = 0
@@ -4776,6 +4789,7 @@ async function loadUploadCapabilities() {
     uploadCapabilities.value = data.formats
     uploadLimits.value = {
       max_files_per_batch: data.limits?.max_files_per_batch ?? 50,
+      max_files_per_selection: data.limits?.max_files_per_selection ?? 200,
       max_total_size_mb: data.limits?.max_total_size_mb ?? 500,
       max_expanded_files: data.limits?.max_expanded_files ?? 100,
     }
@@ -4959,32 +4973,60 @@ async function uploadSourceDocument() {
   pageError.value = ''
   uploading.value = true
   uploadPercent.value = 0
+  const uploadFiles = [...selectedFiles.value]
+  const uploadBatches = buildUploadBatches(
+    uploadFiles,
+    uploadLimits.value,
+    resolvedTargetLanguages.length,
+  )
+  let completedFileCount = 0
+
+  const updateOverallUploadProgress = (batchFileCount: number, batchProgress: number) => {
+    uploadPercent.value = calculateOverallUploadProgress(
+      completedFileCount,
+      uploadFiles.length,
+      batchFileCount,
+      batchProgress,
+      uploadPercent.value,
+    )
+  }
 
   try {
-    const formData = new FormData()
-    selectedFiles.value.forEach((file) => {
-      formData.append('files', file)
-    })
-    formData.append('threshold', '0.6')
-    formData.append('source_language', resolvedSourceLanguage)
-    resolvedTargetLanguages.forEach((language) => {
-      formData.append('target_languages', language)
-    })
-    formData.append('document_parse_mode', documentParseMode.value)
-    formData.append('document_parse_options', JSON.stringify(documentParseOptions.value))
-
-    const { data } = await http.post<unknown | ImportTaskAccepted>(`/projects/${props.id}/source-document`, formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-      onUploadProgress: (event) => {
-        const total = event.total || 0
-        const loaded = event.loaded || 0
-        uploadPercent.value = total > 0 ? Math.min(40, Math.round((loaded / total) * 40)) : 0
-      },
-    })
-    if (isImportTaskAccepted(data)) {
-      await waitForImportTask(data.task_id, (status) => {
-        uploadPercent.value = Math.min(100, 40 + Math.round(status.progress * 0.6))
+    for (const batch of uploadBatches) {
+      const formData = new FormData()
+      batch.forEach((file) => {
+        formData.append('files', file)
       })
+      formData.append('threshold', '0.6')
+      formData.append('source_language', resolvedSourceLanguage)
+      resolvedTargetLanguages.forEach((language) => {
+        formData.append('target_languages', language)
+      })
+      formData.append('document_parse_mode', documentParseMode.value)
+      formData.append('document_parse_options', JSON.stringify(documentParseOptions.value))
+
+      const { data } = await http.post<unknown | ImportTaskAccepted>(
+        `/projects/${props.id}/source-document`,
+        formData,
+        {
+          headers: { 'Content-Type': 'multipart/form-data' },
+          onUploadProgress: (event) => {
+            const total = event.total || 0
+            const loaded = event.loaded || 0
+            const uploadProgress = total > 0 ? loaded / total : 0
+            updateOverallUploadProgress(batch.length, uploadProgress * 0.4)
+          },
+        },
+      )
+      if (isImportTaskAccepted(data)) {
+        await waitForImportTask(data.task_id, (status) => {
+          updateOverallUploadProgress(batch.length, 0.4 + (status.progress / 100) * 0.6)
+        })
+      }
+
+      completedFileCount += batch.length
+      selectedFiles.value = getRemainingUploadFiles(uploadFiles, completedFileCount)
+      updateOverallUploadProgress(0, 1)
     }
 
     await loadProject()
@@ -4993,10 +5035,24 @@ async function uploadSourceDocument() {
     selectedFileIds.value = new Set<string>()
     toast.success(t('projectDetail.messages.uploaded'))
   } catch (error) {
-    uploadMessage.value = getErrorMessage(error, t('projectDetail.errors.upload'))
+    const errorMessage = getErrorMessage(error, t('projectDetail.errors.upload'))
+    if (completedFileCount > 0) {
+      await loadProject()
+      uploadInputKey.value += 1
+      uploadMessage.value = t('projectDetail.messages.partiallyUploaded', {
+        completed: completedFileCount,
+        total: uploadFiles.length,
+        remaining: uploadFiles.length - completedFileCount,
+        error: errorMessage,
+      })
+    } else {
+      uploadMessage.value = errorMessage
+    }
   } finally {
     uploading.value = false
-    uploadPercent.value = 0
+    if (!showUploadModal.value) {
+      uploadPercent.value = 0
+    }
   }
 }
 

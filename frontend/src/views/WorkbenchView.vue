@@ -45,6 +45,7 @@ import {
   Strikethrough,
   Subscript,
   Superscript,
+  TableCellsSplit,
   Tag as TagIcon,
   Tags,
   Trash2,
@@ -85,6 +86,7 @@ import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { http } from '../api/http'
 import {
   replaceAlignmentPairRange,
+  splitAlignmentPairsByCell,
   updateAlignmentPairText,
   type AlignmentPairReplacement,
 } from '../api/documentAlignment'
@@ -6975,6 +6977,34 @@ async function splitAlignmentPairInWorkbench() {
   await applyAlignmentReplacement(current.alignment_pair_order, before, after, '拆分')
 }
 
+async function splitAlignmentPairsByCellInWorkbench() {
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId || alignmentAdvancing.value) return
+  const pairIds = [...selectedSentenceIds.value]
+    .map(sentenceId => alignmentSegmentByKey(sentenceId)?.alignment_pair_id)
+    .filter((value): value is string => Boolean(value))
+  alignmentAdvancing.value = true
+  try {
+    const result = await splitAlignmentPairsByCell(batchId, [...new Set(pairIds)])
+    selectedSentenceIds.value = new Set()
+    // 批量单元格修复可能跨越多个分页，旧的局部撤回命令不再对应当前 pair_order。
+    alignmentUndoStack.value = []
+    alignmentRedoStack.value = []
+    await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize, { includeStats: false })
+    if (result.changed_pairs) {
+      toast.success({
+        message: `已拆分 ${result.changed_pairs} 个跨单元格配对，并回收 ${result.merged_gaps} 组相邻错位。`,
+      })
+    } else {
+      toast.info({ message: '所选范围内未发现跨单元格粘连。' })
+    }
+  } catch (error) {
+    toast.error({ message: getErrorMessage(error, '按单元格拆分失败。') })
+  } finally {
+    alignmentAdvancing.value = false
+  }
+}
+
 async function insertAlignmentPairInWorkbench() {
   const current = activeSegment.value
   if (!current || typeof current.alignment_pair_order !== 'number') return
@@ -9087,6 +9117,15 @@ onBeforeRouteLeave(async () => {
             </button>
             <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" @click="void splitAlignmentPairInWorkbench()">
               <Split :size="15" /><span>拆分</span>
+            </button>
+            <button
+              class="workbench-ribbon__top-action"
+              type="button"
+              :disabled="alignmentAdvancing"
+              :title="selectedSentenceIds.size ? '按单元格拆分选中行' : '扫描整批并按单元格拆分'"
+              @click="void splitAlignmentPairsByCellInWorkbench()"
+            >
+              <TableCellsSplit :size="15" /><span>按单元格拆分</span>
             </button>
             <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" title="下一项开头的译文移入当前项" @click="void shiftAlignmentBoundaryInWorkbench('target', 'next_into_current')">
               <ChevronUp :size="15" /><span>上移</span>

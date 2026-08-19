@@ -4,7 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 import re
 
-from .dp import AlignPair
+from .dp import AlignPair, BoundaryKey, align_block
 from .parser import AlignUnit
 
 
@@ -81,6 +81,12 @@ def build_structural_blocks(units: list[AlignUnit]) -> list[StructuralBlock]:
             numbers=numbers,
             is_heading=first.is_heading,
             parent_segment_id=first.parent_segment_id,
+            cell_key=(
+                first.cell_key
+                if len({member.cell_key for member in members if member.cell_key}) <= 1
+                else ""
+            ),
+            row_key=first.row_key,
         )
         result.append(StructuralBlock(coarse, tuple(members)))
     return result
@@ -90,6 +96,18 @@ def _expand_members(
     indexes: list[int], blocks: list[StructuralBlock],
 ) -> list[AlignUnit]:
     return [member for index in indexes for member in blocks[index].members]
+
+
+def _table_boundary_key(
+    source: list[AlignUnit], target: list[AlignUnit],
+) -> BoundaryKey | None:
+    source_cells = {unit.cell_key for unit in source if unit.cell_key}
+    target_cells = {unit.cell_key for unit in target if unit.cell_key}
+    if not source_cells or not target_cells:
+        return None
+    ratio = min(len(source_cells), len(target_cells)) / max(len(source_cells), len(target_cells))
+    use_row = ratio < 0.5
+    return lambda unit: unit.row_key if use_row else unit.cell_key
 
 
 def _align_by_cumulative_progress(
@@ -188,7 +206,15 @@ def build_hierarchical_seed_pairs(
         for coarse_pair in coarse_pairs:
             block_source = _expand_members(coarse_pair.src_indices, source_blocks)
             block_target = _expand_members(coarse_pair.tgt_indices, target_blocks)
-            fine_pairs = _align_by_cumulative_progress(block_source, block_target)
+            boundary_key = _table_boundary_key(block_source, block_target)
+            fine_pairs = (
+                align_block(
+                    block_source, block_target,
+                    lang_ratio=lang_ratio, boundary_key=boundary_key,
+                )
+                if boundary_key is not None
+                else _align_by_cumulative_progress(block_source, block_target)
+            )
             for pair in fine_pairs:
                 pair.method = "hierarchical_seed"
                 pair.features.update({
@@ -273,9 +299,13 @@ def repair_adjacent_bilingual_gaps(
             target_indices.extend(candidate.tgt_indices)
             end += 1
         if source_indices and target_indices:
-            repaired = _align_by_cumulative_progress(
-                [source_map[item] for item in source_indices],
-                [target_map[item] for item in target_indices],
+            source_units = [source_map[item] for item in source_indices]
+            target_units = [target_map[item] for item in target_indices]
+            boundary_key = _table_boundary_key(source_units, target_units)
+            repaired = (
+                align_block(source_units, target_units, boundary_key=boundary_key)
+                if boundary_key is not None
+                else _align_by_cumulative_progress(source_units, target_units)
             )
             for item in repaired:
                 item.method = "hierarchical_gap_repair"

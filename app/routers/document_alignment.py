@@ -24,7 +24,8 @@ from app.services.document_alignment.segments import (
 from app.services.document_alignment.service import (
     create_alignment_batch, preview_document_pair, refresh_pair_text,
     merge_alignment_pair_range, replace_alignment_pair_range,
-    run_alignment_batch, serialize_pair, validate_pair_integrity,
+    run_alignment_batch, serialize_pair, split_alignment_pairs_by_cell,
+    validate_pair_integrity,
 )
 from app.services.import_task_storage import (
     cleanup_import_task_staging, get_import_task_staging_dir, stage_import_file_streams,
@@ -85,6 +86,10 @@ class PairRangeReplace(BaseModel):
     replacements: list[PairReplacement] = Field(default_factory=list, max_length=100)
 
 
+class PairCellSplit(BaseModel):
+    pair_ids: list[UUID] = Field(default_factory=list, max_length=100)
+
+
 def _project(db: Session, project_id: UUID) -> Project:
     project = db.get(Project, project_id)
     if not project:
@@ -120,9 +125,9 @@ async def preview_alignment(
 ):
     _project(db, project_id)
     source_name, target_name = source_file.filename or "source.txt", target_file.filename or "target.txt"
-    allowed = {".docx", ".doc", ".txt"}
+    allowed = {".docx", ".doc", ".txt", ".html", ".htm"}
     if Path(source_name).suffix.lower() not in allowed or Path(target_name).suffix.lower() not in allowed:
-        raise HTTPException(400, "仅支持 docx、doc 和 txt 文档。")
+        raise HTTPException(400, "仅支持 docx、doc、txt、html 和 htm 文档。")
     token = str(uuid4())
     try:
         staged = await asyncio.to_thread(
@@ -358,6 +363,28 @@ def replace_pair_range(
         db.rollback()
         raise HTTPException(400, str(exc)) from exc
     return {"items": [serialize_pair(row) for row in rows]}
+
+
+@router.post("/proofreading-batches/{batch_id}/alignment-pairs/split-by-cell")
+def split_pairs_by_cell(
+    batch_id: UUID,
+    payload: PairCellSplit,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    """按解析时保留的表格单元格坐标修复跨格粘连；空列表表示扫描整批。"""
+    batch = _batch(db, batch_id)
+    if batch.alignment_status not in {"draft", "confirmed"}:
+        raise HTTPException(409, "当前对齐结果不可调整。")
+    try:
+        result = split_alignment_pairs_by_cell(db, batch_id, payload.pair_ids)
+        if batch.alignment_status == "confirmed" and result["changed_pairs"]:
+            ensure_document_pair_segments_complete(db, batch, refresh_existing=True)
+        db.commit()
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    return result
 
 
 @router.post("/proofreading-batches/{batch_id}/alignment/rerun")

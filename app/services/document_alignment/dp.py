@@ -4,7 +4,13 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable
 
-from .features import classify_field, comparable_text, punctuation_features, unit_numbering
+from .features import (
+    classify_field,
+    comparable_text,
+    crosses_heading_boundary,
+    punctuation_features,
+    unit_numbering,
+)
 from .parser import AlignUnit
 
 ALIGN_OPS = ((1, 1), (1, 2), (2, 1), (1, 0), (0, 1), (2, 2), (1, 3), (3, 1))
@@ -35,6 +41,14 @@ def _group_values(units: list[AlignUnit]) -> tuple[int, set[str], str, bool, dic
 
 
 SemanticSimilarity = Callable[[list[AlignUnit], list[AlignUnit]], float | None]
+BoundaryKey = Callable[[AlignUnit], str]
+
+
+def _within_single_key(units: list[AlignUnit], boundary_key: BoundaryKey | None) -> bool:
+    if boundary_key is None:
+        return True
+    keys = {boundary_key(unit) for unit in units if boundary_key(unit)}
+    return len(keys) <= 1
 
 
 def _transition_cost(
@@ -101,6 +115,7 @@ def _confidence(cost: float, op: tuple[int, int]) -> float:
 def align_block(
     src: list[AlignUnit], tgt: list[AlignUnit], *, lang_ratio: float = 1.0,
     semantic_similarity: SemanticSimilarity | None = None,
+    boundary_key: BoundaryKey | None = None,
 ) -> list[AlignPair]:
     """动态规划对齐，并保证两侧每个输入下标恰好出现一次。"""
     n, m = len(src), len(tgt)
@@ -123,6 +138,13 @@ def align_block(
             for a, b in ALIGN_OPS:
                 ni, nj = i + a, j + b
                 if ni > n or nj > m:
+                    continue
+                if (
+                    not _within_single_key(src[i:ni], boundary_key)
+                    or not _within_single_key(tgt[j:nj], boundary_key)
+                    or crosses_heading_boundary(src[i:ni])
+                    or crosses_heading_boundary(tgt[j:nj])
+                ):
                     continue
                 cost, features = _transition_cost(src[i:ni], tgt[j:nj], (a, b), ratio, semantic_similarity)
                 candidate = scores[i][j] + cost

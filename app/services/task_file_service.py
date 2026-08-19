@@ -606,6 +606,7 @@ def get_upload_capabilities() -> dict[str, Any]:
         "formats": formats,
         "limits": {
             "max_files_per_batch": settings.upload_max_files_per_batch,
+            "max_files_per_selection": settings.upload_max_files_per_selection,
             "max_total_size_mb": settings.upload_max_total_size_mb,
             "max_expanded_files": settings.upload_max_expanded_files,
         },
