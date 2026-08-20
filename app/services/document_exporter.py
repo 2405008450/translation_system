@@ -32,7 +32,6 @@ from app.services.document_workspace import (
     NumberingSchema,
     OMML_ATOMIC_TAGS,
     StoryPart,
-    get_cached_docx_workspace,
     _build_numbering_schema,
     _build_story_parts,
     _build_trimmed_span,
@@ -51,6 +50,7 @@ from app.services.document_workspace import (
     _select_preferred_alternate_content_branch,
     normalize_document_parse_options,
     normalize_document_parse_mode,
+    parse_docx_workspace,
     should_merge_table_cell_paragraph_texts,
 )
 from app.services.normalizer import compact_match_core, normalize_text
@@ -166,6 +166,8 @@ REVISION_DIFF_TOKEN_RE = re.compile(
 )
 REVISION_MARKER_PREFIX = "\ue000DOCX_REVISION_"
 REVISION_MARKER_SUFFIX = "\ue001"
+FORMAT_MARKER_PREFIX = "\ue002DOCX_FORMAT_"
+FORMAT_MARKER_SUFFIX = "\ue003"
 EXPLICIT_FORMAT_RUN_PROPERTIES = {
     "b",
     "bCs",
@@ -525,7 +527,9 @@ def export_bilingual_docx_with_layout(
         document_parse_options=document_parse_options,
     )
     numbering_schema = _build_numbering_schema(package)
-    source_workspace = get_cached_docx_workspace(
+    # 导出必须使用当前解析器重新读取源文件，避免旧版本预览缓存与本次
+    # 实际写入的 XML 断句结构不一致。
+    source_workspace = parse_docx_workspace(
         raw_bytes,
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
@@ -586,7 +590,8 @@ def export_translated_docx(
         document_parse_options=document_parse_options,
     )
     numbering_schema = _build_numbering_schema(package)
-    source_workspace = get_cached_docx_workspace(
+    # 不复用预览缓存，确保句段定位与本次实际遍历的 DOCX 结构一致。
+    source_workspace = parse_docx_workspace(
         raw_bytes,
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
@@ -769,10 +774,11 @@ def _group_segments_by_block(
     source_segment_by_sentence_id = _build_source_segment_lookup_by_sentence_id(source_segment_list)
     source_segment_by_text_key = _build_unique_source_segment_lookup_by_text(source_segment_list)
     revision_map = revisions_by_sentence_id or {}
-    authoritative_block_keys = _build_authoritative_block_keys_by_sequence(
-        segment_list,
-        source_segment_list,
-    )
+    has_authoritative_sequence = _has_complete_persisted_sequence(segment_list)
+    source_block_keys = {
+        _source_segment_block_key(source_segment)
+        for source_segment in source_segment_list
+    }
 
     for segment in segment_list:
         block_type = str(_get_segment_value(segment, "block_type", "paragraph") or "paragraph")
@@ -782,11 +788,16 @@ def _group_segments_by_block(
         sentence_id = str(_get_segment_value(segment, "sentence_id", "") or "")
         target_html = _get_segment_value(segment, "target_html")
         sequence_index = _get_export_sequence_index(segment)
-        block_key = authoritative_block_keys.get(sequence_index)
-        if block_key is None:
+        fallback_block_key = (block_type, block_index, row_index, cell_index)
+        if has_authoritative_sequence and fallback_block_key in source_block_keys:
+            # 工作台顺序由持久化块位置 + sequence_index 共同决定。只要这组位置
+            # 仍存在于源文档，就必须与网页使用同一坐标，不能再被原文哈希或
+            # 当前解析器生成的 sentence_id 重新定位到其他段落/文本框。
+            block_key = fallback_block_key
+        else:
             block_key = _resolve_export_segment_block_key(
                 segment=segment,
-                fallback=(block_type, block_index, row_index, cell_index),
+                fallback=fallback_block_key,
                 source_segment_by_sentence_id=source_segment_by_sentence_id,
                 source_segment_by_text_key=source_segment_by_text_key,
             )
@@ -836,36 +847,11 @@ def _group_segments_by_block(
     return _order_segment_groups_by_source(grouped, source_segment_list)
 
 
-def _build_authoritative_block_keys_by_sequence(
-    segments: list[Any],
-    source_segments: list[Mapping[str, Any]],
-) -> dict[int, BlockKey]:
-    """按持久化顺序把译文映射到当前源文档的句段槽位。"""
-    if not segments or len(segments) != len(source_segments):
-        return {}
-
-    indexed_segments: list[tuple[int, Any]] = []
-    for segment in segments:
-        sequence_index = _get_export_sequence_index(segment)
-        if sequence_index is None:
-            return {}
-        indexed_segments.append((sequence_index, segment))
-
-    sequence_indexes = [sequence_index for sequence_index, _ in indexed_segments]
-    if len(sequence_indexes) != len(set(sequence_indexes)):
-        return {}
-
-    # sequence_index 是工作台展示顺序的持久化依据。当前解析器生成的 sentence_id
-    # 或原文文本只能用于历史数据兜底，不能再次改变完整顺序数据的跨块位置。
-    indexed_segments.sort(key=lambda item: item[0])
-    return {
-        sequence_index: _source_segment_block_key(source_segment)
-        for (sequence_index, _), source_segment in zip(
-            indexed_segments,
-            source_segments,
-            strict=True,
-        )
-    }
+def _has_complete_persisted_sequence(segments: Iterable[Any]) -> bool:
+    sequence_indexes = [_get_export_sequence_index(segment) for segment in segments]
+    return bool(sequence_indexes) and all(
+        sequence_index is not None for sequence_index in sequence_indexes
+    ) and len(sequence_indexes) == len(set(sequence_indexes))
 
 
 def _build_source_segment_lookup_by_sentence_id(
@@ -2543,6 +2529,7 @@ def _replace_block_tokens(
     previous_replacement = ""
     previous_span: SentenceSpan | None = None
     pending_revision_markers: list[tuple[str, ExportSegment, str]] = []
+    pending_format_markers: list[tuple[str, str]] = []
     for span in spans:
         sentence_source = _normalize_segment_source_text(_collect_span_text(tokens, span, use_source=True))
         if not sentence_source:
@@ -2609,7 +2596,16 @@ def _replace_block_tokens(
                 expected_math_placeholders=expected_math_placeholders,
             )
         elif has_custom_target_html:
-            _queue_formatted_sentence_replacement(tokens, span, segment.target_html)
+            format_marker = (
+                f"{FORMAT_MARKER_PREFIX}{len(pending_format_markers)}{FORMAT_MARKER_SUFFIX}"
+            )
+            if _queue_formatted_sentence_replacement(
+                tokens,
+                span,
+                segment.target_html,
+                inline_marker=format_marker,
+            ):
+                pending_format_markers.append((format_marker, segment.target_html))
         else:
             _queue_sentence_replacement(tokens, span, replacement)
 
@@ -2617,6 +2613,7 @@ def _replace_block_tokens(
         previous_span = span
 
     _apply_token_edits(tokens)
+    _expand_formatted_markers(tokens, pending_format_markers)
     _expand_word_revision_markers(tokens, pending_revision_markers)
 
 
@@ -3589,12 +3586,13 @@ def _queue_formatted_sentence_replacement(
     tokens: list[TextToken],
     span: SentenceSpan,
     target_html: str,
-) -> None:
+    inline_marker: str | None = None,
+) -> bool:
     """使用带格式的 HTML 替换句子"""
     # 解析 HTML 获取格式化片段
     fragments = _parse_formatted_html(target_html)
     if not fragments:
-        return
+        return False
 
     # 找到可写入的 token
     writable_overlaps: list[tuple[TextToken, int, int]] = []
@@ -3610,10 +3608,22 @@ def _queue_formatted_sentence_replacement(
         )
 
     if not writable_overlaps:
-        return
+        return False
 
     # 清空所有重叠 token 的文本
     first_token, first_start, first_end = writable_overlaps[0]
+
+    # 多个句段可能共享同一个 w:t。若当前句段从 token 中间开始，直接把
+    # 格式化 run 插到原 run 前会把后面的译文移动到整段最前面。此时改用
+    # 字符偏移替换；超链接范围仍由普通替换逻辑保留，顺序和内容优先。
+    if first_start > 0 and inline_marker:
+        _queue_sentence_replacement(
+            tokens,
+            span,
+            inline_marker,
+        )
+        return True
+
     for token, local_start, local_end in writable_overlaps:
         token.edits.append((local_start, local_end, ""))
 
@@ -3629,6 +3639,63 @@ def _queue_formatted_sentence_replacement(
                 continue
             run = _build_formatted_word_run(fragment, first_token.run_element)
             parent.insert(insert_index + i, run)
+
+    return False
+
+
+def _expand_formatted_markers(
+    tokens: list[TextToken],
+    pending_markers: list[tuple[str, str]],
+) -> None:
+    if not pending_markers:
+        return
+
+    for marker, target_html in pending_markers:
+        fragments = _parse_formatted_html(target_html)
+        plain_text = "".join(fragment.text for fragment in fragments)
+        expanded = False
+
+        for token in tokens:
+            element = token.element
+            text_value = element.text if element is not None else None
+            if not text_value or marker not in text_value:
+                continue
+
+            before_text, after_text = text_value.split(marker, 1)
+            run = token.run_element
+            parent = token.container_element
+            if (
+                run is None
+                or parent is None
+                or _namespace_uri(run.tag) != NS["w"]
+                or run not in list(parent)
+            ):
+                element.text = text_value.replace(marker, plain_text, 1)
+                expanded = True
+                break
+
+            element.text = before_text
+            insert_index = list(parent).index(run) + 1
+            inserted_count = 0
+            for fragment in fragments:
+                if not fragment.text:
+                    continue
+                parent.insert(
+                    insert_index + inserted_count,
+                    _build_formatted_word_run(fragment, run),
+                )
+                inserted_count += 1
+
+            if after_text:
+                parent.insert(
+                    insert_index + inserted_count,
+                    _build_inserted_word_run(after_text, run),
+                )
+            expanded = True
+            break
+
+        if not expanded:
+            logger.warning("DOCX formatted replacement marker was not expanded: %s", marker)
 
 
 def _build_formatted_word_run(
