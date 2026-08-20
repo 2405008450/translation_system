@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -33,6 +34,16 @@ logger = logging.getLogger(__name__)
 
 class AlignmentCanceled(Exception):
     """用户主动终止双文档对齐任务。"""
+
+
+@dataclass(frozen=True)
+class AlignmentBatchSnapshot:
+    """对齐计算所需的批次快照；计算阶段不得持有 ORM 会话或数据库事务。"""
+
+    id: UUID
+    source_language: str
+    target_language: str
+    config_json: str | None
 
 
 def _utcnow_naive() -> datetime:
@@ -289,7 +300,8 @@ async def _compute_hierarchical_pairs(
 
 
 async def _compute_pairs(
-    batch: ProofreadingBatch, src: list[AlignUnit], tgt: list[AlignUnit],
+    batch: ProofreadingBatch | AlignmentBatchSnapshot,
+    src: list[AlignUnit], tgt: list[AlignUnit],
     progress_callback: AlignmentProgress | None = None,
 ) -> list[AlignPair]:
     config = json.loads(batch.config_json or "{}")
@@ -1037,68 +1049,144 @@ def _write_alignment_progress(batch_id: UUID, completed: int, total: int, phase:
         progress_db.commit()
 
 
-def run_alignment_batch(batch_id: UUID) -> None:
+def _load_alignment_work(
+    batch_id: UUID,
+) -> tuple[
+    AlignmentBatchSnapshot,
+    list[AlignUnit],
+    list[AlignUnit],
+    list[tuple[list[int], list[int]]],
+    set[tuple[tuple[int, ...], tuple[int, ...]]],
+] | None:
+    """用短事务读取对齐输入，返回后连接已归还连接池。"""
+
+    with SessionLocal() as db:
+        batch = db.get(ProofreadingBatch, batch_id)
+        if not batch:
+            return None
+        src = _orm_units(db, batch.id, "source")
+        tgt = _orm_units(db, batch.id, "target")
+        locked_rows = (
+            db.query(DocumentAlignmentPair)
+            .filter_by(batch_id=batch.id, locked=True)
+            .order_by(DocumentAlignmentPair.pair_order)
+            .all()
+        )
+        locked_anchors = [
+            (
+                list(json.loads(row.src_indices or "[]")),
+                list(json.loads(row.tgt_indices or "[]")),
+            )
+            for row in locked_rows
+        ]
+        locked_signatures = {
+            (tuple(src_indices), tuple(tgt_indices))
+            for src_indices, tgt_indices in locked_anchors
+        }
+        snapshot = AlignmentBatchSnapshot(
+            id=batch.id,
+            source_language=batch.source_language,
+            target_language=batch.target_language,
+            config_json=batch.config_json,
+        )
+    return snapshot, src, tgt, locked_anchors, locked_signatures
+
+
+def _persist_alignment_result(
+    batch_id: UUID,
+    pairs: list[AlignPair],
+    locked_signatures: set[tuple[tuple[int, ...], tuple[int, ...]]],
+) -> None:
+    """使用全新短事务检查取消状态并保存计算结果。"""
+
     with SessionLocal() as db:
         batch = db.get(ProofreadingBatch, batch_id)
         if not batch:
             return
-        try:
-            src, tgt = _orm_units(db, batch.id, "source"), _orm_units(db, batch.id, "target")
-            locked_rows = db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id, locked=True).order_by(DocumentAlignmentPair.pair_order).all()
-            locked_signatures = {
-                (tuple(json.loads(row.src_indices or "[]")), tuple(json.loads(row.tgt_indices or "[]")))
-                for row in locked_rows
-            }
-            if not locked_rows:
-                pairs = asyncio.run(_compute_pairs(
-                    batch, src, tgt,
-                    progress_callback=lambda completed, total, phase: _write_alignment_progress(
-                        batch.id, completed, total, phase,
-                    ),
+        if batch.cancel_requested or batch.status in {"canceling", "canceled"}:
+            raise AlignmentCanceled("用户已终止双文档对齐任务。")
+        _store_pairs(db, batch, pairs, locked_signatures=locked_signatures)
+
+
+def _mark_alignment_canceled(batch_id: UUID) -> None:
+    with SessionLocal() as db:
+        batch = db.get(ProofreadingBatch, batch_id)
+        if not batch:
+            return
+        batch.cancel_requested = True
+        has_previous_draft = (
+            db.query(DocumentAlignmentPair.id).filter_by(batch_id=batch.id).first()
+            is not None
+        )
+        batch.alignment_status = "draft" if has_previous_draft else "canceled"
+        batch.status = "draft" if has_previous_draft else "canceled"
+        batch.message = (
+            "重跑已终止，已保留上一次对齐草稿。"
+            if has_previous_draft else "双文档对齐已终止。"
+        )
+        batch.error_message = ""
+        batch.finished_at = _utcnow_naive()
+        db.commit()
+
+
+def _mark_alignment_failed(batch_id: UUID, exc: Exception) -> None:
+    with SessionLocal() as db:
+        batch = db.get(ProofreadingBatch, batch_id)
+        if not batch:
+            return
+        batch.alignment_status = "failed"
+        batch.status = "failed"
+        batch.error_message = str(exc)
+        batch.finished_at = _utcnow_naive()
+        db.commit()
+
+
+def run_alignment_batch(batch_id: UUID) -> None:
+    try:
+        work = _load_alignment_work(batch_id)
+        if work is None:
+            return
+        batch, src, tgt, locked_anchors, locked_signatures = work
+
+        # 从这里到最终落库之间不持有数据库会话。全量 LLM 复核即使运行数小时，
+        # 也不会触发 PostgreSQL idle-in-transaction 超时。
+        if not locked_anchors:
+            pairs = asyncio.run(_compute_pairs(
+                batch, src, tgt,
+                progress_callback=lambda completed, total, phase: _write_alignment_progress(
+                    batch.id, completed, total, phase,
+                ),
+            ))
+        else:
+            pairs = []
+            src_cursor = tgt_cursor = 0
+            for src_indices, tgt_indices in locked_anchors:
+                src_start = min(src_indices) if src_indices else src_cursor
+                tgt_start = min(tgt_indices) if tgt_indices else tgt_cursor
+                if src_start < src_cursor or tgt_start < tgt_cursor:
+                    raise ValueError("锁定配对的顺序发生交叉，无法作为重跑锚点。")
+                pairs.extend(asyncio.run(_compute_pairs(
+                    batch, src[src_cursor:src_start], tgt[tgt_cursor:tgt_start],
+                )))
+                pairs.append(AlignPair(
+                    src_indices, tgt_indices, 1.0,
+                    method="manual", features={"locked_anchor": True},
                 ))
-            else:
-                pairs = []
-                src_cursor = tgt_cursor = 0
-                for row in locked_rows:
-                    src_indices = json.loads(row.src_indices or "[]")
-                    tgt_indices = json.loads(row.tgt_indices or "[]")
-                    src_start = min(src_indices) if src_indices else src_cursor
-                    tgt_start = min(tgt_indices) if tgt_indices else tgt_cursor
-                    if src_start < src_cursor or tgt_start < tgt_cursor:
-                        raise ValueError("锁定配对的顺序发生交叉，无法作为重跑锚点。")
-                    pairs.extend(asyncio.run(_compute_pairs(batch, src[src_cursor:src_start], tgt[tgt_cursor:tgt_start])))
-                    pairs.append(AlignPair(src_indices, tgt_indices, 1.0, method="manual", features={"locked_anchor": True}))
-                    src_cursor = max(src_indices) + 1 if src_indices else src_start
-                    tgt_cursor = max(tgt_indices) + 1 if tgt_indices else tgt_start
-                pairs.extend(asyncio.run(_compute_pairs(batch, src[src_cursor:], tgt[tgt_cursor:])))
-            db.refresh(batch)
-            if batch.cancel_requested or batch.status in {"canceling", "canceled"}:
-                raise AlignmentCanceled("用户已终止双文档对齐任务。")
-            _store_pairs(db, batch, pairs, locked_signatures=locked_signatures)
-        except AlignmentCanceled:
-            db.rollback()
-            batch = db.get(ProofreadingBatch, batch_id)
-            if batch:
-                batch.cancel_requested = True
-                has_previous_draft = db.query(DocumentAlignmentPair.id).filter_by(batch_id=batch.id).first() is not None
-                batch.alignment_status = "draft" if has_previous_draft else "canceled"
-                batch.status = "draft" if has_previous_draft else "canceled"
-                batch.message = (
-                    "重跑已终止，已保留上一次对齐草稿。"
-                    if has_previous_draft else "双文档对齐已终止。"
-                )
-                batch.error_message = ""
-                batch.finished_at = _utcnow_naive()
-                db.commit()
-        except Exception as exc:
-            db.rollback()
-            batch = db.get(ProofreadingBatch, batch_id)
-            if batch:
-                batch.alignment_status = "failed"
-                batch.status = "failed"
-                batch.error_message = str(exc)
-                batch.finished_at = _utcnow_naive()
-                db.commit()
+                src_cursor = max(src_indices) + 1 if src_indices else src_start
+                tgt_cursor = max(tgt_indices) + 1 if tgt_indices else tgt_start
+            pairs.extend(asyncio.run(_compute_pairs(
+                batch, src[src_cursor:], tgt[tgt_cursor:],
+            )))
+        _persist_alignment_result(batch_id, pairs, locked_signatures)
+    except AlignmentCanceled:
+        _mark_alignment_canceled(batch_id)
+    except Exception as exc:
+        logger.exception("document alignment batch failed batch_id=%s", batch_id)
+        try:
+            # 原计算/落库会话可能已经失效，失败状态始终由新会话写回。
+            _mark_alignment_failed(batch_id, exc)
+        except Exception:
+            logger.exception("failed to persist alignment failure batch_id=%s", batch_id)
 
 
 def serialize_pair(pair: DocumentAlignmentPair) -> dict:

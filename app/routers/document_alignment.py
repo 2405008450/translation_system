@@ -129,6 +129,9 @@ async def preview_alignment(
     db: Session = Depends(get_db), _: User = Depends(require_business_manager),
 ):
     _project(db, project_id)
+    # 文件暂存、解析可能持续很久；项目权限校验完成后立即结束只读事务，
+    # 避免在 asyncio.to_thread 期间触发 idle-in-transaction 超时。
+    db.rollback()
     source_name, target_name = source_file.filename or "source.txt", target_file.filename or "target.txt"
     allowed = {".docx", ".doc", ".txt", ".html", ".htm"}
     if Path(source_name).suffix.lower() not in allowed or Path(target_name).suffix.lower() not in allowed:
@@ -170,8 +173,13 @@ def create_batch(
         raise HTTPException(400, str(exc)) from exc
     finally:
         cleanup_import_task_staging(payload.preview_token)
-    background_tasks.add_task(run_alignment_batch, batch.id)
-    return serialize_batch(db, batch)
+    queued_batch_id = batch.id
+    response = serialize_batch(db, batch)
+    # Starlette 会在请求依赖清理前执行 BackgroundTasks。序列化产生的只读事务
+    # 必须先主动结束，否则会在整个 LLM 对齐期间占用连接。
+    db.rollback()
+    background_tasks.add_task(run_alignment_batch, queued_batch_id)
+    return response
 
 
 @router.get("/proofreading-batches/{batch_id}/alignment-pairs")
@@ -435,9 +443,10 @@ def rerun(batch_id: UUID, background_tasks: BackgroundTasks, db: Session = Depen
     batch.error_message = ""
     batch.cancel_requested = False
     batch.finished_at = None
+    queued_batch_id = batch.id
     db.commit()
-    background_tasks.add_task(run_alignment_batch, batch.id)
-    return {"batch_id": str(batch.id), "alignment_status": "aligning"}
+    background_tasks.add_task(run_alignment_batch, queued_batch_id)
+    return {"batch_id": str(queued_batch_id), "alignment_status": "aligning"}
 
 
 @router.post("/proofreading-batches/{batch_id}/alignment/cancel")
