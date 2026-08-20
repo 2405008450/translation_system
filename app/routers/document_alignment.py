@@ -106,6 +106,11 @@ def _batch(db: Session, batch_id: UUID, project_id: UUID | None = None) -> Proof
     return batch
 
 
+def _require_alignment_stage(batch: ProofreadingBatch) -> None:
+    if getattr(batch, "workflow_stage", "not_applicable") != "alignment":
+        raise HTTPException(409, "当前不在对齐阶段，无法调整边界。")
+
+
 def _load_pair_preview(token: str) -> tuple[str, bytes, str, bytes]:
     value = (token or "").strip().lower()
     if not value or any(char not in "0123456789abcdef-" for char in value):
@@ -231,6 +236,7 @@ def patch_pair_text(
     batch = _batch(db, pair.batch_id)
     if batch.alignment_status not in {"draft", "confirmed"}:
         raise HTTPException(409, "当前对齐结果不可编辑。")
+    _require_alignment_stage(batch)
     changed_fields = payload.model_fields_set
     if not changed_fields.intersection({"source_text", "target_text"}):
         raise HTTPException(400, "请提供需要修改的原文或译文。")
@@ -261,7 +267,8 @@ def patch_pair_text(
 
 @router.post("/proofreading-batches/{batch_id}/alignment-pairs/split")
 def split_pair(batch_id: UUID, payload: PairSplit, db: Session = Depends(get_db), _: User = Depends(require_business_manager)):
-    _batch(db, batch_id)
+    batch = _batch(db, batch_id)
+    _require_alignment_stage(batch)
     pair = db.get(DocumentAlignmentPair, payload.pair_id)
     if not pair or pair.batch_id != batch_id:
         raise HTTPException(404, "配对不存在。")
@@ -297,7 +304,8 @@ def split_pair(batch_id: UUID, payload: PairSplit, db: Session = Depends(get_db)
 
 @router.post("/proofreading-batches/{batch_id}/alignment-pairs/merge")
 def merge_pairs(batch_id: UUID, payload: PairMerge, db: Session = Depends(get_db), _: User = Depends(require_business_manager)):
-    _batch(db, batch_id)
+    batch = _batch(db, batch_id)
+    _require_alignment_stage(batch)
     pair_ids = payload.pair_ids
     if not pair_ids and payload.first_pair_id and payload.second_pair_id:
         pair_ids = [payload.first_pair_id, payload.second_pair_id]
@@ -314,6 +322,7 @@ def merge_pairs(batch_id: UUID, payload: PairMerge, db: Session = Depends(get_db
 @router.post("/proofreading-batches/{batch_id}/alignment-pairs/shift-boundary")
 def shift_boundary(batch_id: UUID, payload: BoundaryShift, db: Session = Depends(get_db), _: User = Depends(require_business_manager)):
     batch = _batch(db, batch_id)
+    _require_alignment_stage(batch)
     current = db.get(DocumentAlignmentPair, payload.pair_id)
     if not current or current.batch_id != batch_id:
         raise HTTPException(404, "配对不存在。")
@@ -348,6 +357,7 @@ def replace_pair_range(
     batch = _batch(db, batch_id)
     if batch.alignment_status not in {"draft", "confirmed"}:
         raise HTTPException(409, "当前对齐结果不可调整。")
+    _require_alignment_stage(batch)
     try:
         rows = replace_alignment_pair_range(
             db,
@@ -376,6 +386,7 @@ def split_pairs_by_cell(
     batch = _batch(db, batch_id)
     if batch.alignment_status not in {"draft", "confirmed"}:
         raise HTTPException(409, "当前对齐结果不可调整。")
+    _require_alignment_stage(batch)
     try:
         result = split_alignment_pairs_by_cell(db, batch_id, payload.pair_ids)
         if batch.alignment_status == "confirmed" and result["changed_pairs"]:
@@ -447,3 +458,37 @@ def confirm(batch_id: UUID, db: Session = Depends(get_db), current_user: User = 
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"batch": serialize_batch(db, batch), "file_record_id": str(file_record.id)}
+
+
+@router.post("/proofreading-batches/{batch_id}/alignment/complete")
+def complete_alignment(
+    batch_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    batch = _batch(db, batch_id)
+    if getattr(batch, "workflow_stage", "not_applicable") != "alignment":
+        raise HTTPException(409, "当前批次不在对齐阶段，无法进入校对。")
+    if batch.alignment_status != "confirmed":
+        raise HTTPException(409, "请先确认对齐并生成句段。")
+    batch.workflow_stage = "proofreading"
+    db.commit()
+    db.refresh(batch)
+    return serialize_batch(db, batch)
+
+
+@router.post("/proofreading-batches/{batch_id}/alignment/reopen")
+def reopen_alignment(
+    batch_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    batch = _batch(db, batch_id)
+    if getattr(batch, "workflow_stage", "not_applicable") != "proofreading":
+        raise HTTPException(409, "当前批次不在校对阶段，无法退回对齐。")
+    if batch.status != "ready":
+        raise HTTPException(409, "已开始校对生成，不能退回对齐，以免覆盖已有校对成果。")
+    batch.workflow_stage = "alignment"
+    db.commit()
+    db.refresh(batch)
+    return serialize_batch(db, batch)

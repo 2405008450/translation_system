@@ -2855,6 +2855,7 @@ class ProofreadingBatch(Base):
     target_language: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default=text("''"))
     batch_kind: Mapped[str] = mapped_column(String(30), nullable=False, default="xlsx_columns", server_default=text("'xlsx_columns'"))
     alignment_status: Mapped[str] = mapped_column(String(20), nullable=False, default="not_applicable", server_default=text("'not_applicable'"))
+    workflow_stage: Mapped[str] = mapped_column(String(20), nullable=False, default="not_applicable", server_default=text("'not_applicable'"))
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="ready", server_default=text("'ready'"))
     progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))

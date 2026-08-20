@@ -62,6 +62,7 @@ export interface ProofreadingBatch {
   target_language?: string
   batch_kind?: 'xlsx_columns' | 'document_pair'
   alignment_status?: 'not_applicable' | 'aligning' | 'canceling' | 'canceled' | 'draft' | 'confirmed' | 'failed'
+  workflow_stage?: 'not_applicable' | 'import' | 'alignment' | 'proofreading'
   status: 'aligning' | 'draft' | 'ready' | 'queued' | 'running' | 'canceling' | 'completed' | 'partial_failed' | 'failed' | 'canceled'
   progress: number
   message: string
@@ -142,6 +143,16 @@ export async function listProofreadingBatches(projectId: string) {
 
 export async function getProofreadingBatch(batchId: string) {
   const { data } = await http.get<ProofreadingBatch>(`/proofreading-batches/${batchId}`)
+  return data
+}
+
+export async function completeAlignment(batchId: string) {
+  const { data } = await http.post<ProofreadingBatch>(`/proofreading-batches/${batchId}/alignment/complete`)
+  return data
+}
+
+export async function reopenAlignment(batchId: string) {
+  const { data } = await http.post<ProofreadingBatch>(`/proofreading-batches/${batchId}/alignment/reopen`)
   return data
 }
 

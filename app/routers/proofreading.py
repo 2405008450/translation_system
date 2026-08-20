@@ -208,6 +208,8 @@ def generate_proofreading_batch(
         raise HTTPException(status_code=409, detail="当前校对批次正在运行。")
     if batch.status not in {"ready", "partial_failed", "failed", "canceled"}:
         raise HTTPException(status_code=409, detail=f"当前状态（{batch.status}）不可启动校对。")
+    if getattr(batch, "batch_kind", "xlsx_columns") == "document_pair" and getattr(batch, "workflow_stage", "not_applicable") != "proofreading":
+        raise HTTPException(status_code=409, detail="请先完成对齐再开始校对。")
     ensure_document_pair_segments_complete(db, batch)
     provider = payload.provider
     model = (payload.model or "").strip() or None
@@ -322,7 +324,11 @@ def create_proofreading_export_task(
     readiness = build_export_readiness(db, batch)
     if payload.format not in readiness["available_formats"]:
         raise HTTPException(status_code=400, detail="当前校对批次不支持所选导出格式。")
-    if readiness["has_warnings"] and not payload.acknowledge_warnings:
+    requires_warning_ack = (
+        readiness["has_warnings"]
+        and payload.format != "proofreading_audit_xlsx"
+    )
+    if requires_warning_ack and not payload.acknowledge_warnings:
         raise HTTPException(status_code=409, detail={
             "message": "导出内容仍有未确认或待处理项目。",
             "readiness": readiness,
@@ -449,6 +455,8 @@ def get_file_proofreading_baselines(
         proofreading_context = {
             "batch_id": str(binding.batch_id),
             "batch_kind": getattr(batch, "batch_kind", "xlsx_columns") if batch else "xlsx_columns",
+            "workflow_stage": getattr(batch, "workflow_stage", "not_applicable") if batch else "not_applicable",
+            "alignment_status": getattr(batch, "alignment_status", "not_applicable") if batch else "not_applicable",
             "batch_status": batch.status if batch else "",
             "sheet_name": binding.sheet_name,
             "target_language": binding.target_language,

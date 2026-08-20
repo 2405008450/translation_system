@@ -1,40 +1,56 @@
 <script setup lang="ts">
 import { ArrowLeft, FileText } from 'lucide-vue-next'
-import { onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
 import { confirmAlignment } from '../api/documentAlignment'
 import { listProofreadingBatches } from '../api/proofreading'
 import DocumentAlignmentEditor from '../components/DocumentAlignmentEditor.vue'
 
 const props = defineProps<{ id: string }>()
+const route = useRoute()
 const router = useRouter()
 const resolvingExisting = ref(true)
+const startNew = computed(() => route.query.action === 'new')
+const resumeBatchId = computed(() => typeof route.query.batch === 'string' ? route.query.batch : '')
 
 function backToProject() {
   void router.push({ name: 'project-detail', params: { id: props.id } })
 }
 
-async function openFocus(fileRecordId: string) {
+async function openFocus(fileRecordId: string, stage: string | undefined) {
   await router.replace({
     name: 'workbench-focus',
     params: { id: fileRecordId },
-    query: { from: 'project', pid: props.id, mode: 'alignment' },
+    query: {
+      from: 'project',
+      pid: props.id,
+      ...(stage === 'alignment' ? { mode: 'alignment' } : {}),
+    },
   })
 }
 
 onMounted(async () => {
   try {
-    const batch = (await listProofreadingBatches(props.id)).find(item => item.batch_kind === 'document_pair')
+    // “导入新文档”必须直接显示空白上传表单，不能被历史批次劫持到工作台。
+    if (startNew.value) return
+    const batch = (await listProofreadingBatches(props.id)).find(item => (
+      item.batch_kind === 'document_pair'
+      && (!resumeBatchId.value || item.id === resumeBatchId.value)
+    ))
     if (!batch) return
     const fileRecordId = batch.bindings[0]?.file_record_id
-    if (batch.alignment_status === 'confirmed' && fileRecordId) {
-      await openFocus(fileRecordId)
+    if (batch.workflow_stage === 'proofreading' && fileRecordId) {
+      await openFocus(fileRecordId, 'proofreading')
+      return
+    }
+    if ((batch.workflow_stage === 'alignment' || batch.alignment_status === 'confirmed') && fileRecordId) {
+      await openFocus(fileRecordId, 'alignment')
       return
     }
     if (batch.alignment_status === 'draft') {
       const result = await confirmAlignment(batch.id)
-      await openFocus(result.file_record_id)
+      await openFocus(result.file_record_id, 'alignment')
     }
   } finally {
     resolvingExisting.value = false
@@ -59,7 +75,12 @@ onMounted(async () => {
     </header>
     <section v-if="resolvingExisting" class="alignment-workspace__loading">正在进入对齐工作台…</section>
     <section v-else class="alignment-workspace__editor">
-      <DocumentAlignmentEditor :project-id="id" compact />
+      <DocumentAlignmentEditor
+        :project-id="id"
+        :start-new="startNew"
+        :resume-batch-id="resumeBatchId"
+        compact
+      />
     </section>
   </main>
 </template>

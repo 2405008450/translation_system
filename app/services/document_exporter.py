@@ -765,23 +765,31 @@ def _group_segments_by_block(
     grouped: dict[BlockKey, list[ExportSegment]] = defaultdict(list)
     math_map = math_placeholders_by_sentence_id or {}
     source_segment_list = list(source_segments or [])
+    segment_list = list(segments)
     source_segment_by_sentence_id = _build_source_segment_lookup_by_sentence_id(source_segment_list)
     source_segment_by_text_key = _build_unique_source_segment_lookup_by_text(source_segment_list)
     revision_map = revisions_by_sentence_id or {}
+    authoritative_block_keys = _build_authoritative_block_keys_by_sequence(
+        segment_list,
+        source_segment_list,
+    )
 
-    for segment in segments:
+    for segment in segment_list:
         block_type = str(_get_segment_value(segment, "block_type", "paragraph") or "paragraph")
         block_index = int(_get_segment_value(segment, "block_index", 0) or 0)
         row_index = _to_optional_int(_get_segment_value(segment, "row_index"))
         cell_index = _to_optional_int(_get_segment_value(segment, "cell_index"))
         sentence_id = str(_get_segment_value(segment, "sentence_id", "") or "")
         target_html = _get_segment_value(segment, "target_html")
-        block_key = _resolve_export_segment_block_key(
-            segment=segment,
-            fallback=(block_type, block_index, row_index, cell_index),
-            source_segment_by_sentence_id=source_segment_by_sentence_id,
-            source_segment_by_text_key=source_segment_by_text_key,
-        )
+        sequence_index = _get_export_sequence_index(segment)
+        block_key = authoritative_block_keys.get(sequence_index)
+        if block_key is None:
+            block_key = _resolve_export_segment_block_key(
+                segment=segment,
+                fallback=(block_type, block_index, row_index, cell_index),
+                source_segment_by_sentence_id=source_segment_by_sentence_id,
+                source_segment_by_text_key=source_segment_by_text_key,
+            )
         source_segment_by_id = source_segment_by_sentence_id.get(sentence_id)
         source_segment_by_text = _find_source_segment_by_export_text(
             segment,
@@ -817,7 +825,7 @@ def _group_segments_by_block(
                 target_html=resolved_target_html,
                 source_html=str(source_html) if source_html else None,
                 math_placeholders=dict(math_map.get(sentence_id) or {}),
-                sequence_index=_get_export_sequence_index(segment),
+                sequence_index=sequence_index,
                 source_structure_changed=bool(source_segment_list) and not has_original_source_match,
                 revision=revision,
             )
@@ -826,6 +834,38 @@ def _group_segments_by_block(
     # 原格式译文和双语 Word 共用这一排序入口。即使源块元数据无法重新定位，
     # 仍应优先使用持久化的 sequence_index，不能保留调用方或哈希 ID 带来的乱序。
     return _order_segment_groups_by_source(grouped, source_segment_list)
+
+
+def _build_authoritative_block_keys_by_sequence(
+    segments: list[Any],
+    source_segments: list[Mapping[str, Any]],
+) -> dict[int, BlockKey]:
+    """按持久化顺序把译文映射到当前源文档的句段槽位。"""
+    if not segments or len(segments) != len(source_segments):
+        return {}
+
+    indexed_segments: list[tuple[int, Any]] = []
+    for segment in segments:
+        sequence_index = _get_export_sequence_index(segment)
+        if sequence_index is None:
+            return {}
+        indexed_segments.append((sequence_index, segment))
+
+    sequence_indexes = [sequence_index for sequence_index, _ in indexed_segments]
+    if len(sequence_indexes) != len(set(sequence_indexes)):
+        return {}
+
+    # sequence_index 是工作台展示顺序的持久化依据。当前解析器生成的 sentence_id
+    # 或原文文本只能用于历史数据兜底，不能再次改变完整顺序数据的跨块位置。
+    indexed_segments.sort(key=lambda item: item[0])
+    return {
+        sequence_index: _source_segment_block_key(source_segment)
+        for (sequence_index, _), source_segment in zip(
+            indexed_segments,
+            source_segments,
+            strict=True,
+        )
+    }
 
 
 def _build_source_segment_lookup_by_sentence_id(

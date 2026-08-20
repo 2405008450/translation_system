@@ -64,6 +64,7 @@ from app.models import (
     PretranslationTask,
     ProjectWorkflowStep,
     ProofreadingBatch,
+    ProofreadingColumnBinding,
     ProofreadingSegmentBaseline,
     Segment,
     SegmentQAIssue,
@@ -6828,6 +6829,7 @@ def _build_project_file_payload(
     assignees: list[User] | None = None,
     workflow_steps: list[ProjectWorkflowStep] | None = None,
     workflow_progress: list[dict[str, Any]] | None = None,
+    proofreading: dict[str, Any] | None = None,
 ) -> dict:
     source_bytes = load_file_record_source(file_record)
     operation_state = (
@@ -6901,8 +6903,35 @@ def _build_project_file_payload(
         "open_issue_count": issue_stats.get("open_issue_count", 0),
         "can_manage": _can_manage_workflow(current_user),
         "can_write": _can_write_file_record(file_record, current_user),
+        "proofreading": proofreading,
         **operation_state,
     }
+
+
+def _serialize_file_proofreading_summary(batch: ProofreadingBatch) -> dict[str, Any]:
+    return {
+        "batch_id": str(batch.id),
+        "batch_kind": getattr(batch, "batch_kind", "xlsx_columns"),
+        "workflow_stage": getattr(batch, "workflow_stage", "not_applicable"),
+        "alignment_status": getattr(batch, "alignment_status", "not_applicable"),
+        "batch_status": batch.status,
+    }
+
+
+def _load_proofreading_by_file_ids(db: Session, file_record_ids: list[UUID]) -> dict[UUID, dict[str, Any]]:
+    if not file_record_ids:
+        return {}
+    rows = (
+        db.query(ProofreadingColumnBinding, ProofreadingBatch)
+        .join(ProofreadingBatch, ProofreadingColumnBinding.batch_id == ProofreadingBatch.id)
+        .filter(ProofreadingColumnBinding.file_record_id.in_(file_record_ids))
+        .order_by(ProofreadingColumnBinding.created_at.asc())
+        .all()
+    )
+    result: dict[UUID, dict[str, Any]] = {}
+    for binding, batch in rows:
+        result.setdefault(binding.file_record_id, _serialize_file_proofreading_summary(batch))
+    return result
 
 
 def _get_file_segment_stats(db: Session, file_record_ids: list[UUID]) -> dict[UUID, dict]:
@@ -8245,6 +8274,11 @@ def _build_project_detail_payload(
         workflow_progress=workflow_progress,
     )
     file_assignees = file_assignees or {}
+    proofreading_by_file = (
+        _load_proofreading_by_file_ids(db, [file_record.id for file_record in files])
+        if db is not None
+        else {}
+    )
     payload["files"] = [
         _build_project_file_payload(
             file_record=file_record,
@@ -8256,6 +8290,7 @@ def _build_project_detail_payload(
             assignees=file_assignees.get(file_record.id),
             workflow_steps=workflow_steps,
             workflow_progress=file_workflow_progress.get(file_record.id, []),
+            proofreading=proofreading_by_file.get(file_record.id),
         )
         for file_record in files
     ]
@@ -10952,6 +10987,7 @@ def get_file_records(
     )
     workflow_steps_by_project = _load_workflow_steps_by_project(db, project_ids)
     file_workflow_progress = _get_file_workflow_progress(db, file_record_ids)
+    proofreading_by_file = _load_proofreading_by_file_ids(db, file_record_ids)
     return [
         {
             "id": file_record.id,
@@ -10994,6 +11030,7 @@ def get_file_records(
             "can_write": _can_write_file_record(file_record, current_user, db),
             "created_at": file_record.created_at.isoformat(),
             "updated_at": file_record.updated_at.isoformat(),
+            "proofreading": proofreading_by_file.get(file_record.id),
         }
         for file_record in file_records
     ]

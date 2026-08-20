@@ -1489,6 +1489,25 @@ CREATE INDEX IF NOT EXISTS ix_glossary_bases_project_id
 CREATE INDEX IF NOT EXISTS ix_glossary_bases_origin
     ON glossary_bases (origin);
 
+ALTER TABLE IF EXISTS proofreading_batches
+    ADD COLUMN IF NOT EXISTS workflow_stage VARCHAR(20) NOT NULL DEFAULT 'not_applicable';
+
+DO $$
+BEGIN
+    IF to_regclass('public.proofreading_batches') IS NOT NULL THEN
+        UPDATE proofreading_batches
+        SET workflow_stage = CASE
+            WHEN batch_kind = 'xlsx_columns' THEN 'proofreading'
+            WHEN batch_kind = 'document_pair' AND alignment_status = 'confirmed'
+                AND status IN ('queued', 'running', 'canceling', 'completed', 'partial_failed') THEN 'proofreading'
+            WHEN batch_kind = 'document_pair' AND alignment_status = 'confirmed' THEN 'alignment'
+            WHEN batch_kind = 'document_pair' THEN 'import'
+            ELSE workflow_stage
+        END
+        WHERE workflow_stage = 'not_applicable';
+    END IF;
+END $$;
+
 -- =============================================================================
 -- 完成。首次运行后请通过前端 "/login" 页面使用首次初始化接口创建管理员账号：
 --   POST /api/auth/init  { "username": "admin", "password": "..." }

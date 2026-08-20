@@ -250,6 +250,7 @@ def materialize_alignment(db: Session, batch: ProofreadingBatch, *, current_user
         )
         sequence += 1
     batch.alignment_status = "confirmed"
+    batch.workflow_stage = "alignment"
     batch.status = "ready"
     batch.progress = 100
     batch.total_segments = sequence

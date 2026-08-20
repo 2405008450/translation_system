@@ -155,7 +155,7 @@ def create_alignment_batch(
         project_id=project.id, created_by_id=current_user.id, filename=source_filename,
         file_hash=hashlib.sha256(source_bytes + b"\0" + target_bytes).hexdigest(),
         source_language=source_language, target_language=target_language,
-        batch_kind="document_pair", alignment_status="aligning", status="aligning",
+        batch_kind="document_pair", alignment_status="aligning", workflow_stage="import", status="aligning",
         message="文档已解析，正在生成对齐草稿。",
         config_json=json.dumps({
             "granularity": granularity, "target_filename": target_filename,

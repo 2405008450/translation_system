@@ -17,7 +17,14 @@ import { getProofreadingBatch, listProofreadingBatches } from '../api/proofreadi
 import { languageOptions } from '../constants/languages'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
-const props = defineProps<{ projectId: string; compact?: boolean }>()
+const props = defineProps<{
+  projectId: string
+  compact?: boolean
+  /** 强制显示新导入表单，不恢复项目中的历史对齐批次。 */
+  startNew?: boolean
+  /** 从批次列表进入时，只恢复用户选中的对齐批次。 */
+  resumeBatchId?: string
+}>()
 const emit = defineEmits<{ refresh: [] }>()
 const router = useRouter()
 
@@ -36,6 +43,9 @@ const busy = ref(false)
 const alignmentProgress = ref(0)
 const message = ref('')
 const error = ref('')
+const draggingSide = ref<'source' | 'target' | null>(null)
+const dragDepth = { source: 0, target: 0 }
+const acceptedExtensions = new Set(['doc', 'docx', 'txt', 'html', 'htm'])
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 function stopPolling() {
@@ -50,11 +60,43 @@ function errorText(value: unknown) {
     : value instanceof Error ? value.message : '操作失败。'
 }
 
-function selectFile(side: 'source' | 'target', event: Event) {
-  const file = (event.target as HTMLInputElement).files?.[0] || null
+function setFile(side: 'source' | 'target', file: File | null) {
+  if (file) {
+    const extension = file.name.split('.').pop()?.toLowerCase() || ''
+    if (!acceptedExtensions.has(extension)) {
+      error.value = `不支持“${file.name}”的文件格式，请上传 DOC、DOCX、TXT、HTML 或 HTM 文件。`
+      return
+    }
+  }
+  error.value = ''
   if (side === 'source') sourceFile.value = file
   else targetFile.value = file
   preview.value = null
+}
+
+function selectFile(side: 'source' | 'target', event: Event) {
+  setFile(side, (event.target as HTMLInputElement).files?.[0] || null)
+}
+
+function enterDropZone(side: 'source' | 'target') {
+  dragDepth[side] += 1
+  draggingSide.value = side
+}
+
+function leaveDropZone(side: 'source' | 'target') {
+  dragDepth[side] = Math.max(0, dragDepth[side] - 1)
+  if (dragDepth[side] === 0 && draggingSide.value === side) draggingSide.value = null
+}
+
+function dropFile(side: 'source' | 'target', event: DragEvent) {
+  dragDepth[side] = 0
+  draggingSide.value = null
+  const files = Array.from(event.dataTransfer?.files || [])
+  if (files.length > 1) {
+    error.value = '原文和译文区域每次只能分别放入一个文件。'
+    return
+  }
+  setFile(side, files[0] || null)
 }
 
 async function makePreview() {
@@ -180,9 +222,12 @@ async function openAlignmentWorkbench() {
 }
 
 onMounted(async () => {
+  if (props.startNew) return
   try {
     const existing = (await listProofreadingBatches(props.projectId)).find(batch => (
-      batch.batch_kind === 'document_pair' && ['aligning', 'canceling', 'draft'].includes(batch.alignment_status || '')
+      batch.batch_kind === 'document_pair'
+      && (!props.resumeBatchId || batch.id === props.resumeBatchId)
+      && ['aligning', 'canceling', 'draft'].includes(batch.alignment_status || '')
     ))
     if (!existing) return
     batchId.value = existing.id
@@ -218,31 +263,47 @@ onBeforeUnmount(stopPolling)
         <span class="alignment-upload__head-icon"><Upload :size="20" /></span>
         <div>
           <strong>上传需要校对的两个文档</strong>
-          <p>依次选择原文和译文。系统会识别段落、表格、重复页眉页脚和页码。</p>
+          <p>可点击选择或将文件分别拖放到下方区域。系统会识别段落、表格、重复页眉页脚和页码。</p>
         </div>
       </div>
 
       <div class="alignment-upload__files">
-        <label class="file-pick" :class="{ 'is-selected': sourceFile }">
+        <label
+          class="file-pick"
+          :class="{ 'is-selected': sourceFile, 'is-dragging': draggingSide === 'source' }"
+          data-testid="alignment-source-dropzone"
+          @dragenter.prevent="enterDropZone('source')"
+          @dragover.prevent
+          @dragleave.prevent="leaveDropZone('source')"
+          @drop.prevent="dropFile('source', $event)"
+        >
           <input type="file" accept=".doc,.docx,.txt,.html,.htm" @change="selectFile('source', $event)">
           <span class="file-pick__step">1</span>
           <span class="file-pick__icon"><Check v-if="sourceFile" :size="22" /><FileText v-else :size="22" /></span>
           <span class="file-pick__copy">
             <strong>选择原文文档</strong>
-            <small :title="sourceFile?.name">{{ sourceFile?.name || '点击此处浏览文件' }}</small>
+            <small :title="sourceFile?.name">{{ sourceFile?.name || '拖放到此处，或点击浏览文件' }}</small>
           </span>
           <span class="file-pick__action">{{ sourceFile ? '重新选择' : '选择文件' }}</span>
         </label>
 
         <span class="alignment-upload__direction" aria-hidden="true"><ArrowRight :size="20" /></span>
 
-        <label class="file-pick" :class="{ 'is-selected': targetFile }">
+        <label
+          class="file-pick"
+          :class="{ 'is-selected': targetFile, 'is-dragging': draggingSide === 'target' }"
+          data-testid="alignment-target-dropzone"
+          @dragenter.prevent="enterDropZone('target')"
+          @dragover.prevent
+          @dragleave.prevent="leaveDropZone('target')"
+          @drop.prevent="dropFile('target', $event)"
+        >
           <input type="file" accept=".doc,.docx,.txt,.html,.htm" @change="selectFile('target', $event)">
           <span class="file-pick__step">2</span>
           <span class="file-pick__icon"><Check v-if="targetFile" :size="22" /><FileText v-else :size="22" /></span>
           <span class="file-pick__copy">
             <strong>选择译文文档</strong>
-            <small :title="targetFile?.name">{{ targetFile?.name || '点击此处浏览文件' }}</small>
+            <small :title="targetFile?.name">{{ targetFile?.name || '拖放到此处，或点击浏览文件' }}</small>
           </span>
           <span class="file-pick__action">{{ targetFile ? '重新选择' : '选择文件' }}</span>
         </label>
@@ -331,6 +392,7 @@ onBeforeUnmount(stopPolling)
 .alignment-running progress { width: 100%; height: 12px; }
 .file-pick { position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 96px; padding: 16px 16px 16px 20px; border: 2px dashed rgba(15, 118, 110, .38); border-radius: 12px; background: #fff; cursor: pointer; transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease; }
 .file-pick:hover { border-color: var(--brand); box-shadow: 0 10px 24px rgba(15, 23, 42, .08); transform: translateY(-1px); }
+.file-pick.is-dragging { border-style: solid; border-color: var(--brand); background: rgba(204, 251, 241, .82); box-shadow: 0 0 0 4px rgba(15, 118, 110, .14), 0 12px 28px rgba(15, 23, 42, .1); transform: translateY(-2px) scale(1.01); }
 .file-pick.is-selected { border-style: solid; border-color: var(--brand); background: rgba(236, 253, 245, .72); }
 .file-pick input { display: none; }
 .file-pick__step { position: absolute; top: 8px; left: 8px; display: grid; width: 20px; height: 20px; place-items: center; border-radius: 999px; background: var(--brand); color: #fff; font-size: 11px; font-weight: 800; }

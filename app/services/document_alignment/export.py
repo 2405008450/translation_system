@@ -148,11 +148,17 @@ def build_proofreading_export_rows(
 
 def build_export_readiness(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
     rows, file_record = build_proofreading_export_rows(db, batch)
-    available_formats = (
-        ["proofreading_audit_xlsx"]
-        if batch.batch_kind == "document_pair"
-        else ["proofreading_xlsx_original"]
-    )
+    stage = getattr(batch, "workflow_stage", "not_applicable")
+    if batch.batch_kind == "document_pair":
+        available_formats = ["proofreading_audit_xlsx"]
+        if stage == "proofreading":
+            available_formats = [
+                "proofreading_docx_layout",
+                "proofreading_docx_ordered",
+                "proofreading_audit_xlsx",
+            ]
+    else:
+        available_formats = ["proofreading_xlsx_original"]
     return {
         "batch_id": str(batch.id),
         "total": len(rows),

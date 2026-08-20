@@ -73,6 +73,13 @@ import {
   groupExportOptions,
   type FileExportOption,
 } from '../utils/exportOptions'
+import {
+  createProofreadingExportTask,
+  downloadProofreadingExportTask,
+  getProofreadingExportReadiness,
+  getProofreadingExportTask,
+  type ProofreadingExportFormat,
+} from '../api/proofreading'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import { matchesSearchKeyword, normalizeSearchKeyword, splitSearchKeywords } from '../utils/search'
 import {
@@ -235,6 +242,13 @@ interface ProjectFileItem {
   term_base_write_ids: string[]
   qa_term_base_ids: string[]
   glossary_base_ids: string[]
+  proofreading?: {
+    batch_id: string
+    batch_kind: 'xlsx_columns' | 'document_pair'
+    workflow_stage: 'not_applicable' | 'import' | 'alignment' | 'proofreading'
+    alignment_status: string
+    batch_status: string
+  } | null
 }
 
 interface EnglishVariantCopyResponse {
@@ -879,6 +893,7 @@ const exportingFileType = ref('')
 const exportFileProgress = ref(0)
 const exportFileMessage = ref('')
 const showProjectExportMenu = ref(false)
+const showProofreadingExportMenu = ref(false)
 const loadingProjectExportOptions = ref(false)
 const projectExportOptions = ref<FileExportOption[]>([])
 const groupedProjectExportOptions = computed(() => groupExportOptions(projectExportOptions.value))
@@ -1000,6 +1015,31 @@ const tabs = computed(() => {
     : items
 })
 const tableRows = computed<ProjectFileItem[]>(() => project.value?.files ?? [])
+const proofreadingStageSteps = [
+  { key: 'import', label: '导入' },
+  { key: 'alignment', label: '对齐' },
+  { key: 'proofreading', label: '校对' },
+  { key: 'export', label: '导出' },
+] as const
+type ProofreadingProjectStage = (typeof proofreadingStageSteps)[number]['key']
+const projectProofreadingStage = computed<ProofreadingProjectStage>(() => {
+  const stages = tableRows.value
+    .map((row) => row.proofreading?.workflow_stage)
+    .filter((stage): stage is NonNullable<typeof stage> => Boolean(stage && stage !== 'not_applicable'))
+  if (!tableRows.value.length || stages.includes('import')) return 'import'
+  if (stages.includes('alignment')) return 'alignment'
+  if (stages.some((stage) => stage === 'proofreading')) {
+    const proofreadingRows = tableRows.value.filter((row) => row.proofreading?.workflow_stage === 'proofreading')
+    if (
+      proofreadingRows.length
+      && proofreadingRows.every((row) => row.proofreading?.batch_status === 'completed')
+    ) {
+      return 'export'
+    }
+    return 'proofreading'
+  }
+  return tableRows.value.length ? 'proofreading' : 'import'
+})
 const projectFileById = computed(() => new Map(tableRows.value.map((file) => [file.id, file])))
 const fileStatusFilterOptions = computed(() => {
   const counts = new Map<string, number>()
@@ -1429,6 +1469,34 @@ const canOpenProjectExportMenu = computed(() => (
   && !exportingFileId.value
   && !loadingProjectExportOptions.value
 ))
+const selectedProofreadingExportChoices = computed(() => {
+  const byFormat = new Map<ProofreadingExportFormat, ProofreadingExportChoice>()
+  for (const row of selectedProjectFiles.value) {
+    for (const choice of getProofreadingExportChoices(row)) {
+      if (!byFormat.has(choice.format)) {
+        byFormat.set(choice.format, choice)
+      }
+    }
+  }
+  return [...byFormat.values()]
+})
+const canOpenProofreadingExportMenu = computed(() => (
+  isProofreadingProject.value
+  && selectedProofreadingExportChoices.value.length > 0
+  && !exportingFileId.value
+))
+const proofreadingExportButtonTitle = computed(() => {
+  if (selectedProjectFiles.value.length === 0) {
+    return t('projectDetail.files.actions.exportSelectFirst')
+  }
+  if (selectedProofreadingExportChoices.value.length === 0) {
+    return '所选文件当前阶段还不能导出。'
+  }
+  if (exportingFileId.value) {
+    return exportFileMessage.value
+  }
+  return ''
+})
 const canExportSelectedProjectFilesAsZip = computed(() => (
   selectedProjectFiles.value.length > 1
   && projectExportOptions.value.some((option) => option.id === 'original')
@@ -1483,7 +1551,7 @@ async function confirmRevisionMarkedExport() {
 
 const columns = computed<DataTableColumn[]>(() => {
   const items: DataTableColumn[] = [
-    { key: 'filename', label: t('projectDetail.files.columns.details'), width: '300px', sortable: true },
+    { key: 'filename', label: t('projectDetail.files.columns.details'), width: isProofreadingProject.value ? '420px' : '300px', sortable: true },
     { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '150px', sortable: true },
     { key: 'pretranslation_progress', label: t('projectDetail.files.columns.pretranslationProgress'), width: '150px', sortable: true },
     { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '140px', sortable: true },
@@ -1776,6 +1844,74 @@ function getDerivedFileKindLabel(row: ProjectRow) {
     return t('projectDetail.files.kinds.americanCopy')
   }
   return ''
+}
+
+function getProofreadingStageBadge(row: ProjectRow): { key: 'alignment' | 'proofreading'; label: string } | null {
+  if (!isProofreadingProject.value) return null
+  const stage = row.proofreading?.workflow_stage
+  if (stage === 'alignment') return { key: 'alignment', label: '对齐中' }
+  if (stage === 'proofreading') return { key: 'proofreading', label: '校对中' }
+  return null
+}
+
+type ProofreadingExportChoice = {
+  format: ProofreadingExportFormat
+  name: string
+  description: string
+}
+
+function getProofreadingExportChoices(row: ProjectRow): ProofreadingExportChoice[] {
+  const info = row.proofreading
+  if (!info?.batch_id) return []
+  const stage = info.workflow_stage
+  if (info.batch_kind === 'document_pair') {
+    const alignmentTable: ProofreadingExportChoice = {
+      format: 'proofreading_audit_xlsx',
+      name: '一一对照表',
+      description: '原文与译文逐条对照的 Excel 表格。',
+    }
+    if (stage === 'proofreading') {
+      return [
+        {
+          format: 'proofreading_docx_layout',
+          name: '校对后译文',
+          description: '导出经校对修改后的译文文档，尽量保留源排版。',
+        },
+        {
+          format: 'proofreading_docx_ordered',
+          name: '顺序优先 Word',
+          description: '按对齐顺序导出原文与校对后译文。',
+        },
+        alignmentTable,
+      ]
+    }
+    if (stage === 'alignment' || stage === 'import' || info.alignment_status === 'confirmed' || info.alignment_status === 'draft') {
+      return [alignmentTable]
+    }
+    return []
+  }
+  return [{
+    format: 'proofreading_xlsx_original',
+    name: '校对版 Excel',
+    description: '保留原工作簿结构，导出经校对修改后的译文。',
+  }]
+}
+
+function getPrimaryProofreadingExport(row: ProjectRow) {
+  return getProofreadingExportChoices(row)[0] || null
+}
+
+function exportPrimaryProofreadingFile(row: ProjectRow) {
+  const choice = getPrimaryProofreadingExport(row)
+  if (!choice) return
+  void exportProofreadingFile(row, choice.format)
+}
+
+function proofreadingExportSuccessMessage(format: ProofreadingExportFormat) {
+  if (format === 'proofreading_audit_xlsx') return '已导出一一对照 Excel。'
+  if (format === 'proofreading_docx_layout') return '已导出校对后译文。'
+  if (format === 'proofreading_docx_ordered') return '已导出顺序优先校对文档。'
+  return '已导出校对版 Excel。'
 }
 
 function getFileAssignees(row: ProjectRow): User[] {
@@ -3062,6 +3198,7 @@ function handleDocumentClick(ev: MouseEvent) {
   }
   if (!target.closest('.pd-export-dropdown')) {
     showProjectExportMenu.value = false
+    showProofreadingExportMenu.value = false
   }
   if (!target.closest('.pd-file-selection')) {
     closeFileSelectionMenu()
@@ -3075,6 +3212,7 @@ function handleDocumentClick(ev: MouseEvent) {
 function handleDocumentScroll() {
   closeUploadTargetMenu()
   showProjectExportMenu.value = false
+  showProofreadingExportMenu.value = false
   closeFileSelectionMenu()
   if (openActionMenuId.value) {
     closeActionMenu()
@@ -3201,6 +3339,7 @@ function openWorkbench(row: ProjectRow) {
 
   closeActionMenu()
   const rowId = String(row.id)
+  const stage = row.proofreading?.workflow_stage
   const resolved = router.resolve({
     name: 'workbench-focus',
     params: { id: rowId },
@@ -3208,6 +3347,7 @@ function openWorkbench(row: ProjectRow) {
       from: 'project',
       pid: props.id,
       ...(cameFromTasks.value ? { parent: 'tasks' } : {}),
+      ...(stage === 'alignment' ? { mode: 'alignment' } : {}),
     },
   })
   window.open(resolved.href, '_blank', 'noopener,noreferrer')
@@ -5186,6 +5326,125 @@ async function toggleProjectExportMenu() {
   showProjectExportMenu.value = true
 }
 
+function toggleProofreadingExportMenu() {
+  if (!canOpenProofreadingExportMenu.value) {
+    return
+  }
+  showProofreadingExportMenu.value = !showProofreadingExportMenu.value
+}
+
+async function downloadProofreadingBatchExportTask(batchId: string, format: ProofreadingExportFormat) {
+  const readiness = await getProofreadingExportReadiness(batchId)
+  let acknowledgeWarnings = false
+  if (readiness.has_warnings && format !== 'proofreading_audit_xlsx') {
+    acknowledgeWarnings = await confirm({
+      title: '校对版仍有待处理内容',
+      message: [
+        `总计 ${readiness.total} 条，未确认 ${readiness.unconfirmed} 条。`,
+        `缺译 ${readiness.missing_translation} 条，增译 ${readiness.translation_only} 条，`,
+        `其中未校对增译 ${readiness.translation_only_unreviewed} 条，LLM 失败 ${readiness.llm_failed} 条。`,
+        '仍然导出时，缺译会被明确标记。',
+      ].join(''),
+      confirmText: '仍然导出',
+      cancelText: '返回检查',
+    })
+    if (!acknowledgeWarnings) {
+      return false
+    }
+  }
+  let task = await createProofreadingExportTask(batchId, format, acknowledgeWarnings)
+  exportFileProgress.value = Number(task.progress || 0)
+  exportFileMessage.value = task.message || '正在导出校对文件…'
+  for (let attempt = 0; ['queued', 'running'].includes(task.status) && attempt < 240; attempt += 1) {
+    await waitForExportPoll(1500)
+    task = await getProofreadingExportTask(task.task_id)
+    exportFileProgress.value = Number(task.progress || 0)
+    exportFileMessage.value = task.message || `导出处理中：${task.progress}%`
+  }
+  if (task.status === 'failed') {
+    throw new Error(task.error || task.message || '导出失败。')
+  }
+  if (task.status !== 'completed') {
+    throw new Error('导出超时，请稍后重试。')
+  }
+  const response = await downloadProofreadingExportTask(task.task_id)
+  const filename = resolveDownloadFilename(
+    response.headers['content-disposition'],
+    task.filename || '校对导出',
+  )
+  downloadBlob(response.data, filename)
+  return true
+}
+
+async function exportProofreadingFile(row: ProjectRow, format: ProofreadingExportFormat) {
+  const batchId = row.proofreading?.batch_id
+  if (!batchId || exportingFileId.value) {
+    return
+  }
+  closeActionMenu()
+  showProofreadingExportMenu.value = false
+  pageError.value = ''
+  exportingFileId.value = String(row.id)
+  exportingFileType.value = format
+  exportFileProgress.value = 0
+  exportFileMessage.value = '正在导出校对文件…'
+  try {
+    const downloaded = await downloadProofreadingBatchExportTask(batchId, format)
+    if (downloaded) {
+      toast.success(proofreadingExportSuccessMessage(format))
+    }
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '校对文件导出失败。')
+    toast.error(getErrorMessage(error, '校对文件导出失败。'))
+  } finally {
+    exportingFileId.value = ''
+    exportingFileType.value = ''
+    exportFileProgress.value = 0
+    exportFileMessage.value = ''
+  }
+}
+
+async function exportSelectedProofreadingFiles(format: ProofreadingExportFormat) {
+  const rows = uniqueProofreadingExportRows(selectedProjectFiles.value, format)
+  if (!rows.length || exportingFileId.value) {
+    return
+  }
+  showProofreadingExportMenu.value = false
+  pageError.value = ''
+  try {
+    for (const row of rows) {
+      exportingFileId.value = String(row.id)
+      exportingFileType.value = format
+      exportFileProgress.value = 0
+      exportFileMessage.value = `正在导出 ${row.filename}…`
+      const downloaded = await downloadProofreadingBatchExportTask(row.proofreading!.batch_id, format)
+      if (!downloaded) {
+        return
+      }
+    }
+    toast.success(proofreadingExportSuccessMessage(format))
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '校对文件导出失败。')
+    toast.error(getErrorMessage(error, '校对文件导出失败。'))
+  } finally {
+    exportingFileId.value = ''
+    exportingFileType.value = ''
+    exportFileProgress.value = 0
+    exportFileMessage.value = ''
+  }
+}
+
+function uniqueProofreadingExportRows(rows: ProjectRow[], format: ProofreadingExportFormat) {
+  const seen = new Set<string>()
+  return rows.filter((row) => {
+    const batchId = row.proofreading?.batch_id
+    if (!batchId || seen.has(batchId)) return false
+    if (!getProofreadingExportChoices(row).some((choice) => choice.format === format)) return false
+    seen.add(batchId)
+    return true
+  })
+}
+
 async function downloadProjectFileExport(
   row: ProjectRow,
   exportType: string,
@@ -5873,6 +6132,25 @@ onBeforeUnmount(() => {
             <p class="panel-subtitle">{{ t('projectDetail.description') }}</p>
           </div>
         </div>
+
+        <ol
+          v-if="isProofreadingProject"
+          class="pd-stage-stepper"
+          data-testid="proofreading-stage-stepper"
+        >
+          <li
+            v-for="(step, index) in proofreadingStageSteps"
+            :key="step.key"
+            class="pd-stage-stepper__item"
+            :class="{
+              'is-current': step.key === projectProofreadingStage,
+              'is-done': proofreadingStageSteps.findIndex((item) => item.key === projectProofreadingStage) > index,
+            }"
+          >
+            <span class="pd-stage-stepper__index">{{ index + 1 }}</span>
+            <span>{{ step.label }}</span>
+          </li>
+        </ol>
 
         <div class="pd-hero__progress">
           <span class="pd-hero__progress-label">{{ t('projectDetail.totals.progressLabel') }}</span>
@@ -7323,7 +7601,7 @@ onBeforeUnmount(() => {
             </div>
             <p class="panel-subtitle">
               {{ isProofreadingProject
-                ? '每个目标语言对应一个校对任务，可进入工作台复核、编辑并确认校对结果。'
+                ? '每个目标语言对应一个校对任务。对齐阶段可导出一一对照表，校对完成后可导出修改后的译文。'
                 : t('projectDetail.files.description') }}
             </p>
           </div>
@@ -7536,7 +7814,46 @@ onBeforeUnmount(() => {
                   <Users :size="15" />
                   <span>{{ t('projectDetail.files.actions.assign') }}</span>
                 </button>
-                <div v-if="!isProofreadingProject" class="pd-export-dropdown">
+                <div v-if="isProofreadingProject" class="pd-export-dropdown">
+                  <button
+                    class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-export-button"
+                    data-testid="project-file-proofreading-export-selected"
+                    type="button"
+                    :disabled="!canOpenProofreadingExportMenu"
+                    :title="proofreadingExportButtonTitle || (exportingFileId ? `导出中 ${exportFileProgress}%` : '导出校对文件')"
+                    aria-label="导出校对文件"
+                    aria-haspopup="menu"
+                    :aria-expanded="showProofreadingExportMenu"
+                    @click.stop="toggleProofreadingExportMenu"
+                  >
+                    <Loader2 v-if="exportingFileId" class="lucide-spin" :size="15" />
+                    <Download v-else :size="15" />
+                    <span>{{ exportingFileId ? `导出 ${exportFileProgress}%` : '导出' }}</span>
+                    <ChevronDown :size="12" />
+                  </button>
+                  <div v-if="showProofreadingExportMenu" class="pd-export-menu" role="menu" @click.stop>
+                    <div v-if="selectedProofreadingExportChoices.length === 0" class="pd-export-menu__loading">
+                      所选文件当前阶段还不能导出。
+                    </div>
+                    <div v-else class="pd-export-menu__group">
+                      <div class="pd-export-menu__group-title">按当前阶段导出</div>
+                      <button
+                        v-for="choice in selectedProofreadingExportChoices"
+                        :key="choice.format"
+                        class="pd-export-menu__item"
+                        type="button"
+                        :disabled="Boolean(exportingFileId)"
+                        @click="void exportSelectedProofreadingFiles(choice.format)"
+                      >
+                        <span class="pd-export-menu__item-head">
+                          <span class="pd-export-menu__item-name">{{ choice.name }}</span>
+                        </span>
+                        <span class="pd-export-menu__item-desc">{{ choice.description }}</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <div v-else class="pd-export-dropdown">
                   <button
                     class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-export-button"
                     data-testid="project-file-export-selected"
@@ -7802,6 +8119,27 @@ onBeforeUnmount(() => {
                     {{ row.filename }}
                   </button>
                   <span v-else class="pd-file-cell__title" :title="row.filename">{{ row.filename }}</span>
+                  <span
+                    v-if="getProofreadingStageBadge(row)"
+                    class="pd-file-stage-badge"
+                    :class="`pd-file-stage-badge--${getProofreadingStageBadge(row)?.key}`"
+                    data-testid="project-file-stage-badge"
+                  >
+                    {{ getProofreadingStageBadge(row)?.label }}
+                  </span>
+                  <button
+                    v-if="getPrimaryProofreadingExport(row)"
+                    class="pd-file-export-button"
+                    data-testid="project-file-proofreading-export"
+                    type="button"
+                    :disabled="Boolean(exportingFileId)"
+                    :title="getPrimaryProofreadingExport(row)?.description"
+                    @click.stop="exportPrimaryProofreadingFile(row)"
+                  >
+                    <Loader2 v-if="isProjectFileExporting(row)" class="lucide-spin" :size="12" />
+                    <Download v-else :size="12" />
+                    {{ getPrimaryProofreadingExport(row)?.name }}
+                  </button>
                   <span
                     v-if="getDerivedFileKind(row)"
                     class="pd-file-kind-badge"
@@ -8237,6 +8575,19 @@ onBeforeUnmount(() => {
         >
           {{ t('projectDetail.files.task.assign') }}
         </button>
+        <template v-if="isProofreadingProject">
+          <button
+            v-for="choice in getProofreadingExportChoices(actionMenuRow)"
+            :key="choice.format"
+            type="button"
+            :disabled="Boolean(exportingFileId) || !actionMenuRow.proofreading?.batch_id"
+            :title="choice.description"
+            @click="void exportProofreadingFile(actionMenuRow, choice.format)"
+          >
+            {{ choice.name }}
+          </button>
+        </template>
+        <template v-else>
         <button
           type="button"
           :disabled="!actionMenuRow.has_source_document || Boolean(exportingFileId)"
@@ -8267,6 +8618,7 @@ onBeforeUnmount(() => {
         >
           {{ getProjectFileExportLabel(actionMenuRow, 'source') }}
         </button>
+        </template>
         <button
           type="button"
           @click="openFileIssueDialog(actionMenuRow)"
@@ -9221,6 +9573,60 @@ onBeforeUnmount(() => {
   gap: 8px;
   flex: 1 1 360px;
   min-width: 0;
+}
+
+.pd-stage-stepper {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex: 1 1 320px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pd-stage-stepper__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pd-stage-stepper__item + .pd-stage-stepper__item::before {
+  content: '';
+  width: 18px;
+  height: 1px;
+  margin: 0 8px 0 2px;
+  background: #d5dee4;
+}
+
+.pd-stage-stepper__index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #e8eef2;
+  color: #5b6b74;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pd-stage-stepper__item.is-done {
+  color: var(--brand-800, #095f52);
+}
+
+.pd-stage-stepper__item.is-done .pd-stage-stepper__index,
+.pd-stage-stepper__item.is-current .pd-stage-stepper__index {
+  background: var(--brand-700, #0d7a68);
+  color: #fff;
+}
+
+.pd-stage-stepper__item.is-current {
+  color: var(--brand-800, #095f52);
 }
 
 .pd-hero__back {
@@ -10692,6 +11098,56 @@ onBeforeUnmount(() => {
   font-size: 10px;
   font-weight: 700;
   line-height: 1.2;
+}
+
+.pd-file-stage-badge {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.pd-file-stage-badge--alignment {
+  border-color: color-mix(in srgb, #d97706 22%, transparent);
+  background: color-mix(in srgb, #d97706 8%, transparent);
+  color: #9a5b00;
+}
+
+.pd-file-stage-badge--proofreading {
+  border-color: color-mix(in srgb, #0d7a68 22%, transparent);
+  background: color-mix(in srgb, #0d7a68 8%, transparent);
+  color: #0d7a68;
+}
+
+.pd-file-export-button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--brand-700, #0d7a68) 22%, transparent);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--brand-800, #095f52);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.pd-file-export-button:hover:not(:disabled),
+.pd-file-export-button:focus-visible {
+  background: color-mix(in srgb, #0d7a68 8%, transparent);
+  outline: none;
+}
+
+.pd-file-export-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .pd-file-kind-badge--template-copy {
@@ -13075,6 +13531,11 @@ onBeforeUnmount(() => {
 
   .pd-hero__progress {
     width: 100%;
+  }
+
+  .pd-stage-stepper {
+    flex: 1 1 100%;
+    overflow-x: auto;
   }
 
   .pd-basic-grid {

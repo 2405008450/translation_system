@@ -7,13 +7,18 @@ import { useRouter } from 'vue-router'
 import {
   cancelProofreadingBatch,
   createProofreadingBatch,
+  createProofreadingExportTask,
   downloadProofreadingBatchExport,
+  downloadProofreadingExportTask,
   exportProofreadingBatch,
   generateProofreadingBatch,
   getProofreadingBatch,
+  getProofreadingExportReadiness,
+  getProofreadingExportTask,
   listProofreadingBatches,
   previewProofreadingWorkbook,
   type ProofreadingBatch,
+  type ProofreadingExportFormat,
   type ProofreadingPreview,
   type ProofreadingSheetMapping,
 } from '../api/proofreading'
@@ -70,7 +75,11 @@ const canCreate = computed(() => {
 })
 
 function canConfigureBatch(batch: ProofreadingBatch) {
-  return CONFIGURABLE_STATUSES.has(batch.status)
+  if (!CONFIGURABLE_STATUSES.has(batch.status)) return false
+  if (batch.batch_kind === 'document_pair' && batch.workflow_stage && batch.workflow_stage !== 'proofreading') {
+    return false
+  }
+  return true
 }
 
 function isBatchExpanded(batchId: string) {
@@ -283,11 +292,53 @@ async function downloadBatch(batch: ProofreadingBatch) {
   }
 }
 
-function openWorkbench(fileRecordId: string) {
+function documentPairExportChoice(batch: ProofreadingBatch): { format: ProofreadingExportFormat; name: string } | null {
+  if (batch.batch_kind !== 'document_pair' || !batch.bindings[0]?.file_record_id) return null
+  if (batch.workflow_stage === 'proofreading') {
+    return { format: 'proofreading_docx_layout', name: '导出校对后译文' }
+  }
+  if (batch.workflow_stage === 'alignment' || batch.alignment_status === 'confirmed' || batch.alignment_status === 'draft') {
+    return { format: 'proofreading_audit_xlsx', name: '导出一一对照表' }
+  }
+  return null
+}
+
+async function exportDocumentPairBatch(batch: ProofreadingBatch) {
+  const choice = documentPairExportChoice(batch)
+  if (!choice) return
+  actionBatchId.value = batch.id
+  errorMessage.value = ''
+  try {
+    const readiness = await getProofreadingExportReadiness(batch.id)
+    const acknowledgeWarnings = choice.format === 'proofreading_audit_xlsx' ? false : readiness.has_warnings
+    let task = await createProofreadingExportTask(batch.id, choice.format, acknowledgeWarnings)
+    for (let attempt = 0; ['queued', 'running'].includes(task.status) && attempt < 240; attempt += 1) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 1500))
+      task = await getProofreadingExportTask(task.task_id)
+    }
+    if (task.status === 'failed') throw new Error(task.error || task.message || '导出失败。')
+    if (task.status !== 'completed') throw new Error('导出超时，请稍后重试。')
+    const response = await downloadProofreadingExportTask(task.task_id)
+    downloadBlob(
+      response.data,
+      resolveDownloadFilename(response.headers['content-disposition'], task.filename || '校对导出'),
+    )
+  } catch (error) {
+    errorMessage.value = errorText(error, '导出失败。')
+  } finally {
+    actionBatchId.value = ''
+  }
+}
+
+function openWorkbench(fileRecordId: string, batch?: ProofreadingBatch) {
   const resolved = router.resolve({
     name: 'workbench-focus',
     params: { id: fileRecordId },
-    query: { from: 'project', pid: props.projectId },
+    query: {
+      from: 'project',
+      pid: props.projectId,
+      ...(batch?.workflow_stage === 'alignment' ? { mode: 'alignment' } : {}),
+    },
   })
   window.open(resolved.href, '_blank', 'noopener,noreferrer')
 }
@@ -333,24 +384,45 @@ function batchKindLabel(batch: ProofreadingBatch) {
 
 function selectImportMode(mode: 'document_pair' | 'xlsx_columns') {
   if (mode === 'document_pair') {
-    void router.push({ name: 'document-alignment', params: { id: props.projectId } })
+    void router.push({
+      name: 'document-alignment',
+      params: { id: props.projectId },
+      query: { action: 'new' },
+    })
     return
   }
   selectedImportMode.value = selectedImportMode.value === mode ? null : mode
   errorMessage.value = ''
 }
 
+function documentPairActionLabel(batch: ProofreadingBatch) {
+  const stage = batch.workflow_stage
+  const status = batch.alignment_status || ''
+  if (stage === 'proofreading') return '进入校对'
+  if (stage === 'alignment' || status === 'confirmed' || status === 'draft') return '继续对齐'
+  return '查看对齐进度'
+}
+
 function openDocumentPairBatch(batch: ProofreadingBatch) {
   const fileRecordId = batch.bindings[0]?.file_record_id
-  if (batch.alignment_status === 'confirmed' && fileRecordId) {
+  const stage = batch.workflow_stage
+  if ((stage === 'proofreading' || stage === 'alignment' || batch.alignment_status === 'confirmed') && fileRecordId) {
     void router.push({
       name: 'workbench-focus',
       params: { id: fileRecordId },
-      query: { from: 'project', pid: props.projectId, mode: 'alignment' },
+      query: {
+        from: 'project',
+        pid: props.projectId,
+        ...(stage === 'alignment' || (!stage && batch.alignment_status === 'confirmed') ? { mode: 'alignment' } : {}),
+      },
     })
     return
   }
-  void router.push({ name: 'document-alignment', params: { id: props.projectId } })
+  void router.push({
+    name: 'document-alignment',
+    params: { id: props.projectId },
+    query: { batch: batch.id },
+  })
 }
 
 onMounted(async () => {
@@ -515,7 +587,7 @@ onBeforeUnmount(() => {
                   :key="binding.id"
                   class="proofreading-batch__language-chip"
                   type="button"
-                  @click="openWorkbench(binding.file_record_id)"
+                  @click="openWorkbench(binding.file_record_id, batch)"
                 >
                   <span>{{ getLanguageLabel(binding.target_language) }}</span>
                   <span class="proofreading-batch__language-sheet">{{ binding.sheet_name }}</span>
@@ -543,7 +615,7 @@ onBeforeUnmount(() => {
                 @click="openDocumentPairBatch(batch)"
               >
                 <FileText :size="14" />
-                {{ ['draft', 'confirmed'].includes(batch.alignment_status || '') ? '进入对齐工作台' : '查看对齐进度' }}
+                {{ documentPairActionLabel(batch) }}
               </button>
               <button
                 v-if="canConfigureBatch(batch)"
@@ -568,6 +640,18 @@ onBeforeUnmount(() => {
                 {{ batch.status === 'canceling' ? '取消中…' : '暂停' }}
               </button>
               <button
+                v-if="documentPairExportChoice(batch)"
+                class="button"
+                type="button"
+                :disabled="Boolean(actionBatchId)"
+                @click="exportDocumentPairBatch(batch)"
+              >
+                <Loader2 v-if="actionBatchId === batch.id" class="lucide-spin" :size="14" />
+                <Download v-else :size="14" />
+                {{ documentPairExportChoice(batch)?.name }}
+              </button>
+              <button
+                v-if="batch.batch_kind !== 'document_pair'"
                 class="button"
                 type="button"
                 :disabled="Boolean(actionBatchId) || batch.status === 'ready' || isBatchGenerating(batch) || ['queued', 'running'].includes(batch.export_status)"

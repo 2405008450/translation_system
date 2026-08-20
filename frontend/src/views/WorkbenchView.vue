@@ -92,6 +92,7 @@ import {
 } from '../api/documentAlignment'
 import { queryOnlineTerms, type OnlineTermSource } from '../api/onlineTerms'
 import {
+  completeAlignment,
   createProofreadingExportTask,
   downloadProofreadingBatchExport,
   downloadProofreadingExportTask,
@@ -100,6 +101,7 @@ import {
   getProofreadingBatch,
   getProofreadingExportReadiness,
   getProofreadingExportTask,
+  reopenAlignment,
   type ProofreadingBatch,
   type ProofreadingExportFormat,
 } from '../api/proofreading'
@@ -313,6 +315,8 @@ type ProofreadingBaselineResponse = {
   proofreading_context: {
     batch_id: string
     batch_kind: 'xlsx_columns' | 'document_pair'
+    workflow_stage?: 'not_applicable' | 'import' | 'alignment' | 'proofreading'
+    alignment_status?: string
     batch_status: string
     sheet_name: string
     target_language: string
@@ -471,11 +475,13 @@ const proofreadingModelLabel = computed(() => {
   return '自动：优先 DeepSeek Chat，失败回退 OpenRouter'
 })
 const proofreadingExportButtonLabel = computed(() => {
-  if (!proofreadingExporting.value) return '导出校对版'
-  if (proofreadingExportProgress.value > 0 && proofreadingExportProgress.value < 100) {
-    return `导出 ${Math.round(proofreadingExportProgress.value)}%`
+  if (proofreadingExporting.value) {
+    if (proofreadingExportProgress.value > 0 && proofreadingExportProgress.value < 100) {
+      return `导出 ${Math.round(proofreadingExportProgress.value)}%`
+    }
+    return proofreadingExportStatus.value === 'completed' ? '下载中' : '生成中'
   }
-  return proofreadingExportStatus.value === 'completed' ? '下载中' : '生成中'
+  return proofreadingContext.value?.batch_kind === 'document_pair' ? '导出译文' : '导出校对版'
 })
 const canStartProofreadingGeneration = computed(() => (
   ['ready', 'partial_failed', 'failed', 'canceled'].includes(proofreadingContext.value?.batch_status || '')
@@ -728,18 +734,36 @@ const proofreadingExportChoices = computed<Array<{
   description: string
 }>>(() => (
   proofreadingContext.value?.batch_kind === 'document_pair'
-    ? [
-        {
-          format: 'proofreading_audit_xlsx',
-          name: '原文译文对齐表',
-          description: '仅包含原文、原始译文及对齐状态，不生成校对后译文。',
-        },
-      ]
+    ? proofreadingContext.value?.workflow_stage === 'proofreading'
+      ? [
+          {
+            format: 'proofreading_docx_layout',
+            name: '校对后译文',
+            description: '导出经校对修改后的译文文档，尽量保留源排版。',
+          },
+          {
+            format: 'proofreading_docx_ordered',
+            name: '顺序优先 Word',
+            description: '按对齐顺序导出原文与校对后译文。',
+          },
+          {
+            format: 'proofreading_audit_xlsx',
+            name: '一一对照表',
+            description: '原文与译文逐条对照的 Excel 表格。',
+          },
+        ]
+      : [
+          {
+            format: 'proofreading_audit_xlsx',
+            name: '一一对照表',
+            description: '原文与原始译文逐条对照，不生成校对后译文。',
+          },
+        ]
     : [
         {
           format: 'proofreading_xlsx_original',
           name: '校对版 Excel',
-          description: '保留工作簿、工作表和原始行序，在译文旁插入校对列。',
+          description: '保留工作簿、工作表和原始行序，导出经校对修改后的译文。',
         },
       ]
 ))
@@ -757,7 +781,7 @@ async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
     }
     const readiness = await getProofreadingExportReadiness(batchId)
     let acknowledgeWarnings = false
-    if (readiness.has_warnings) {
+    if (readiness.has_warnings && format !== 'proofreading_audit_xlsx') {
       acknowledgeWarnings = await confirm({
         title: '校对版仍有待处理内容',
         message: [
@@ -6760,9 +6784,26 @@ const isCadFile = computed(() => {
 const isDocumentPairProofreading = computed(() => (
   isProofreadingWorkbench.value && proofreadingContext.value?.batch_kind === 'document_pair'
 ))
-const isAlignmentWorkbench = computed(() => (
-  isDocumentPairProofreading.value && route.query.mode === 'alignment'
+const isAlignmentWorkbench = computed(() => {
+  const stage = proofreadingContext.value?.workflow_stage
+  if (stage === 'alignment') return true
+  if (stage === 'proofreading' || stage === 'import') return false
+  return route.query.mode === 'alignment' && (
+    !workbenchModeResolved.value || isDocumentPairProofreading.value
+  )
+})
+const canReopenAlignment = computed(() => (
+  isDocumentPairProofreading.value
+  && proofreadingContext.value?.workflow_stage === 'proofreading'
+  && proofreadingContext.value?.batch_status === 'ready'
 ))
+const reopenAlignmentDisabledReason = computed(() => {
+  if (!isDocumentPairProofreading.value || proofreadingContext.value?.workflow_stage !== 'proofreading') {
+    return ''
+  }
+  if (proofreadingContext.value?.batch_status === 'ready') return ''
+  return '已开始校对生成，不能退回对齐，以免覆盖已有校对成果。'
+})
 
 interface AlignmentWorkbenchCommand {
   startOrder: number
@@ -6864,6 +6905,11 @@ async function handleSegmentSourceUpdate(sentenceId: string, sourceText: string)
 
 async function enterProofreadingFromAlignment() {
   if (alignmentAdvancing.value) return
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId) {
+    toast.error({ message: '缺少对齐批次，无法进入校对。' })
+    return
+  }
   alignmentAdvancing.value = true
   try {
     const saved = await flushAlignmentTextPatches()
@@ -6871,10 +6917,47 @@ async function enterProofreadingFromAlignment() {
       toast.error({ message: '仍有对齐文本未保存，请检查后重试。' })
       return
     }
+    const batch = await completeAlignment(batchId)
+    if (proofreadingContext.value) {
+      proofreadingContext.value = {
+        ...proofreadingContext.value,
+        workflow_stage: batch.workflow_stage || 'proofreading',
+        batch_status: batch.status,
+      }
+    }
     const query = { ...route.query }
     delete query.mode
     await router.replace({ name: 'workbench-focus', params: { id: props.id }, query })
-    toast.success({ message: '已保存对齐结果，进入校对工作流。' })
+    toast.success({ message: '已完成对齐，进入校对工作流。' })
+  } catch (error) {
+    toast.error({ message: getErrorMessage(error, '进入校对失败，请重试。') })
+  } finally {
+    alignmentAdvancing.value = false
+  }
+}
+
+async function reopenAlignmentFromProofreading() {
+  if (alignmentAdvancing.value || !canReopenAlignment.value) return
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId) return
+  alignmentAdvancing.value = true
+  try {
+    const batch = await reopenAlignment(batchId)
+    if (proofreadingContext.value) {
+      proofreadingContext.value = {
+        ...proofreadingContext.value,
+        workflow_stage: batch.workflow_stage || 'alignment',
+        batch_status: batch.status,
+      }
+    }
+    await router.replace({
+      name: 'workbench-focus',
+      params: { id: props.id },
+      query: { ...route.query, mode: 'alignment' },
+    })
+    toast.success({ message: '已退回对齐阶段，可继续调整边界。' })
+  } catch (error) {
+    toast.error({ message: getErrorMessage(error, '退回对齐失败。') })
   } finally {
     alignmentAdvancing.value = false
   }
@@ -9098,7 +9181,7 @@ onBeforeRouteLeave(async () => {
       <div class="workbench-ribbon__tabs proofreading-workbench-toolbar__main">
         <button class="workbench-ribbon__tab is-active proofreading-workbench-toolbar__back" type="button" title="返回项目" @click="goBack">
           <ArrowLeft :size="14" />
-          <span>{{ isAlignmentWorkbench ? '对齐' : '校对' }}</span>
+          <span>{{ isAlignmentWorkbench ? '阶段 2/3 · 对齐' : '阶段 3/3 · 校对' }}</span>
         </button>
         <div class="workbench-ribbon__task">
           <strong>{{ workbenchHeaderTitle }}</strong>
@@ -9149,14 +9232,27 @@ onBeforeRouteLeave(async () => {
               <Search :size="15" /><span>查找</span>
             </button>
             <button
+              class="workbench-ribbon__top-action"
+              data-testid="proofreading-export-alignment-button"
+              type="button"
+              :disabled="proofreadingExporting || !proofreadingContext?.batch_id || alignmentAdvancing"
+              title="导出原文与译文一一对照的 Excel 表格"
+              @click="void exportProofreadingWithFormat('proofreading_audit_xlsx')"
+            >
+              <Loader2 v-if="proofreadingExporting" class="lucide-spin" :size="15" />
+              <Download v-else :size="15" />
+              <span>{{ proofreadingExporting ? '导出中' : '导出对照表' }}</span>
+            </button>
+            <button
               class="workbench-ribbon__top-action proofreading-workbench-toolbar__primary"
+              data-testid="proofreading-complete-alignment-button"
               type="button"
               :disabled="alignmentAdvancing"
               @click="void enterProofreadingFromAlignment()"
             >
               <Loader2 v-if="alignmentAdvancing" class="lucide-spin" :size="15" />
               <ArrowRight v-else :size="15" />
-              <span>{{ alignmentAdvancing ? '保存中' : '进入校对' }}</span>
+              <span>{{ alignmentAdvancing ? '保存中' : '完成对齐，进入校对' }}</span>
             </button>
           </template>
           <template v-else>
@@ -9207,6 +9303,19 @@ onBeforeRouteLeave(async () => {
             <Loader2 v-if="proofreadingGenerating || ['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')" class="lucide-spin" :size="15" />
             <Bot v-else :size="15" />
             <span>{{ proofreadingGenerationButtonLabel }}</span>
+          </button>
+          <button
+            v-if="isDocumentPairProofreading"
+            class="workbench-ribbon__top-action"
+            data-testid="proofreading-reopen-alignment-button"
+            type="button"
+            :disabled="alignmentAdvancing || !canReopenAlignment"
+            :title="canReopenAlignment ? '退回对齐阶段，继续调整原文与译文边界' : reopenAlignmentDisabledReason"
+            @click="void reopenAlignmentFromProofreading()"
+          >
+            <Loader2 v-if="alignmentAdvancing" class="lucide-spin" :size="15" />
+            <Undo2 v-else :size="15" />
+            <span>退回对齐</span>
           </button>
           <button class="workbench-ribbon__top-action" type="button" title="撤回当前句段的编辑" @click="undoActiveSegmentEdit">
             <Undo2 :size="15" /><span>撤回</span>
@@ -13460,6 +13569,39 @@ onBeforeRouteLeave(async () => {
   border-radius: 0;
   background: #f7f9fb;
   box-shadow: 0 4px 10px rgba(17, 49, 42, 0.08);
+}
+
+.workbench-page.is-proofreading-workbench:not(.is-alignment-workbench) .proofreading-workbench-toolbar {
+  background: #eef7f4;
+  box-shadow: inset 4px 0 0 var(--brand-700, #0d7a68), 0 4px 10px rgba(17, 49, 42, 0.08);
+}
+
+.workbench-page.is-alignment-workbench .proofreading-workbench-toolbar {
+  background: #fbf6ee;
+  box-shadow: inset 4px 0 0 #d97706, 0 4px 10px rgba(120, 53, 15, 0.08);
+}
+
+.workbench-page.is-alignment-workbench .proofreading-workbench-toolbar__back svg {
+  color: #b45309;
+}
+
+.workbench-page.is-alignment-workbench .proofreading-workbench-toolbar__primary {
+  border-color: #d97706 !important;
+  background: #d97706 !important;
+  color: #fff !important;
+}
+
+.workbench-page.is-alignment-workbench .proofreading-workbench-toolbar__primary:hover:not(:disabled),
+.workbench-page.is-alignment-workbench .proofreading-workbench-toolbar__primary:focus-visible {
+  background: #b45309 !important;
+}
+
+.workbench-page.is-alignment-workbench .proofreading-workbench-toolbar__info-item svg {
+  color: #d97706;
+}
+
+.workbench-page.is-alignment-workbench .workbench-ribbon__top-action svg {
+  color: #d97706;
 }
 
 .proofreading-workbench-toolbar__main {

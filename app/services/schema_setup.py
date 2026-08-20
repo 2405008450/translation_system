@@ -657,6 +657,7 @@ REQUIRED_SCHEMA = {
         "export_path",
         "batch_kind",
         "alignment_status",
+        "workflow_stage",
         "target_language",
     },
     "proofreading_column_bindings": {
@@ -879,6 +880,14 @@ def ensure_runtime_schema() -> None:
             time.sleep(delay_seconds)
 
 
+def _is_insufficient_privilege_error(exc: ProgrammingError) -> bool:
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if sqlstate == "42501":
+        return True
+    message = str(exc)
+    return "InsufficientPrivilege" in message or "必须是表" in message or "must be owner" in message.lower()
+
+
 def _ensure_runtime_schema_once() -> None:
     with engine.connect() as connection:
         inspector = inspect(connection)
@@ -921,10 +930,22 @@ def _ensure_runtime_schema_once() -> None:
             )
         statements.extend(length_statements)
 
+    skipped_privilege_statements = 0
     try:
         with engine.begin() as connection:
             for statement in statements:
-                connection.execute(text(statement))
+                connection.execute(text("SAVEPOINT schema_stmt"))
+                try:
+                    connection.execute(text(statement))
+                except ProgrammingError as exc:
+                    connection.execute(text("ROLLBACK TO SAVEPOINT schema_stmt"))
+                    if not _is_insufficient_privilege_error(exc):
+                        raise
+                    skipped_privilege_statements += 1
+                    preview = " ".join(statement.split())[:160]
+                    logger.warning("skip schema statement due to insufficient privilege: %s", preview)
+                else:
+                    connection.execute(text("RELEASE SAVEPOINT schema_stmt"))
     except ProgrammingError as exc:
         missing_text = ", ".join(all_missing_items)
         raise RuntimeError(
@@ -932,6 +953,25 @@ def _ensure_runtime_schema_once() -> None:
             "或 scripts/rename_translation_memory_tables.sql 后再启动服务。"
             f" 当前缺失项: {missing_text}"
         ) from exc
+
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        remaining_items = [
+            *_collect_missing_schema(inspector),
+            *_collect_column_length_migrations(inspector)[0],
+        ]
+    if remaining_items:
+        remaining_text = ", ".join(remaining_items)
+        raise RuntimeError(
+            "数据库账号缺少结构升级权限，请使用有权限的账号执行 scripts/init_db.sql "
+            "或 scripts/rename_translation_memory_tables.sql 后再启动服务。"
+            f" 当前缺失项: {remaining_text}"
+        )
+    if skipped_privilege_statements:
+        logger.warning(
+            "runtime schema setup skipped %s privileged statements owned by another role",
+            skipped_privilege_statements,
+        )
 
 
 def _is_transient_schema_lock_error(exc: OperationalError) -> bool:
@@ -3711,6 +3751,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 target_language VARCHAR(20) NOT NULL DEFAULT '',
                 batch_kind VARCHAR(30) NOT NULL DEFAULT 'xlsx_columns',
                 alignment_status VARCHAR(20) NOT NULL DEFAULT 'not_applicable',
+                workflow_stage VARCHAR(20) NOT NULL DEFAULT 'not_applicable',
                 status VARCHAR(20) NOT NULL DEFAULT 'ready',
                 progress INTEGER NOT NULL DEFAULT 0,
                 message TEXT NOT NULL DEFAULT '',
@@ -3766,6 +3807,22 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS proofreading_batches
             ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS workflow_stage VARCHAR(20) NOT NULL DEFAULT 'not_applicable'
+            """,
+            """
+            UPDATE proofreading_batches
+            SET workflow_stage = CASE
+                WHEN batch_kind = 'xlsx_columns' THEN 'proofreading'
+                WHEN batch_kind = 'document_pair' AND alignment_status = 'confirmed'
+                    AND status IN ('queued', 'running', 'canceling', 'completed', 'partial_failed') THEN 'proofreading'
+                WHEN batch_kind = 'document_pair' AND alignment_status = 'confirmed' THEN 'alignment'
+                WHEN batch_kind = 'document_pair' THEN 'import'
+                ELSE workflow_stage
+            END
+            WHERE workflow_stage = 'not_applicable'
             """,
             f"""
             CREATE TABLE IF NOT EXISTS proofreading_column_bindings (
