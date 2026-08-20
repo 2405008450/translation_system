@@ -155,6 +155,14 @@ export async function replaceAlignmentPairRange(batchId: string, payload: {
   return data
 }
 
+export async function deleteAlignmentPair(pairId: string) {
+  const { data } = await http.delete<{
+    deleted_pair_id: string
+    neighbor: AlignmentPair | null
+  }>(`/alignment-pairs/${pairId}`)
+  return data
+}
+
 export async function splitAlignmentPairsByCell(batchId: string, pairIds: string[] = []) {
   const { data } = await http.post<{
     changed_pairs: number

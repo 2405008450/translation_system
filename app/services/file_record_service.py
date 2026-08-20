@@ -10,7 +10,19 @@ from uuid import UUID
 from sqlalchemy import case, event, func, or_, update
 from sqlalchemy.orm import Session
 
-from app.models import FileRecord, FileSegmentStats, Segment, TranslationMemory, User
+from app.config import get_settings
+from app.models import (
+    DocumentAlignmentPair,
+    DocumentAlignmentUnit,
+    FileRecord,
+    FileSegmentStats,
+    ProofreadingBatch,
+    ProofreadingColumnBinding,
+    ProofreadingSegmentBaseline,
+    Segment,
+    TranslationMemory,
+    User,
+)
 from app.services.document_storage import (
     delete_source_file,
     load_source_file,
@@ -43,6 +55,10 @@ logger = logging.getLogger(__name__)
 _DOCX_EXTENSIONS = {".docx"}
 _WORKSPACE_SOURCE_BYTES_KEY = "_source_bytes"
 _WORKSPACE_SOURCE_FILENAME_KEY = "_source_filename"
+
+# 运行中的校对批次不随文件删除联动清理，避免中断后台任务；可先取消再手动删除。
+_ACTIVE_PROOFREADING_STATUSES = {"aligning", "queued", "running", "canceling"}
+_ACTIVE_EXPORT_STATUSES = {"queued", "running"}
 
 
 SEGMENT_ORDERING = (
@@ -1519,11 +1535,70 @@ def delete_file_record(db: Session, file_record_id: UUID) -> bool:
     if not file_record:
         return False
 
+    affected_batch_ids = [
+        row[0]
+        for row in db.query(ProofreadingColumnBinding.batch_id)
+        .filter(ProofreadingColumnBinding.file_record_id == file_record_id)
+        .distinct()
+    ]
+    binding_ids = [
+        row[0]
+        for row in db.query(ProofreadingColumnBinding.id)
+        .filter(ProofreadingColumnBinding.file_record_id == file_record_id)
+    ]
+    if binding_ids:
+        db.query(ProofreadingSegmentBaseline).filter(
+            ProofreadingSegmentBaseline.binding_id.in_(binding_ids)
+        ).delete(synchronize_session=False)
+        db.query(ProofreadingColumnBinding).filter(
+            ProofreadingColumnBinding.id.in_(binding_ids)
+        ).delete(synchronize_session=False)
     db.delete(file_record)
     db.commit()
     if file_record.filename:
         delete_source_file(file_record.id, file_record.filename)
+    for batch_id in affected_batch_ids:
+        batch = db.query(ProofreadingBatch).filter(ProofreadingBatch.id == batch_id).first()
+        if not batch:
+            continue
+        if (
+            batch.status in _ACTIVE_PROOFREADING_STATUSES
+            or batch.export_status in _ACTIVE_EXPORT_STATUSES
+        ):
+            continue
+        has_remaining_binding = db.query(ProofreadingColumnBinding.id).filter(
+            ProofreadingColumnBinding.batch_id == batch_id
+        ).first()
+        if has_remaining_binding is None:
+            delete_proofreading_batch(db, batch)
     return True
+
+
+def delete_proofreading_batch(db: Session, batch: ProofreadingBatch) -> None:
+    """删除校对批次及其绑定、基线、对齐数据，并清理绑定文件与磁盘缓存。"""
+    file_record_ids = [
+        row[0]
+        for row in db.query(ProofreadingColumnBinding.file_record_id)
+        .filter(ProofreadingColumnBinding.batch_id == batch.id)
+        .distinct()
+    ]
+    if batch.export_path:
+        export_path = Path(batch.export_path)
+        if export_path.is_file():
+            try:
+                export_path.unlink()
+            except OSError:
+                logger.warning("无法删除校对导出文件：%s", export_path)
+    db.delete(batch)
+    db.commit()
+    cache_dir = Path(get_settings().file_storage_dir) / "alignment_sources"
+    for stale in cache_dir.glob(f"{batch.id}*"):
+        try:
+            stale.unlink()
+        except OSError:
+            logger.warning("无法删除对齐原文缓存：%s", stale)
+    for file_record_id in file_record_ids:
+        delete_file_record(db, file_record_id)
 
 
 def _is_docx_filename(filename: str) -> bool:

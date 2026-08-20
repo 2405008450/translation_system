@@ -23,7 +23,7 @@ from app.services.document_alignment.segments import (
 )
 from app.services.document_alignment.service import (
     create_alignment_batch, preview_document_pair, refresh_pair_text,
-    merge_alignment_pair_range, replace_alignment_pair_range,
+    delete_alignment_pair, merge_alignment_pair_range, replace_alignment_pair_range,
     run_alignment_batch, serialize_pair, split_alignment_pairs_by_cell,
     validate_pair_integrity,
 )
@@ -265,6 +265,33 @@ def patch_pair_text(
     return serialize_pair(pair)
 
 
+@router.delete("/alignment-pairs/{pair_id}")
+def remove_pair(
+    pair_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    pair = db.get(DocumentAlignmentPair, pair_id)
+    if not pair:
+        raise HTTPException(404, "配对不存在。")
+    batch = _batch(db, pair.batch_id)
+    if batch.alignment_status not in {"draft", "confirmed"}:
+        raise HTTPException(409, "当前对齐结果不可删除。")
+    _require_alignment_stage(batch)
+    try:
+        neighbor = delete_alignment_pair(db, batch.id, pair.id)
+        if batch.alignment_status == "confirmed":
+            ensure_document_pair_segments_complete(db, batch, refresh_existing=True)
+        db.commit()
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "deleted_pair_id": str(pair_id),
+        "neighbor": serialize_pair(neighbor) if neighbor is not None else None,
+    }
+
+
 @router.post("/proofreading-batches/{batch_id}/alignment-pairs/split")
 def split_pair(batch_id: UUID, payload: PairSplit, db: Session = Depends(get_db), _: User = Depends(require_business_manager)):
     batch = _batch(db, batch_id)
@@ -471,6 +498,9 @@ def complete_alignment(
         raise HTTPException(409, "当前批次不在对齐阶段，无法进入校对。")
     if batch.alignment_status != "confirmed":
         raise HTTPException(409, "请先确认对齐并生成句段。")
+    # 进入校对前执行一次权威同步，覆盖拆分、合并、边界移动以及防抖保存刚落库的
+    # 最新结果；否则旧句段/旧修订会在校对页表现为跨行新增和删除。
+    ensure_document_pair_segments_complete(db, batch, refresh_existing=True)
     batch.workflow_stage = "proofreading"
     db.commit()
     db.refresh(batch)

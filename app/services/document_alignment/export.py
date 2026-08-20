@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from copy import copy
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from io import BytesIO, StringIO
 import json
 from pathlib import Path
@@ -20,7 +21,9 @@ from app.models import (
 )
 from app.services.normalizer import compact_match_core
 
+from .parser import AlignUnit, parse_side
 from .segments import TRANSLATION_ONLY_SOURCE_LABEL, ensure_document_pair_segments_complete
+from .service import target_cache_path
 
 MISSING_TRANSLATION_LABEL = "【译文缺失】"
 TRANSLATION_ONLY_EXPORT_LABEL = "【增译】"
@@ -146,6 +149,16 @@ def build_proofreading_export_rows(
     return rows, file_record
 
 
+def target_revision_export_available(batch: ProofreadingBatch) -> bool:
+    """目标 DOCX 原件存在时，才允许生成保留目标排版的修订版。"""
+    config = _batch_config(batch)
+    target_filename = str(config.get("target_filename") or "")
+    return (
+        Path(target_filename).suffix.lower() == ".docx"
+        and target_cache_path(batch.id, target_filename, create_parent=False).is_file()
+    )
+
+
 def build_export_readiness(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
     rows, file_record = build_proofreading_export_rows(db, batch)
     stage = getattr(batch, "workflow_stage", "not_applicable")
@@ -157,6 +170,8 @@ def build_export_readiness(db: Session, batch: ProofreadingBatch) -> dict[str, A
                 "proofreading_docx_ordered",
                 "proofreading_audit_xlsx",
             ]
+            if target_revision_export_available(batch):
+                available_formats.insert(0, "proofreading_docx_target_revisions")
     else:
         available_formats = ["proofreading_xlsx_original"]
     return {
@@ -176,6 +191,224 @@ def build_export_readiness(db: Session, batch: ProofreadingBatch) -> dict[str, A
             bool(batch.failed_segments),
         )),
     }
+
+
+def _batch_config(batch: ProofreadingBatch) -> dict[str, Any]:
+    try:
+        value = json.loads(batch.config_json or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _project_boundaries(before: str, after: str, boundaries: list[int]) -> list[int]:
+    """把旧文本边界投影到新文本，保证边界单调且覆盖全部新文本。"""
+    matcher = SequenceMatcher(a=before, b=after, autojunk=False)
+    opcodes = matcher.get_opcodes()
+    projected: list[int] = []
+    for boundary in boundaries:
+        mapped = len(after)
+        for _tag, i1, i2, j1, j2 in opcodes:
+            if boundary < i1:
+                mapped = j1
+                break
+            if i1 <= boundary <= i2:
+                if i2 == i1:
+                    mapped = j2
+                elif j2 == j1:
+                    mapped = j1
+                else:
+                    ratio = (boundary - i1) / (i2 - i1)
+                    mapped = j1 + round(ratio * (j2 - j1))
+                break
+        projected.append(max(0, min(len(after), mapped)))
+    for index in range(1, len(projected)):
+        projected[index] = max(projected[index], projected[index - 1])
+    return projected
+
+
+def _split_reviewed_text(original_parts: list[str], reviewed: str) -> list[str]:
+    if not original_parts:
+        return []
+    if len(original_parts) == 1:
+        return [reviewed]
+    original = "".join(original_parts)
+    boundaries: list[int] = []
+    cursor = 0
+    for part in original_parts[:-1]:
+        cursor += len(part)
+        boundaries.append(cursor)
+    cuts = [0, *_project_boundaries(original, reviewed, boundaries), len(reviewed)]
+    return [reviewed[cuts[index]:cuts[index + 1]] for index in range(len(original_parts))]
+
+
+def _split_block_text(original_parts: list[str], joiner: str, reviewed: str) -> list[str]:
+    """按原 DOCX 句段边界拆分块文本，不把解析时的人造连接符写回句段。"""
+    if not original_parts:
+        return []
+    original = joiner.join(original_parts)
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for index, part in enumerate(original_parts):
+        start = cursor
+        end = start + len(part)
+        spans.append((start, end))
+        cursor = end + (len(joiner) if index < len(original_parts) - 1 else 0)
+    boundary_values = [value for span in spans for value in span]
+    mapped = _project_boundaries(original, reviewed, boundary_values)
+    return [reviewed[mapped[index * 2]:mapped[index * 2 + 1]] for index in range(len(spans))]
+
+
+def _workspace_block_key(segment: dict[str, Any]) -> tuple[int, int | None, int | None]:
+    return (
+        int(segment.get("block_index") or 0),
+        segment.get("row_index"),
+        segment.get("cell_index"),
+    )
+
+
+def _unit_block_key(unit: AlignUnit) -> tuple[int, int | None, int | None]:
+    return (unit.block_index, unit.row_index, unit.cell_index)
+
+
+def _build_target_revision_payload(
+    db: Session,
+    batch: ProofreadingBatch,
+    target_bytes: bytes,
+    target_filename: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """将对齐对的校对结果重新投影到目标 DOCX 的原始句段。"""
+    from app.services.document_workspace import parse_docx_workspace
+
+    config = _batch_config(batch)
+    granularity = str(config.get("granularity") or "sentence")
+    target_units = parse_side(target_bytes, target_filename, granularity)
+    units_by_index = {unit.index: unit for unit in target_units}
+    reviewed_by_pair = {
+        row.pair_id: row.reviewed_target_text
+        for row in build_proofreading_export_rows(db, batch)[0]
+    }
+    pairs = db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(
+        DocumentAlignmentPair.pair_order,
+    ).all()
+
+    replacement_by_unit = {unit.index: unit.text for unit in target_units}
+    deferred_insertions: list[tuple[int, str]] = []
+    last_target_index: int | None = None
+    for pair in pairs:
+        try:
+            indices = json.loads(pair.tgt_indices or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            indices = []
+        valid_indices: list[int] = []
+        for index in indices if isinstance(indices, list) else []:
+            try:
+                normalized_index = int(index)
+            except (TypeError, ValueError):
+                continue
+            if normalized_index in units_by_index:
+                valid_indices.append(normalized_index)
+        indices = valid_indices
+        reviewed = str(reviewed_by_pair.get(str(pair.id), pair.target_text or "") or "")
+        if indices:
+            pieces = _split_reviewed_text([units_by_index[index].text for index in indices], reviewed)
+            for index, piece in zip(indices, pieces):
+                replacement_by_unit[index] = piece
+            last_target_index = indices[-1]
+        elif reviewed:
+            # 原文有而目标文档无的段落没有天然版式锚点，先挂到前一目标单元；
+            # 若位于文首，则在完成遍历后挂到后一目标单元之前。
+            deferred_insertions.append((last_target_index if last_target_index is not None else -1, reviewed))
+
+    for anchor_index, inserted in deferred_insertions:
+        if anchor_index >= 0 and anchor_index in replacement_by_unit:
+            replacement_by_unit[anchor_index] = f"{replacement_by_unit[anchor_index]}\n{inserted}"
+        elif target_units:
+            first = target_units[0].index
+            replacement_by_unit[first] = f"{inserted}\n{replacement_by_unit[first]}"
+
+    workspace_segments = list(parse_docx_workspace(target_bytes).get("segments", []))
+    grouped: dict[tuple[int, int | None, int | None], list[dict[str, Any]]] = {}
+    for segment in workspace_segments:
+        grouped.setdefault(_workspace_block_key(segment), []).append(segment)
+    units_by_block: dict[tuple[int, int | None, int | None], list[AlignUnit]] = {}
+    for unit in target_units:
+        units_by_block.setdefault(_unit_block_key(unit), []).append(unit)
+
+    export_segments: list[dict[str, Any]] = []
+    revisions: list[dict[str, Any]] = []
+    for block_key, block_segments in grouped.items():
+        block_type = str(block_segments[0].get("block_type") or "paragraph")
+        if granularity == "sentence":
+            source_parts = [
+                str(item.get("display_text") or item.get("source_text") or "").strip()
+                for item in block_segments
+            ]
+            joiner = "\n" if block_type == "table_cell" else " "
+        else:
+            source_parts = [
+                str(item.get("display_text") or item.get("source_text") or "")
+                for item in block_segments
+            ]
+            joiner = ""
+        source_parts = [part for part in source_parts if part]
+        old_block = joiner.join(source_parts).strip()
+        edits = []
+        for unit in units_by_block.get(block_key, []):
+            edits.append((unit.source_start, unit.source_end, replacement_by_unit.get(unit.index, unit.text)))
+        new_block = old_block
+        for start, end, replacement in sorted(edits, reverse=True):
+            new_block = f"{new_block[:start]}{replacement}{new_block[end:]}"
+
+        corrected_parts = _split_block_text(source_parts, joiner, new_block)
+        for segment, before_text, after_text in zip(block_segments, source_parts, corrected_parts):
+            payload = dict(segment)
+            payload["target_text"] = after_text
+            payload["target_html"] = None
+            export_segments.append(payload)
+            sentence_id = str(segment.get("sentence_id") or "")
+            if sentence_id and before_text != after_text:
+                revisions.append({
+                    "id": f"proofreading-{batch.id}-{sentence_id}",
+                    "sentence_id": sentence_id,
+                    "before_text": before_text,
+                    "after_text": after_text,
+                    "status": "pending",
+                    "source": "manual",
+                    "author": {"name": "校对工作流"},
+                })
+    return export_segments, revisions
+
+
+def export_target_docx_with_revisions(
+    db: Session, batch: ProofreadingBatch,
+) -> tuple[bytes, str]:
+    """以目标 DOCX 原件为母版，导出校对后的真实 Word 修订痕迹。"""
+    from app.services.document_exporter import export_translated_docx
+
+    if batch.batch_kind != "document_pair":
+        raise ValueError("目标原格式修订导出仅用于双文档校对批次。")
+    config = _batch_config(batch)
+    target_filename = str(config.get("target_filename") or "")
+    if Path(target_filename).suffix.lower() != ".docx":
+        raise ValueError("目标原格式修订导出目前仅支持 DOCX 目标文档。")
+    path = target_cache_path(batch.id, target_filename, create_parent=False)
+    if not path.is_file():
+        raise ValueError("该历史批次未保存目标文档原件，请重新导入双文档后再导出。")
+    target_bytes = path.read_bytes()
+    segments, revisions = _build_target_revision_payload(
+        db, batch, target_bytes, target_filename,
+    )
+    content = export_translated_docx(
+        target_bytes,
+        segments,
+        target_language=batch.target_language,
+        revisions=revisions,
+        include_revision_marks=True,
+    )
+    if not _docx_package_is_well_formed(content):
+        raise ValueError("目标原格式修订文档生成失败，请检查目标 DOCX 后重试。")
+    return content, f"{Path(target_filename).stem}_校对版_保留目标格式_含修订.docx"
 
 
 def export_alignment_csv(pairs: list[DocumentAlignmentPair]) -> bytes:

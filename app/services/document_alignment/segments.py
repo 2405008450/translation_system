@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     DocumentAlignmentPair, FileRecord, ProofreadingBatch, ProofreadingColumnBinding,
-    ProofreadingSegmentBaseline, Segment, User,
+    ProofreadingSegmentBaseline, Segment, SegmentRevision, User,
 )
 from app.services.analytics_service import count_source_words
 from app.services.document_storage import save_source_file
@@ -144,20 +144,53 @@ def ensure_document_pair_segments_complete(
             added += 1
             baselines_by_segment[segment.id] = baseline
         else:
+            existing_baseline = baselines_by_segment.get(segment.id)
+            try:
+                previous_metadata = json.loads(segment.segment_metadata or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                previous_metadata = {}
+            if not isinstance(previous_metadata, dict):
+                previous_metadata = {}
             metadata = _pair_segment_metadata(batch, pair)
+            expected_source_text = (
+                TRANSLATION_ONLY_SOURCE_LABEL if metadata["translation_only"] else pair.source_text
+            )
+            alignment_changed = any((
+                existing_baseline is None,
+                existing_baseline is not None
+                and (existing_baseline.original_target_text or "") != (pair.target_text or ""),
+                (segment.source_text or "") != (expected_source_text or ""),
+                previous_metadata.get("src_indices") != metadata.get("src_indices"),
+                previous_metadata.get("tgt_indices") != metadata.get("tgt_indices"),
+            ))
             segment.segment_metadata = json.dumps(metadata, ensure_ascii=False)
             if refresh_existing:
-                source_text = TRANSLATION_ONLY_SOURCE_LABEL if metadata["translation_only"] else pair.source_text
-                segment.source_text = source_text
-                segment.display_text = source_text
+                segment.source_text = expected_source_text
+                segment.display_text = expected_source_text
                 segment.source_hash = build_source_hash(
                     f"translation-only:{pair.id}" if metadata["translation_only"] else pair.source_text,
                 )
                 segment.source_word_count = 0 if metadata["translation_only"] else count_source_words(pair.source_text)
-                existing_baseline = baselines_by_segment.get(segment.id)
                 # 对齐模式下句段尚未人工校对，可以随边界调整同步原始译文；
                 # 已经产生人工校对内容的历史任务必须保留 target_text。
                 if (
+                    alignment_changed
+                    and getattr(batch, "workflow_stage", "not_applicable") == "alignment"
+                ):
+                    # 对齐关系或对齐文本已经变化时，新 pair 是该句段的新权威基线。
+                    # 旧修订继续存在会在校对页制造跨行“新增/删除”的假象，只清理
+                    # 受影响句段，未调整句段已有的人工校对成果保持不变。
+                    db.query(SegmentRevision).filter_by(segment_id=segment.id).delete(
+                        synchronize_session=False,
+                    )
+                    segment.target_text = pair.target_text
+                    segment.target_html = None
+                    segment.status = "none"
+                    segment.confirmed_at = None
+                    segment.source = IMPORTED_TRANSLATION_SOURCE if pair.target_text else "none"
+                    segment.llm_provider = None
+                    segment.llm_model = None
+                elif (
                     segment.status != "confirmed"
                     or existing_baseline is None
                     or (segment.target_text or "") == (existing_baseline.original_target_text or "")

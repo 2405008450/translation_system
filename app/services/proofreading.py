@@ -1218,6 +1218,8 @@ def load_exported_batch(batch: ProofreadingBatch) -> tuple[bytes, str]:
 
 
 def serialize_batch(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
+    from app.services.document_alignment.export import target_revision_export_available
+
     bindings = (
         db.query(ProofreadingColumnBinding)
         .filter(ProofreadingColumnBinding.batch_id == batch.id)
@@ -1261,6 +1263,7 @@ def serialize_batch(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
         "batch_kind": getattr(batch, "batch_kind", "xlsx_columns"),
         "alignment_status": getattr(batch, "alignment_status", "not_applicable"),
         "workflow_stage": getattr(batch, "workflow_stage", "not_applicable"),
+        "target_revision_export_available": target_revision_export_available(batch),
         "status": batch.status,
         "progress": batch.progress,
         "message": batch.message,

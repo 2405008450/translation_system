@@ -1,6 +1,5 @@
 <script setup lang="ts">
-import axios from 'axios'
-import { Bot, CheckCircle2, ChevronDown, Download, ExternalLink, FileSpreadsheet, FileText, Loader2, MessageSquareText, Pause, Play, Settings2, Upload } from 'lucide-vue-next'
+import { Bot, CheckCircle2, ChevronDown, Download, ExternalLink, FileSpreadsheet, FileText, Loader2, MessageSquareText, Pause, Play, Settings2, Trash2, Upload } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
@@ -8,6 +7,7 @@ import {
   cancelProofreadingBatch,
   createProofreadingBatch,
   createProofreadingExportTask,
+  deleteProofreadingBatch,
   downloadProofreadingBatchExport,
   downloadProofreadingExportTask,
   exportProofreadingBatch,
@@ -22,12 +22,15 @@ import {
   type ProofreadingPreview,
   type ProofreadingSheetMapping,
 } from '../api/proofreading'
+import { useConfirm } from '../composables/useConfirm'
 import { getLanguageLabel, languageOptions } from '../constants/languages'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import { getApiErrorMessage } from '../utils/apiError'
 
 const props = defineProps<{ projectId: string }>()
 const emit = defineEmits<{ refreshProject: [] }>()
 const router = useRouter()
+const confirm = useConfirm()
 
 interface TargetDraft {
   enabled: boolean
@@ -136,8 +139,7 @@ function batchActualModel(batch: ProofreadingBatch) {
 }
 
 function errorText(error: unknown, fallback: string) {
-  if (axios.isAxiosError(error)) return String(error.response?.data?.detail || fallback)
-  return error instanceof Error ? error.message : fallback
+  return getApiErrorMessage(error, fallback)
 }
 
 function resetDrafts(result: ProofreadingPreview) {
@@ -272,6 +274,32 @@ async function stopGeneration(batch: ProofreadingBatch) {
   }
 }
 
+function canDeleteBatch(batch: ProofreadingBatch) {
+  return !ACTIVE_GENERATE_STATUSES.has(batch.status) && !['queued', 'running'].includes(batch.export_status)
+}
+
+async function removeBatch(batch: ProofreadingBatch) {
+  if (!canDeleteBatch(batch)) return
+  const confirmed = await confirm({
+    title: '删除任务',
+    message: `确定删除「${batch.filename}」的对齐/校对任务吗？${batch.bindings.length ? '其生成的语言任务文件也将一并删除，' : ''}操作不可恢复。`,
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!confirmed) return
+  actionBatchId.value = batch.id
+  errorMessage.value = ''
+  try {
+    await deleteProofreadingBatch(batch.id)
+    batches.value = batches.value.filter((item) => item.id !== batch.id)
+    emit('refreshProject')
+  } catch (error) {
+    errorMessage.value = errorText(error, '删除任务失败。')
+  } finally {
+    actionBatchId.value = ''
+  }
+}
+
 async function downloadBatch(batch: ProofreadingBatch) {
   actionBatchId.value = batch.id
   errorMessage.value = ''
@@ -295,7 +323,9 @@ async function downloadBatch(batch: ProofreadingBatch) {
 function documentPairExportChoice(batch: ProofreadingBatch): { format: ProofreadingExportFormat; name: string } | null {
   if (batch.batch_kind !== 'document_pair' || !batch.bindings[0]?.file_record_id) return null
   if (batch.workflow_stage === 'proofreading') {
-    return { format: 'proofreading_docx_layout', name: '导出校对后译文' }
+    return batch.target_revision_export_available
+      ? { format: 'proofreading_docx_target_revisions', name: '导出目标原格式（含修订）' }
+      : { format: 'proofreading_docx_layout', name: '导出源格式双语 Word' }
   }
   if (batch.workflow_stage === 'alignment' || batch.alignment_status === 'confirmed' || batch.alignment_status === 'draft') {
     return { format: 'proofreading_audit_xlsx', name: '导出一一对照表' }
@@ -310,6 +340,11 @@ async function exportDocumentPairBatch(batch: ProofreadingBatch) {
   errorMessage.value = ''
   try {
     const readiness = await getProofreadingExportReadiness(batch.id)
+    if (!readiness.available_formats.includes(choice.format)) {
+      throw new Error(choice.format === 'proofreading_docx_target_revisions'
+        ? '该批次未保存目标 DOCX 原件，无法导出目标原格式修订版。请重新导入双文档。'
+        : '当前批次不支持所选导出格式。')
+    }
     const acknowledgeWarnings = choice.format === 'proofreading_audit_xlsx' ? false : readiness.has_warnings
     let task = await createProofreadingExportTask(batch.id, choice.format, acknowledgeWarnings)
     for (let attempt = 0; ['queued', 'running'].includes(task.status) && attempt < 240; attempt += 1) {
@@ -433,6 +468,8 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (pollTimer) clearInterval(pollTimer)
 })
+
+defineExpose({ refreshBatches })
 </script>
 
 <template>
@@ -557,11 +594,16 @@ onBeforeUnmount(() => {
         <span class="proofreading-task-section__count">{{ batches.length }} 个批次</span>
       </div>
 
+      <p v-if="errorMessage" class="form-message is-error">{{ errorMessage }}</p>
+
       <div v-if="batches.length" class="proofreading-batches">
         <article v-for="batch in batches" :key="batch.id" class="proofreading-batch">
+          <div class="proofreading-batch__progress" aria-hidden="true">
+            <div class="proofreading-batch__progress-fill" :style="{ width: `${batch.progress}%` }" />
+          </div>
           <div class="proofreading-batch__header">
             <div class="proofreading-batch__title">
-              <strong>{{ batch.filename }}</strong>
+              <strong :title="batch.filename">{{ batch.filename }}</strong>
               <span class="proofreading-batch__kind" :class="`is-${batch.batch_kind || 'xlsx_columns'}`">{{ batchKindLabel(batch) }}</span>
               <span class="proofreading-batch__badge" :class="statusTone(batch.status)">{{ statusLabel(batch.status) }}</span>
             </div>
@@ -572,10 +614,16 @@ onBeforeUnmount(() => {
               <span :class="{ 'is-error': batch.failed_segments > 0 }">失败 {{ batch.failed_segments }}</span>
             </small>
             <span class="proofreading-batch__percent">{{ batch.progress }}%</span>
-          </div>
-
-          <div class="proofreading-batch__progress">
-            <div class="progress-bar"><div class="progress-bar__track"><div class="progress-bar__fill" :style="{ width: `${batch.progress}%` }" /></div></div>
+            <button
+              class="proofreading-batch__delete"
+              type="button"
+              :title="canDeleteBatch(batch) ? '删除任务' : '运行中，请先暂停或取消后再删除'"
+              :aria-label="`删除任务 ${batch.filename}`"
+              :disabled="Boolean(actionBatchId) || !canDeleteBatch(batch)"
+              @click="removeBatch(batch)"
+            >
+              <Trash2 :size="14" />
+            </button>
           </div>
 
           <div class="proofreading-batch__footer">
@@ -791,6 +839,7 @@ onBeforeUnmount(() => {
 .proofreading-panel__head input { display: none; }
 .proofreading-panel__notice { display: flex; align-items: center; gap: 8px; color: var(--ink-600); }
 .proofreading-mapping, .proofreading-batches { display: grid; gap: 8px; }
+.proofreading-batches { gap: 6px; }
 .proofreading-mapping { padding: 16px; border: 1px solid var(--line-soft); border-radius: 10px; background: #fafcfb; }
 .proofreading-mapping__top > span { display: flex; align-items: center; gap: 8px; font-weight: 700; }
 .proofreading-source-language { width: min(280px, 45%); }
@@ -803,16 +852,18 @@ onBeforeUnmount(() => {
 .proofreading-target-row small { grid-column: 2 / 4; overflow: hidden; color: var(--ink-500); text-overflow: ellipsis; white-space: nowrap; }
 .proofreading-mapping__actions > span { color: var(--ink-500); font-size: 12px; }
 .proofreading-batch {
+  position: relative;
   display: grid;
-  gap: 7px;
-  padding: 10px 14px;
+  gap: 5px;
+  padding: 8px 12px;
   border: 1px solid var(--line-soft);
   border-radius: 10px;
   background: #fff;
+  overflow: hidden;
 }
 .proofreading-batch__header {
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) auto auto;
+  grid-template-columns: minmax(240px, 1fr) auto auto auto;
   align-items: center;
   gap: 12px;
 }
@@ -845,13 +896,27 @@ onBeforeUnmount(() => {
 .proofreading-batch__badge.is-danger { background: #fee2e2; color: #b91c1c; }
 .proofreading-batch__badge.is-muted { background: #f1f5f9; color: #64748b; }
 .proofreading-batch__percent { color: var(--ink-500); font-size: 13px; font-variant-numeric: tabular-nums; }
-.proofreading-batch__progress { display: grid; }
-.proofreading-batch__progress .progress-bar__track { height: 6px; }
-.proofreading-batch__progress small { color: var(--ink-500); }
+.proofreading-batch__progress { position: absolute; top: 0; right: 0; left: 0; height: 3px; background: #eef2f7; }
+.proofreading-batch__progress-fill { height: 100%; background: var(--brand, #0f766e); transition: width .3s ease; }
+.proofreading-batch__delete {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-400, #94a3b8);
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+.proofreading-batch__delete:hover:not(:disabled) { background: #fee2e2; color: #b91c1c; }
+.proofreading-batch__delete:disabled { cursor: not-allowed; opacity: .45; }
 .proofreading-batch__message { overflow: hidden; margin: 0; color: var(--ink-600); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .proofreading-batch__stats { display: inline-flex; flex: 0 0 auto; gap: 8px; color: var(--ink-500); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .proofreading-batch__stats span + span { padding-left: 10px; border-left: 1px solid var(--line-soft); }
-.proofreading-batch__footer { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.proofreading-batch__footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .proofreading-batch__context { display: flex; flex: 1 1 auto; align-items: center; gap: 12px; min-width: 0; }
 .proofreading-batch__language-list { display: flex; flex-wrap: wrap; gap: 8px; }
 .proofreading-batch__language-chip {
@@ -869,7 +934,7 @@ onBeforeUnmount(() => {
 .proofreading-batch__language-chip:hover { border-color: #94a3b8; background: #fff; }
 .proofreading-batch__language-sheet { color: var(--ink-500); }
 .proofreading-batch__actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
-.proofreading-batch__actions .button { min-height: 32px; padding: 6px 10px; }
+.proofreading-batch__actions .button { min-height: 30px; padding: 5px 9px; }
 .proofreading-batch__settings-toggle svg:last-child { transition: transform .16s ease; }
 .proofreading-batch__settings-toggle .is-rotated { transform: rotate(180deg); }
 .proofreading-batch__error { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -894,9 +959,10 @@ onBeforeUnmount(() => {
   .proofreading-import__modes { grid-template-columns: 1fr; }
   .proofreading-sheet__settings { grid-template-columns: 1fr; }
   .proofreading-generation-config__fields { grid-template-columns: 1fr; }
-  .proofreading-batch__header { grid-template-columns: minmax(220px, 1fr) auto; }
+  .proofreading-batch__header { grid-template-columns: minmax(220px, 1fr) auto auto; }
   .proofreading-batch__stats { grid-column: 1 / -1; grid-row: 2; }
   .proofreading-batch__percent { grid-column: 2; grid-row: 1; }
+  .proofreading-batch__delete { grid-column: 3; grid-row: 1; }
   .proofreading-batch__footer { align-items: flex-start; flex-direction: column; }
   .proofreading-batch__actions { justify-content: flex-start; }
 }

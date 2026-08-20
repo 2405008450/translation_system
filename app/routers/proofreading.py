@@ -44,8 +44,9 @@ from app.services.proofreading import (
 )
 from app.services.llm_service import LLMConfigurationError, validate_provider_choice
 from app.services.document_alignment.segments import ensure_document_pair_segments_complete
-from app.services.document_alignment.export import build_export_readiness
+from app.services.document_alignment.export import build_export_readiness, target_revision_export_available
 from app.services.file_export_queue import queue_file_export
+from app.services.file_record_service import delete_proofreading_batch
 
 router = APIRouter()
 
@@ -77,6 +78,7 @@ class ProofreadingGenerateRequest(BaseModel):
 
 class ProofreadingExportTaskRequest(BaseModel):
     format: Literal[
+        "proofreading_docx_target_revisions",
         "proofreading_docx_layout",
         "proofreading_docx_ordered",
         "proofreading_audit_xlsx",
@@ -193,6 +195,22 @@ def get_proofreading_batch(
     _: User = Depends(require_business_manager),
 ):
     return serialize_batch(db, _get_batch_or_404(db, batch_id))
+
+
+@router.delete("/proofreading-batches/{batch_id}")
+def remove_proofreading_batch(
+    batch_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    """删除校对批次及其对齐数据、绑定的语言任务文件。"""
+    batch = _get_batch_or_404(db, batch_id)
+    if batch.status in {"aligning", "queued", "running", "canceling"}:
+        raise HTTPException(status_code=409, detail="任务正在运行，请先暂停或取消后再删除。")
+    if batch.export_status in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail="导出任务正在运行，请稍后再删除。")
+    delete_proofreading_batch(db, batch)
+    return {"message": "任务已删除。"}
 
 
 @router.post("/proofreading-batches/{batch_id}/generate")
@@ -323,6 +341,11 @@ def create_proofreading_export_task(
         raise HTTPException(status_code=409, detail="请先结束当前 LLM 校对任务再导出。")
     readiness = build_export_readiness(db, batch)
     if payload.format not in readiness["available_formats"]:
+        if payload.format == "proofreading_docx_target_revisions":
+            raise HTTPException(
+                status_code=400,
+                detail="该批次没有可用的目标 DOCX 原件；历史批次请重新导入双文档后再导出。",
+            )
         raise HTTPException(status_code=400, detail="当前校对批次不支持所选导出格式。")
     requires_warning_ack = (
         readiness["has_warnings"]
@@ -466,6 +489,9 @@ def get_file_proofreading_baselines(
             "actual_provider": str(actual_provider or ""),
             "actual_model": str(actual_model or ""),
             "failed_segments": int(batch.failed_segments or 0) if batch else 0,
+            "target_revision_export_available": bool(
+                batch and target_revision_export_available(batch)
+            ),
         }
     return {
         "is_proofreading": is_proofreading,

@@ -52,6 +52,7 @@ FILE_EXPORT_POLL_INTERVAL_SECONDS = 0.3
 FILE_EXPORT_WAIT_TIMEOUT_SECONDS = 30 * 60
 LANGUAGE_TAGGED_EXPORT_TYPES = {"tmx", "xliff", "xliff2"}
 PROOFREADING_EXPORT_TYPES = {
+    "proofreading_docx_target_revisions",
     "proofreading_docx_layout",
     "proofreading_docx_ordered",
     "proofreading_audit_xlsx",
@@ -507,6 +508,7 @@ def build_file_record_exported_file(
             export_document_pair_xlsx,
             export_layout_bilingual_docx,
             export_ordered_bilingual_docx,
+            export_target_docx_with_revisions,
         )
         from app.services.proofreading import export_batch_xlsx
 
@@ -527,6 +529,13 @@ def build_file_record_exported_file(
         if batch is None:
             raise ValueError("当前文件没有可导出的校对批次。")
 
+        if export_type == "proofreading_docx_target_revisions":
+            content, filename = export_target_docx_with_revisions(db, batch)
+            return _GenericExportedFile(
+                content=content,
+                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                filename=filename,
+            )
         if export_type == "proofreading_docx_layout":
             content, filename, _ = export_layout_bilingual_docx(db, batch)
             return _GenericExportedFile(

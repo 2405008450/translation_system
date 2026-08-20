@@ -85,6 +85,7 @@ import TranslationReviewPanel from '../components/TranslationReviewPanel.vue'
 import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { http } from '../api/http'
 import {
+  deleteAlignmentPair,
   replaceAlignmentPairRange,
   splitAlignmentPairsByCell,
   updateAlignmentPairText,
@@ -185,6 +186,7 @@ import type {
 } from '../types/api'
 import { buildDocumentPreviewHtml } from '../utils/documentPreview'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import { getApiErrorMessage } from '../utils/apiError'
 import {
   getExportOptionExtensionLabel,
   groupExportOptions,
@@ -326,6 +328,7 @@ type ProofreadingBaselineResponse = {
     actual_provider: string
     actual_model: string
     failed_segments: number
+    target_revision_export_available: boolean
   } | null
   items: Array<{
     segment_id: string
@@ -736,10 +739,15 @@ const proofreadingExportChoices = computed<Array<{
   proofreadingContext.value?.batch_kind === 'document_pair'
     ? proofreadingContext.value?.workflow_stage === 'proofreading'
       ? [
+          ...(proofreadingContext.value?.target_revision_export_available ? [{
+            format: 'proofreading_docx_target_revisions' as const,
+            name: '目标原格式（含修订）',
+            description: '以导入的译文 DOCX 为母版，保留其排版并写入可接受或拒绝的 Word 修订。',
+          }] : []),
           {
             format: 'proofreading_docx_layout',
-            name: '校对后译文',
-            description: '导出经校对修改后的译文文档，尽量保留源排版。',
+            name: '源格式双语 Word',
+            description: '沿用原文排版，按原文在前导出原文与校对后译文。',
           },
           {
             format: 'proofreading_docx_ordered',
@@ -780,6 +788,11 @@ async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
       throw new Error('当前编辑尚未保存，已取消导出。')
     }
     const readiness = await getProofreadingExportReadiness(batchId)
+    if (!readiness.available_formats.includes(format)) {
+      throw new Error(format === 'proofreading_docx_target_revisions'
+        ? '该批次未保存目标 DOCX 原件，无法导出目标原格式修订版。请重新导入双文档。'
+        : '当前批次不支持所选导出格式。')
+    }
     let acknowledgeWarnings = false
     if (readiness.has_warnings && format !== 'proofreading_audit_xlsx') {
       acknowledgeWarnings = await confirm({
@@ -812,7 +825,9 @@ async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
       task.filename || '双语校对版',
     )
     downloadBlob(response.data, filename)
-    const successMessage = format === 'proofreading_docx_layout'
+    const successMessage = format === 'proofreading_docx_target_revisions'
+      ? '已导出目标原格式 Word（含修订）'
+      : format === 'proofreading_docx_layout'
       ? filename.includes('顺序优先')
         ? '原排版校验未通过，已自动导出顺序优先 Word'
         : '已导出双语 Word（保留源排版）'
@@ -1643,10 +1658,7 @@ function observeSegmentEditorResults() {
 }
 
 function getErrorMessage(error: unknown, fallback: string) {
-  if (axios.isAxiosError(error)) {
-    return String(error.response?.data?.detail || fallback)
-  }
-  return error instanceof Error ? error.message : fallback
+  return getApiErrorMessage(error, fallback)
 }
 
 function normalizeTextForSaveToTM(value: string | null | undefined) {
@@ -6928,6 +6940,10 @@ async function enterProofreadingFromAlignment() {
     const query = { ...route.query }
     delete query.mode
     await router.replace({ name: 'workbench-focus', params: { id: props.id }, query })
+    // 切换阶段的接口会按最新对齐结果重建受影响句段和基线；必须立即重新读取，
+    // 不能继续复用对齐模式下的本地 Segment/修订缓存。
+    if (props.id) await loadProofreadingBaselines(props.id)
+    await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize, { includeStats: true })
     toast.success({ message: '已完成对齐，进入校对工作流。' })
   } catch (error) {
     toast.error({ message: getErrorMessage(error, '进入校对失败，请重试。') })
@@ -7103,8 +7119,41 @@ async function deleteAlignmentPairInWorkbench() {
   const current = activeSegment.value
   if (!current || typeof current.alignment_pair_order !== 'number') return
   const before = alignmentReplacement(current)
-  if (before.src_indices.length || before.tgt_indices.length) {
-    toast.warn({ message: '只能删除没有原文和译文单元的空行。' })
+  const isTranslationOnly = !before.src_indices.length && before.tgt_indices.length > 0
+  if (before.src_indices.length || (before.tgt_indices.length && !isTranslationOnly)) {
+    toast.warn({ message: '只能删除空行或无对应原文的增译行。' })
+    return
+  }
+  if (isTranslationOnly) {
+    if ((current.target_text || '').trim()) {
+      const confirmed = await confirm({
+        title: '删除增译行',
+        message: '该行仍有译文。删除后，其底层目标文档单元会并入相邻配对，但该段增译内容不会进入校对结果。',
+        confirmText: '删除增译行',
+        danger: true,
+      })
+      if (!confirmed) return
+    }
+    const saved = await flushAlignmentTextPatches()
+    if (!saved) {
+      toast.error({ message: '仍有对齐文本未保存，暂未删除。' })
+      return
+    }
+    if (!current.alignment_pair_id) return
+    alignmentAdvancing.value = true
+    try {
+      await deleteAlignmentPair(current.alignment_pair_id)
+      // 此删除会把目标解析单元吸收到相邻配对，不能用普通区间替换安全撤回。
+      alignmentUndoStack.value = []
+      alignmentRedoStack.value = []
+      selectedSentenceIds.value = new Set()
+      await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize, { includeStats: true })
+      toast.success({ message: '增译行已删除，后续句段顺序已自动更新。' })
+    } catch (error) {
+      toast.error({ message: getErrorMessage(error, '删除增译行失败。') })
+    } finally {
+      alignmentAdvancing.value = false
+    }
     return
   }
   await applyAlignmentReplacement(current.alignment_pair_order, [before], [], '删除空行')
@@ -17084,6 +17133,25 @@ onBeforeRouteLeave(async () => {
  * 按编辑区自身宽度切换成图标模式，为分页控件保留稳定空间；按钮文字仍供
  * 屏幕阅读器读取，并可通过原有 title 查看。
  */
+/*
+ * 半屏或侧栏展开时，默认表格列最小宽度之和会超过编辑区，导致“状态/阶段”列被裁掉。
+ * 按编辑器自身宽度收紧列宽，比 viewport 断点更可靠，也能覆盖可拖拽侧栏场景。
+ */
+@container segment-editor-shell (max-width: 940px) {
+  .workbench-page.is-stable-grid .segment-editor-results {
+    --segment-editor-grid-template: 56px minmax(190px, 0.9fr) minmax(230px, 1.1fr) 64px 56px;
+  }
+
+  .workbench-page.has-proofreading-baseline .segment-editor-results {
+    --segment-editor-grid-template: 56px minmax(150px, 1fr) minmax(150px, 1fr) minmax(170px, 1.1fr) minmax(170px, 0.9fr);
+  }
+
+  .workbench-page.has-proofreading-baseline.is-alignment-workbench .segment-editor-results,
+  .workbench-page.is-alignment-workbench .segment-editor-results {
+    --segment-editor-grid-template: 56px minmax(220px, 1fr) minmax(220px, 1fr);
+  }
+}
+
 @container segment-editor-shell (max-width: 860px) {
   .segment-editor-bottom-tools,
   .segment-editor-bottom-tools.is-docked {
@@ -18376,6 +18444,7 @@ onBeforeRouteLeave(async () => {
     grid-row: 2;
   }
 
+  .workbench-layout .segment-editor-side-tools,
   .workbench-layout.has-active-tool .segment-editor-side-tools {
     grid-column: 1;
     grid-row: 1;
@@ -18458,6 +18527,28 @@ onBeforeRouteLeave(async () => {
     --workbench-toolbar-left: 12px;
     --workbench-drawer-left: 12px;
     --workbench-fixed-max: calc(100vw - 24px);
+  }
+
+  .workbench-ribbon__tab {
+    min-width: 72px;
+    padding-inline: 12px;
+  }
+
+  .workbench-ribbon__task {
+    padding-inline: 10px;
+  }
+
+  .workbench-ribbon__task strong {
+    max-width: min(300px, 32vw);
+  }
+
+  .workbench-ribbon__task span {
+    display: none;
+  }
+
+  .workbench-ribbon__top-actions {
+    gap: 2px;
+    padding-inline: 2px;
   }
 
   .segment-editor-footer {

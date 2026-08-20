@@ -63,6 +63,7 @@ export interface ProofreadingBatch {
   batch_kind?: 'xlsx_columns' | 'document_pair'
   alignment_status?: 'not_applicable' | 'aligning' | 'canceling' | 'canceled' | 'draft' | 'confirmed' | 'failed'
   workflow_stage?: 'not_applicable' | 'import' | 'alignment' | 'proofreading'
+  target_revision_export_available?: boolean
   status: 'aligning' | 'draft' | 'ready' | 'queued' | 'running' | 'canceling' | 'completed' | 'partial_failed' | 'failed' | 'canceled'
   progress: number
   message: string
@@ -89,6 +90,7 @@ export interface ProofreadingBatch {
 }
 
 export type ProofreadingExportFormat =
+  | 'proofreading_docx_target_revisions'
   | 'proofreading_docx_layout'
   | 'proofreading_docx_ordered'
   | 'proofreading_audit_xlsx'
@@ -171,6 +173,10 @@ export async function generateProofreadingBatch(
 export async function cancelProofreadingBatch(batchId: string) {
   const { data } = await http.post<ProofreadingBatch>(`/proofreading-batches/${batchId}/cancel`)
   return data
+}
+
+export async function deleteProofreadingBatch(batchId: string) {
+  await http.delete(`/proofreading-batches/${batchId}`)
 }
 
 export async function exportProofreadingBatch(batchId: string) {

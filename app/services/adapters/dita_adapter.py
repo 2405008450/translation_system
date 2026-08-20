@@ -388,6 +388,7 @@ class DitaAdapter(FormatAdapter):
             tag in SEGMENT_BOUNDARY_ELEMENTS
             or self._is_term_label(element)
             or self._is_redundant_formatting_boundary(element)
+            or self._is_leading_format_label(element)
         )
 
     def _is_translatable_boundary(self, element: etree._Element) -> bool:
@@ -399,6 +400,10 @@ class DitaAdapter(FormatAdapter):
             tag in TRANSLATABLE_BOUNDARY_ELEMENTS
             or self._is_term_label(element)
             or self._is_redundant_formatting_boundary(element)
+            or (
+                self._is_leading_format_label(element)
+                and not self._is_fixed_code_label(element)
+            )
         )
 
     def _is_term_label(self, element: etree._Element) -> bool:
@@ -429,6 +434,55 @@ class DitaAdapter(FormatAdapter):
             parent is not None
             and isinstance(parent.tag, str)
             and etree.QName(parent).localname == tag
+        )
+
+    def _is_leading_format_label(self, element: etree._Element) -> bool:
+        """识别 ``<p><b>ACC：</b>正文</p>`` 形式的段首标签。
+
+        标签文本与其后的 tail 属于不同 XML 文本槽。若继续聚合成一个
+        句段，导出器无法把整句译文精确写回任一文本槽。
+        """
+        if not isinstance(element.tag, str):
+            return False
+        if etree.QName(element).localname != "b":
+            return False
+
+        parent = element.getparent()
+        if parent is None or not isinstance(parent.tag, str):
+            return False
+        if etree.QName(parent).localname != "p":
+            return False
+        if parent.text and parent.text.strip():
+            return False
+
+        # 必须是段落中的第一个元素子节点，避免把普通句中间的加粗内容
+        # 错判为段首标签。
+        previous = element.getprevious()
+        while previous is not None:
+            if isinstance(previous.tag, str):
+                return False
+            previous = previous.getprevious()
+
+        label = self._get_all_text(element).strip()
+        return (
+            bool(label)
+            and label.endswith((":", "："))
+            and bool(element.tail and self._has_translatable_text(element.tail))
+        )
+
+    def _is_fixed_code_label(self, element: etree._Element) -> bool:
+        """判断段首标签是否为无需翻译的大写代码，如 OFF/ACC/ON。"""
+        if not self._is_leading_format_label(element):
+            return False
+
+        label = self._get_all_text(element).strip().rstrip(":：").strip()
+        return (
+            bool(label)
+            and any(char.isalnum() for char in label)
+            and all(
+                not char.isalpha() or (char.isascii() and char.isupper())
+                for char in label
+            )
         )
 
     def _contains_segment_boundary(self, element: etree._Element) -> bool:

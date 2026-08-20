@@ -6909,12 +6909,15 @@ def _build_project_file_payload(
 
 
 def _serialize_file_proofreading_summary(batch: ProofreadingBatch) -> dict[str, Any]:
+    from app.services.document_alignment.export import target_revision_export_available
+
     return {
         "batch_id": str(batch.id),
         "batch_kind": getattr(batch, "batch_kind", "xlsx_columns"),
         "workflow_stage": getattr(batch, "workflow_stage", "not_applicable"),
         "alignment_status": getattr(batch, "alignment_status", "not_applicable"),
         "batch_status": batch.status,
+        "target_revision_export_available": target_revision_export_available(batch),
     }
 
 

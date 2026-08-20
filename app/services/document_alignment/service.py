@@ -133,6 +133,18 @@ def _source_cache_path(batch_id: UUID, filename: str) -> Path:
     return path
 
 
+def target_cache_path(batch_id: UUID, filename: str, *, create_parent: bool = True) -> Path:
+    """返回双文档批次的目标文档原件路径。
+
+    源文档沿用历史文件名，目标文档增加明确后缀，避免同扩展名时互相覆盖。
+    """
+    suffix = Path(filename).suffix.lower() or ".bin"
+    path = Path(get_settings().file_storage_dir) / "alignment_sources" / f"{batch_id}_target{suffix}"
+    if create_parent:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def create_alignment_batch(
     db: Session, *, project: Project, current_user: User,
     source_bytes: bytes, source_filename: str, target_bytes: bytes, target_filename: str,
@@ -170,6 +182,9 @@ def create_alignment_batch(
     db.add(batch)
     db.flush()
     _source_cache_path(batch.id, source_filename).write_bytes(source_bytes)
+    # 校对成品必须以译文原件为版式母版。旧实现只保存源文档，导致后续只能保留
+    # 原文排版；这里独立保存目标原件，同时不改变既有对齐/双语导出路径。
+    target_cache_path(batch.id, target_filename).write_bytes(target_bytes)
     for side, units in (("source", src_units), ("target", tgt_units)):
         db.add_all(DocumentAlignmentUnit(
             batch_id=batch.id, side=side, unit_index=unit.index, text=unit.text,
@@ -1315,6 +1330,68 @@ def replace_alignment_pair_range(
     validate_pair_integrity(db, batch_id)
     db.flush()
     return created
+
+
+def delete_alignment_pair(
+    db: Session,
+    batch_id: UUID,
+    pair_id: UUID,
+) -> DocumentAlignmentPair | None:
+    """删除人工空行或增译配对，同时保持两侧解析单元完整覆盖。
+
+    增译配对仍持有目标文档单元，不能直接物理删除；将其单元并入相邻配对，
+    并把相邻配对当前译文保存为人工文本，确保被删除的增译不会重新出现。
+    """
+    rows = db.query(DocumentAlignmentPair).filter_by(batch_id=batch_id).order_by(
+        DocumentAlignmentPair.pair_order,
+    ).all()
+    current_index = next((index for index, row in enumerate(rows) if row.id == pair_id), -1)
+    if current_index < 0:
+        raise ValueError("待删除配对不存在或不属于当前批次。")
+    current = rows[current_index]
+    source_indices = json.loads(current.src_indices or "[]")
+    target_indices = json.loads(current.tgt_indices or "[]")
+    if source_indices:
+        raise ValueError("只能删除空行或无对应原文的增译行。")
+
+    neighbor: DocumentAlignmentPair | None = None
+    if target_indices:
+        if current_index > 0:
+            neighbor = rows[current_index - 1]
+            neighbor_target_indices = json.loads(neighbor.tgt_indices or "[]")
+            neighbor.tgt_indices = json.dumps([*neighbor_target_indices, *target_indices])
+        elif current_index + 1 < len(rows):
+            neighbor = rows[current_index + 1]
+            neighbor_target_indices = json.loads(neighbor.tgt_indices or "[]")
+            neighbor.tgt_indices = json.dumps([*target_indices, *neighbor_target_indices])
+        else:
+            raise ValueError("文档仅剩这一条增译，无法在保持目标文档结构的同时删除。")
+
+        try:
+            neighbor_features = json.loads(neighbor.features or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            neighbor_features = {}
+        if not isinstance(neighbor_features, dict):
+            neighbor_features = {}
+        neighbor_features["manual_target_text"] = neighbor.target_text or ""
+        deleted_ids = neighbor_features.get("absorbed_deleted_pair_ids")
+        neighbor_features["absorbed_deleted_pair_ids"] = [
+            *(deleted_ids if isinstance(deleted_ids, list) else []),
+            str(current.id),
+        ]
+        neighbor_features["manual_deleted_translation_only"] = True
+        neighbor.features = json.dumps(neighbor_features, ensure_ascii=False)
+        neighbor.locked = True
+
+    db.delete(current)
+    db.flush()
+    if neighbor is not None:
+        refresh_pair_text(db, neighbor)
+    # 由统一完整性校验完成一次连续编号重排。这里若先手工迁移、随后校验再次迁移，
+    # PostgreSQL 会在第二轮批量 UPDATE 中命中 (batch_id, pair_order) 唯一约束。
+    validate_pair_integrity(db, batch_id)
+    db.flush()
+    return neighbor
 
 
 def _ordered_cell_groups(

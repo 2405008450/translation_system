@@ -4,6 +4,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from hashlib import sha1
 from html import escape as escape_html
@@ -161,8 +162,18 @@ ENGLISH_BOUNDARY_TRAILING_RE = re.compile(r"[,;:.!?][\"')\]\}]*$")
 ENGLISH_WORD_LEADING_RE = re.compile(r"^[\"'“‘(\[]*[A-Za-z0-9]")
 # 支持的格式标签
 FORMAT_TAG_RE = re.compile(r"<(/?)(b|strong|i|em|u|s|strike|del|sub|sup)>", re.IGNORECASE)
+_REVISION_DIFF_IDEOGRAPHIC = (
+    "\u3040-\u30ff"  # 日文假名
+    "\u3400-\u4dbf"  # CJK 扩展 A
+    "\u4e00-\u9fff"  # CJK 基本区
+    "\uf900-\ufaff"  # CJK 兼容区
+    "\uac00-\ud7af"  # 韩文音节
+)
 REVISION_DIFF_TOKEN_RE = re.compile(
-    r"[a-zA-Z0-9]+(?:[-'][a-zA-Z0-9]+)*|[\u4e00-\u9fff]|\s+|[^\s\w\u4e00-\u9fff]+"
+    rf"[^\W{_REVISION_DIFF_IDEOGRAPHIC}]+(?:[-'\u2019][^\W{_REVISION_DIFF_IDEOGRAPHIC}]+)*"
+    rf"|\s+"
+    rf"|.",
+    re.DOTALL,
 )
 REVISION_MARKER_PREFIX = "\ue000DOCX_REVISION_"
 REVISION_MARKER_SUFFIX = "\ue001"
@@ -716,11 +727,7 @@ def _build_export_revision_lookup(
             continue
 
         revision_key = str(_get_segment_value(revision, "id", sentence_id) or sentence_id)
-        created_at_value = _get_segment_value(revision, "created_at")
-        if hasattr(created_at_value, "isoformat"):
-            created_at = created_at_value.isoformat()
-        else:
-            created_at = str(created_at_value) if created_at_value else None
+        created_at = _normalize_word_revision_date(_get_segment_value(revision, "created_at"))
 
         lookup[sentence_id] = ExportRevisionInfo(
             revision_key=revision_key,
@@ -730,6 +737,28 @@ def _build_export_revision_lookup(
             created_at=created_at,
         )
     return lookup
+
+
+def _normalize_word_revision_date(value: Any) -> str | None:
+    if value is None:
+        return None
+    parsed: datetime
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw_value = str(value).strip()
+        if not raw_value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        except ValueError:
+            logger.warning("DOCX revision date is not ISO-8601 and was omitted: %r", raw_value)
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _resolve_revision_author_name(author: Any) -> str:
@@ -748,16 +777,36 @@ def _enable_word_revision_tracking(package: DocxPackage) -> bool:
     settings_root = package.read_xml("word/settings.xml")
     if settings_root is None:
         return False
-    revision_view = settings_root.find("./w:revisionView", NS)
-    if revision_view is None:
-        revision_view = ET.Element(_qn("w", "revisionView"))
-        settings_root.append(revision_view)
+    revision_view = _upsert_ordered_word_property(
+        settings_root,
+        "revisionView",
+        before=(
+            "trackRevisions",
+            "doNotTrackMoves",
+            "doNotTrackFormatting",
+            "documentProtection",
+            "autoFormatOverride",
+            "styleLockTheme",
+            "styleLockQFSet",
+            "defaultTabStop",
+        ),
+    )
     revision_view.set(_qn("w", "markup"), "1")
     revision_view.set(_qn("w", "insDel"), "1")
 
-    track_revisions = settings_root.find("./w:trackRevisions", NS)
-    if track_revisions is None:
-        settings_root.append(ET.Element(_qn("w", "trackRevisions")))
+    _upsert_ordered_word_property(
+        settings_root,
+        "trackRevisions",
+        before=(
+            "doNotTrackMoves",
+            "doNotTrackFormatting",
+            "documentProtection",
+            "autoFormatOverride",
+            "styleLockTheme",
+            "styleLockQFSet",
+            "defaultTabStop",
+        ),
+    )
     return True
 
 
@@ -821,9 +870,18 @@ def _group_segments_by_block(
         )
         target_text = str(_get_segment_value(segment, "target_text", "") or "")
         revision = revision_map.get(sentence_id)
-        if revision is not None and revision.after_text != target_text:
+        if revision is not None and normalize_text(revision.after_text) != normalize_text(target_text):
             # 只导出仍对应当前译文的待审修订，避免把过期快照写入 Word。
+            logger.info(
+                "DOCX revision skipped because current target no longer matches: sentence_id=%s",
+                sentence_id,
+            )
             revision = None
+        if revision is not None:
+            # 真实 Word 修订需要由 w:ins / w:del 承载。若继续使用从 source_html
+            # 派生的富文本替换路径，该句会被直接改写为普通文字，拒绝全部修订时
+            # 就无法恢复原文。修订 run 会继承参考 run 的版式，因此这里关闭 HTML 路径。
+            resolved_target_html = None
 
         grouped[block_key].append(
             ExportSegment(
@@ -2515,6 +2573,8 @@ def _replace_block_tokens(
     ]
     source_spans = [(span, source_text) for span, source_text in source_spans if source_text]
     if _should_replace_structurally_modified_block(source_spans, segments):
+        if any(segment.revision is not None for segment in segments):
+            logger.info("DOCX revision marks skipped for a structurally modified block")
         _replace_structurally_modified_block(
             tokens=tokens,
             source_spans=source_spans,
@@ -2528,7 +2588,7 @@ def _replace_block_tokens(
     use_explicit_sequence = _has_complete_explicit_sequence(segments)
     previous_replacement = ""
     previous_span: SentenceSpan | None = None
-    pending_revision_markers: list[tuple[str, ExportSegment, str]] = []
+    pending_revision_markers: list[tuple[str, ExportSegment, str, str]] = []
     pending_format_markers: list[tuple[str, str]] = []
     for span in spans:
         sentence_source = _normalize_segment_source_text(_collect_span_text(tokens, span, use_source=True))
@@ -2556,6 +2616,15 @@ def _replace_block_tokens(
         ) or len(segments)
         segment = segments[match_index]
         replacement = _resolve_segment_replacement_text(segment)
+        if (
+            segment.revision is None
+            and normalize_text(segment.source_text) == normalize_text(replacement)
+        ):
+            # 保留未修改句段的原始 Word runs。即使文字归一化后相同，重新写回解析后的
+            # display_text 仍可能吞掉软换行、跨 run 字符，或把自动项目符号写成普通文本。
+            previous_replacement = sentence_source
+            previous_span = span
+            continue
         if previous_span is not None:
             boundary_text = display_text[previous_span.end:span.start]
             replacement = _normalize_adjacent_english_target_boundary(
@@ -2568,8 +2637,12 @@ def _replace_block_tokens(
                 segment.revision.revision_key,
                 len(pending_revision_markers),
             )
+            # 修订的删除侧必须使用 DOCX 当前 span 的原始文字。revision.before_text
+            # 来自工作区解析结果，可能已经合并换行、项目符号或跨 run 文本；用它重建
+            # w:del 会导致“拒绝全部修订”无法无损还原目标原件。
+            original_span_text = display_text[span.start:span.end]
             _queue_sentence_replacement(tokens, span, marker)
-            pending_revision_markers.append((marker, segment, replacement))
+            pending_revision_markers.append((marker, segment, replacement, original_span_text))
             previous_replacement = replacement
             previous_span = span
             continue
@@ -2626,7 +2699,13 @@ def _can_queue_word_revision_marker(
         segment.revision is None
         or segment.source_structure_changed
         or segment.math_placeholders
+        or segment.target_html is not None
     ):
+        if segment.revision is not None:
+            logger.info(
+                "DOCX revision marks skipped for unsupported segment structure: sentence_id=%s",
+                segment.sentence_id,
+            )
         return False
 
     writable_tokens = [
@@ -2636,7 +2715,16 @@ def _can_queue_word_revision_marker(
         and token.start < span.end
         and token.end > span.start
     ]
-    if not writable_tokens or any(token.is_math or token.is_hyperlink for token in writable_tokens):
+    if not writable_tokens or any(
+        token.is_math
+        or token.is_hyperlink
+        or token.field_instruction_prefix is not None
+        for token in writable_tokens
+    ):
+        logger.info(
+            "DOCX revision marks skipped for formula, hyperlink, or field code: sentence_id=%s",
+            segment.sentence_id,
+        )
         return False
 
     anchor = writable_tokens[0]
@@ -2658,7 +2746,7 @@ def _build_revision_marker(revision_key: str, marker_index: int) -> str:
 
 def _expand_word_revision_markers(
     tokens: list[TextToken],
-    pending_markers: list[tuple[str, ExportSegment, str]],
+    pending_markers: list[tuple[str, ExportSegment, str, str]],
 ) -> None:
     paragraphs: list[ET.Element] = []
     seen_paragraph_ids: set[int] = set()
@@ -2673,9 +2761,25 @@ def _expand_word_revision_markers(
         seen_paragraph_ids.add(id(paragraph))
         paragraphs.append(paragraph)
 
-    for marker, segment, replacement in pending_markers:
+    for marker, segment, replacement, original_span_text in pending_markers:
         marker_context = _find_word_revision_marker_context(paragraphs, marker)
         if marker_context is None or segment.revision is None:
+            expanded_as_plain_text = False
+            for token in tokens:
+                text_element = token.element
+                current_text = text_element.text if text_element is not None else None
+                if not current_text or marker not in current_text:
+                    continue
+                text_element.text = current_text.replace(marker, replacement, 1)
+                if text_element.tag == _qn("w", "t"):
+                    _sync_word_text_space_attribute(text_element)
+                expanded_as_plain_text = True
+                break
+            logger.warning(
+                "DOCX revision marker could not be expanded and %s plain text: %s",
+                "fell back to" if expanded_as_plain_text else "was not found for",
+                marker,
+            )
             continue
 
         parent, run_element, text_element = marker_context
@@ -2694,6 +2798,7 @@ def _expand_word_revision_markers(
             segment,
             run_element,
             effective_after_text=replacement,
+            effective_before_text=original_span_text,
         )
         for node in revision_nodes:
             parent.insert(insert_index, node)
@@ -2741,12 +2846,16 @@ def _build_word_revision_nodes(
     segment: ExportSegment,
     reference_run: ET.Element | None,
     effective_after_text: str | None = None,
+    effective_before_text: str | None = None,
 ) -> list[ET.Element]:
     revision = segment.revision
     if revision is None:
         return _build_inserted_word_runs(_resolve_segment_replacement_text(segment), reference_run)
 
-    before_text = _resolve_revision_replacement_text(segment, revision.before_text)
+    before_text = _resolve_revision_replacement_text(
+        segment,
+        effective_before_text if effective_before_text is not None else revision.before_text,
+    )
     resolved_after_text = _resolve_revision_replacement_text(segment, revision.after_text)
     after_text = effective_after_text if effective_after_text is not None else resolved_after_text
     if (

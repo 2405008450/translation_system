@@ -68,6 +68,7 @@ import { getFileStatusMeta } from '../constants/status'
 import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
 import { useAuthStore } from '../stores/auth'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import { getApiErrorMessage } from '../utils/apiError'
 import {
   getExportOptionExtensionLabel,
   groupExportOptions,
@@ -248,6 +249,7 @@ interface ProjectFileItem {
     workflow_stage: 'not_applicable' | 'import' | 'alignment' | 'proofreading'
     alignment_status: string
     batch_status: string
+    target_revision_export_available: boolean
   } | null
 }
 
@@ -436,6 +438,7 @@ const authStore = useAuthStore()
 const route = useRoute()
 const router = useRouter()
 const toast = useToast()
+const proofreadingPanelRef = ref<InstanceType<typeof ProofreadingPanel> | null>(null)
 const { t } = useI18n()
 
 // 首次渲染即进入加载态，避免项目类型返回前短暂显示通用项目布局。
@@ -1762,10 +1765,7 @@ function getPlaceholder() {
 }
 
 function getErrorMessage(error: unknown, fallback: string) {
-  if (axios.isAxiosError(error)) {
-    return String(error.response?.data?.detail || fallback)
-  }
-  return error instanceof Error ? error.message : fallback
+  return getApiErrorMessage(error, fallback)
 }
 
 function formatDateParts(value: string | null) {
@@ -1872,10 +1872,15 @@ function getProofreadingExportChoices(row: ProjectRow): ProofreadingExportChoice
     }
     if (stage === 'proofreading') {
       return [
+        ...(info.target_revision_export_available ? [{
+          format: 'proofreading_docx_target_revisions',
+          name: '目标原格式（含修订）',
+          description: '保留导入译文的排版，并写入可接受或拒绝的 Word 修订。',
+        } as ProofreadingExportChoice] : []),
         {
           format: 'proofreading_docx_layout',
-          name: '校对后译文',
-          description: '导出经校对修改后的译文文档，尽量保留源排版。',
+          name: '源格式双语 Word',
+          description: '沿用原文排版，按原文在前导出原文与校对后译文。',
         },
         {
           format: 'proofreading_docx_ordered',
@@ -1909,6 +1914,7 @@ function exportPrimaryProofreadingFile(row: ProjectRow) {
 
 function proofreadingExportSuccessMessage(format: ProofreadingExportFormat) {
   if (format === 'proofreading_audit_xlsx') return '已导出一一对照 Excel。'
+  if (format === 'proofreading_docx_target_revisions') return '已导出目标原格式 Word（含修订）。'
   if (format === 'proofreading_docx_layout') return '已导出校对后译文。'
   if (format === 'proofreading_docx_ordered') return '已导出顺序优先校对文档。'
   return '已导出校对版 Excel。'
@@ -5335,6 +5341,11 @@ function toggleProofreadingExportMenu() {
 
 async function downloadProofreadingBatchExportTask(batchId: string, format: ProofreadingExportFormat) {
   const readiness = await getProofreadingExportReadiness(batchId)
+  if (!readiness.available_formats.includes(format)) {
+    throw new Error(format === 'proofreading_docx_target_revisions'
+      ? '该批次未保存目标 DOCX 原件，无法导出目标原格式修订版。请重新导入双文档。'
+      : '当前批次不支持所选导出格式。')
+  }
   let acknowledgeWarnings = false
   if (readiness.has_warnings && format !== 'proofreading_audit_xlsx') {
     acknowledgeWarnings = await confirm({
@@ -5678,6 +5689,7 @@ async function deleteProjectFiles(rows: ProjectRow[]) {
       ? t('projectDetail.messages.fileDeleted', { name: firstFilename })
       : t('projectDetail.messages.filesDeleted', { count: fileCount }))
     await loadProject()
+    void proofreadingPanelRef.value?.refreshBatches()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.delete'))
   } finally {
@@ -7609,6 +7621,7 @@ onBeforeUnmount(() => {
 
         <ProofreadingPanel
           v-if="project.workflow_template_id === 'proofread' && project.can_manage"
+          ref="proofreadingPanelRef"
           :project-id="project.id"
           @refresh-project="loadProject"
         />
