@@ -822,12 +822,11 @@ def _group_segments_by_block(
     segment_list = list(segments)
     source_segment_by_sentence_id = _build_source_segment_lookup_by_sentence_id(source_segment_list)
     source_segment_by_text_key = _build_unique_source_segment_lookup_by_text(source_segment_list)
+    source_segment_by_sequence_index = _build_source_segment_lookup_by_sequence_index(
+        segment_list,
+        source_segment_list,
+    )
     revision_map = revisions_by_sentence_id or {}
-    has_authoritative_sequence = _has_complete_persisted_sequence(segment_list)
-    source_block_keys = {
-        _source_segment_block_key(source_segment)
-        for source_segment in source_segment_list
-    }
 
     for segment in segment_list:
         block_type = str(_get_segment_value(segment, "block_type", "paragraph") or "paragraph")
@@ -838,18 +837,13 @@ def _group_segments_by_block(
         target_html = _get_segment_value(segment, "target_html")
         sequence_index = _get_export_sequence_index(segment)
         fallback_block_key = (block_type, block_index, row_index, cell_index)
-        if has_authoritative_sequence and fallback_block_key in source_block_keys:
-            # 工作台顺序由持久化块位置 + sequence_index 共同决定。只要这组位置
-            # 仍存在于源文档，就必须与网页使用同一坐标，不能再被原文哈希或
-            # 当前解析器生成的 sentence_id 重新定位到其他段落/文本框。
-            block_key = fallback_block_key
-        else:
-            block_key = _resolve_export_segment_block_key(
-                segment=segment,
-                fallback=fallback_block_key,
-                source_segment_by_sentence_id=source_segment_by_sentence_id,
-                source_segment_by_text_key=source_segment_by_text_key,
-            )
+        block_key = _resolve_export_segment_block_key(
+            segment=segment,
+            fallback=fallback_block_key,
+            source_segment_by_sentence_id=source_segment_by_sentence_id,
+            source_segment_by_text_key=source_segment_by_text_key,
+            source_segment_by_sequence_index=source_segment_by_sequence_index,
+        )
         source_segment_by_id = source_segment_by_sentence_id.get(sentence_id)
         source_segment_by_text = _find_source_segment_by_export_text(
             segment,
@@ -945,13 +939,41 @@ def _build_unique_source_segment_lookup_by_text(
     }
 
 
+def _build_source_segment_lookup_by_sequence_index(
+    segments: list[Any],
+    source_segments: list[Mapping[str, Any]],
+) -> dict[int, Mapping[str, Any]]:
+    """在完整的一一对应导出中，让工作台全局顺序成为 Word 定位的权威来源。"""
+    if len(segments) != len(source_segments) or not _has_complete_persisted_sequence(segments):
+        return {}
+
+    sequence_indexes = sorted(_get_export_sequence_index(segment) for segment in segments)
+    if sequence_indexes != list(range(len(source_segments))):
+        return {}
+
+    return {
+        sequence_index: source_segment
+        for sequence_index, source_segment in enumerate(source_segments)
+    }
+
+
 def _resolve_export_segment_block_key(
     *,
     segment: Any,
     fallback: BlockKey,
     source_segment_by_sentence_id: Mapping[str, Mapping[str, Any]],
     source_segment_by_text_key: Mapping[str, Mapping[str, Any]],
+    source_segment_by_sequence_index: Mapping[int, Mapping[str, Any]],
 ) -> BlockKey:
+    sequence_index = _get_export_sequence_index(segment)
+    source_segment_by_sequence = (
+        source_segment_by_sequence_index.get(sequence_index)
+        if sequence_index is not None
+        else None
+    )
+    if source_segment_by_sequence is not None:
+        return _source_segment_block_key(source_segment_by_sequence)
+
     sentence_id = str(_get_segment_value(segment, "sentence_id", "") or "")
     source_segment_by_id = source_segment_by_sentence_id.get(sentence_id)
     source_segment_by_text = _find_source_segment_by_export_text(
