@@ -728,7 +728,7 @@ export default {
         temporaryPrompt: '本次临时提示词',
         modelDefault: '使用后端默认',
         modelTipTitle: '模型选择建议',
-        modelTipBody: '一般预翻译建议使用快速版 Gemini 3 Flash Preview 或 GPT-5.4 Mini；如果翻译规则较多、术语或风格要求较高，推荐 Gemini 3.1 Pro Preview 或 GPT-5.5。以上模型均通过 OpenRouter 调用。',
+        modelTipBody: '一般预翻译建议使用快速版 Gemini 3.7 Flash 或 GPT-5.6 Luna；如果翻译规则较多、术语或风格要求较高，推荐 Gemini 3.1 Pro Preview。',
         scopeHint: '默认流程会先做记忆库匹配，再只把模糊匹配和无匹配句段交给 LLM；100% 记忆匹配通常不需要模型重写。这里的“精确匹配”和“100% 匹配率”是同一状态。',
         contextModeTitle: '关闭：句段稳定模式；开启：段落上下文严格模式，会要求模型返回结构化 JSON。',
         guidelinesPlaceholder: '输入翻译要求，如术语规范、语气风格等...',

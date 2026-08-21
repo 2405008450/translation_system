@@ -2637,9 +2637,8 @@ def _replace_block_tokens(
                 segment.revision.revision_key,
                 len(pending_revision_markers),
             )
-            # 修订的删除侧必须使用 DOCX 当前 span 的原始文字。revision.before_text
-            # 来自工作区解析结果，可能已经合并换行、项目符号或跨 run 文本；用它重建
-            # w:del 会导致“拒绝全部修订”无法无损还原目标原件。
+            # 同时保留 DOCX 当前 span，展开标记时再判断母版究竟是目标译文原件
+            # 还是源语言原件：前者优先保留精确 run 文字，后者必须使用修订前译文。
             original_span_text = display_text[span.start:span.end]
             _queue_sentence_replacement(tokens, span, marker)
             pending_revision_markers.append((marker, segment, replacement, original_span_text))
@@ -2798,7 +2797,10 @@ def _expand_word_revision_markers(
             segment,
             run_element,
             effective_after_text=replacement,
-            effective_before_text=original_span_text,
+            effective_before_text=_resolve_word_revision_baseline(
+                segment,
+                original_span_text,
+            ),
         )
         for node in revision_nodes:
             parent.insert(insert_index, node)
@@ -2808,6 +2810,31 @@ def _expand_word_revision_markers(
             for suffix_run in _build_inserted_word_runs(suffix, run_element):
                 parent.insert(insert_index, suffix_run)
                 insert_index += 1
+
+
+def _resolve_word_revision_baseline(
+    segment: ExportSegment,
+    original_span_text: str,
+) -> str:
+    """在目标母版原文与工作区译文基线之间选择正确的删除侧文字。"""
+
+    revision = segment.revision
+    if revision is None:
+        return original_span_text
+
+    revision_before_text = _resolve_revision_replacement_text(
+        segment,
+        revision.before_text,
+    )
+    if normalize_text(original_span_text) == normalize_text(revision_before_text):
+        # 双文档校对以目标 DOCX 为母版。二者内容一致时保留母版中的精确空格、
+        # 换行与跨 run 字符，使“拒绝全部修订”可以无损恢复目标原件。
+        return original_span_text
+
+    # 普通翻译导出的母版是源语言 DOCX，不能把源文当作译文修订基线。
+    # 此时删除侧必须来自人工修改前的译文，接受/拒绝修订才分别得到
+    # after_text / before_text，而不是“目标译文 / 源文”。
+    return revision_before_text
 
 
 def _find_word_revision_marker_context(

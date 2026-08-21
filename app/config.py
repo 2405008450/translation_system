@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-chat"
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_model: str = "google/gemini-3-flash-preview"
+    openrouter_model: str = "google/gemini-3.7-flash"
     online_term_search_engine: str = "auto"
     online_term_search_model: str | None = None
     online_term_search_max_results: int = 5
