@@ -501,6 +501,7 @@ class TextToken:
     field_instruction_suffix: str = ""
     field_instruction_extra_elements: list[ET.Element] = field(default_factory=list)
     checkbox_marker: str | None = None
+    preserved_word_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2245,7 +2246,20 @@ def _collect_inline_tokens(
         symbol_text = _decode_symbol(node)
         if not symbol_text:
             return []
-        return [TextToken(display_text=symbol_text, source_text=symbol_text)]
+        return [
+            TextToken(
+                display_text=symbol_text,
+                source_text=symbol_text,
+                run_element=current_run,
+                anchor_element=current_run if current_run is not None else node,
+                container_element=(
+                    current_run_container
+                    if current_run_container is not None
+                    else parent_element
+                ),
+                preserved_word_symbol=symbol_text,
+            )
+        ]
 
     if node.tag in {_qn("w", "footnoteReference"), _qn("w", "endnoteReference")}:
         note_id = node.get(_qn("w", "id"), "")
@@ -2680,7 +2694,12 @@ def _replace_block_tokens(
 
         expected_math_placeholders = _extract_math_placeholders_from_tokens(tokens, span)
 
-        has_custom_target_html = segment.target_html is not None
+        # w:sym 是独立的 Word 结构，不能把同一个私用区字符再次写入 w:t。
+        # 这类句段优先走保留符号的纯文本路径；否则格式标记展开后会重复复选框。
+        has_custom_target_html = (
+            segment.target_html is not None
+            and not _span_contains_preserved_word_symbols(tokens, span)
+        )
 
         if expected_math_placeholders:
             _queue_math_sentence_replacement(
@@ -2729,6 +2748,13 @@ def _can_queue_word_revision_marker(
             )
         return False
 
+    if _span_contains_preserved_word_symbols(tokens, span):
+        logger.info(
+            "DOCX revision marks skipped for preserved Word symbol: sentence_id=%s",
+            segment.sentence_id,
+        )
+        return False
+
     writable_tokens = [
         token
         for token in tokens
@@ -2757,6 +2783,18 @@ def _can_queue_word_revision_marker(
         and anchor.container_element is not None
         and anchor.container_element.tag == _qn("w", "p")
         and anchor.run_element in list(anchor.container_element)
+    )
+
+
+def _span_contains_preserved_word_symbols(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+) -> bool:
+    return any(
+        token.preserved_word_symbol is not None
+        and token.start < span.end
+        and token.end > span.start
+        for token in tokens
     )
 
 
@@ -3939,6 +3977,8 @@ def _queue_sentence_replacement(
 ) -> None:
     if _queue_checkbox_macro_replacement(tokens, span, replacement):
         return
+    if _queue_sentence_replacement_preserving_word_symbols(tokens, span, replacement):
+        return
     if _queue_sentence_replacement_preserving_hyperlink_scope(tokens, span, replacement):
         return
 
@@ -3965,6 +4005,67 @@ def _queue_sentence_replacement(
         replacement,
         structural_line_break_tokens=structural_line_break_tokens,
     )
+
+
+def _queue_sentence_replacement_preserving_word_symbols(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    replacement: str,
+) -> bool:
+    overlapping_tokens = [
+        token
+        for token in tokens
+        if token.start < span.end and token.end > span.start
+    ]
+    symbol_tokens = [
+        token
+        for token in overlapping_tokens
+        if token.preserved_word_symbol is not None
+    ]
+    if not symbol_tokens:
+        return False
+
+    # 超链接有独立的作用域保持逻辑。若同一句同时包含超链接和 w:sym，
+    # 交给通用路径处理，避免为了复用符号而改变链接覆盖范围。
+    if any(token.is_hyperlink for token in overlapping_tokens):
+        return False
+
+    symbol_matches: list[tuple[int, int]] = []
+    replacement_cursor = 0
+    for token in symbol_tokens:
+        symbol_text = token.preserved_word_symbol or ""
+        match_start = replacement.find(symbol_text, replacement_cursor)
+        if match_start < 0:
+            return False
+        match_end = match_start + len(symbol_text)
+        symbol_matches.append((match_start, match_end))
+        replacement_cursor = match_end
+
+    source_cursor = span.start
+    replacement_cursor = 0
+    previous_symbol: TextToken | None = None
+    for token, (match_start, match_end) in zip(symbol_tokens, symbol_matches, strict=True):
+        _queue_text_region_replacement(
+            tokens=tokens,
+            region_start=source_cursor,
+            region_end=token.start,
+            replacement_text=replacement[replacement_cursor:match_start],
+            before_token=previous_symbol,
+            after_token=token,
+        )
+        source_cursor = token.end
+        replacement_cursor = match_end
+        previous_symbol = token
+
+    _queue_text_region_replacement(
+        tokens=tokens,
+        region_start=source_cursor,
+        region_end=span.end,
+        replacement_text=replacement[replacement_cursor:],
+        before_token=previous_symbol,
+        after_token=_find_first_token_starting_at_or_after(tokens, span.end),
+    )
+    return True
 
 
 def _queue_checkbox_macro_replacement(

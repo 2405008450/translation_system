@@ -1035,7 +1035,10 @@ function hasRenderedTargetHighlights(): boolean {
 }
 
 function hasRenderedEditorDecorations(): boolean {
-  return hasVisibleRevisionMarks.value || props.showVisibleChars || hasRenderedTargetHighlights()
+  return hasVisibleRevisionMarks.value
+    || props.showVisibleChars
+    || hasRenderedTargetHighlights()
+    || containsCheckboxGlyph(getTargetStateText())
 }
 
 function editorHasDecorationNodes(editor: HTMLElement): boolean {
@@ -1045,6 +1048,7 @@ function editorHasDecorationNodes(editor: HTMLElement): boolean {
     '.segment-row__term-highlight',
     '.segment-row__search-highlight',
     '.segment-row__qa-highlight',
+    '.segment-row__checkbox-glyph',
     '.visible-char',
   ].join(',')))
 }
@@ -1081,6 +1085,7 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
       || element.classList.contains('segment-row__term-highlight')
       || element.classList.contains('segment-row__search-highlight')
       || element.classList.contains('segment-row__qa-highlight')
+      || element.classList.contains('segment-row__checkbox-glyph')
     ) {
       return
     }
@@ -1093,10 +1098,7 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
 }
 
 function renderTargetHtmlWithHighlights(targetHtml: string): string {
-  if (
-    (!hasRenderedTargetHighlights() && !props.showVisibleChars)
-    || typeof document === 'undefined'
-  ) {
+  if (typeof document === 'undefined') {
     return targetHtml
   }
 
@@ -1133,6 +1135,7 @@ function renderTargetHtmlWithHighlights(targetHtml: string): string {
       || element.classList.contains('segment-row__term-highlight')
       || element.classList.contains('segment-row__search-highlight')
       || element.classList.contains('segment-row__qa-highlight')
+      || element.classList.contains('segment-row__checkbox-glyph')
     ) {
       return
     }
@@ -1157,12 +1160,35 @@ const sourceHtmlContent = computed(() => {
  * 将文本转换为显示标记模式（显示空格、制表符、换行符）
  */
 function textToVisibleChars(text: string): string {
-  const escaped = escapeHtml(text)
-  if (!props.showVisibleChars) return escaped
-  return escaped
-    .replace(/ /g, '<span class="visible-char visible-char--space" contenteditable="false">·</span>')
-    .replace(/\t/g, '<span class="visible-char visible-char--tab" contenteditable="false">→</span>')
-    .replace(/\n/g, '<span class="visible-char visible-char--newline" contenteditable="false">¶</span>\n')
+  let rendered = escapeHtml(text)
+  if (props.showVisibleChars) {
+    rendered = rendered
+      .replace(/ /g, '<span class="visible-char visible-char--space" contenteditable="false">·</span>')
+      .replace(/\t/g, '<span class="visible-char visible-char--tab" contenteditable="false">→</span>')
+      .replace(/\n/g, '<span class="visible-char visible-char--newline" contenteditable="false">¶</span>\n')
+  }
+  return renderCheckboxGlyphs(rendered)
+}
+
+const CHECKBOX_GLYPH_PATTERN = /[\uF052\u25A1\u2610\u2611\u2612]/
+const CHECKBOX_GLYPH_PATTERN_GLOBAL = /[\uF052\u25A1\u2610\u2611\u2612]/g
+
+function containsCheckboxGlyph(text: string): boolean {
+  return CHECKBOX_GLYPH_PATTERN.test(text)
+}
+
+/**
+ * 只统一复选框的视觉外观，子节点仍保留原字符，避免影响保存和 Word 导出。
+ */
+function renderCheckboxGlyphs(escapedText: string): string {
+  return escapedText.replace(CHECKBOX_GLYPH_PATTERN_GLOBAL, (glyph) => {
+    const state = glyph === '\uF052' || glyph === '\u2611'
+      ? 'checked'
+      : glyph === '\u2612'
+        ? 'crossed'
+        : 'empty'
+    return `<span class="segment-row__checkbox-glyph segment-row__checkbox-glyph--${state}"><span class="segment-row__checkbox-raw">${glyph}</span></span>`
+  })
 }
 
 function renderTargetTextHtml(text: string): string {
@@ -4005,6 +4031,82 @@ watch(
 .segment-row__source-editor :deep(.visible-char--newline),
 .segment-row__editor :deep(.visible-char--newline) {
   color: #ef4444;
+}
+
+/*
+ * Word 的 Wingdings 复选框与普通 Unicode 方框字面尺寸不同。
+ * 界面统一绘制外框，但隐藏节点中继续保存原字符，保证复制、编辑和导出语义不变。
+ */
+.segment-row__text :deep(.segment-row__checkbox-glyph),
+.segment-row__source-editor :deep(.segment-row__checkbox-glyph),
+.segment-row__editor :deep(.segment-row__checkbox-glyph),
+.segment-row__target-preview :deep(.segment-row__checkbox-glyph) {
+  position: relative;
+  display: inline-block;
+  width: 0.88em;
+  height: 0.88em;
+  margin-inline: 0.04em;
+  border: 0.075em solid currentColor;
+  border-radius: 0.06em;
+  box-sizing: border-box;
+  line-height: 1;
+  vertical-align: -0.08em;
+  pointer-events: none;
+}
+
+.segment-row__text :deep(.segment-row__checkbox-raw),
+.segment-row__source-editor :deep(.segment-row__checkbox-raw),
+.segment-row__editor :deep(.segment-row__checkbox-raw),
+.segment-row__target-preview :deep(.segment-row__checkbox-raw) {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  font-size: 0;
+  line-height: 0;
+}
+
+.segment-row__text :deep(.segment-row__checkbox-glyph--checked::after),
+.segment-row__source-editor :deep(.segment-row__checkbox-glyph--checked::after),
+.segment-row__editor :deep(.segment-row__checkbox-glyph--checked::after),
+.segment-row__target-preview :deep(.segment-row__checkbox-glyph--checked::after) {
+  content: '';
+  position: absolute;
+  left: 0.25em;
+  top: 0.03em;
+  width: 0.25em;
+  height: 0.5em;
+  border-right: 0.105em solid currentColor;
+  border-bottom: 0.105em solid currentColor;
+  transform: rotate(42deg);
+  transform-origin: center;
+}
+
+.segment-row__text :deep(.segment-row__checkbox-glyph--crossed::before),
+.segment-row__text :deep(.segment-row__checkbox-glyph--crossed::after),
+.segment-row__source-editor :deep(.segment-row__checkbox-glyph--crossed::before),
+.segment-row__source-editor :deep(.segment-row__checkbox-glyph--crossed::after),
+.segment-row__editor :deep(.segment-row__checkbox-glyph--crossed::before),
+.segment-row__editor :deep(.segment-row__checkbox-glyph--crossed::after),
+.segment-row__target-preview :deep(.segment-row__checkbox-glyph--crossed::before),
+.segment-row__target-preview :deep(.segment-row__checkbox-glyph--crossed::after) {
+  content: '';
+  position: absolute;
+  left: 0.12em;
+  top: 0.37em;
+  width: 0.58em;
+  height: 0.09em;
+  border-radius: 0.05em;
+  background: currentColor;
+  transform: rotate(45deg);
+  transform-origin: center;
+}
+
+.segment-row__text :deep(.segment-row__checkbox-glyph--crossed::after),
+.segment-row__source-editor :deep(.segment-row__checkbox-glyph--crossed::after),
+.segment-row__editor :deep(.segment-row__checkbox-glyph--crossed::after),
+.segment-row__target-preview :deep(.segment-row__checkbox-glyph--crossed::after) {
+  transform: rotate(-45deg);
 }
 
 /* 译文只读样式预览：只读、非编辑框，展示逐词样式（开关开+非编辑态时替代编辑框的

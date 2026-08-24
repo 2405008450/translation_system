@@ -3839,32 +3839,13 @@ def _apply_segment_assignment_visibility_filter(
     if _file_has_unindexed_display_segments(db, file_record.id):
         refresh_segment_display_indexes(db, file_record)
 
-    # 流程阶段限制的是编辑权，而不是审阅上下文的读取权。后续阶段的译者需要
-    # 看到当前阶段及之前阶段的内容，否则在管理员尚未执行流程流转时，任务页会
-    # 返回 0 个句段并呈现空白。编辑接口仍通过
-    # ``_can_write_segment_with_assignments`` 严格校验为“当前阶段完全匹配”。
-    workflow_steps = _load_project_workflow_steps(db, file_record.project_id)
-    workflow_step_by_id = {step.id: step for step in workflow_steps}
-    first_step_id = workflow_steps[0].id if workflow_steps else None
-
+    # 流程阶段只限制编辑权，不限制已分配范围的读取权。句段推进到审校/校对后，
+    # 原翻译人员仍应能看到自己处理过的范围，否则任务仍显示在“我的任务”中，
+    # 打开后却会得到 0 个句段。编辑接口继续通过
+    # ``_can_write_segment_with_assignments`` 严格校验“当前阶段完全匹配”。
     visibility_conditions = []
     for assignment in visible_assignments:
-        assigned_step = workflow_step_by_id.get(assignment.workflow_step_id)
-        if assigned_step is None:
-            readable_step_ids = [assignment.workflow_step_id]
-        else:
-            assigned_order = int(assigned_step.sort_order or 0)
-            readable_step_ids = [
-                step.id
-                for step in workflow_steps
-                if int(step.sort_order or 0) <= assigned_order
-            ]
-
-        step_condition = Segment.workflow_step_id.in_(readable_step_ids)
-        if first_step_id in readable_step_ids:
-            # 兼容尚未完成历史数据回填的句段；正常详情接口会先将其归到首阶段。
-            step_condition = or_(step_condition, Segment.workflow_step_id.is_(None))
-        condition = step_condition
+        condition = literal(True)
         if assignment.range_start is not None and assignment.range_end is not None:
             condition = and_(
                 condition,
@@ -4705,6 +4686,18 @@ def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, A
         .order_by(FileAssignment.assigned_at.asc(), FileAssignment.id.asc())
         .all()
     )
+    file_ids = {row.file_record_id for row in file_rows}
+    segment_counts_by_file_id = {
+        file_record_id: int(segment_count or 0)
+        for file_record_id, segment_count in (
+            db.query(Segment.file_record_id, func.count(Segment.id))
+            .filter(Segment.file_record_id.in_(file_ids))
+            .group_by(Segment.file_record_id)
+            .all()
+            if file_ids
+            else []
+        )
+    }
     files_by_user_step: dict[tuple[UUID, UUID], list[str]] = {}
     file_ranges_by_user_step: dict[tuple[UUID, UUID], list[dict[str, Any]]] = {}
     first_file_assignment_by_user_step: dict[tuple[UUID, UUID], FileAssignment] = {}
@@ -4712,12 +4705,29 @@ def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, A
         workflow_step_id = file_assignment.workflow_step_id or first_step_id
         if workflow_step_id is None:
             continue
+        range_start = file_assignment.segment_range_start
+        range_end = file_assignment.segment_range_end
+        if range_start is not None or range_end is not None:
+            segment_count = segment_counts_by_file_id.get(file_assignment.file_record_id, 0)
+            # 文件拆分/合并或删除句段后，历史范围可能仍指向旧的总句段数。
+            # GET 响应先把尾部越界范围收缩到当前文件末尾；管理员下次保存时，
+            # 现有差异更新流程会将规范化后的范围持久化，避免无关的新分配被旧数据拦截。
+            if (
+                range_start is None
+                or range_end is None
+                or segment_count <= 0
+                or range_start > segment_count
+            ):
+                continue
+            range_end = min(range_end, segment_count)
+            if range_end < range_start:
+                continue
         key = (file_assignment.assignee_id, workflow_step_id)
         files_by_user_step.setdefault(key, []).append(str(file_assignment.file_record_id))
         file_ranges_by_user_step.setdefault(key, []).append({
             "file_record_id": str(file_assignment.file_record_id),
-            "range_start": file_assignment.segment_range_start,
-            "range_end": file_assignment.segment_range_end,
+            "range_start": range_start,
+            "range_end": range_end,
         })
         first_file_assignment_by_user_step.setdefault(key, file_assignment)
 
