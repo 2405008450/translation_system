@@ -513,15 +513,6 @@ function getMergeViewMeta(view: MergeView) {
   return `${(view.file_ids || []).filter((fileId) => props.files.some((file) => file.id === fileId)).length} 个文件`
 }
 
-function getCheckedMergeViewIds(draft: AssignmentDraft) {
-  return props.mergeViews
-    .filter((view) => {
-      const fileIds = (view.file_ids || []).filter((fileId) => props.files.some((file) => file.id === fileId))
-      return fileIds.length > 0 && fileIds.every((fileId) => draft.file_record_ids.has(fileId))
-    })
-    .map((view) => view.id)
-}
-
 function buildSaveRequest(): AssignmentSaveRequest {
   return {
     base_revision: props.revision,
@@ -545,7 +536,6 @@ function buildSaveRequest(): AssignmentSaveRequest {
         workflow_step_id: draft.workflow_step_id,
         file_record_ids,
         file_ranges,
-        merge_view_ids: getCheckedMergeViewIds(draft),
       }
     }),
   }

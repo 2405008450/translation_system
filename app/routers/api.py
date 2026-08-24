@@ -4400,6 +4400,15 @@ def _validate_assignment_payload(
                     )
                     validated_boundary_ranges.add(range_key)
             file_range_targets.add((file_range.file_record_id, range_start, range_end))
+        # 合并视图会展开成整文件授权；若调用方同时提交了显式分段范围，
+        # 以分段范围为准，避免同一用户在同一文件上同时出现“整文件 + 分段”目标，
+        # 并进一步与其他用户的合法分段产生伪重叠。
+        ranged_file_ids_for_entry = {
+            file_record_id
+            for file_record_id, range_start, range_end in file_range_targets
+            if range_start is not None or range_end is not None
+        }
+        file_ids.difference_update(ranged_file_ids_for_entry)
         desired_user_ids.add(assignee.id)
         targets = desired.setdefault((assignee.id, workflow_step_id), set())
         targets.update((file_record_id, None, None) for file_record_id in file_ids)
