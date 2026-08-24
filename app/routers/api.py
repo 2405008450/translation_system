@@ -110,6 +110,10 @@ from app.services.auto_tm_sync import (
     run_auto_tm_background_once,
     run_auto_tm_rematch_background_once,
 )
+from app.services.assignment_split import (
+    AssignmentSplitError,
+    build_assignment_split_preview,
+)
 from app.services.adapters.dita_exporter import DitaExporter
 from app.services.adapters.svg_exporter import SvgExporter
 from app.services.adapters.tmx_exporter import TmxExporter
@@ -2860,6 +2864,15 @@ class ProjectAssignmentFileRangeRequest(BaseModel):
     range_end: int | None = Field(default=None, ge=1)
 
 
+class AssignmentSplitPreviewRequest(BaseModel):
+    file_record_id: UUID
+    mode: Literal["by_part_count", "by_words_per_part"]
+    part_count: int | None = Field(default=None, ge=1, le=1000)
+    words_per_part: int | None = Field(default=None, ge=1, le=10_000_000)
+    range_start: int | None = Field(default=None, ge=1)
+    range_end: int | None = Field(default=None, ge=1)
+
+
 class ProjectAssignmentEntryRequest(BaseModel):
     assignee_id: UUID
     workflow_step_id: UUID | None = None
@@ -4071,6 +4084,8 @@ def _get_active_project_assignees(db: Session, project_ids: list[UUID]) -> dict[
     )
     result: dict[UUID, list[User]] = {}
     for project_id, user in rows:
+        if not is_external_translator(user):
+            continue
         result.setdefault(project_id, []).append(user)
     return result
 
@@ -4091,6 +4106,8 @@ def _get_active_file_assignees(db: Session, file_record_ids: list[UUID]) -> dict
     result: dict[UUID, list[User]] = {}
     seen: set[tuple[UUID, UUID]] = set()
     for file_record_id, user in rows:
+        if not is_external_translator(user):
+            continue
         key = (file_record_id, user.id)
         if key in seen:
             continue
@@ -4346,8 +4363,13 @@ def _validate_assignment_payload(
     validated_boundary_ranges: set[tuple[UUID, int, int]] = set()
     for entry in payload.assignments:
         assignee = get_user_by_id(db, entry.assignee_id)
-        if assignee is None or not assignee.is_active or assignee.role != USER_ROLE:
-            raise HTTPException(status_code=400, detail="只能指派给启用中的普通译者账号。")
+        if (
+            assignee is None
+            or not assignee.is_active
+            or assignee.role != USER_ROLE
+            or not is_external_translator(assignee)
+        ):
+            raise HTTPException(status_code=400, detail="只能指派给启用中的外部译者账号。")
         workflow_step_id = entry.workflow_step_id or first_step_id
         if workflow_step_id not in workflow_step_ids:
             raise HTTPException(status_code=400, detail="存在不属于当前项目的流程阶段授权。")
@@ -4676,25 +4698,34 @@ def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, A
     workflow_steps = _load_project_workflow_steps(db, project_id)
     workflow_step_by_id = {step.id: step for step in workflow_steps}
     first_step_id = workflow_steps[0].id if workflow_steps else None
-    assignments = (
-        db.query(ProjectAssignment)
-        .join(User, User.id == ProjectAssignment.assignee_id)
-        .filter(
-            ProjectAssignment.project_id == project_id,
-            ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+    assignments = [
+        assignment
+        for assignment in (
+            db.query(ProjectAssignment)
+            .join(User, User.id == ProjectAssignment.assignee_id)
+            .filter(
+                ProjectAssignment.project_id == project_id,
+                ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .order_by(ProjectAssignment.assigned_at.asc(), User.username.asc())
+            .all()
         )
-        .order_by(ProjectAssignment.assigned_at.asc(), User.username.asc())
-        .all()
-    )
-    file_rows = (
-        db.query(FileAssignment)
-        .filter(
-            FileAssignment.project_id == project_id,
-            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        if is_external_translator(assignment.assignee)
+    ]
+    external_assignee_ids = {assignment.assignee_id for assignment in assignments}
+    file_rows = [
+        assignment
+        for assignment in (
+            db.query(FileAssignment)
+            .filter(
+                FileAssignment.project_id == project_id,
+                FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .order_by(FileAssignment.assigned_at.asc(), FileAssignment.id.asc())
+            .all()
         )
-        .order_by(FileAssignment.assigned_at.asc(), FileAssignment.id.asc())
-        .all()
-    )
+        if assignment.assignee_id in external_assignee_ids
+    ]
     file_ids = {row.file_record_id for row in file_rows}
     segment_counts_by_file_id = {
         file_record_id: int(segment_count or 0)
@@ -6873,6 +6904,12 @@ def _build_project_file_payload(
     assignee_id = getattr(file_record, "assignee_id", None)
     assignee = getattr(file_record, "assignee", None)
     assigned_at = getattr(file_record, "assigned_at", None)
+    if assignees is not None:
+        # 内部译者天然拥有全部文件权限，不应再作为文件“被分配人”展示。
+        assignee = assignees[0] if assignees else None
+        assignee_id = assignee.id if assignee is not None else None
+        if assignee is None:
+            assigned_at = None
     deadline = getattr(file_record, "deadline", None)
     collection_ids = _load_file_record_collection_ids(file_record)
     term_base_ids = _load_file_record_term_base_ids(file_record)
@@ -8339,6 +8376,42 @@ def get_project_assignments(
 ):
     _get_project_or_404(db, project_id)
     return _serialize_project_assignments(db, project_id)
+
+
+@router.post("/projects/{project_id}/assignment-split-preview")
+def preview_project_assignment_split(
+    project_id: UUID,
+    payload: AssignmentSplitPreviewRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_project_assignment_manager),
+):
+    _get_project_or_404(db, project_id)
+    file_record = (
+        db.query(FileRecord)
+        .filter(
+            FileRecord.id == payload.file_record_id,
+            FileRecord.project_id == project_id,
+        )
+        .first()
+    )
+    if file_record is None:
+        raise HTTPException(status_code=404, detail="项目中不存在该文件。")
+    if payload.mode == "by_part_count" and payload.part_count is None:
+        raise HTTPException(status_code=400, detail="按份数拆分时必须填写份数。")
+    if payload.mode == "by_words_per_part" and payload.words_per_part is None:
+        raise HTTPException(status_code=400, detail="按每份字数拆分时必须填写每份字数。")
+    try:
+        return build_assignment_split_preview(
+            db,
+            file_record,
+            mode=payload.mode,
+            part_count=payload.part_count,
+            words_per_part=payload.words_per_part,
+            range_start=payload.range_start,
+            range_end=payload.range_end,
+        )
+    except AssignmentSplitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.patch("/projects/{project_id}/assignments")
@@ -13159,8 +13232,13 @@ def assign_file_record_task(
     assignee: User | None = None
     if payload.assignee_id is not None:
         assignee = get_user_by_id(db, payload.assignee_id)
-        if assignee is None or not assignee.is_active or assignee.role != USER_ROLE:
-            raise HTTPException(status_code=400, detail="只能指派给启用中的普通译者账号。")
+        if (
+            assignee is None
+            or not assignee.is_active
+            or assignee.role != USER_ROLE
+            or not is_external_translator(assignee)
+        ):
+            raise HTTPException(status_code=400, detail="只能指派给启用中的外部译者账号。")
 
     file_record.assignee_id = assignee.id if assignee else None
     file_record.assigned_by_id = current_user.id if assignee else None

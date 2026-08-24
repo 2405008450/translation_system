@@ -174,6 +174,32 @@ export interface ProjectAssignmentFileRange {
   range_end: number | null
 }
 
+export interface AssignmentSplitPreviewRequest {
+  file_record_id: string
+  mode: 'by_part_count' | 'by_words_per_part'
+  part_count?: number
+  words_per_part?: number
+  range_start?: number
+  range_end?: number
+}
+
+export interface AssignmentSplitPart {
+  index: number
+  range_start: number
+  range_end: number
+  segment_count: number
+  word_count: number
+  word_percent: number
+}
+
+export interface AssignmentSplitPreviewResponse {
+  total_segments: number
+  segment_words: number
+  document_words: number | null
+  parts: AssignmentSplitPart[]
+  warnings: string[]
+}
+
 export interface ProjectAssignmentsResponse {
   project_id: string
   workflow_steps?: WorkflowStep[]

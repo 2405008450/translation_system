@@ -40,6 +40,7 @@ import {
   waitForImportTask,
   type ImportTaskAccepted,
 } from '../api/importTasks'
+import { previewProjectAssignmentSplit } from '../api/assignmentSplit'
 import {
   createProjectMergeView,
   deleteMergeView,
@@ -97,6 +98,7 @@ import type {
   AssignmentWorkflowTransitionRequired,
 } from '../types/assignment'
 import type {
+  AssignmentSplitPreviewRequest,
   DocumentParseMode,
   DocumentParseOptions,
   DocumentMatchAnalysis,
@@ -2652,7 +2654,11 @@ async function loadAssignableUsers() {
   loadingAssignableUsers.value = true
   try {
     const { data } = await http.get<User[]>('/auth/assignable-users')
-    assignableUsers.value = data.filter((user) => user.role === 'user' && user.is_active)
+    assignableUsers.value = data.filter((user) => (
+      user.role === 'user'
+      && user.is_active
+      && user.translator_type === 'external'
+    ))
   } catch (error) {
     toast.error(getErrorMessage(error, '译者列表加载失败。'))
   } finally {
@@ -2798,6 +2804,13 @@ async function saveAssignment(request: AssignmentSaveRequest) {
   } finally {
     savingAssignment.value = false
   }
+}
+
+async function previewAssignmentSplit(payload: AssignmentSplitPreviewRequest) {
+  if (!project.value) {
+    throw new Error('项目尚未加载。')
+  }
+  return previewProjectAssignmentSplit(project.value.id, payload)
 }
 
 async function closeTermExtractionDialog() {
@@ -8902,6 +8915,7 @@ onBeforeUnmount(() => {
       :loading="loadingAssignableUsers || loadingAssignments"
       :saving="savingAssignment"
       :initial-file-id="assignmentInitialFileId"
+      :preview-split="previewAssignmentSplit"
       @close="closeAssignmentDialog"
       @save="saveAssignment"
     />

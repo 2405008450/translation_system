@@ -17,6 +17,7 @@ from app.auth import (
     get_current_user,
     get_user_by_id,
     is_admin_role,
+    is_external_translator,
     is_super_admin_role,
     list_users,
     require_admin,
@@ -173,7 +174,7 @@ def get_assignable_users(
     return [
         UserRead.model_validate(serialize_user(user))
         for user in list_users(db)
-        if user.role == USER_ROLE and user.is_active
+        if user.role == USER_ROLE and user.is_active and is_external_translator(user)
     ]
 
 
