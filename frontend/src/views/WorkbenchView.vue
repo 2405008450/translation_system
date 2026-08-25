@@ -9898,7 +9898,7 @@ onBeforeRouteLeave(async () => {
             <button class="style-item tool-button" type="button" data-testid="workbench-format-subscript" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
               <span class="icon-text-area"><span class="tool-item"><Subscript class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
+            <button class="style-item tool-button visible-characters-toggle" type="button" data-testid="workbench-visible-characters" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :aria-pressed="richTextEditor.visibleCharactersEnabled.value" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
               <span class="icon-text-area"><span class="tool-item"><Pilcrow class="tool-label-icon" :size="15" /></span></span>
             </button>
             <button class="style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.formatMarksVisible.value }" title="显示/隐藏原文与译文样式预览" @click="toggleFormatMarks">
@@ -18938,6 +18938,14 @@ onBeforeRouteLeave(async () => {
 .tool-button.is-active {
   border-color: #b8cbd4;
   background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
+}
+
+/* “显示标记”开启后使用更明确的品牌色反馈，避免只靠浅灰背景判断状态。 */
+.visible-characters-toggle.is-active {
+  border-color: #65ad9f;
+  background: linear-gradient(180deg, #effbf8 0%, #dff4ef 100%);
+  color: #087667;
+  box-shadow: inset 0 0 0 1px rgba(8, 118, 103, 0.12);
 }
 
 /* 特殊字符下拉菜单 */

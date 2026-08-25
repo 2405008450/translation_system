@@ -4007,30 +4007,54 @@ watch(
 /* 显示标记样式 */
 .segment-row__text :deep(.visible-char),
 .segment-row__source-editor :deep(.visible-char),
-.segment-row__editor :deep(.visible-char) {
-  color: #64748b;
-  font-size: 0.85em;
-  font-weight: 700;
+.segment-row__editor :deep(.visible-char),
+.segment-row__target-preview :deep(.visible-char) {
+  display: inline-block;
+  color: #087667;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+  font-weight: 800;
+  line-height: 1.05;
+  text-align: center;
+  vertical-align: 0.04em;
   user-select: none;
   pointer-events: none;
 }
 
 .segment-row__text :deep(.visible-char--space),
 .segment-row__source-editor :deep(.visible-char--space),
-.segment-row__editor :deep(.visible-char--space) {
-  color: #6b7280;
+.segment-row__editor :deep(.visible-char--space),
+.segment-row__target-preview :deep(.visible-char--space) {
+  min-width: 0.52em;
+  margin-inline: 0.02em;
+  border-radius: 0.2em;
+  background: #dff5ef;
+  color: #067565;
+  box-shadow: inset 0 0 0 1px rgba(6, 117, 101, 0.24);
 }
 
 .segment-row__text :deep(.visible-char--tab),
 .segment-row__source-editor :deep(.visible-char--tab),
-.segment-row__editor :deep(.visible-char--tab) {
-  color: #3b82f6;
+.segment-row__editor :deep(.visible-char--tab),
+.segment-row__target-preview :deep(.visible-char--tab) {
+  min-width: 1.35em;
+  margin-inline: 0.04em;
+  border-radius: 0.2em;
+  background: #e8f1ff;
+  color: #2563b8;
+  box-shadow: inset 0 -1px 0 rgba(37, 99, 184, 0.38);
 }
 
 .segment-row__text :deep(.visible-char--newline),
 .segment-row__source-editor :deep(.visible-char--newline),
-.segment-row__editor :deep(.visible-char--newline) {
-  color: #ef4444;
+.segment-row__editor :deep(.visible-char--newline),
+.segment-row__target-preview :deep(.visible-char--newline) {
+  min-width: 1.05em;
+  margin-inline: 0.04em;
+  border-radius: 0.2em;
+  background: #fff0ed;
+  color: #c24132;
+  box-shadow: inset 0 0 0 1px rgba(194, 65, 50, 0.2);
 }
 
 /*
