@@ -261,6 +261,11 @@ from app.services.tm_match_state import (
     is_tm_match_signature_current,
     mark_tm_match_signature_current,
 )
+from app.services.tm_numeric_cleanup import (
+    count_numeric_only_tm_entries,
+    delete_numeric_only_tm_entries,
+    list_numeric_only_tm_entry_examples,
+)
 from app.services.notification_service import (
     build_resource_import_notification,
     build_save_to_tm_notification,
@@ -18513,6 +18518,47 @@ def list_tm_collection_entries(
         "total": total,
         "skip": safe_skip,
         "limit": safe_limit,
+    }
+
+
+@router.get("/translation-memory/collections/{collection_id}/numeric-only-entries/preview")
+def preview_numeric_only_tm_entries(
+    collection_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    collection = _get_collection_or_404(db, collection_id)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
+
+    return {
+        "matched_entries": count_numeric_only_tm_entries(db, collection.id),
+        "examples": list_numeric_only_tm_entry_examples(db, collection.id),
+    }
+
+
+@router.delete("/translation-memory/collections/{collection_id}/numeric-only-entries")
+def cleanup_numeric_only_tm_entries(
+    collection_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    collection = _get_collection_or_404(db, collection_id)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
+
+    try:
+        deleted_entries = delete_numeric_only_tm_entries(db, collection.id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    db.refresh(collection)
+    return {
+        "message": "纯数字 TM 条目已清理。",
+        "deleted_entries": deleted_entries,
+        "remaining_entries": int(collection.entry_count or 0),
     }
 
 

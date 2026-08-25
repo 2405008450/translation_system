@@ -163,14 +163,15 @@ CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_id
     ON memory_entries (collection_id);
 CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_source_hash
     ON memory_entries (collection_id, source_hash);
-CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_source_normalized
-    ON memory_entries (collection_id, source_normalized);
 CREATE INDEX IF NOT EXISTS ix_memory_entries_source_hash
     ON memory_entries (source_hash);
-CREATE INDEX IF NOT EXISTS ix_memory_entries_source_text
-    ON memory_entries (source_text);
-CREATE INDEX IF NOT EXISTS ix_memory_entries_source_normalized
-    ON memory_entries (source_normalized);
+
+-- TEXT 全值不能安全地使用 B-tree：较长的 TM 句段会超过 PostgreSQL
+-- 单个索引项约 2704 字节的上限，进而导致导入事务失败。
+DROP INDEX IF EXISTS ix_memory_entries_collection_source_normalized;
+DROP INDEX IF EXISTS ix_memory_entries_source_text;
+DROP INDEX IF EXISTS ix_memory_entries_source_normalized;
+
 CREATE INDEX IF NOT EXISTS ix_memory_entries_language_pair
     ON memory_entries (source_language, target_language);
 CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_language_pair

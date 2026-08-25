@@ -2014,14 +2014,9 @@ class TranslationMemory(Base):
         ),
         Index("ix_memory_entries_collection_id", "collection_id"),
         Index("ix_memory_entries_collection_source_hash", "collection_id", "source_hash"),
-        Index(
-            "ix_memory_entries_collection_source_normalized",
-            "collection_id",
-            "source_normalized",
-        ),
+        # 不要为 source_text/source_normalized 建全值 B-tree 索引：合法的长 TM
+        # 句段可能超过 PostgreSQL 单个 B-tree 索引项的大小上限。
         Index("ix_memory_entries_source_hash", "source_hash"),
-        Index("ix_memory_entries_source_text", "source_text"),
-        Index("ix_memory_entries_source_normalized", "source_normalized"),
         Index("ix_memory_entries_language_pair", "source_language", "target_language"),
         Index(
             "ix_memory_entries_collection_language_pair",

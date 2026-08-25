@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   ChevronDown,
   Download,
+  Eraser,
   FileCode2,
   FileSpreadsheet,
   Loader2,
@@ -53,6 +54,17 @@ interface ResourceExportTask {
   updated_at: string
 }
 
+interface TMNumericCleanupPreview {
+  matched_entries: number
+  examples: string[]
+}
+
+interface TMNumericCleanupResult {
+  message: string
+  deleted_entries: number
+  remaining_entries: number
+}
+
 const props = defineProps<{
   id: string
   mode: ResourceMode
@@ -70,6 +82,7 @@ const creatingEntry = ref(false)
 const updatingEntryId = ref('')
 const deletingEntryId = ref('')
 const exportingEntries = ref(false)
+const cleaningNumericEntries = ref(false)
 const pageError = ref('')
 const entryMessage = ref('')
 
@@ -518,6 +531,49 @@ async function deleteEntry(entry: EntryRecord) {
   }
 }
 
+async function cleanupNumericEntries() {
+  if (props.mode !== 'tm' || !resource.value || !canManageResources.value) {
+    return
+  }
+
+  cleaningNumericEntries.value = true
+  entryMessage.value = '正在检查纯数字条目...'
+  try {
+    const endpoint = `/translation-memory/collections/${props.id}/numeric-only-entries`
+    const { data: preview } = await http.get<TMNumericCleanupPreview>(`${endpoint}/preview`)
+    if (preview.matched_entries === 0) {
+      entryMessage.value = '当前记忆库没有需要清理的纯数字条目。'
+      return
+    }
+
+    const examples = preview.examples
+      .slice(0, 3)
+      .map(value => `“${value}”`)
+      .join('、')
+    const exampleMessage = examples ? `例如 ${examples}。` : ''
+    const confirmed = await confirm({
+      title: '清理纯数字条目',
+      message: `检测到 ${preview.matched_entries} 条源文仅包含阿拉伯数字及常见数字符号的 TM 条目。${exampleMessage}含中文、英文字母或其他语言文字的条目不会删除。此操作不可恢复。`,
+      confirmText: `删除 ${preview.matched_entries} 条`,
+      danger: true,
+    })
+    if (!confirmed) {
+      entryMessage.value = ''
+      return
+    }
+
+    entryMessage.value = '正在清理纯数字条目...'
+    const { data } = await http.delete<TMNumericCleanupResult>(endpoint)
+    currentPage.value = 1
+    await reloadPage()
+    entryMessage.value = `已清理 ${data.deleted_entries} 条纯数字 TM 条目。`
+  } catch (error) {
+    entryMessage.value = getErrorMessage(error, '纯数字条目清理失败。')
+  } finally {
+    cleaningNumericEntries.value = false
+  }
+}
+
 async function waitForExportTask(task: ResourceExportTask) {
   let currentTask = task
   currentExportTaskId.value = task.task_id
@@ -769,6 +825,19 @@ onUnmounted(() => {
             >
               <Plus :size="14" />
               添加
+            </button>
+
+            <button
+              v-if="props.mode === 'tm' && canManageResources"
+              class="resource-detail-button resource-detail-button--danger"
+              type="button"
+              :disabled="cleaningNumericEntries || loadingEntries"
+              title="删除源文仅包含阿拉伯数字及常见数字符号的条目"
+              @click="cleanupNumericEntries"
+            >
+              <Loader2 v-if="cleaningNumericEntries" class="lucide-spin" :size="14" />
+              <Eraser v-else :size="14" />
+              {{ cleaningNumericEntries ? '清理中...' : '清理纯数字' }}
             </button>
 
             <div class="resource-detail-search">
