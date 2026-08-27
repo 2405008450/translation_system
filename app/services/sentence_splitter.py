@@ -51,6 +51,15 @@ NUMBERED_HEADING_PATTERN = re.compile(
     r"^\s*(?:\d+(?:\.\d+){0,5}|[A-Z])(?:[.)])?\s+(?P<title>\S.*)$"
 )
 
+# Word 中常见“短标题 + 手动换行 + 长说明正文”的排版。标题通常没有句号，
+# 下一行明显更长并以完整句标点结尾；长度比例用于避免拆开“采\n购”这类词内换行。
+HEADING_LINE_MAX_LENGTH = 80
+HEADING_LINE_MAX_WORDS = 14
+HEADING_BODY_MIN_LENGTH = 24
+HEADING_BODY_LENGTH_RATIO = 2
+HEADING_FORBIDDEN_PUNCTUATION = frozenset("。？！?!.；;：:，,")
+HEADING_BODY_ENDINGS = frozenset("。？！?!.")
+
 
 def looks_like_numbered_heading(text: str) -> bool:
     value = text.strip()
@@ -64,6 +73,20 @@ def looks_like_numbered_heading(text: str) -> bool:
         return False
     # 冒号常用于合同小节标题；完整句号、问号、感叹号和分号则更像条款正文。
     return not title.endswith((".", "?", "!", "。", "？", "！", ";", "；"))
+
+
+def looks_like_short_heading_before_body(current_line: str, next_line: str) -> bool:
+    heading = normalize_text(current_line)
+    body = normalize_text(next_line)
+    if not heading or not body or "\n" in heading or "\r" in heading:
+        return False
+    if len(heading) > HEADING_LINE_MAX_LENGTH or len(heading.split()) > HEADING_LINE_MAX_WORDS:
+        return False
+    if any(char in HEADING_FORBIDDEN_PUNCTUATION for char in heading):
+        return False
+    if len(body) < max(HEADING_BODY_MIN_LENGTH, len(heading) * HEADING_BODY_LENGTH_RATIO):
+        return False
+    return body[-1] in HEADING_BODY_ENDINGS
 
 
 @dataclass(frozen=True)
@@ -109,6 +132,7 @@ def split_sentence_spans(text: str, *, preserve_dotted_names: bool = False) -> l
                 newline_count >= 2
                 or looks_like_numbered_heading(current_line)
                 or looks_like_numbered_heading(next_line)
+                or looks_like_short_heading_before_body(current_line, next_line)
             ):
                 end = _trim_right_boundary(scan_text, newline_start)
                 if end > start:
