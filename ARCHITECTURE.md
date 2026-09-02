@@ -1060,7 +1060,7 @@ python scripts/rebuild_tm_embeddings.py --database-url "$env:DATABASE_URL" --bat
 16. **翻译规则来源**：可复用规则使用 UTF-8 Markdown；用户在工作台或预翻译中手动输入的内容只作为本次临时提示词。翻译内容校对读取的是 `projects.translation_rules` 规则文件。
 17. **资源类型区分**：TM 用于句段级记忆匹配；术语库用于译后术语一致性检查；词汇表用于 AI 预翻译上下文注入。
 18. **TM 检索范围**：`selected` 只检索选中的库；`language_pair_all` 按语言对覆盖所有库并避免超长 ID 列表。无论哪种范围，都必须先校验任务与资源语言对一致。
-19. **项目同步链路**：确认后的同源句段通过 `project_segment_sync_outbox` 异步传播；同步译文保留来源句段/文件 ID，`PROJECT_SYNC_CONFIRMED_ONLY` 控制是否只同步已确认内容。
+19. **项目同步链路**：确认后的同源句段通过 `project_segment_sync_outbox` 异步传播；`PROJECT_SYNC_BLUR_PROJECT_IDS` 白名单项目还会在编辑单元格失焦且保存成功后，以源句段版本触发一次传播。同步只覆盖空值或未确认的 `none/llm/llm_review/tm/project_sync` 结果，人工稿、导入稿和已确认译文均受保护；Outbox 的 `generation` 阻止旧任务提交。`PROJECT_SYNC_CONFIRMED_ONLY` 仍只控制普通保存是否入队，默认保持开启。
 20. **阶段进度口径**：项目页显示全流程汇总进度，工作台底栏显示活动句段所属阶段进度；接口写回后必须同步刷新 `workflow_progress`，不能只在首次加载文件时计算。
 21. **导入导出队列**：大文件导入、资源导出、文件导出、翻译内容校对优先走任务状态接口；生产建议使用 Redis + ARQ worker。
 22. **安全配置**：`.env` 不入库；`JWT_SECRET_KEY` 必须替换；LLM API Key、数据库密码等只放环境变量。

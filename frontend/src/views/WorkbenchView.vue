@@ -7159,6 +7159,10 @@ async function deleteAlignmentPairInWorkbench() {
   await applyAlignmentReplacement(current.alignment_pair_order, [before], [], '删除空行')
 }
 
+function handleSegmentTargetBlurCommit(sentenceId: string) {
+  void segmentStore.syncBlurredSegment(sentenceId)
+}
+
 async function undoAlignmentWorkbench() {
   const command = alignmentUndoStack.value.pop()
   if (!command) return
@@ -11355,6 +11359,7 @@ onBeforeRouteLeave(async () => {
                       :show-proofreading-diff="proofreadingDiffVisible"
                       :proofreading-suggestion="isProofreadingWorkbench && !isAlignmentWorkbench ? proofreadingSuggestionFor(item) : null"
                       @focus="segmentStore.setActiveSentence"
+                      @blur-commit="handleSegmentTargetBlurCommit"
                       @activate-target="handleSegmentTargetActivate"
                       @activate-source="handleSegmentSourceActivate"
                       @source-caret-change="handleSourceCaretChange"

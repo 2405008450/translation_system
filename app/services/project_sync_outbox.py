@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from time import perf_counter
 from uuid import UUID
 
 from sqlalchemy import and_, or_
@@ -17,12 +18,13 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.database import SessionLocal
+from app.database import SessionLocal, engine
 from app.models import FileRecord, ProjectSegmentSyncOutbox, Segment, User
 from app.services.normalizer import build_source_hash, normalize_text
 from app.services.project_segment_sync import (
     ProjectSegmentSyncSummary,
     sync_project_segments_for_hash,
+    sync_project_segments_from_source,
 )
 from app.services.segment_events import publish_segment_changes
 
@@ -34,6 +36,8 @@ PROJECT_SYNC_OUTBOX_MAX_BATCHES_PER_RUN = 20
 PROJECT_SYNC_OUTBOX_MAX_ATTEMPTS = 5
 PROJECT_SYNC_OUTBOX_COMPLETED_RETENTION = timedelta(days=7)
 PROJECT_SYNC_OUTBOX_PROCESSING_LEASE = timedelta(minutes=5)
+PROJECT_SYNC_TRIGGER_CONFIRMED = "confirmed"
+PROJECT_SYNC_TRIGGER_BLUR = "blur"
 
 
 @dataclass(frozen=True)
@@ -43,15 +47,33 @@ class _ProjectSyncOutboxClaim:
     source_language: str
     target_language: str
     source_hash: str
+    source_segment_id: UUID | None
+    source_version: int | None
+    trigger_kind: str
+    generation: int
     requested_by_id: UUID | None
     claimed_at: datetime
+    last_enqueued_at: datetime
 
 
 def _project_sync_confirmed_only() -> bool:
     return bool(getattr(get_settings(), "project_sync_confirmed_only", True))
 
 
-def select_segments_for_project_sync(segments: list[Segment]) -> list[Segment]:
+def project_sync_blur_enabled_for_project(project_id: UUID | None) -> bool:
+    """判断项目是否在显式失焦同步白名单中。"""
+    if project_id is None:
+        return False
+    configured = str(getattr(get_settings(), "project_sync_blur_project_ids", "") or "")
+    allowed = {item.strip().lower() for item in configured.split(",") if item.strip()}
+    return "*" in allowed or str(project_id).lower() in allowed
+
+
+def select_segments_for_project_sync(
+    segments: list[Segment],
+    *,
+    trigger_kind: str = PROJECT_SYNC_TRIGGER_CONFIRMED,
+) -> list[Segment]:
     """按触发策略筛选需要项目同步的句段（默认仅确认触发）。"""
     confirmed_only = _project_sync_confirmed_only()
     selected: list[Segment] = []
@@ -60,7 +82,7 @@ def select_segments_for_project_sync(segments: list[Segment]) -> list[Segment]:
             continue
         if not normalize_text(segment.target_text):
             continue
-        if confirmed_only and segment.status != "confirmed":
+        if trigger_kind != PROJECT_SYNC_TRIGGER_BLUR and confirmed_only and segment.status != "confirmed":
             continue
         selected.append(segment)
     return selected
@@ -72,11 +94,16 @@ def enqueue_project_segment_sync(
     file_record: FileRecord,
     segments: list[Segment],
     current_user: User | None = None,
+    trigger_kind: str = PROJECT_SYNC_TRIGGER_CONFIRMED,
 ) -> int:
     """把句段的同步任务合并写入 outbox；须与业务改动同事务提交。"""
     if file_record.project_id is None:
         return 0
-    eligible = select_segments_for_project_sync(segments)
+    if trigger_kind not in {PROJECT_SYNC_TRIGGER_CONFIRMED, PROJECT_SYNC_TRIGGER_BLUR}:
+        raise ValueError(f"unsupported project sync trigger: {trigger_kind}")
+    if trigger_kind == PROJECT_SYNC_TRIGGER_BLUR and not project_sync_blur_enabled_for_project(file_record.project_id):
+        return 0
+    eligible = select_segments_for_project_sync(segments, trigger_kind=trigger_kind)
     if not eligible:
         return 0
 
@@ -96,6 +123,9 @@ def enqueue_project_segment_sync(
             "source_hash": source_hash,
             "source_file_record_id": file_record.id,
             "source_segment_id": segment.id,
+            "source_version": int(segment.version or 1),
+            "trigger_kind": trigger_kind,
+            "generation": 1,
             "requested_by_id": current_user.id if current_user else None,
             "status": "pending",
             "attempt_count": 0,
@@ -125,6 +155,9 @@ def enqueue_project_segment_sync(
                 "error_message": "",
                 "source_file_record_id": stmt.excluded.source_file_record_id,
                 "source_segment_id": stmt.excluded.source_segment_id,
+                "source_version": stmt.excluded.source_version,
+                "trigger_kind": stmt.excluded.trigger_kind,
+                "generation": ProjectSegmentSyncOutbox.generation + 1,
                 "requested_by_id": stmt.excluded.requested_by_id,
                 "last_enqueued_at": stmt.excluded.last_enqueued_at,
                 "processed_at": None,
@@ -147,8 +180,10 @@ def enqueue_project_segment_sync(
             if existing is None:
                 db.add(ProjectSegmentSyncOutbox(**row_values))
                 continue
+            next_generation = int(existing.generation or 1) + 1
             for field_name, value in row_values.items():
                 setattr(existing, field_name, value)
+            existing.generation = next_generation
             existing.processed_at = None
     return len(rows)
 
@@ -195,8 +230,13 @@ def _claim_project_sync_outbox_rows(
                 source_language=row.source_language or "",
                 target_language=row.target_language or "",
                 source_hash=row.source_hash,
+                source_segment_id=row.source_segment_id,
+                source_version=row.source_version,
+                trigger_kind=row.trigger_kind or PROJECT_SYNC_TRIGGER_CONFIRMED,
+                generation=int(row.generation or 1),
                 requested_by_id=row.requested_by_id,
                 claimed_at=claimed_at,
+                last_enqueued_at=row.last_enqueued_at,
             )
         )
     db.commit()
@@ -207,7 +247,7 @@ def _claim_filter(db: Session, claim: _ProjectSyncOutboxClaim):
     return db.query(ProjectSegmentSyncOutbox).filter(
         ProjectSegmentSyncOutbox.id == claim.id,
         ProjectSegmentSyncOutbox.status == "processing",
-        ProjectSegmentSyncOutbox.updated_at == claim.claimed_at,
+        ProjectSegmentSyncOutbox.generation == claim.generation,
     )
 
 
@@ -225,15 +265,33 @@ def process_project_sync_outbox(db: Session, *, batch_size: int = PROJECT_SYNC_O
             db.rollback()
             continue
 
+        started_at = perf_counter()
+        savepoint = None
         try:
             current_user = (
                 db.query(User).filter(User.id == claim.requested_by_id).first()
                 if claim.requested_by_id is not None
                 else None
             )
-            # SAVEPOINT 隔离单条失败，避免中止整批事务。
-            with db.begin_nested():
-                summary: ProjectSegmentSyncSummary = sync_project_segments_for_hash(
+            # 同步写入和 claim 完成标记共用 SAVEPOINT；claim 过期时一起回滚，旧结果不会短暂提交。
+            savepoint = db.begin_nested()
+            if (
+                claim.trigger_kind == PROJECT_SYNC_TRIGGER_BLUR
+                and claim.source_segment_id is not None
+                and claim.source_version is not None
+            ):
+                summary = sync_project_segments_from_source(
+                    db,
+                    project_id=claim.project_id,
+                    source_language=claim.source_language,
+                    target_language=claim.target_language,
+                    source_hash=claim.source_hash,
+                    source_segment_id=claim.source_segment_id,
+                    source_version=claim.source_version,
+                    current_user=current_user,
+                )
+            else:
+                summary = sync_project_segments_for_hash(
                     db,
                     project_id=claim.project_id,
                     source_language=claim.source_language,
@@ -251,21 +309,38 @@ def process_project_sync_outbox(db: Session, *, batch_size: int = PROJECT_SYNC_O
                 },
                 synchronize_session=False,
             )
-            db.commit()
             if not finalized:
-                continue
-
-            affected_file_ids.update(summary.affected_file_ids)
-            if summary.filled_count or summary.updated_count or summary.conflict_count:
+                savepoint.rollback()
+                db.rollback()
                 logger.info(
-                    "project sync outbox processed project=%s hash=%s filled=%s updated=%s conflicts=%s",
+                    "project sync outbox discarded stale claim project=%s hash=%s generation=%s",
                     claim.project_id,
                     claim.source_hash[:12],
-                    summary.filled_count,
-                    summary.updated_count,
-                    summary.conflict_count,
+                    claim.generation,
                 )
+                continue
+            savepoint.commit()
+            db.commit()
+
+            affected_file_ids.update(summary.affected_file_ids)
+            logger.info(
+                "project sync outbox processed project=%s hash=%s trigger=%s generation=%s "
+                "queue_ms=%s duration_ms=%s filled=%s updated=%s protected=%s stale_sources=%s conflicts=%s",
+                claim.project_id,
+                claim.source_hash[:12],
+                claim.trigger_kind,
+                claim.generation,
+                max(0, int((claim.claimed_at - claim.last_enqueued_at).total_seconds() * 1000)),
+                int((perf_counter() - started_at) * 1000),
+                summary.filled_count,
+                summary.updated_count,
+                summary.protected_count,
+                summary.stale_source_count,
+                summary.conflict_count,
+            )
         except Exception as exc:
+            if savepoint is not None and savepoint.is_active:
+                savepoint.rollback()
             db.rollback()
             current_attempt = (
                 _claim_filter(db, claim)
@@ -320,6 +395,14 @@ def run_project_sync_outbox_once() -> None:
                 if processed < PROJECT_SYNC_OUTBOX_BATCH_SIZE:
                     break
             _prune_completed_outbox_rows(db)
+            pool = engine.pool
+            if all(hasattr(pool, name) for name in ("size", "checkedout", "overflow")):
+                logger.info(
+                    "project sync db pool size=%s checked_out=%s overflow=%s",
+                    pool.size(),
+                    pool.checkedout(),
+                    pool.overflow(),
+                )
         except Exception:
             db.rollback()
             logger.exception("project sync outbox run failed")

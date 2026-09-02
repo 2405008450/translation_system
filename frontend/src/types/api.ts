@@ -917,6 +917,8 @@ export interface ProjectSegmentSyncSummary {
   filled_count: number
   updated_count: number
   conflict_count: number
+  protected_count?: number
+  stale_source_count?: number
   affected_file_count: number
 }
 

@@ -429,6 +429,8 @@ export const useSegmentStore = defineStore('segment', () => {
   const segmentIndexMap = new Map<string, number>()
   let syncTimer: number | null = null
   let syncPromise: Promise<boolean> | null = null
+  const blurSyncGenerationByKey = new Map<string, number>()
+  const lastBlurSyncedVersionByKey = new Map<string, number>()
   let changePollTimer: number | null = null
   let changePollBurstTimers: number[] = []
   let segmentEventAbortController: AbortController | null = null
@@ -1288,6 +1290,8 @@ export const useSegmentStore = defineStore('segment', () => {
     lastModifiedAt.value = null
     dirtyEntries.value = {}
     conflictEntries.value = {}
+    blurSyncGenerationByKey.clear()
+    lastBlurSyncedVersionByKey.clear()
     changeCursor = null
     previewUpdateToken.value = 0
     lastPreviewUpdatedSentenceId.value = null
@@ -2081,6 +2085,54 @@ export const useSegmentStore = defineStore('segment', () => {
     syncTimer = window.setTimeout(() => {
       void syncToBackend()
     }, AUTO_SYNC_DELAY_MS)
+  }
+
+  async function syncBlurredSegment(segmentKey: string): Promise<void> {
+    const generation = (blurSyncGenerationByKey.get(segmentKey) || 0) + 1
+    blurSyncGenerationByKey.set(segmentKey, generation)
+
+    // 失焦立即冲刷当前保存队列；请求是异步的，不阻塞焦点切换。
+    const saved = await syncToBackend()
+    if (!saved || blurSyncGenerationByKey.get(segmentKey) !== generation) {
+      return
+    }
+    // 保存过程中若该格又产生了新编辑，等待下一次失焦，不能传播尚未落库的内容。
+    if (dirtyEntries.value[segmentKey]) {
+      return
+    }
+
+    const index = getSegmentIndex(segmentKey)
+    if (index === -1) {
+      return
+    }
+    const segment = segments.value[index]
+    if (segment.project_sync_disabled) {
+      return
+    }
+    const fileId = fileRecordIdForSegment(segment) ?? fileRecord.value?.id
+    const sourceVersion = Number(segment.version || 1)
+    if (!fileId || lastBlurSyncedVersionByKey.get(segmentKey) === sourceVersion) {
+      return
+    }
+
+    try {
+      await http.post<{
+        enabled: boolean
+        queued_count: number
+        source_version: number
+      }>(`/file-records/${fileId}/segments/${segment.sentence_id}/project-sync`, {
+        expected_version: sourceVersion,
+        trigger: 'blur',
+      })
+      if (blurSyncGenerationByKey.get(segmentKey) === generation) {
+        lastBlurSyncedVersionByKey.set(segmentKey, sourceVersion)
+      }
+    } catch (error: any) {
+      // 409 表示保存后该句段已被再次更新；下一次失焦会携带新版本重试。
+      if (Number(error?.response?.status) !== 409) {
+        console.warn('Failed to enqueue blurred segment sync:', error)
+      }
+    }
   }
 
   async function runSyncToBackend(): Promise<boolean> {
@@ -3113,6 +3165,7 @@ export const useSegmentStore = defineStore('segment', () => {
     getInlineSpellingIssues,
     setLiveSpellingEnabled,
     syncToBackend,
+    syncBlurredSegment,
     acceptRevision,
     rejectRevision,
     applyPartialRevision,

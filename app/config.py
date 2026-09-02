@@ -211,6 +211,9 @@ class Settings(BaseSettings):
     tm_search_projection_fallback_enabled: bool = True
     # 项目重复句段同步是否仅由“确认”触发（False 时保留旧行为：有译文的保存也触发）。
     project_sync_confirmed_only: bool = True
+    # 允许显式“失焦同步”的项目白名单，逗号分隔；为空时关闭，使用 * 时允许全部项目。
+    # 普通 1.5 秒自动保存不读取此配置，避免编辑过程中反复传播。
+    project_sync_blur_project_ids: str = ""
     # 句段变更 SSE 推送（依赖 redis_url；不可用时前端自动回退轮询）。
     segment_events_enabled: bool = True
     jwt_secret_key: str = DEFAULT_JWT_SECRET_KEY

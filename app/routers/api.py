@@ -359,7 +359,9 @@ from app.services.project_segment_sync import (
     sync_project_repeated_segments_from_file,
 )
 from app.services.project_sync_outbox import (
+    PROJECT_SYNC_TRIGGER_BLUR,
     enqueue_project_segment_sync,
+    project_sync_blur_enabled_for_project,
     run_project_sync_outbox_once,
 )
 from app.services.segment_events import (
@@ -1517,6 +1519,7 @@ class AutoTMWorkerSettings:
 class SegmentSyncWorkerSettings:
     queue_name = ARQ_SEGMENT_SYNC_QUEUE_NAME
     keep_result = 0
+    poll_delay = 0.1
     max_jobs = _resolve_arq_worker_max_jobs(
         get_settings().arq_segment_sync_max_jobs,
         1,
@@ -1600,6 +1603,17 @@ class LiveSpellingPreviewRequest(BaseModel):
 
 class SegmentProjectSyncUpdate(BaseModel):
     disabled: bool
+
+
+class SegmentProjectSyncTrigger(BaseModel):
+    expected_version: int = Field(ge=1)
+    trigger: Literal["blur"] = "blur"
+
+
+class SegmentProjectSyncTriggerResponse(BaseModel):
+    enabled: bool
+    queued_count: int
+    source_version: int
 
 
 class ProjectSyncDisableResponse(BaseModel):
@@ -15296,6 +15310,58 @@ def update_segment_project_sync(
         workflow_step_by_id=workflow_step_by_id,
         writable_workflow_assignments=writable_workflow_assignments,
         can_manage=can_manage,
+    )
+
+
+@router.post("/file-records/{file_record_id}/segments/{sentence_id}/project-sync", status_code=202)
+def trigger_segment_project_sync(
+    file_record_id: UUID,
+    sentence_id: str,
+    payload: SegmentProjectSyncTrigger,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+) -> SegmentProjectSyncTriggerResponse:
+    """当前单元格保存成功后，显式触发一次失焦同步。"""
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not segment:
+        raise HTTPException(status_code=404, detail="句段不存在。")
+    _require_segment_work_access(db, file_record, segment, current_user)
+
+    current_version = int(segment.version or 1)
+    if current_version != payload.expected_version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "句段版本已变化，已取消本次失焦同步。",
+                "current_version": current_version,
+                "expected_version": payload.expected_version,
+            },
+        )
+
+    enabled = project_sync_blur_enabled_for_project(file_record.project_id)
+    queued_count = 0
+    if enabled:
+        queued_count = enqueue_project_segment_sync(
+            db,
+            file_record=file_record,
+            segments=[segment],
+            current_user=current_user,
+            trigger_kind=PROJECT_SYNC_TRIGGER_BLUR,
+        )
+        db.commit()
+        _schedule_project_segment_sync_processing(background_tasks, queued_count)
+
+    return SegmentProjectSyncTriggerResponse(
+        enabled=enabled,
+        queued_count=queued_count,
+        source_version=current_version,
     )
 
 

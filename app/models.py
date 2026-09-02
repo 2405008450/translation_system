@@ -2221,7 +2221,18 @@ class ProjectSegmentSyncOutbox(Base):
             "source_hash",
             name="uq_project_sync_outbox_scope",
         ),
-        Index("ix_project_sync_outbox_status_enqueued", "status", "last_enqueued_at"),
+        Index(
+            "ix_project_sync_outbox_pending_enqueued",
+            "last_enqueued_at",
+            "id",
+            postgresql_where=text("status = 'pending'"),
+        ),
+        Index(
+            "ix_project_sync_outbox_processing_updated",
+            "updated_at",
+            "id",
+            postgresql_where=text("status = 'processing'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -2248,6 +2259,14 @@ class ProjectSegmentSyncOutbox(Base):
         ForeignKey("segments.id", ondelete="SET NULL"),
         nullable=True,
     )
+    source_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    trigger_kind: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="confirmed",
+        server_default=text("'confirmed'"),
+    )
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
     requested_by_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),

@@ -88,6 +88,7 @@ const emit = defineEmits<{
   updateSource: [sentenceId: string, value: string]
   updateTargetLayout: [sentenceId: string, targetLayoutText: string]
   focus: [sentenceId: string]
+  blurCommit: [sentenceId: string]
   activateTarget: [sentenceId: string]
   activateSource: [sentenceId: string]
   sourceCaretChange: [sentenceId: string, offset: number]
@@ -105,6 +106,8 @@ const isFocused = ref(false)
 const isSourceFocused = ref(false)
 const isComposing = ref(false)
 const editorDirtySinceFocus = ref(false)
+const targetTextAtFocus = ref('')
+const targetHtmlAtFocus = ref<string | null>(null)
 const pendingSourceFocus = ref(false)
 const pendingSourceFocusPoint = ref<{ x: number; y: number } | null>(null)
 
@@ -1857,6 +1860,8 @@ function redoEditorChange() {
 function handleFocus() {
   isFocused.value = true
   editorDirtySinceFocus.value = false
+  targetTextAtFocus.value = getTargetStateText()
+  targetHtmlAtFocus.value = getTargetStateHtml()
   emit('focus', segmentKey.value)
   cacheTargetSelectionFromDom()
 }
@@ -1864,11 +1869,23 @@ function handleFocus() {
 function handleBlur() {
   clearRevisionRerenderTimer()
   cacheTargetSelectionFromDom()
-  commitEditorContent()
+  const wasEdited = editorDirtySinceFocus.value
+  const committed = commitEditorContent()
+  const contentChanged = Boolean(
+    wasEdited
+    && committed
+    && (
+      committed.text !== targetTextAtFocus.value
+      || committed.html !== targetHtmlAtFocus.value
+    ),
+  )
   isFocused.value = false
   editorDirtySinceFocus.value = false
   resetHistoryGroup()
   void nextTick(() => syncEditorHtmlFromState(false))
+  if (contentChanged) {
+    emit('blurCommit', segmentKey.value)
+  }
 }
 
 function isSegmentMultiSelectEvent(event?: MouseEvent) {
