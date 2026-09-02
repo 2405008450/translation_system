@@ -213,6 +213,10 @@ class MultiFormatExporter:
             translation_maps = self._build_translation_maps(segments)
 
         text_map = self._build_text_translation_map(translation_maps)
+        if extension in {".dwg", ".dxf"}:
+            # 普通 source->target 映射无法可靠表达同一 MTEXT 内的多段译文；
+            # 额外按 handle/段落序号重建整块译文，让导出器一次性整体回写。
+            text_map.update(self._build_cad_mtext_translation_map(segments))
         export_filename = self._build_translated_filename(filename)
 
         if extension in {".txt", ".dat"}:
@@ -693,6 +697,107 @@ class MultiFormatExporter:
             **translation_maps["source_text"],
         }
 
+    def _build_cad_mtext_translation_map(
+        self,
+        segments: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        """按 MTEXT 稳定身份重建整块译文，避免逐段匹配造成中英混排。"""
+        from app.services.adapters.dxf_adapter import clean_mtext
+        from app.services.adapters.dxf_exporter import (
+            CAD_MTEXT_HANDLE_BLOCK_PREFIX,
+            CAD_MTEXT_HANDLE_TRANSLATION_PREFIX,
+            CAD_MTEXT_SOURCE_BLOCK_PREFIX,
+        )
+
+        groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+        incomplete_groups: set[tuple[str, str, str]] = set()
+
+        for segment in segments:
+            metadata = segment.get("metadata", {}) or {}
+            if str(metadata.get("entity_type") or "").upper() != "MTEXT":
+                continue
+            if "mtext_para_index" not in metadata:
+                continue
+            handle = str(metadata.get("handle") or "")
+            raw = str(metadata.get("mtext_raw") or "")
+            if not handle or not raw:
+                continue
+            key = (str(metadata.get("scope") or ""), handle, raw)
+            groups[key].append(segment)
+            if not str(segment.get("target_text") or "").strip():
+                incomplete_groups.add(key)
+
+        candidates: dict[str, set[str]] = defaultdict(set)
+        handle_translations: dict[str, str] = {}
+        blocked_sources: set[str] = set()
+        for key, items in groups.items():
+            if key in incomplete_groups:
+                cleaned_source = clean_mtext(key[2])
+                handle_translations[CAD_MTEXT_HANDLE_BLOCK_PREFIX + key[1]] = "1"
+                handle_translations[CAD_MTEXT_SOURCE_BLOCK_PREFIX + cleaned_source] = "1"
+                blocked_sources.add(cleaned_source)
+                continue
+            cleaned = clean_mtext(key[2])
+            source_parts = cleaned.split("\n")
+            targets_by_paragraph: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            valid_group = True
+
+            for item in items:
+                metadata = item.get("metadata", {}) or {}
+                try:
+                    paragraph_index = int(metadata.get("mtext_para_index"))
+                except (TypeError, ValueError):
+                    valid_group = False
+                    break
+                if paragraph_index < 0 or paragraph_index >= len(source_parts):
+                    valid_group = False
+                    break
+                targets_by_paragraph[paragraph_index].append(item)
+
+            if not valid_group or not targets_by_paragraph:
+                continue
+
+            # 只有所有非空原段都找到了对应句段，才允许整块重建；否则宁可交给
+            # 后续安全兜底，也不能把某一段译文误写到另一段的位置。
+            expected_paragraphs = {
+                index for index, source_part in enumerate(source_parts) if source_part.strip()
+            }
+            if not expected_paragraphs.issubset(targets_by_paragraph.keys()):
+                continue
+
+            target_parts = list(source_parts)
+            for paragraph_index, paragraph_items in targets_by_paragraph.items():
+                paragraph_items.sort(key=lambda item: int(
+                    (item.get("metadata", {}) or {}).get("cad_sentence_index", 0) or 0
+                ))
+                first_metadata = paragraph_items[0].get("metadata", {}) or {}
+                joiner = str(first_metadata.get("cad_sentence_joiner", " "))
+                paragraph_target = joiner.join(
+                    str(item.get("target_text") or "").strip()
+                    for item in paragraph_items
+                ).strip()
+                if not paragraph_target:
+                    valid_group = False
+                    break
+                target_parts[paragraph_index] = paragraph_target
+
+            if not valid_group:
+                continue
+            target_text = "\\P".join(target_parts)
+            handle_translations[
+                CAD_MTEXT_HANDLE_TRANSLATION_PREFIX + key[1]
+            ] = target_text
+            candidates[cleaned].add(target_text)
+
+        # handle 映射用于精确回写；文本映射仅作为 DWG 重转导致 handle 变化时的
+        # 唯一译文兜底。相同源文本存在多个译法时不得任选其一。
+        handle_translations.update({
+            source_text: next(iter(target_values))
+            for source_text, target_values in candidates.items()
+            if len(target_values) == 1 and source_text not in blocked_sources
+        })
+        return handle_translations
+
     def _build_source_to_target_map(self, segments: list[dict[str, Any]]) -> dict[str, str]:
         result: dict[str, str] = {}
         for segment in segments:
@@ -894,9 +999,11 @@ class MultiFormatExporter:
             aggregate["display_text"] = str(
                 metadata.get("cad_parent_display_text") or aggregate["source_text"]
             )
+            translation_complete = bool(targets) and all(targets)
+            metadata["cad_sentence_translation_complete"] = translation_complete
             aggregate["target_text"] = (
-                joiner.join(target or source for source, target in zip(sources, targets))
-                if any(targets)
+                joiner.join(targets)
+                if translation_complete
                 else ""
             )
         return collapsed
@@ -910,37 +1017,54 @@ class MultiFormatExporter:
 
         每段带自身 y 位置，翻译后各段固定在原 y 上，不会因某段行数变化影响其他段。
         """
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for segment in segments:
+            metadata = segment.get("metadata", {}) or {}
+            parent = str(metadata.get("mtext_split_parent") or "")
+            if parent:
+                grouped[parent].append(segment)
+
         out: list[dict[str, Any]] = []
-        for seg in segments:
-            metadata = seg.get("metadata", {}) or {}
-            parent = metadata.get("mtext_split_parent")
-            if not parent:
+        for parent, parent_segments in grouped.items():
+            # 拆段回写会先清空整个父 MTEXT，因此必须确保每个非空源段都有
+            # 显式译文；任一段为空就保留原实体，禁止只重建成功的部分。
+            if any(
+                str(segment.get("source_text") or "").strip()
+                and not str(segment.get("target_text") or "").strip()
+                for segment in parent_segments
+            ):
+                logger.warning(
+                    "跳过不完整 MTEXT 拆段回写 parent=%s segments=%d",
+                    parent,
+                    len(parent_segments),
+                )
                 continue
-            source_text = str(seg.get("source_text", "")).strip()
-            target_text = str(seg.get("target_text", "")).strip()
-            if not target_text and source_text:
-                target_text = translations.get(source_text, "")
-            if not target_text:
-                continue
-            out.append({
-                "parent_handle": parent,
-                "layout_version": metadata.get("mtext_split_layout_version", 1),
-                "indices": metadata.get("mtext_split_indices", []),
-                "source_text": source_text,
-                "target_text": target_text,
-                "x": metadata.get("primary_x") or metadata.get("group_x", 0),
-                "y": metadata.get("primary_y") or metadata.get("group_y_top", 0),
-                "height": metadata.get("primary_height", 2.5),
-                "width": metadata.get("group_width", 0),
-                "layer": metadata.get("layer", "0"),
-                "scope": metadata.get("scope", ""),
-                "style": metadata.get("primary_style", ""),
-                "color": metadata.get("primary_color", 256),
-                "true_color": metadata.get("primary_true_color"),
-                "transparency": metadata.get("primary_transparency"),
-                # 高度预算：本段 y 到下一段 y 的距离，导出时用于缩字号防砸表格
-                "y_budget": metadata.get("mtext_split_y_budget"),
-            })
+
+            for segment in parent_segments:
+                metadata = segment.get("metadata", {}) or {}
+                source_text = str(segment.get("source_text") or "").strip()
+                target_text = str(segment.get("target_text") or "").strip()
+                if not target_text:
+                    continue
+                out.append({
+                    "parent_handle": parent,
+                    "layout_version": metadata.get("mtext_split_layout_version", 1),
+                    "indices": metadata.get("mtext_split_indices", []),
+                    "source_text": source_text,
+                    "target_text": target_text,
+                    "x": metadata.get("primary_x") or metadata.get("group_x", 0),
+                    "y": metadata.get("primary_y") or metadata.get("group_y_top", 0),
+                    "height": metadata.get("primary_height", 2.5),
+                    "width": metadata.get("group_width", 0),
+                    "layer": metadata.get("layer", "0"),
+                    "scope": metadata.get("scope", ""),
+                    "style": metadata.get("primary_style", ""),
+                    "color": metadata.get("primary_color", 256),
+                    "true_color": metadata.get("primary_true_color"),
+                    "transparency": metadata.get("primary_transparency"),
+                    # 高度预算：本段 y 到下一段 y 的距离，导出时用于缩字号防砸表格
+                    "y_budget": metadata.get("mtext_split_y_budget"),
+                })
         return out
 
     def _extract_merged_text_info(
@@ -979,7 +1103,23 @@ class MultiFormatExporter:
             
             is_merged = metadata.get('is_merged', False)
             is_table_cell = metadata.get('cad_table_cell', False)
-            if not is_merged and not is_table_cell:
+            entity_type = str(metadata.get('entity_type', '') or '').upper()
+            # 单个 TEXT/ATTRIB/ATTDEF 也是有宽高范围的 CAD 文本块。兼容旧任务：
+            # 即使尚无 cad_text_block 标记，只要保存了完整组几何也纳入候选。
+            is_single_text_block = bool(
+                not is_merged
+                and not is_table_cell
+                and entity_type in {'TEXT', 'ATTRIB', 'ATTDEF'}
+                and (
+                    metadata.get('cad_text_block', False)
+                    or (
+                        metadata.get('merged_handles')
+                        and metadata.get('group_width')
+                        and metadata.get('group_height')
+                    )
+                )
+            )
+            if not (is_merged or is_table_cell or is_single_text_block):
                 continue
             
             logger.info(
@@ -1019,6 +1159,11 @@ class MultiFormatExporter:
             
             merged_info = {
                 'source_text': source_text,
+                'source_layout_text': str(
+                    seg.get('display_text')
+                    or metadata.get('cad_parent_display_text')
+                    or source_text
+                ),
                 'target_text': target_text,
                 'primary_handle': primary_handle,
                 'merged_handles': merged_handles,
@@ -1033,7 +1178,9 @@ class MultiFormatExporter:
                 'group_y_top': metadata.get('group_y_top') or metadata.get('primary_y') or metadata.get('y', 0),
                 'group_width': metadata.get('group_width', 0),
                 'group_height': metadata.get('group_height', 0),
+                'first_line_indent': metadata.get('group_first_line_indent', 0),
                 'cad_table_cell': is_table_cell,
+                'single_text_block': is_single_text_block,
                 'scope': metadata.get('scope', ''),
                 'layer': metadata.get('layer', '0'),
             }

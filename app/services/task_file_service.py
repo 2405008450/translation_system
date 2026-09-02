@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import re
 from typing import Any
 from uuid import UUID
 
@@ -952,34 +953,104 @@ def build_export_segments_from_source(
         for segment in segments
     }
 
-    # 对于 CAD 文件，额外按 handle 建立索引（因为合并后 segment_id 会变）
-
-    handle_to_db_segment: dict[str, Any] = {}
+    # 对于 CAD 文件，额外按稳定实体身份建立索引（因为重新解析后 segment_id 可能变化）。
+    # 同一个 MTEXT handle 会拆成多个段落/句段，不能再用 handle -> 单句段映射，
+    # 否则后一个段落会覆盖前一个段落，导出时就会出现半句仍是原文。
+    handle_to_db_segments: dict[str, list[Any]] = {}
+    member_handle_to_db_segments: dict[str, list[Any]] = {}
+    cad_identity_to_db_segments: dict[tuple[str, str, str], list[Any]] = {}
+    db_metadata_by_segment_id: dict[int, dict[str, Any]] = {}
     merged_handles_set: set[str] = set()  # 所有被合并的 handles（用于清空）
+
+    def _load_segment_metadata(segment: Any) -> dict[str, Any]:
+        cached = db_metadata_by_segment_id.get(id(segment))
+        if cached is not None:
+            return cached
+        raw_metadata = _get_segment_value(segment, "segment_metadata", None)
+        if raw_metadata is None:
+            raw_metadata = _get_segment_value(segment, "metadata", {})
+        if isinstance(raw_metadata, dict):
+            metadata = dict(raw_metadata)
+        else:
+            try:
+                metadata = _json.loads(raw_metadata) if raw_metadata else {}
+            except (TypeError, _json.JSONDecodeError):
+                metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        db_metadata_by_segment_id[id(segment)] = metadata
+        return metadata
+
+    def _normalize_handle_list(raw_handles: Any) -> list[str]:
+        if isinstance(raw_handles, str):
+            try:
+                parsed = _json.loads(raw_handles)
+            except (TypeError, _json.JSONDecodeError):
+                parsed = [value.strip() for value in raw_handles.split(",")]
+            raw_handles = parsed if isinstance(parsed, list) else []
+        if not isinstance(raw_handles, (list, tuple, set)):
+            return []
+        return [str(handle) for handle in raw_handles if str(handle).strip()]
+
+    def _cad_segment_identity(metadata: dict[str, Any]) -> tuple[str, str, str] | None:
+        handle = str(metadata.get("handle") or "")
+        if not handle:
+            return None
+        return (
+            handle,
+            str(metadata.get("mtext_para_index", "")),
+            str(metadata.get("cad_sentence_index", "")),
+        )
+
+    def _take_unused_candidate(
+        candidates: list[Any],
+        *,
+        source_text: str = "",
+        require_source_match: bool = False,
+    ) -> Any | None:
+        unused = [candidate for candidate in candidates if id(candidate) not in used_translated_segment_ids]
+        if source_text:
+            for candidate in unused:
+                candidate_source = _normalize_export_source_text(
+                    _get_segment_value(candidate, "source_text", "")
+                )
+                if candidate_source == source_text:
+                    return candidate
+            if require_source_match:
+                return None
+        return unused[0] if unused else None
 
     if is_cad_file:
         for segment in segments:
-            db_metadata_str = _get_segment_value(segment, "segment_metadata", "{}")
-            try:
-                db_metadata = _json.loads(db_metadata_str) if db_metadata_str else {}
-            except (TypeError, _json.JSONDecodeError):
-                db_metadata = {}
-
-            handle = db_metadata.get("handle", "")
+            db_metadata = _load_segment_metadata(segment)
+            handle = str(db_metadata.get("handle") or "")
             if handle:
-                handle_to_db_segment[handle] = segment
+                handle_to_db_segments.setdefault(handle, []).append(segment)
+                identity = _cad_segment_identity(db_metadata)
+                if identity is not None:
+                    cad_identity_to_db_segments.setdefault(identity, []).append(segment)
+
+            member_handles = _normalize_handle_list(db_metadata.get("merged_handles", []))
+            if handle and handle not in member_handles:
+                member_handles.insert(0, handle)
+            for member_handle in member_handles:
+                candidates = member_handle_to_db_segments.setdefault(member_handle, [])
+                if all(id(candidate) != id(segment) for candidate in candidates):
+                    candidates.append(segment)
 
             # 收集所有被合并的 handles
             if db_metadata.get("is_merged"):
-                merged_handles = db_metadata.get("merged_handles", [])
-                primary_handle = db_metadata.get("primary_handle", "")
+                merged_handles = member_handles
+                primary_handle = str(
+                    db_metadata.get("primary_handle") or db_metadata.get("handle") or ""
+                )
                 for h in merged_handles:
                     if h != primary_handle:
                         merged_handles_set.add(h)
 
         _logger.info(
-            "build_export_segments_from_source: CAD 文件，handle 索引 %d 个，被合并实体 %d 个",
-            len(handle_to_db_segment), len(merged_handles_set)
+            "build_export_segments_from_source: CAD 文件，handle 索引 %d 个，稳定身份 %d 个，被合并实体 %d 个",
+            len(handle_to_db_segments), len(cad_identity_to_db_segments), len(merged_handles_set)
         )
 
     translated_segments_by_source: dict[str, list[Any]] = {}
@@ -999,16 +1070,159 @@ def build_export_segments_from_source(
     for index, parsed_segment in enumerate(parse_result.segments):
         # 首先尝试按 segment_id 匹配
         translated_segment = translated_segments.get(parsed_segment.segment_id)
+        if translated_segment is not None and id(translated_segment) in used_translated_segment_ids:
+            translated_segment = None
 
         # 获取解析时的 metadata（CAD 文件需要 handle 用于兜底匹配）
         segment_metadata = getattr(parsed_segment, 'metadata', {}) or {}
         handle = segment_metadata.get('handle', '')
 
         parsed_source = _normalize_export_source_text(parsed_segment.source_text)
+        combined_cad_segments: list[Any] = []
         if translated_segment is not None and _normalize_export_source_text(
             _get_segment_value(translated_segment, "source_text", "")
         ) != parsed_source:
             translated_segment = None
+
+        # 导入和导出两次空间重建可能采用不同分组：例如引线框的上下两排
+        # 在数据库中是两个翻译句段，导出重解析时却合成一个 MERGED_TEXT。
+        # 这时不能只按主 handle 取第一条记录；应按新组的全部成员 handle
+        # 收集旧组译文，并保留新组 metadata 一次性重建/清空所有原实体。
+        if is_cad_file and translated_segment is None:
+            parsed_handles = _normalize_handle_list(segment_metadata.get("merged_handles", []))
+            if handle and handle not in parsed_handles:
+                parsed_handles.insert(0, str(handle))
+            handle_order = {member_handle: pos for pos, member_handle in enumerate(parsed_handles)}
+            overlap_candidates: list[Any] = []
+            overlap_ids: set[int] = set()
+            for member_handle in parsed_handles:
+                for candidate in member_handle_to_db_segments.get(member_handle, []):
+                    if id(candidate) in used_translated_segment_ids or id(candidate) in overlap_ids:
+                        continue
+                    candidate_metadata = _load_segment_metadata(candidate)
+                    candidate_handles = _normalize_handle_list(
+                        candidate_metadata.get("merged_handles", [])
+                    )
+                    candidate_primary = str(candidate_metadata.get("handle") or "")
+                    if candidate_primary and candidate_primary not in candidate_handles:
+                        candidate_handles.insert(0, candidate_primary)
+                    # 候选旧组必须完整包含在本次新组中，避免只因一个错误 handle
+                    # 重用就把邻近但独立的标注串进来。
+                    if candidate_handles and not set(candidate_handles).issubset(handle_order):
+                        continue
+                    overlap_candidates.append(candidate)
+                    overlap_ids.add(id(candidate))
+
+            if len(overlap_candidates) > 1 and len(parsed_handles) > 1:
+                def _candidate_order(candidate: Any) -> int:
+                    candidate_metadata = _load_segment_metadata(candidate)
+                    candidate_handles = _normalize_handle_list(
+                        candidate_metadata.get("merged_handles", [])
+                    )
+                    candidate_primary = str(candidate_metadata.get("handle") or "")
+                    if candidate_primary and candidate_primary not in candidate_handles:
+                        candidate_handles.insert(0, candidate_primary)
+                    return min(
+                        (handle_order[value] for value in candidate_handles if value in handle_order),
+                        default=len(handle_order),
+                    )
+
+                overlap_candidates.sort(key=_candidate_order)
+                parsed_compact = re.sub(r"\s+", "", parsed_source)
+                source_parts = [
+                    _normalize_export_source_text(
+                        _get_segment_value(candidate, "source_text", "")
+                    )
+                    for candidate in overlap_candidates
+                ]
+                target_parts = [
+                    str(_get_segment_value(candidate, "target_text", "") or "").strip()
+                    for candidate in overlap_candidates
+                ]
+                candidate_handle_sets: list[set[str]] = []
+                for candidate in overlap_candidates:
+                    candidate_metadata = _load_segment_metadata(candidate)
+                    candidate_handles = set(_normalize_handle_list(
+                        candidate_metadata.get("merged_handles", [])
+                    ))
+                    candidate_primary = str(candidate_metadata.get("handle") or "")
+                    if candidate_primary:
+                        candidate_handles.add(candidate_primary)
+                    candidate_handle_sets.append(candidate_handles)
+
+                covered_handles: set[str] = set()
+                handles_are_disjoint = True
+                for candidate_handles in candidate_handle_sets:
+                    if covered_handles.intersection(candidate_handles):
+                        handles_are_disjoint = False
+                    covered_handles.update(candidate_handles)
+                handles_form_partition = (
+                    handles_are_disjoint
+                    and covered_handles == set(parsed_handles)
+                )
+                sources_belong_to_group = all(
+                    source_part and re.sub(r"\s+", "", source_part) in parsed_compact
+                    for source_part in source_parts
+                )
+                combined_cad_segments = overlap_candidates
+                if handles_form_partition and sources_belong_to_group and all(target_parts):
+                    translated_segment = {
+                        "source_text": parsed_segment.source_text,
+                        "target_text": "\n".join(target_parts),
+                        "status": (
+                            "confirmed"
+                            if all(
+                                str(_get_segment_value(candidate, "status", "")) == "confirmed"
+                                for candidate in overlap_candidates
+                            )
+                            else str(_get_segment_value(overlap_candidates[0], "status", "none"))
+                        ),
+                        "matched_source_text": "",
+                    }
+                    _logger.info(
+                        "build_export_segments_from_source: 新 CAD 合并组覆盖 %d 个旧句段，"
+                        "按 %d 个成员 handle 聚合完整译文",
+                        len(overlap_candidates),
+                        len(parsed_handles),
+                    )
+                else:
+                    # 已确认是跨旧组的重分组，却无法完整、安全地聚合时必须
+                    # fail closed：保留新解析 metadata 和全部原文，禁止后续按主
+                    # handle 退化成只写第一组并留下另一组未翻译。
+                    translated_segment = {
+                        "source_text": parsed_segment.source_text,
+                        "target_text": "",
+                        "status": "none",
+                        "matched_source_text": "",
+                    }
+                    _logger.warning(
+                        "build_export_segments_from_source: CAD 重分组校验失败，保留原文 "
+                        "candidates=%d partition=%s source_match=%s targets_complete=%s "
+                        "parsed_handles=%d covered_handles=%d",
+                        len(overlap_candidates),
+                        handles_form_partition,
+                        sources_belong_to_group,
+                        all(target_parts),
+                        len(parsed_handles),
+                        len(covered_handles),
+                    )
+
+        # CAD 稳定身份必须先于位置/全局源文本兜底，避免重复原文在不同
+        # handle 上使用不同译文时，被另一个实体的候选提前消费。
+        if is_cad_file and translated_segment is None and handle:
+            identity = _cad_segment_identity(segment_metadata)
+            if identity is not None:
+                translated_segment = _take_unused_candidate(
+                    cad_identity_to_db_segments.get(identity, []),
+                    source_text=parsed_source,
+                )
+                if translated_segment is not None:
+                    _logger.info(
+                        "build_export_segments_from_source: 使用 CAD 稳定身份 "
+                        "handle=%s para=%s sentence=%s 匹配成功",
+                        identity[0], identity[1] or "-", identity[2] or "-",
+                    )
+
         if translated_segment is None and index < len(ordered_translated_segments):
             candidate_segment = ordered_translated_segments[index]
             if id(candidate_segment) not in used_translated_segment_ids and _normalize_export_source_text(
@@ -1022,33 +1236,39 @@ def build_export_segments_from_source(
             if candidates:
                 translated_segment = candidates.pop(0)
 
-        # 对于 CAD 文件，如果上述匹配都失败，再用 handle 兜底
+        # 兼容没有段落序号的旧 CAD 数据：精确身份、位置和源文本均失败后，
+        # 再从同一 handle 的有序候选中取尚未使用的一项。若本次重解析已把
+        # 一个实体拆成多个句段，则只允许原文精确匹配；不能把数据库里的整块
+        # 合并译文塞给第一个子句，否则后续子句为空会导致整组导出被判不完整。
         if is_cad_file and translated_segment is None and handle:
-            translated_segment = handle_to_db_segment.get(handle)
-            if translated_segment and id(translated_segment) not in used_translated_segment_ids:
+            translated_segment = _take_unused_candidate(
+                handle_to_db_segments.get(str(handle), []),
+                source_text=parsed_source,
+                require_source_match=bool(segment_metadata.get("cad_sentence_split")),
+            )
+            if translated_segment is not None:
                 _logger.info(
-                    "build_export_segments_from_source: segment_id/source_text 匹配失败，使用 handle=%s 匹配成功",
-                    handle
+                    "build_export_segments_from_source: CAD 精确匹配失败，"
+                    "使用有序 handle=%s 候选匹配成功",
+                    handle,
                 )
-            elif translated_segment:
-                # 已经被用过，跳过
-                translated_segment = None
 
-        if translated_segment is not None:
+        if combined_cad_segments:
+            used_translated_segment_ids.update(id(candidate) for candidate in combined_cad_segments)
+        elif translated_segment is not None:
             used_translated_segment_ids.add(id(translated_segment))
         context = _build_segment_context(parse_result.ast, parsed_segment.block_path, fallback_index=index)
         
         # 优先使用数据库中的 segment_metadata（可能包含手动合并信息）
         if translated_segment:
-            db_metadata_str = _get_segment_value(translated_segment, "segment_metadata", "{}")
-            try:
-                db_metadata = _json.loads(db_metadata_str) if db_metadata_str else {}
-            except (TypeError, _json.JSONDecodeError):
-                db_metadata = {}
-            
-            # 如果数据库中有合并信息，覆盖解析的 metadata
-            if db_metadata.get("is_merged"):
+            db_metadata = _load_segment_metadata(translated_segment)
+
+            # CAD 数据库元数据保存了原始 MTEXT 的 handle、段落序号和原始格式；
+            # 导出重解析可能改按句子切分，必须把这些稳定身份字段带回导出句段。
+            if is_cad_file and db_metadata:
                 segment_metadata = {**segment_metadata, **db_metadata}
+
+            if db_metadata.get("is_merged"):
                 _logger.info(
                     "build_export_segments_from_source: 句段 %s 是合并句段, metadata=%s",
                     parsed_segment.segment_id, segment_metadata
@@ -1082,6 +1302,64 @@ def build_export_segments_from_source(
                 **context,
             }
         )
+
+    # 导出重解析的句子边界可能与导入时不同。把尚未匹配的稳定数据库
+    # 句段一并交给 MultiFormatExporter：MTEXT 段落按 handle + 段落序号
+    # 重建；未拆分的合并组则直接按原 merged_handles 整块回写。后者用于
+    # 防止“数据库一整块、重解析多个子句”时整块译文被错误消费为第一句。
+    if is_cad_file:
+        appended_mtext_segments = 0
+        appended_merged_segments = 0
+        for segment in segments:
+            if id(segment) in used_translated_segment_ids:
+                continue
+            db_metadata = _load_segment_metadata(segment)
+            is_mtext_paragraph = bool(
+                str(db_metadata.get("entity_type") or "").upper() == "MTEXT"
+                and db_metadata.get("handle")
+                and "mtext_para_index" in db_metadata
+            )
+            is_unsplit_merged_group = bool(
+                db_metadata.get("handle")
+                and (db_metadata.get("is_merged") or db_metadata.get("cad_table_cell"))
+                and not db_metadata.get("cad_sentence_split")
+            )
+            if not is_mtext_paragraph and not is_unsplit_merged_group:
+                continue
+            sentence_id = str(
+                _get_segment_value(
+                    segment,
+                    "sentence_id",
+                    _get_segment_value(segment, "segment_id", ""),
+                )
+            )
+            export_segments.append(
+                {
+                    "segment_id": sentence_id,
+                    "sentence_id": sentence_id,
+                    "source_text": _get_segment_value(segment, "source_text", ""),
+                    "display_text": _get_segment_value(segment, "display_text", ""),
+                    "target_text": _get_segment_value(segment, "target_text", ""),
+                    "status": _get_segment_value(segment, "status", "none"),
+                    "matched_source_text": _get_segment_value(segment, "matched_source_text", ""),
+                    "metadata": db_metadata,
+                    "block_type": _get_segment_value(segment, "block_type", "paragraph"),
+                    "block_index": _get_segment_value(segment, "block_index", len(export_segments)),
+                    "row_index": _get_segment_value(segment, "row_index"),
+                    "cell_index": _get_segment_value(segment, "cell_index"),
+                }
+            )
+            if is_mtext_paragraph:
+                appended_mtext_segments += 1
+            if is_unsplit_merged_group:
+                appended_merged_segments += 1
+        if appended_mtext_segments or appended_merged_segments:
+            _logger.info(
+                "build_export_segments_from_source: 追加重解析未覆盖的数据库句段 "
+                "MTEXT=%d 合并组=%d",
+                appended_mtext_segments,
+                appended_merged_segments,
+            )
 
     return export_segments
 

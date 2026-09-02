@@ -283,7 +283,12 @@ def build_file_export_download_response(task: FileExportTask) -> FileResponse:
             "Content-Disposition": (
                 f'attachment; filename="{ascii_filename}"; '
                 f"filename*=UTF-8''{quoted_filename}"
-            )
+            ),
+            # 同一源文件多次导出的下载名相同；禁止浏览器或代理复用旧任务的
+            # DWG 响应，否则用户重新导出后仍可能打开上一次的单行 TEXT 文件。
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
         },
     )
 

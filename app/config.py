@@ -132,13 +132,13 @@ class Settings(BaseSettings):
     dwg_llm_verify_max_items: int = 60
     dwg_llm_verify_model: str = "google/gemini-2.5-flash"
     dwg_llm_verify_provider: str = "openrouter"
-    # DWG 空间合并 L6：GPT-5 Mini 对局部候选区域做结构化语义分组
+    # DWG 空间合并 L6：GPT-5.4 Mini 对局部候选区域做结构化语义分组
     dwg_llm_layout_enabled: bool = True
     # 两个碎片（如序号+正文）也必须进入判断；区域过大则预先切成局部窗口
     dwg_llm_layout_min_bucket: int = 2
     dwg_llm_layout_max_bucket: int = 30
     dwg_llm_layout_concurrency: int = 3
-    dwg_llm_layout_model: str = "openai/gpt-5-mini"
+    dwg_llm_layout_model: str = "openai/gpt-5.4-mini"
     dwg_llm_layout_provider: str = "openrouter"
     # DWG 空间合并诊断：竖线/管道分隔的正则片段列表，命中则 dump 该实体及其邻居
     # 例如 DWG_DEBUG_TEXT_PATTERNS="JZ3|DN150|316L"

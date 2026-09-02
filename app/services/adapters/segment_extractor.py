@@ -70,10 +70,21 @@ class SegmentExtractor:
                     "TEXT", "MTEXT", "ATTRIB", "ATTDEF", "DIMENSION",
                     "MULTILEADER", "ACAD_TABLE", "MERGED_TEXT",
                 )
+                preserve_merged_cad_unit = bool(
+                    is_cad_entity
+                    and (
+                        node.metadata.get("is_merged")
+                        or int(node.metadata.get("merged_count", 1) or 1) > 1
+                    )
+                )
                 sentences = (
-                    self._split_cad_sentences(text)
-                    if is_cad_entity
-                    else self._split_sentences(text)
+                    [(self._normalize_text(text), text)]
+                    if preserve_merged_cad_unit
+                    else (
+                        self._split_cad_sentences(text)
+                        if is_cad_entity
+                        else self._split_sentences(text)
+                    )
                 )
 
                 if is_cad_entity and len(sentences) > 1:

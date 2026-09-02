@@ -18,9 +18,10 @@ import json
 import logging
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple
+from statistics import median
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -110,41 +111,6 @@ class BarrierIndex:
                     return ln
         return None
 
-    def enclosing_cell(
-        self,
-        scope: str,
-        x: float,
-        y: float,
-        height: float = 0.0,
-    ) -> Optional[Tuple[float, float, float, float]]:
-        """返回包围文本锚点的最近闭合线框 (left, right, bottom, top)。"""
-        if not self._sorted:
-            self.finalize()
-
-        center_y = y + max(height, 0.0) * 0.5
-        verticals = [
-            line for line in self._v.get(scope, [])
-            if line.range_min <= center_y <= line.range_max
-        ]
-        lefts = [line.pos for line in verticals if line.pos < x]
-        rights = [line.pos for line in verticals if line.pos > x]
-        if not lefts or not rights:
-            return None
-        left, right = max(lefts), min(rights)
-
-        horizontals = [
-            line for line in self._h.get(scope, [])
-            if line.range_min <= x <= line.range_max
-        ]
-        bottoms = [line.pos for line in horizontals if line.pos < center_y]
-        tops = [line.pos for line in horizontals if line.pos > center_y]
-        if not bottoms or not tops:
-            return None
-        bottom, top = max(bottoms), min(tops)
-
-        if right <= left or top <= bottom:
-            return None
-        return (left, right, bottom, top)
     def enclosing_cell(
         self,
         scope: str,
@@ -275,7 +241,15 @@ class TextEntity:
     color: int = 256          # DXF ACI；256=BYLAYER，0=BYBLOCK
     true_color: Optional[int] = None
     transparency: Optional[int] = None
-    
+    # INSERT 变换前的 block 局部坐标（left-bottom）。
+    # 只有在实体位于 INSERT 内部时才写入；顶层实体保持 None。
+    # 用于同一 INSERT scope 内的归行判断：INSERT 的 rotation / mirror
+    # 会打乱世界坐标下的 y 顺序，但 block 定义里的 local_y 始终稳定，
+    # 反映绘图员设计块时的上下关系。
+    local_x: Optional[float] = None
+    local_y: Optional[float] = None
+    local_width: Optional[float] = None
+
     @property
     def priority(self) -> int:
         if self.entity_type == "MTEXT":
@@ -293,6 +267,144 @@ class TextEntity:
     def baseline(self) -> float:
         """基线 Y 坐标（简化处理，取 y）"""
         return self.y
+
+
+def is_independent_legend_label_pair(
+    first: TextEntity,
+    second: TextEntity,
+) -> bool:
+    """识别被图形符号隔开的“平面/系统”独立图例标签。"""
+    first_label = re.sub(r"\s+", "", first.text or "").rstrip(":：")
+    second_label = re.sub(r"\s+", "", second.text or "").rstrip(":：")
+    if {first_label, second_label} != {"平面", "系统"}:
+        return False
+
+    average_height = max((first.height + second.height) / 2.0, 1e-6)
+    if abs(first.y - second.y) > average_height * 0.9:
+        return False
+    left, right = (first, second) if first.x <= second.x else (second, first)
+    horizontal_gap = right.x - left.right_edge
+    # 正常短语碎片几乎相邻；图例标签之间会留出数倍字高放置线型/符号。
+    return horizontal_gap >= average_height * 2.0
+
+
+def split_visual_paragraph_entities(
+    entities: Sequence[TextEntity],
+) -> List[List[TextEntity]]:
+    """按原图行距和首行缩进把同一文本流拆成视觉段落。
+
+    CAD 常把一章正文的每一行保存为独立 TEXT。仅靠连通图会把章节标题和
+    多个首行缩进段落串成一个句段，导出后所有文字便共用同一个左边界。
+    这里先恢复视觉行，再识别“明显段间距”以及“句末后重新首行缩进”。
+    """
+    if len(entities) <= 1:
+        return [list(entities)] if entities else []
+
+    average_height = max(
+        sum(max(entity.height, 1e-6) for entity in entities) / len(entities),
+        1e-6,
+    )
+    ordered = sorted(
+        entities,
+        key=lambda entity: (
+            -round(entity.y / max(average_height * 0.8, 1e-6)),
+            entity.x,
+        ),
+    )
+
+    rows: List[List[TextEntity]] = []
+    for entity in ordered:
+        if not rows:
+            rows.append([entity])
+            continue
+        row = rows[-1]
+        row_y = sum(item.y for item in row) / len(row)
+        row_height = max(
+            average_height,
+            sum(max(item.height, 1e-6) for item in row) / len(row),
+            entity.height,
+        )
+        if abs(entity.y - row_y) <= row_height * 0.8:
+            row.append(entity)
+            row.sort(key=lambda item: item.x)
+        else:
+            rows.append([entity])
+
+    if len(rows) <= 1:
+        return [ordered]
+
+    def row_text(row: Sequence[TextEntity]) -> str:
+        parts: List[str] = []
+        for item in sorted(row, key=lambda value: value.x):
+            value = (item.text or "").strip()
+            if not value:
+                continue
+            if parts:
+                previous = parts[-1]
+                if (
+                    previous[-1:].isascii()
+                    and value[:1].isascii()
+                    and previous[-1:].isalnum()
+                    and value[:1].isalnum()
+                ):
+                    parts.append(" ")
+            parts.append(value)
+        return "".join(parts)
+
+    row_lefts = [min(item.x for item in row) for row in rows]
+    base_left = min(row_lefts)
+    row_heights = [
+        max(sum(max(item.height, 1e-6) for item in row) / len(row), 1e-6)
+        for row in rows
+    ]
+    row_ys = [sum(item.y for item in row) / len(row) for row in rows]
+    positive_gaps = [
+        row_ys[index - 1] - row_ys[index]
+        for index in range(1, len(rows))
+        if row_ys[index - 1] > row_ys[index]
+    ]
+    normal_gap = median(positive_gaps) if positive_gaps else average_height * 1.67
+
+    paragraph_rows: List[List[List[TextEntity]]] = [[rows[0]]]
+    for index in range(1, len(rows)):
+        previous_row = rows[index - 1]
+        current_row = rows[index]
+        local_height = max(row_heights[index - 1], row_heights[index], average_height)
+        vertical_gap = max(row_ys[index - 1] - row_ys[index], 0.0)
+        previous_indent = row_lefts[index - 1] - base_left
+        current_indent = row_lefts[index] - base_left
+        previous_text = row_text(previous_row).rstrip()
+
+        has_paragraph_gap = vertical_gap > max(
+            local_height * 2.15,
+            normal_gap * 1.30,
+        )
+        starts_indented_paragraph = bool(
+            current_indent >= local_height * 0.75
+            and previous_indent <= local_height * 0.40
+            and previous_text.endswith(("。", "！", "？", ".", "!", "?", "；", ";"))
+        )
+        follows_short_heading = bool(
+            abs(current_indent - previous_indent) >= local_height * 0.35
+            and len(previous_text) <= 48
+            and vertical_gap >= local_height * 1.05
+        )
+
+        if has_paragraph_gap or starts_indented_paragraph or follows_short_heading:
+            paragraph_rows.append([current_row])
+        else:
+            paragraph_rows[-1].append(current_row)
+
+    paragraphs: List[List[TextEntity]] = []
+    for paragraph in paragraph_rows:
+        flattened = [
+            item
+            for row in paragraph
+            for item in sorted(row, key=lambda value: value.x)
+        ]
+        if flattened:
+            paragraphs.append(flattened)
+    return paragraphs or [ordered]
 
 
 @dataclass 
@@ -441,6 +553,32 @@ class TextFlowGraph:
             self._reject("mtext_split_siblings")
             return None
 
+        # 若两实体位于同一 INSERT scope 内，切换到 block 局部坐标做几何比较。
+        # INSERT 的 rotation / xy scale 会翻转或倾斜 world 坐标，让原本上下
+        # 相邻的段落 y 值挤到一起被误判为同一行（如 JGADI 印章在 yscale=-1
+        # 或 rotation=180° 的实例里，"NATIONAL...LICENSE" / "JIANGXI GLOBAL
+        # ARCHITECTURE" / "江西省环球建筑设计院有限公司" 的 world y 差只有
+        # 20~180，会被拼成一整行）。block 定义里的 local_x/local_y 反映绘图员
+        # 设计块时的稳定关系，不受 INSERT 变换影响，用它归行更可靠。
+        if (
+            e1.scope == e2.scope
+            and ":insert:" in e1.scope
+            and e1.local_y is not None
+            and e2.local_y is not None
+        ):
+            e1 = replace(
+                e1,
+                x=e1.local_x if e1.local_x is not None else e1.x,
+                y=e1.local_y,
+                width=e1.local_width if e1.local_width is not None else e1.width,
+            )
+            e2 = replace(
+                e2,
+                x=e2.local_x if e2.local_x is not None else e2.x,
+                y=e2.local_y,
+                width=e2.local_width if e2.local_width is not None else e2.width,
+            )
+
         # 同行左侧的纯多级序号（如 1.3.1）与右侧正文属于同一条目。
         # 统一在这里识别该关系，供跨图层、字高和水平间距规则复用，避免各处
         # 的阈值不一致导致“已经识别为编号，却仍被普通文本门槛拆开”。
@@ -450,17 +588,48 @@ class TextFlowGraph:
             (e1, e2) if e1.x <= e2.x else (e2, e1)
         )
         number_to_text_gap = horizontal_right.x - horizontal_left.right_edge
+        is_table_reference_pair = (
+            same_row
+            and self._is_table_reference_prefix_only(horizontal_left.text)
+            and self._is_table_reference_number_only(horizontal_right.text)
+            and -avg_height <= number_to_text_gap <= avg_height * 8
+        )
+        if (
+            self._is_table_reference_prefix_only(e1.text)
+            or self._is_table_reference_prefix_only(e2.text)
+            or self._is_table_reference_number_only(e1.text)
+            or self._is_table_reference_number_only(e2.text)
+        ) and not is_table_reference_pair:
+            self._reject("table_reference_boundary")
+            return None
         is_numbered_item_pair = (
             same_row
             and self._is_hierarchical_number_only(horizontal_left.text)
             and not self._is_hierarchical_number_only(horizontal_right.text)
             and -avg_height <= number_to_text_gap <= avg_height * 20
         )
+        is_standard_edition_pair = (
+            same_row
+            and self._is_standard_edition_pair(
+                horizontal_left.text,
+                horizontal_right.text,
+            )
+            and -avg_height <= number_to_text_gap <= avg_height * 20
+        )
+        is_wide_continuation_pair = (
+            is_numbered_item_pair
+            or is_standard_edition_pair
+            or is_table_reference_pair
+        )
 
-        # 不同图层默认不合并；唯一例外是同行左侧的多级序号与其正文。
-        # CAD 图纸常把序号和正文放在不同图层。
+        if is_independent_legend_label_pair(e1, e2):
+            self._reject("independent_plan_system_labels")
+            return None
+
+        # 不同图层默认不合并；例外是同行左侧的多级序号与正文，以及标准
+        # 编号后被拆开的版本年份/“年版）”尾缀。
         if e1.layer != e2.layer:
-            if not is_numbered_item_pair:
+            if not is_wide_continuation_pair:
                 self._reject("layer")
                 return None
 
@@ -504,9 +673,9 @@ class TextFlowGraph:
 
             if e1.height > 0 and e2.height > 0:
                 h_ratio = abs(e1.height - e2.height) / max(e1.height, e2.height)
-                # 编号常被单独设成大号字，正文则沿用说明文字字号；这仍是同一
-                # 条目的视觉结构。仅该明确关系跳过字高硬断，普通标题/引注不放宽。
-                if h_ratio > self.height_ratio_tolerance and not is_numbered_item_pair:
+                # 编号和标准版本尾缀常被单独设置字号；它们仍属于同一条目。
+                # 仅这些明确关系跳过字高硬断，普通标题/引注不放宽。
+                if h_ratio > self.height_ratio_tolerance and not is_wide_continuation_pair:
                     self._reject("height")
                     logger.debug(
                         "L4 拒绝(height差异 %.1f%%>%.0f%%) %s(%r,h=%.3f) vs %s(%r,h=%.3f)",
@@ -614,7 +783,13 @@ class TextFlowGraph:
                 horizontal_right = e2 if horizontal_left is e1 else e1
                 # “1.3.1 + 同行正文”属于同一条目录项，序号本身不能触发
                 # 标题硬断；多行边界仍由后续行首序号和标准目录规则控制。
-                if self._is_hierarchical_number_only(horizontal_left.text):
+                if (
+                    self._is_hierarchical_number_only(horizontal_left.text)
+                    or self._is_standard_edition_pair(
+                        horizontal_left.text,
+                        horizontal_right.text,
+                    )
+                ):
                     relation = self.SEMANTIC_SOFT_CONTINUE
                 else:
                     relation = self._classify_semantic_relation(
@@ -639,10 +814,10 @@ class TextFlowGraph:
             e1, e2 = e2, e1
 
         x_gap = e2.x - e1.right_edge
-        # 普通同行文本保持 3 倍字高限制；明确的“多级编号 + 正文”与前面的
-        # 分桶候选规则一致，允许到 20 倍平均字高。评分也必须使用同一阈值，
-        # 否则只跳过硬拒绝仍会因 x_score 变成负数而丢边。
-        x_threshold_factor = 20.0 if is_numbered_item_pair else self.x_gap_threshold_factor
+        # 普通同行文本保持 3 倍字高限制；明确的“多级编号 + 正文”及
+        # “标准编号 + 版本尾缀”允许到 20 倍平均字高。评分也必须使用同一
+        # 阈值，否则只跳过硬拒绝仍会因 x_score 变成负数而丢边。
+        x_threshold_factor = 20.0 if is_wide_continuation_pair else self.x_gap_threshold_factor
         x_threshold = avg_height * x_threshold_factor
 
         if is_same_line:
@@ -655,8 +830,11 @@ class TextFlowGraph:
                 # 标准目录里名称和 GB/CJJ 编号常因 CAD 字宽估算偏大而出现
                 # “虚假深重叠”；只要两者同行且都是目录片段，就仍视为一行。
                 if not (
-                    self._is_standard_list_fragment(e1.text)
-                    and self._is_standard_list_fragment(e2.text)
+                    (
+                        self._is_standard_list_fragment(e1.text)
+                        and self._is_standard_list_fragment(e2.text)
+                    )
+                    or is_standard_edition_pair
                 ):
                     self._reject("x_overlap_too_deep")
                     return None
@@ -729,10 +907,23 @@ class TextFlowGraph:
     )
 
     _HIERARCHICAL_NUMBER_ONLY = re.compile(r'^\d+(?:\.\d+)+[.)、]?$')
+    _TABLE_REFERENCE_PREFIX_ONLY = re.compile(
+        r'^(?:表|table|tabla|tabelle|tableau|tabella|tabela|таблица)$',
+        re.IGNORECASE,
+    )
+    _TABLE_REFERENCE_NUMBER_ONLY = re.compile(r'^\d+(?:-\d+)+$')
 
     @classmethod
     def _is_hierarchical_number_only(cls, text: str) -> bool:
         return bool(cls._HIERARCHICAL_NUMBER_ONLY.fullmatch((text or "").strip()))
+
+    @classmethod
+    def _is_table_reference_prefix_only(cls, text: str) -> bool:
+        return bool(cls._TABLE_REFERENCE_PREFIX_ONLY.fullmatch((text or "").strip()))
+
+    @classmethod
+    def _is_table_reference_number_only(cls, text: str) -> bool:
+        return bool(cls._TABLE_REFERENCE_NUMBER_ONLY.fullmatch((text or "").strip()))
 
     # 前缀本身（CJJ/T 后跟空格/破折号/换行）也算标准片段。
     # CAD 里"标准名+编号"常被拆成"《...》 + CJJ/T + 98-2014"多段，
@@ -745,6 +936,39 @@ class TextFlowGraph:
     @classmethod
     def _is_standard_list_fragment(cls, text: str) -> bool:
         return bool(cls._STANDARD_LIST_FRAGMENT.match((text or "").strip()))
+
+    # 标准版本信息在 CAD 中常被拆成“...GB50016-2014（” + “2018” +
+    # “年版）”三个 TEXT。后两段既可能跨图层，也可能因原图预留对齐空白而
+    # 相距较远，不能套普通正文 3 倍字高的间距上限。
+    _STANDARD_EDITION_YEAR_FRAGMENT = re.compile(
+        r"^[（(]?\s*(?:19|20)\d{2}\s*(?:年版)?\s*[）)]?$"
+    )
+    _STANDARD_EDITION_SUFFIX_FRAGMENT = re.compile(r"^(?:年版|版)\s*[）)]?$")
+
+    @classmethod
+    def _is_standard_edition_fragment(cls, text: str) -> bool:
+        stripped = (text or "").strip()
+        return bool(
+            cls._STANDARD_EDITION_YEAR_FRAGMENT.fullmatch(stripped)
+            or cls._STANDARD_EDITION_SUFFIX_FRAGMENT.fullmatch(stripped)
+        )
+
+    @classmethod
+    def _is_standard_edition_pair(
+        cls,
+        left_text: str,
+        right_text: str,
+    ) -> bool:
+        """判断同行左右片段是否构成标准编号的版本尾缀。"""
+        left = (left_text or "").strip()
+        right = (right_text or "").strip()
+        if not left or not right or not cls._is_standard_edition_fragment(right):
+            return False
+        return bool(
+            cls._is_standard_list_fragment(left)
+            or left.endswith(("（", "("))
+            or cls._is_standard_edition_fragment(left)
+        )
 
     def _classify_semantic_relation(self, prev_text: str, curr_text: str) -> str:
         """返回三态之一：hard_break / soft_continue / neutral"""
@@ -1159,10 +1383,14 @@ class TextReconstructor:
                 if any(handle in covered_handles for handle in unique_handles):
                     logger.warning("忽略存在重复 handle 的 LLM 分组：%s", unique_handles)
                     continue
-                sentence = self._path_to_sentence(unique_handles, nodes, 0.85)
-                if sentence is not None:
-                    sentences.append(sentence)
-                    covered_handles.update(unique_handles)
+                grouped_entities = [nodes[handle] for handle in unique_handles]
+                paragraph_groups = split_visual_paragraph_entities(grouped_entities)
+                for paragraph_entities in paragraph_groups:
+                    paragraph_handles = [entity.handle for entity in paragraph_entities]
+                    sentence = self._path_to_sentence(paragraph_handles, nodes, 0.85)
+                    if sentence is not None:
+                        sentences.append(sentence)
+                covered_handles.update(unique_handles)
 
         remaining = [
             entity for entity in entities if entity.handle not in covered_handles
@@ -1193,8 +1421,41 @@ class TextReconstructor:
     def _group_by_context(
         self, entities: List[TextEntity]
     ) -> Dict[Tuple[str, str], List[TextEntity]]:
-        """按 scope/layer 分组；多级序号归入同行正文图层。"""
+        """按 scope/layer 分组；编号和标准版本尾缀归入同行正文图层。"""
         groups: Dict[Tuple[str, str], List[TextEntity]] = {}
+
+        def edition_context_layer(
+            entity: TextEntity,
+            visited: set[int] | None = None,
+        ) -> str:
+            """沿版本尾缀向左追溯到标准正文所在图层。"""
+            seen = visited or set()
+            entity_id = id(entity)
+            if entity_id in seen:
+                return entity.layer
+            seen.add(entity_id)
+            candidates = []
+            for other in entities:
+                if other is entity or other.scope != entity.scope or other.x > entity.x:
+                    continue
+                avg_height = max((entity.height + other.height) / 2.0, 1e-6)
+                if abs(entity.y - other.y) > avg_height * self.y_threshold_factor:
+                    continue
+                x_gap = entity.x - other.right_edge
+                if x_gap < -avg_height or x_gap > avg_height * 20:
+                    continue
+                if not TextFlowGraph._is_standard_edition_pair(
+                    other.text,
+                    entity.text,
+                ):
+                    continue
+                candidates.append((abs(x_gap), -other.x, other))
+            if not candidates:
+                return entity.layer
+            previous = min(candidates, key=lambda item: (item[0], item[1]))[2]
+            if TextFlowGraph._is_standard_edition_fragment(previous.text):
+                return edition_context_layer(previous, seen)
+            return previous.layer
 
         for entity in entities:
             layer = entity.layer
@@ -1214,6 +1475,23 @@ class TextReconstructor:
                     candidates.append((abs(x_gap), other.x, other))
                 if candidates:
                     layer = min(candidates, key=lambda item: (item[0], item[1]))[2].layer
+            elif TextFlowGraph._is_table_reference_number_only(entity.text):
+                candidates = []
+                for other in entities:
+                    if other is entity or other.scope != entity.scope:
+                        continue
+                    if not TextFlowGraph._is_table_reference_prefix_only(other.text):
+                        continue
+                    avg_height = max((entity.height + other.height) / 2.0, 1e-6)
+                    if abs(entity.y - other.y) > avg_height * self.y_threshold_factor:
+                        continue
+                    x_gap = entity.x - other.right_edge
+                    if -avg_height <= x_gap <= avg_height * 8:
+                        candidates.append((abs(x_gap), other.x, other))
+                if candidates:
+                    layer = min(candidates, key=lambda item: (item[0], item[1]))[2].layer
+            elif TextFlowGraph._is_standard_edition_fragment(entity.text):
+                layer = edition_context_layer(entity)
 
             groups.setdefault((entity.scope, layer), []).append(entity)
 
@@ -1260,9 +1538,17 @@ class TextReconstructor:
 
         for path in paths:
             confidence = graph.path_confidence.get(path[0], 1.0) if path else 1.0
-            sentence = self._path_to_sentence(path, graph.nodes, confidence)
-            if sentence:
-                sentences.append(sentence)
+            path_entities = [graph.nodes[handle] for handle in path]
+            paragraph_groups = split_visual_paragraph_entities(path_entities)
+            for paragraph_entities in paragraph_groups:
+                paragraph_path = [entity.handle for entity in paragraph_entities]
+                sentence = self._path_to_sentence(
+                    paragraph_path,
+                    graph.nodes,
+                    confidence,
+                )
+                if sentence:
+                    sentences.append(sentence)
 
         return sentences
 
@@ -1282,13 +1568,29 @@ class TextReconstructor:
         # 使用字高作为"同行"的判断依据
         avg_height = sum(e.height for e in entities) / len(entities)
         y_tolerance = avg_height * 0.8
-        
+
+        # 若所有实体都在同一 INSERT scope 内且带 block 局部坐标，就按局部坐标
+        # 排序。INSERT 的 rotation / mirror 会翻转 world y 顺序，让绘图员认知
+        # 上下相邻的段落在世界坐标下 y 值挤在一起，用局部坐标才能还原原始
+        # 阅读顺序。
+        use_local = (
+            len(entities) > 0
+            and all(
+                ":insert:" in (e.scope or "")
+                and e.local_y is not None
+                and e.local_x is not None
+                for e in entities
+            )
+        )
+
         def sort_key(e: TextEntity) -> Tuple[float, float]:
+            ex = e.local_x if use_local and e.local_x is not None else e.x
+            ey = e.local_y if use_local and e.local_y is not None else e.y
             # 将 Y 坐标量化到行，避免微小差异影响排序
             # Y 越大越靠上，所以用负数让靠上的排在前面
-            quantized_y = round(e.y / y_tolerance) * y_tolerance
-            return (-quantized_y, e.x)
-        
+            quantized_y = round(ey / y_tolerance) * y_tolerance
+            return (-quantized_y, ex)
+
         entities.sort(key=sort_key)
         
         # 合并文本
@@ -1356,6 +1658,13 @@ class TextReconstructor:
         if curr_text[0] in "，。、；：！？,.:;!?-/":
             return False
         
+        # 标准年份与版本尾缀是固定整体：2018 + 年版）不能插入空格。
+        if (
+            re.fullmatch(r"(?:19|20)\d{2}", prev_text)
+            and re.match(r"^(?:年版|版)", curr_text)
+        ):
+            return False
+
         # 数字/单位模式紧密连接
         if re.match(r'^[DN]?\d|^\(\d', curr_text):
             return False

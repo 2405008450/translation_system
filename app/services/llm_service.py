@@ -1597,9 +1597,11 @@ async def _translate_batch_group(
                             error_message=str(ve),
                         ))
 
-                if all_valid or attempt_index == retry_attempts - 1:
+                if all_valid:
                     return results
 
+                # 当前批次只要有一个句段校验失败，就继续尝试下一个请求/provider；
+                # 所有批次重试耗尽后再逐句 fallback，不能把部分失败当作最终结果返回。
                 last_error = LLMResponseValidationError("部分片段验证失败")
                 continue
 
