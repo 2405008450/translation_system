@@ -62,11 +62,15 @@ _ACTIVE_EXPORT_STATUSES = {"queued", "running"}
 
 
 SEGMENT_ORDERING = (
+    # 新导入文档的 sequence_index 是解析器按 Word 阅读顺序生成的权威位置。
+    # 必须先按它排序，否则嵌套表格的较大 block_index 会把表格内容排到
+    # 同一外层单元格的后续段落之后，造成句段编号跳跃和分页错位。
+    case((Segment.sequence_index >= 0, 0), else_=1).asc(),
+    Segment.sequence_index.asc(),
+    # 历史数据的 sequence_index 为 -1；这时继续按结构坐标稳定回退。
     Segment.block_index.asc(),
     Segment.row_index.asc().nullsfirst(),
     Segment.cell_index.asc().nullsfirst(),
-    case((Segment.sequence_index >= 0, 0), else_=1).asc(),
-    Segment.sequence_index.asc(),
     Segment.sentence_id.asc(),
 )
 
