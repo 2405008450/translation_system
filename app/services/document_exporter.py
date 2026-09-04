@@ -179,6 +179,10 @@ REVISION_MARKER_PREFIX = "\ue000DOCX_REVISION_"
 REVISION_MARKER_SUFFIX = "\ue001"
 FORMAT_MARKER_PREFIX = "\ue002DOCX_FORMAT_"
 FORMAT_MARKER_SUFFIX = "\ue003"
+INTERNAL_EXPORT_MARKERS = (
+    (FORMAT_MARKER_PREFIX, "format"),
+    (REVISION_MARKER_PREFIX, "revision"),
+)
 EXPLICIT_FORMAT_RUN_PROPERTIES = {
     "b",
     "bCs",
@@ -575,6 +579,8 @@ def export_bilingual_docx_with_layout(
     if not document_parse_options.get("preserve_hyperlinks", True):
         _strip_story_hyperlinks(stories)
 
+    _assert_no_internal_export_markers(stories)
+
     return _build_modified_docx(
         raw_bytes=raw_bytes,
         package=package,
@@ -656,6 +662,8 @@ def export_translated_docx(
     )
     if revisions_by_sentence_id and _enable_word_revision_tracking(package):
         modified_part_names.add("word/settings.xml")
+
+    _assert_no_internal_export_markers(stories)
 
     return _build_modified_docx(
         raw_bytes=raw_bytes,
@@ -3846,52 +3854,119 @@ def _expand_formatted_markers(
     if not pending_markers:
         return
 
-    for marker, target_html in pending_markers:
+    # token 记录的是替换前的 XML 节点。展开前一个标记时会创建新的 run，后续标记
+    # 可能随 after_text 移入新 run，因此每次都必须从当前 XML 子树重新定位。
+    marker_roots = _collect_live_marker_roots(tokens)
+
+    for marker_index, (marker, target_html) in enumerate(pending_markers):
         fragments = _parse_formatted_html(target_html)
         plain_text = "".join(fragment.text for fragment in fragments)
-        expanded = False
+        context = _find_live_marker_context(marker_roots, marker)
+        if context is None:
+            raise ValueError(
+                "DOCX 导出失败：富文本格式占位符无法定位，"
+                f"marker_index={marker_index}"
+            )
 
-        for token in tokens:
-            element = token.element
-            text_value = element.text if element is not None else None
-            if not text_value or marker not in text_value:
+        parent, run, element = context
+        text_value = element.text or ""
+        before_text, after_text = text_value.split(marker, 1)
+
+        if (
+            run is None
+            or parent is None
+            or _namespace_uri(run.tag) != NS["w"]
+            or run not in list(parent)
+        ):
+            element.text = text_value.replace(
+                marker,
+                _sanitize_xml_text(plain_text),
+                1,
+            )
+            if element.tag == _qn("w", "t"):
+                _sync_word_text_space_attribute(element)
+            logger.warning(
+                "DOCX formatted replacement fell back to plain text: marker_index=%d",
+                marker_index,
+            )
+            continue
+
+        element.text = before_text
+        _sync_word_text_space_attribute(element)
+        insert_index = list(parent).index(run) + 1
+        inserted_count = 0
+        for fragment in fragments:
+            if not fragment.text:
                 continue
+            parent.insert(
+                insert_index + inserted_count,
+                _build_formatted_word_run(fragment, run),
+            )
+            inserted_count += 1
 
-            before_text, after_text = text_value.split(marker, 1)
-            run = token.run_element
-            parent = token.container_element
-            if (
-                run is None
-                or parent is None
-                or _namespace_uri(run.tag) != NS["w"]
-                or run not in list(parent)
-            ):
-                element.text = text_value.replace(marker, plain_text, 1)
-                expanded = True
-                break
+        if after_text:
+            parent.insert(
+                insert_index + inserted_count,
+                _build_inserted_word_run(after_text, run),
+            )
 
-            element.text = before_text
-            insert_index = list(parent).index(run) + 1
-            inserted_count = 0
-            for fragment in fragments:
-                if not fragment.text:
+
+def _collect_live_marker_roots(tokens: list[TextToken]) -> list[ET.Element]:
+    roots: list[ET.Element] = []
+    seen_root_ids: set[int] = set()
+    for token in tokens:
+        root = (
+            token.container_element
+            if token.container_element is not None
+            else token.element
+        )
+        if root is None or id(root) in seen_root_ids:
+            continue
+        seen_root_ids.add(id(root))
+        roots.append(root)
+    return roots
+
+
+def _find_live_marker_context(
+    roots: list[ET.Element],
+    marker: str,
+) -> tuple[ET.Element | None, ET.Element | None, ET.Element] | None:
+    for root in roots:
+        for parent in root.iter():
+            for run in list(parent):
+                if _local_name(run.tag) != "r":
                     continue
-                parent.insert(
-                    insert_index + inserted_count,
-                    _build_formatted_word_run(fragment, run),
-                )
-                inserted_count += 1
+                for element in run.iter():
+                    if marker in (element.text or ""):
+                        return parent, run, element
 
-            if after_text:
-                parent.insert(
-                    insert_index + inserted_count,
-                    _build_inserted_word_run(after_text, run),
-                )
-            expanded = True
-            break
+        # 极少数 OOXML 文本节点不位于 run 下，仍应保住正文并降级为纯文本。
+        for element in root.iter():
+            if marker in (element.text or ""):
+                return None, None, element
+    return None
 
-        if not expanded:
-            logger.warning("DOCX formatted replacement marker was not expanded: %s", marker)
+
+def _assert_no_internal_export_markers(stories: Iterable[StoryPart]) -> None:
+    checked_roots: set[tuple[str, int]] = set()
+    for story in stories:
+        roots = [(story.part_name, story.root)]
+        roots.extend(_iter_related_chart_parts(story.root, story))
+        for part_name, root in roots:
+            root_key = (part_name, id(root))
+            if root_key in checked_roots:
+                continue
+            checked_roots.add(root_key)
+            for element in root.iter():
+                for value in (element.text, element.tail):
+                    if not value:
+                        continue
+                    for marker_prefix, marker_kind in INTERNAL_EXPORT_MARKERS:
+                        if marker_prefix in value:
+                            raise ValueError(
+                                "DOCX 导出失败：检测到未清理的内部占位符，"
+                                f"part={part_name}, marker_kind={marker_kind}"
+                            )
 
 
 def _build_formatted_word_run(
