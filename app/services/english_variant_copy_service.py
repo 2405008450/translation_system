@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.models import FileRecord, Segment, User
 from app.services.english_variant_converter import (
     EnglishVariantConverter,
+    EnglishVariantSemanticError,
     convert_html_fragment,
     get_default_converter,
 )
@@ -32,6 +33,7 @@ EnglishVariantCopyErrorCode = Literal[
     "unsupported_language_pair",
     "active_operation",
     "empty_translation",
+    "semantic_review_failed",
 ]
 
 
@@ -71,6 +73,7 @@ class EnglishVariantCopySummary:
     processed_segments: int
     changed_segments: int
     replacement_count: int
+    llm_review_count: int
 
 
 @dataclass(frozen=True)
@@ -162,6 +165,7 @@ def _create_english_variant_copy(
     processed_segments = 0
     changed_segments = 0
     replacement_count = 0
+    llm_review_count = 0
     for sequence_index, segment in enumerate(source_segments):
         original_target = segment.target_text or ""
         converted_target = ""
@@ -169,14 +173,21 @@ def _create_english_variant_copy(
         segment_source = "none"
         if original_target.strip():
             processed_segments += 1
-            converted_html, conversion = convert_html_fragment(
-                segment.target_html,
-                original_target,
-                target_style=copy_spec.target_style,
-                converter=active_converter,
-            )
+            try:
+                converted_html, conversion = convert_html_fragment(
+                    segment.target_html,
+                    original_target,
+                    target_style=copy_spec.target_style,
+                    converter=active_converter,
+                )
+            except EnglishVariantSemanticError as exc:
+                raise EnglishVariantCopyError(
+                    "semantic_review_failed",
+                    str(exc),
+                ) from exc
             converted_target = conversion.text
             replacement_count += conversion.replacement_count
+            llm_review_count += conversion.llm_review_count
             if converted_target != original_target:
                 changed_segments += 1
             segment_source = ENGLISH_VARIANT_SOURCE
@@ -228,6 +239,7 @@ def _create_english_variant_copy(
             processed_segments=processed_segments,
             changed_segments=changed_segments,
             replacement_count=replacement_count,
+            llm_review_count=llm_review_count,
         ),
     )
 

@@ -251,6 +251,10 @@ class MultiFormatExporter:
         if original_bytes is None:
             raise ValueError("Original export requires the original source file.")
 
+        if extension in {".dwg", ".dxf"}:
+            segments = self._collapse_cad_sentence_segments(segments)
+            translation_maps = self._build_translation_maps(segments)
+
         text_map = self._build_text_translation_map(translation_maps)
         export_filename = self._build_translated_filename(filename)
 
@@ -309,7 +313,11 @@ class MultiFormatExporter:
         elif extension == ".svg":
             from app.services.adapters.svg_exporter import SvgExporter
 
-            content = SvgExporter().export(original_bytes, text_map)
+            svg_translations = {
+                **text_map,
+                **translation_maps["segment_id"],
+            }
+            content, _warnings = SvgExporter().export(original_bytes, svg_translations)
         elif extension == ".pptx":
             from app.services.adapters.pptx_exporter import PptxExporter
 
@@ -331,12 +339,11 @@ class MultiFormatExporter:
 
             # 从 segments 中提取合并文本信息
             merged_text_info = self._extract_merged_text_info(segments, text_map)
-            has_merged_groups = bool(
-                merged_text_info and 
-                any(len(info.get("merged_handles", [])) > 1 for info in merged_text_info)
-            )
+            mtext_split_info = self._extract_mtext_split_info(segments, text_map)
+            has_merged_groups = bool(merged_text_info)
             
             dxf_options = DxfExportOptions(
+                enable_overflow_shrink=True,
                 enable_spatial_merge_export=has_merged_groups,
             )
             content = DxfExporter().export(
@@ -344,17 +351,20 @@ class MultiFormatExporter:
                 text_map,
                 options=dxf_options,
                 merged_text_info=merged_text_info,
+                mtext_split_info=mtext_split_info,
             )
         elif extension == ".dwg":
             from app.services.adapters.dwg_exporter import DwgExporter
 
             # 从 segments 中提取合并文本信息
             merged_text_info = self._extract_merged_text_info(segments, text_map)
-            
+            mtext_split_info = self._extract_mtext_split_info(segments, text_map)
+
             result = DwgExporter().export_with_extension(
                 original_bytes, 
                 text_map,
                 merged_text_info=merged_text_info,
+                mtext_split_info=mtext_split_info,
             )
             content = result.content
             # 当 DWG 回写不可用时降级为 DXF，需要纠正下游 mime/扩展
@@ -917,6 +927,93 @@ class MultiFormatExporter:
         except (TypeError, ValueError):
             return None
 
+    def _collapse_cad_sentence_segments(
+        self,
+        segments: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """导出前将同一 CAD 实体拆出的句段按原顺序合回一项。"""
+        collapsed: list[dict[str, Any]] = []
+        groups: dict[str, list[dict[str, Any]]] = {}
+        group_items: dict[str, dict[str, Any]] = {}
+
+        for segment in segments:
+            metadata = segment.get("metadata", {}) or {}
+            group_id = str(metadata.get("cad_sentence_group_id") or "")
+            if not metadata.get("cad_sentence_split") or not group_id:
+                collapsed.append(segment)
+                continue
+            if group_id not in groups:
+                groups[group_id] = []
+                aggregate = dict(segment)
+                aggregate["metadata"] = dict(metadata)
+                group_items[group_id] = aggregate
+                collapsed.append(aggregate)
+            groups[group_id].append(segment)
+
+        for group_id, items in groups.items():
+            items.sort(key=lambda item: int(
+                (item.get("metadata", {}) or {}).get("cad_sentence_index", 0)
+            ))
+            aggregate = group_items[group_id]
+            metadata = aggregate["metadata"]
+            joiner = str(metadata.get("cad_sentence_joiner", " "))
+            sources = [str(item.get("source_text") or "").strip() for item in items]
+            targets = [str(item.get("target_text") or "").strip() for item in items]
+            aggregate["source_text"] = str(
+                metadata.get("cad_parent_source_text") or joiner.join(sources)
+            )
+            aggregate["display_text"] = str(
+                metadata.get("cad_parent_display_text") or aggregate["source_text"]
+            )
+            aggregate["target_text"] = (
+                joiner.join(target or source for source, target in zip(sources, targets))
+                if any(targets)
+                else ""
+            )
+        return collapsed
+
+    def _extract_mtext_split_info(
+        self,
+        segments: list[dict[str, Any]],
+        translations: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        """从句段中提取 MTEXT 拆段信息，用于导出时替换单一原 MTEXT 为多个独立 MTEXT。
+
+        每段带自身 y 位置，翻译后各段固定在原 y 上，不会因某段行数变化影响其他段。
+        """
+        out: list[dict[str, Any]] = []
+        for seg in segments:
+            metadata = seg.get("metadata", {}) or {}
+            parent = metadata.get("mtext_split_parent")
+            if not parent:
+                continue
+            source_text = str(seg.get("source_text", "")).strip()
+            target_text = str(seg.get("target_text", "")).strip()
+            if not target_text and source_text:
+                target_text = translations.get(source_text, "")
+            if not target_text:
+                continue
+            out.append({
+                "parent_handle": parent,
+                "layout_version": metadata.get("mtext_split_layout_version", 1),
+                "indices": metadata.get("mtext_split_indices", []),
+                "source_text": source_text,
+                "target_text": target_text,
+                "x": metadata.get("primary_x") or metadata.get("group_x", 0),
+                "y": metadata.get("primary_y") or metadata.get("group_y_top", 0),
+                "height": metadata.get("primary_height", 2.5),
+                "width": metadata.get("group_width", 0),
+                "layer": metadata.get("layer", "0"),
+                "scope": metadata.get("scope", ""),
+                "style": metadata.get("primary_style", ""),
+                "color": metadata.get("primary_color", 256),
+                "true_color": metadata.get("primary_true_color"),
+                "transparency": metadata.get("primary_transparency"),
+                # 高度预算：本段 y 到下一段 y 的距离，导出时用于缩字号防砸表格
+                "y_budget": metadata.get("mtext_split_y_budget"),
+            })
+        return out
+
     def _extract_merged_text_info(
         self, 
         segments: list[dict[str, Any]], 
@@ -945,9 +1042,15 @@ class MultiFormatExporter:
         
         for seg in segments:
             metadata = seg.get('metadata', {}) or {}
+
+            # 同一个原 MTEXT 若已进入拆段回写，就不能再按闭合框重建，
+            # 否则两条路径会各创建一套译文并叠在一起。
+            if metadata.get('mtext_split_parent'):
+                continue
             
             is_merged = metadata.get('is_merged', False)
-            if not is_merged:
+            is_table_cell = metadata.get('cad_table_cell', False)
+            if not is_merged and not is_table_cell:
                 continue
             
             logger.info(
@@ -956,11 +1059,11 @@ class MultiFormatExporter:
             )
             
             merged_handles = metadata.get('merged_handles', [])
-            if len(merged_handles) <= 1:
-                logger.warning(
-                    "_extract_merged_text_info: 合并句段 handles 不足 2 个: %s", 
-                    merged_handles
-                )
+            if not merged_handles:
+                primary_metadata_handle = metadata.get('primary_handle') or metadata.get('handle', '')
+                merged_handles = [primary_metadata_handle] if primary_metadata_handle else []
+            if not merged_handles:
+                logger.warning("_extract_merged_text_info: 文本框缺少实体 handle")
                 continue
             
             primary_handle = metadata.get('primary_handle') or metadata.get('handle', '')
@@ -993,6 +1096,16 @@ class MultiFormatExporter:
                 'primary_x': metadata.get('primary_x') or metadata.get('x', 0),
                 'primary_y': metadata.get('primary_y') or metadata.get('y', 0),
                 'primary_height': metadata.get('primary_height') or metadata.get('height', 2.5),
+                'primary_style': metadata.get('primary_style', ''),
+                'primary_color': metadata.get('primary_color', 256),
+                'primary_true_color': metadata.get('primary_true_color'),
+                'primary_transparency': metadata.get('primary_transparency'),
+                'group_x': metadata.get('group_x') or metadata.get('primary_x') or metadata.get('x', 0),
+                'group_y_top': metadata.get('group_y_top') or metadata.get('primary_y') or metadata.get('y', 0),
+                'group_width': metadata.get('group_width', 0),
+                'group_height': metadata.get('group_height', 0),
+                'cad_table_cell': is_table_cell,
+                'scope': metadata.get('scope', ''),
                 'layer': metadata.get('layer', '0'),
             }
             merged_info_list.append(merged_info)

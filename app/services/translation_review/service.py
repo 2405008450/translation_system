@@ -752,6 +752,7 @@ def serialize_item(item: TranslationReviewReportItem) -> dict[str, Any]:
         "confidence": item.confidence,
         "citations": _j(item.citations),
         "apply_mode": item.apply_mode,
+        "original_target_text": item.original_target_text,
         "applied": item.applied,
         "applied_at": item.applied_at.isoformat() if item.applied_at else None,
         "apply_batch_id": str(item.apply_batch_id) if item.apply_batch_id else None,
@@ -800,6 +801,8 @@ def serialize_report(
         "file_record_id": str(report.file_record_id) if report.file_record_id else None,
         "merge_view_id": str(report.merge_view_id) if report.merge_view_id else None,
         "scope": report.scope,
+        "report_mode": getattr(report, "report_mode", "issue_check") or "issue_check",
+        "proofreading_batch_id": str(report.proofreading_batch_id) if getattr(report, "proofreading_batch_id", None) else None,
         "segment_scope": report.segment_scope,
         "enabled_categories": _jl(report.enabled_categories),  # LLM 自动分类后的类别列表
         "file_ids": _jl(report.file_ids),

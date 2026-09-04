@@ -310,6 +310,7 @@ export const useSegmentStore = defineStore('segment', () => {
   const localRevisionBaselines = ref<Record<string, string>>({})
   const revisionTrackingEnabled = ref(getInitialRevisionTrackingEnabled())
   const revisionSettings = ref<RevisionDisplaySettings>(createDefaultRevisionSettings())
+  const liveSpellingEnabled = ref(true)
   const liveSpellingBySegmentKey = ref<Record<string, LiveSpellingState>>({})
 
   // ---- 合并视图(merge-view)模式状态 ----
@@ -428,6 +429,8 @@ export const useSegmentStore = defineStore('segment', () => {
   const segmentIndexMap = new Map<string, number>()
   let syncTimer: number | null = null
   let syncPromise: Promise<boolean> | null = null
+  const blurSyncGenerationByKey = new Map<string, number>()
+  const lastBlurSyncedVersionByKey = new Map<string, number>()
   let changePollTimer: number | null = null
   let changePollBurstTimers: number[] = []
   let segmentEventAbortController: AbortController | null = null
@@ -1287,6 +1290,8 @@ export const useSegmentStore = defineStore('segment', () => {
     lastModifiedAt.value = null
     dirtyEntries.value = {}
     conflictEntries.value = {}
+    blurSyncGenerationByKey.clear()
+    lastBlurSyncedVersionByKey.clear()
     changeCursor = null
     previewUpdateToken.value = 0
     lastPreviewUpdatedSentenceId.value = null
@@ -1296,6 +1301,7 @@ export const useSegmentStore = defineStore('segment', () => {
     localRevisionBaselines.value = {}
     revisionTrackingEnabled.value = getInitialRevisionTrackingEnabled()
     revisionSettings.value = createDefaultRevisionSettings()
+    liveSpellingEnabled.value = true
     liveSpellingBySegmentKey.value = {}
     liveSpellingCooldownUntilByFileId.clear()
     syncPromise = null
@@ -1841,6 +1847,14 @@ export const useSegmentStore = defineStore('segment', () => {
     liveSpellingGeneration += 1
   }
 
+  function setLiveSpellingEnabled(enabled: boolean) {
+    liveSpellingEnabled.value = enabled
+    if (!enabled) {
+      clearLiveSpellingTimersAndRequest()
+      liveSpellingBySegmentKey.value = {}
+    }
+  }
+
   function isInlineSpellingIssue(issue: SegmentQAIssue | LiveSpellingIssue) {
     const issueType = (issue.issue_type || '').toLowerCase()
     const ruleId = (issue.rule_id || '').toUpperCase()
@@ -1854,6 +1868,9 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function getInlineSpellingIssues(segment: Segment): Array<SegmentQAIssue | LiveSpellingIssue> {
+    if (!liveSpellingEnabled.value) {
+      return []
+    }
     const key = segmentKeyOf(segment)
     const liveState = liveSpellingBySegmentKey.value[key]
     if (liveState) {
@@ -1876,6 +1893,9 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function scheduleLiveSpellingCheck(segmentKey: string, text: string, delayOverride?: number) {
+    if (!liveSpellingEnabled.value) {
+      return
+    }
     if (activeSentenceId.value !== segmentKey) {
       return
     }
@@ -1926,7 +1946,7 @@ export const useSegmentStore = defineStore('segment', () => {
     generation: number,
     retryCount: number,
   ) {
-    if (generation !== liveSpellingGeneration) {
+    if (!liveSpellingEnabled.value || generation !== liveSpellingGeneration) {
       return
     }
     const index = getSegmentIndex(segmentKey)
@@ -2065,6 +2085,54 @@ export const useSegmentStore = defineStore('segment', () => {
     syncTimer = window.setTimeout(() => {
       void syncToBackend()
     }, AUTO_SYNC_DELAY_MS)
+  }
+
+  async function syncBlurredSegment(segmentKey: string): Promise<void> {
+    const generation = (blurSyncGenerationByKey.get(segmentKey) || 0) + 1
+    blurSyncGenerationByKey.set(segmentKey, generation)
+
+    // 失焦立即冲刷当前保存队列；请求是异步的，不阻塞焦点切换。
+    const saved = await syncToBackend()
+    if (!saved || blurSyncGenerationByKey.get(segmentKey) !== generation) {
+      return
+    }
+    // 保存过程中若该格又产生了新编辑，等待下一次失焦，不能传播尚未落库的内容。
+    if (dirtyEntries.value[segmentKey]) {
+      return
+    }
+
+    const index = getSegmentIndex(segmentKey)
+    if (index === -1) {
+      return
+    }
+    const segment = segments.value[index]
+    if (segment.project_sync_disabled) {
+      return
+    }
+    const fileId = fileRecordIdForSegment(segment) ?? fileRecord.value?.id
+    const sourceVersion = Number(segment.version || 1)
+    if (!fileId || lastBlurSyncedVersionByKey.get(segmentKey) === sourceVersion) {
+      return
+    }
+
+    try {
+      await http.post<{
+        enabled: boolean
+        queued_count: number
+        source_version: number
+      }>(`/file-records/${fileId}/segments/${segment.sentence_id}/project-sync`, {
+        expected_version: sourceVersion,
+        trigger: 'blur',
+      })
+      if (blurSyncGenerationByKey.get(segmentKey) === generation) {
+        lastBlurSyncedVersionByKey.set(segmentKey, sourceVersion)
+      }
+    } catch (error: any) {
+      // 409 表示保存后该句段已被再次更新；下一次失焦会携带新版本重试。
+      if (Number(error?.response?.status) !== 409) {
+        console.warn('Failed to enqueue blurred segment sync:', error)
+      }
+    }
   }
 
   async function runSyncToBackend(): Promise<boolean> {
@@ -2514,15 +2582,16 @@ export const useSegmentStore = defineStore('segment', () => {
       if (!synced) {
         return 0
       }
-      const results = await Promise.all(
-        targetFileIds.map((fileId) =>
-          http.post<{ updated_count: number }>(
-            `/file-records/${fileId}/segments/confirmation`,
-            target === 'merge_view' ? { action } : payload,
-          ),
-        ),
-      )
-      const updatedCount = results.reduce((sum, result) => sum + Number(result.data.updated_count || 0), 0)
+      let updatedCount = 0
+      // 合并视图中的文件可能包含相同 source_hash。串行确认可避免多个事务同时
+      // upsert 同一批项目同步 outbox 记录，降低数据库锁竞争和死锁概率。
+      for (const fileId of targetFileIds) {
+        const { data } = await http.post<{ updated_count: number }>(
+          `/file-records/${fileId}/segments/confirmation`,
+          target === 'merge_view' ? { action } : payload,
+        )
+        updatedCount += Number(data.updated_count || 0)
+      }
       await refreshMergeViewDetail()
       await refreshMergeViewPage(resolveCurrentMergeQuery())
       return updatedCount
@@ -3094,7 +3163,9 @@ export const useSegmentStore = defineStore('segment', () => {
     refreshActiveTermMatches,
     getTermMatches,
     getInlineSpellingIssues,
+    setLiveSpellingEnabled,
     syncToBackend,
+    syncBlurredSegment,
     acceptRevision,
     rejectRevision,
     applyPartialRevision,

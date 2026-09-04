@@ -202,14 +202,15 @@ CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_id
     ON memory_entries (collection_id);
 CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_source_hash
     ON memory_entries (collection_id, source_hash);
-CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_source_normalized
-    ON memory_entries (collection_id, source_normalized);
 CREATE INDEX IF NOT EXISTS ix_memory_entries_source_hash
     ON memory_entries (source_hash);
-CREATE INDEX IF NOT EXISTS ix_memory_entries_source_text
-    ON memory_entries (source_text);
-CREATE INDEX IF NOT EXISTS ix_memory_entries_source_normalized
-    ON memory_entries (source_normalized);
+
+-- 长 TEXT 的 B-tree 索引会使包含长句段的 TM 导入失败；精确匹配使用
+-- source_hash，文本模糊检索使用下方的 trigram GIN 索引。
+DROP INDEX IF EXISTS ix_memory_entries_collection_source_normalized;
+DROP INDEX IF EXISTS ix_memory_entries_source_text;
+DROP INDEX IF EXISTS ix_memory_entries_source_normalized;
+
 CREATE INDEX IF NOT EXISTS ix_memory_entries_language_pair
     ON memory_entries (source_language, target_language);
 CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_language_pair

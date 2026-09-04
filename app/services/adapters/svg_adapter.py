@@ -3,7 +3,7 @@ SVG 适配器模块 - 解析 SVG 文件中的文本元素
 
 Requirements: 11.1, 11.2, 11.3, 11.4, 11.5
 """
-from typing import List, Optional
+from typing import List
 
 from lxml import etree
 
@@ -16,6 +16,12 @@ from app.services.adapters.models import (
     ParseResult,
 )
 from app.services.adapters.segment_extractor import extract_segments
+from app.services.adapters.svg_text_units import (
+    collect_text_slots,
+    group_logical_text_units,
+    is_simulated_vertical_unit,
+    unit_source_text,
+)
 
 
 # SVG 命名空间
@@ -52,7 +58,12 @@ class SvgAdapter(FormatAdapter):
             )
         
         try:
-            parser = etree.XMLParser(remove_blank_text=True, recover=False)
+            parser = etree.XMLParser(
+                remove_blank_text=False,
+                recover=False,
+                resolve_entities="internal",
+                no_network=True,
+            )
             root = etree.fromstring(raw_bytes, parser=parser)
         except etree.XMLSyntaxError as e:
             raise ParseError(
@@ -60,6 +71,9 @@ class SvgAdapter(FormatAdapter):
                 reason=f"无法解析 SVG 文件: {str(e)}"
             )
         
+        if etree.QName(root).localname.lower() != "svg":
+            raise ParseError(filename="<unknown>", reason="根元素不是 SVG")
+
         nodes = self._extract_text_elements(root)
         
         # 获取 SVG 尺寸
@@ -92,140 +106,63 @@ class SvgAdapter(FormatAdapter):
         """
         nodes = []
         
-        # 查找所有 text 元素（支持带命名空间和不带命名空间）
-        text_elements = root.xpath(
-            "//svg:text | //text",
-            namespaces=NSMAP
-        )
-        
-        for idx, text_elem in enumerate(text_elements):
-            text_node = self._parse_text_element(text_elem, idx)
-            if text_node:
-                nodes.append(text_node)
+        tree = root.getroottree()
+        logical_units = group_logical_text_units(collect_text_slots(root))
+        for unit_index, unit in enumerate(logical_units):
+            first = unit[0]
+            node = self._build_text_node(
+                owner=first.owner,
+                slot_kind=first.slot_kind,
+                text=unit_source_text(unit),
+                text_element=first.text_element,
+                text_index=first.text_index,
+                unit_index=unit_index,
+                node_path=tree.getpath(first.owner),
+            )
+            if len(unit) > 1:
+                node.metadata["svg_slot_count"] = len(unit)
+                node.metadata["svg_node_paths"] = [tree.getpath(slot.owner) for slot in unit]
+            if is_simulated_vertical_unit(unit):
+                node.metadata["svg_simulated_vertical"] = True
+            nodes.append(node)
         
         return nodes
 
-    def _parse_text_element(
+    def _build_text_node(
         self,
-        element: etree._Element,
-        index: int,
-    ) -> Optional[BlockNode]:
-        """解析单个 text 元素
-        
-        Args:
-            element: text 元素
-            index: 元素索引
-            
-        Returns:
-            Optional[BlockNode]: 文本节点
-        """
-        # 提取位置属性
-        x = element.get("x", "0")
-        y = element.get("y", "0")
-        
-        # 提取样式属性
-        style_attrs = {}
-        for attr in ("font-family", "font-size", "font-weight", "font-style",
-                     "fill", "stroke", "text-anchor", "transform"):
-            value = element.get(attr)
-            if value:
-                style_attrs[attr] = value
-        
-        # 检查是否有 tspan 子元素
-        tspans = element.xpath("svg:tspan | tspan", namespaces=NSMAP)
-        
-        if tspans:
-            # 处理 tspan 子元素
-            children = []
-            for tspan in tspans:
-                tspan_node = self._parse_tspan_element(tspan)
-                if tspan_node:
-                    children.append(tspan_node)
-            
-            if not children:
-                return None
-            
-            return BlockNode(
-                node_type=NodeType.PARAGRAPH,
-                children=children,
-                metadata={
-                    "svg_element": "text",
-                    "index": index,
-                    "x": x,
-                    "y": y,
-                    **style_attrs,
-                },
-            )
-        else:
-            # 直接提取文本
-            text = self._get_element_text(element)
-            if not text.strip():
-                return None
-            
-            return BlockNode(
-                node_type=NodeType.PARAGRAPH,
-                text_content=text.strip(),
-                metadata={
-                    "svg_element": "text",
-                    "index": index,
-                    "x": x,
-                    "y": y,
-                    **style_attrs,
-                },
-            )
+        *,
+        owner: etree._Element,
+        slot_kind: str,
+        text: str,
+        text_element: etree._Element,
+        text_index: int,
+        unit_index: int,
+        node_path: str,
+    ) -> BlockNode:
+        """为一个可回写的 SVG 文本槽位创建 AST 节点。"""
+        metadata = {
+            "svg_element": etree.QName(owner).localname,
+            "svg_slot_kind": slot_kind,
+            "svg_text_index": text_index,
+            "svg_unit_index": unit_index,
+            "svg_node_path": node_path,
+            "preserve_as_single_segment": True,
+        }
 
-    def _parse_tspan_element(self, element: etree._Element) -> Optional[BlockNode]:
-        """解析 tspan 元素
-        
-        Args:
-            element: tspan 元素
-            
-        Returns:
-            Optional[BlockNode]: 文本节点
-        """
-        text = self._get_element_text(element)
-        if not text.strip():
-            return None
-        
-        # 提取位置属性
-        x = element.get("x")
-        y = element.get("y")
-        dx = element.get("dx")
-        dy = element.get("dy")
-        
-        # 提取样式属性
-        style_attrs = {}
-        for attr in ("font-family", "font-size", "font-weight", "font-style",
-                     "fill", "stroke", "baseline-shift"):
-            value = element.get(attr)
-            if value:
-                style_attrs[attr] = value
-        
-        metadata = {"svg_element": "tspan", **style_attrs}
-        if x:
-            metadata["x"] = x
-        if y:
-            metadata["y"] = y
-        if dx:
-            metadata["dx"] = dx
-        if dy:
-            metadata["dy"] = dy
-        
+        # 位置和样式可能定义在 text、tspan 或其他文本容器上；槽位自身优先。
+        for attr in (
+            "x", "y", "dx", "dy", "font-family", "font-size", "font-weight",
+            "font-style", "fill", "stroke", "text-anchor", "transform",
+            "baseline-shift",
+        ):
+            value = owner.get(attr)
+            if value is None and owner is not text_element:
+                value = text_element.get(attr)
+            if value is not None:
+                metadata[attr] = value
+
         return BlockNode(
-            node_type=NodeType.INLINE,
+            node_type=NodeType.PARAGRAPH,
             text_content=text.strip(),
             metadata=metadata,
         )
-
-    def _get_element_text(self, element: etree._Element) -> str:
-        """获取元素的直接文本内容
-        
-        Args:
-            element: XML 元素
-            
-        Returns:
-            str: 文本内容
-        """
-        # 只获取直接文本，不包括子元素
-        text = element.text or ""
-        return text

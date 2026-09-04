@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models import FileRecord, Project
+from app.services.cache import delete as cache_delete
 from app.services.cache import get_json as cache_get_json
 from app.services.cache import set_json as cache_set_json
 from app.services.file_export_queue import (
@@ -41,14 +42,38 @@ def queue_project_file_zip_export(
     project_id: UUID,
     project_name: str,
     file_ids: list[UUID],
+    requested_by_id: UUID | None = None,
+    requested_by_name: str | None = None,
 ) -> dict[str, Any]:
+    normalized_file_ids = [str(file_id) for file_id in file_ids]
+    active_key = _project_file_zip_export_active_cache_key(project_id, requested_by_id)
+    active_pointer = cache_get_json(active_key)
+    if isinstance(active_pointer, dict):
+        active_task_id = str(active_pointer.get("task_id") or "")
+        active_task = get_project_file_zip_export_task_status(active_task_id) if active_task_id else None
+        if (
+            active_task
+            and active_task.get("status") in {"queued", "running"}
+            and active_task.get("file_ids") == normalized_file_ids
+        ):
+            logger.info(
+                "reuse active project zip export task task_id=%s project_id=%s requested_by_id=%s",
+                active_task_id,
+                project_id,
+                requested_by_id,
+            )
+            return active_task
+
     task_id = str(uuid4())
     now = _local_now()
     filename = build_project_file_zip_filename(project_name)
     payload: dict[str, Any] = {
         "task_id": task_id,
         "project_id": str(project_id),
-        "file_ids": [str(file_id) for file_id in file_ids],
+        "file_ids": normalized_file_ids,
+        "requested_by_id": str(requested_by_id) if requested_by_id else None,
+        "requested_by_name": requested_by_name or None,
+        "requested_file_count": len(normalized_file_ids),
         "status": "queued",
         "progress": 0,
         "message": "压缩包导出任务已进入队列。",
@@ -65,6 +90,19 @@ def queue_project_file_zip_export(
         progress=0,
         message="压缩包导出任务已进入队列。",
         payload=payload,
+    )
+    cache_set_json(
+        active_key,
+        {"task_id": task_id},
+        ttl_seconds=PROJECT_FILE_ZIP_EXPORT_TASK_TTL_SECONDS,
+    )
+    logger.info(
+        "queue project zip export task_id=%s project_id=%s files=%d requested_by_id=%s requested_by_name=%s",
+        task_id,
+        project_id,
+        len(normalized_file_ids),
+        requested_by_id,
+        requested_by_name,
     )
     future = _PROJECT_FILE_ZIP_EXPORT_EXECUTOR.submit(
         _run_project_file_zip_export_task,
@@ -113,7 +151,8 @@ def build_project_file_zip_export_download_response(task_id: str) -> FileRespons
             "Content-Disposition": (
                 f'attachment; filename="{ascii_filename}"; '
                 f"filename*=UTF-8''{quoted_filename}"
-            )
+            ),
+            "X-Accel-Buffering": "no",
         },
     )
 
@@ -144,7 +183,7 @@ def _run_project_file_zip_export_task(
         _cleanup_expired_export_files(output_dir)
         output_path = output_dir / f"{task_id}.zip"
 
-        with SessionLocal() as db:
+        with SessionLocal(expire_on_commit=False) as db:
             project_uuid = UUID(project_id)
             file_uuid_order = [UUID(file_id) for file_id in file_ids]
             project = db.query(Project).filter(Project.id == project_uuid).first()
@@ -159,25 +198,45 @@ def _run_project_file_zip_export_task(
             if len(ordered_files) < 2:
                 raise ValueError("请至少选择两个文件导出为压缩包。")
 
-            used_names: set[str] = set()
-            total = len(ordered_files)
-            with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                for index, file_record in enumerate(ordered_files, start=1):
-                    _set_project_file_zip_export_task_status(
-                        task_id,
-                        "running",
-                        progress=10 + int(((index - 1) / total) * 80),
-                        message=f"正在导出 {index}/{total}：{file_record.filename}",
+            # 初始查询只负责校验和排序，立即关闭会话，不跨文件导出持有事务。
+            ordered_file_refs = [
+                (file_record.id, file_record.filename)
+                for file_record in ordered_files
+            ]
+
+        used_names: set[str] = set()
+        total = len(ordered_file_refs)
+        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for index, (file_record_id, source_filename) in enumerate(ordered_file_refs, start=1):
+                _set_project_file_zip_export_task_status(
+                    task_id,
+                    "running",
+                    progress=10 + int(((index - 1) / total) * 80),
+                    message=f"正在导出 {index}/{total}：{source_filename}",
+                )
+                # 每个文件使用独立短会话；CAD 渲染开始前会主动释放本次只读事务。
+                with SessionLocal(expire_on_commit=False) as db:
+                    file_record = (
+                        db.query(FileRecord)
+                        .filter(FileRecord.id == file_record_id)
+                        .first()
                     )
-                    exported_file = build_file_record_exported_file(db, file_record, "original")
-                    archive_name = _deduplicate_archive_name(exported_file.filename, used_names)
-                    archive.writestr(archive_name, exported_file.content)
-                    _set_project_file_zip_export_task_status(
-                        task_id,
-                        "running",
-                        progress=10 + int((index / total) * 80),
-                        message=f"已写入 {index}/{total} 个目标文件。",
+                    if file_record is None:
+                        raise ValueError(f"文件不存在：{source_filename}")
+                    exported_file = build_file_record_exported_file(
+                        db,
+                        file_record,
+                        "original",
+                        release_transaction_before_render=True,
                     )
+                archive_name = _deduplicate_archive_name(exported_file.filename, used_names)
+                archive.writestr(archive_name, exported_file.content)
+                _set_project_file_zip_export_task_status(
+                    task_id,
+                    "running",
+                    progress=10 + int((index / total) * 80),
+                    message=f"已写入 {index}/{total} 个目标文件。",
+                )
 
         size_bytes = output_path.stat().st_size
         _set_project_file_zip_export_task_status(
@@ -194,6 +253,7 @@ def _run_project_file_zip_export_task(
             filename=filename,
             size_bytes=size_bytes,
         )
+        _clear_project_file_zip_export_active_pointer(task_id)
     except Exception as exc:
         logger.exception("project file zip export task failed task_id=%s", task_id)
         if output_path is not None:
@@ -208,6 +268,7 @@ def _run_project_file_zip_export_task(
             message="压缩包导出失败。",
             error=str(exc),
         )
+        _clear_project_file_zip_export_active_pointer(task_id)
 
 
 def _load_ordered_project_files(
@@ -304,6 +365,30 @@ def _cleanup_expired_export_files(output_dir: Path) -> None:
 
 def _project_file_zip_export_task_cache_key(task_id: str) -> str:
     return f"project-file-zip-export:{task_id}"
+
+
+def _project_file_zip_export_active_cache_key(
+    project_id: UUID,
+    requested_by_id: UUID | None,
+) -> str:
+    requester = str(requested_by_id) if requested_by_id else "anonymous"
+    return f"project-file-zip-export-active:{requester}:{project_id}"
+
+
+def _clear_project_file_zip_export_active_pointer(task_id: str) -> None:
+    task = get_project_file_zip_export_task_status(task_id)
+    if not task:
+        return
+    try:
+        project_id = UUID(str(task.get("project_id") or ""))
+        requested_by_raw = task.get("requested_by_id")
+        requested_by_id = UUID(str(requested_by_raw)) if requested_by_raw else None
+    except ValueError:
+        return
+    active_key = _project_file_zip_export_active_cache_key(project_id, requested_by_id)
+    pointer = cache_get_json(active_key)
+    if isinstance(pointer, dict) and str(pointer.get("task_id") or "") == task_id:
+        cache_delete(active_key)
 
 
 def _local_now() -> datetime:

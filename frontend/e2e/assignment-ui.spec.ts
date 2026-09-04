@@ -6,6 +6,10 @@ test('大量文件与译者下保持单文件列表并锁定已分配文件', as
   await page.goto('/e2e/assignment-harness.html')
   expect(pageErrors).toEqual([])
   await expect(page.getByTestId('assignment-workbench')).toBeVisible()
+  await expect(page.getByRole('radiogroup', { name: '译者类型' })).toHaveCount(0)
+  await expect(
+    page.getByTestId('assignment-user-list').getByRole('option').filter({ hasText: 'translator_05' }),
+  ).toHaveCount(0)
   await expect(page.getByText('待分配 118')).toBeVisible()
   await expect(page.getByText('已分配 2')).toBeVisible()
 
@@ -23,8 +27,8 @@ test('大量文件与译者下保持单文件列表并锁定已分配文件', as
     }
   })
   expect(compactLayout.modalScrollHeight).toBeLessThanOrEqual(compactLayout.modalClientHeight + 1)
-  expect(compactLayout.userColumns).toBe(2)
-  expect(compactLayout.userButtonHeight).toBeLessThanOrEqual(40)
+  expect(compactLayout.userColumns).toBe(1)
+  expect(compactLayout.userButtonHeight).toBeLessThanOrEqual(64)
   expect(compactLayout.typeSelectWidth).toBeLessThanOrEqual(120)
 
   const renderedRows = page.getByTestId('assignment-file-row')
@@ -33,6 +37,7 @@ test('大量文件与译者下保持单文件列表并锁定已分配文件', as
 
   await page.getByLabel('文件分配状态').selectOption('assigned')
   const wholeFileRow = page.getByTestId('assignment-file-row').filter({ hasText: '001_公司年度可持续发展报告' })
+  await expect(wholeFileRow).toContainText('语言对：中文（简体） -> 英语（美国）')
   await expect(wholeFileRow).toContainText('测试译者 1 · 整文件')
   await expect(wholeFileRow.getByRole('checkbox')).toBeDisabled()
   await page.getByLabel('负责人筛选').selectOption('user-1')
@@ -56,4 +61,38 @@ test('大量文件与译者下保持单文件列表并锁定已分配文件', as
   const confirmDialog = page.getByRole('alertdialog', { name: '确认保存任务分配' })
   await expect(confirmDialog).toBeVisible()
   await expect(confirmDialog).toContainText('新增分配')
+})
+
+test('按字数生成安全拆分并应用到草稿', async ({ page }) => {
+  await page.goto('/e2e/assignment-harness.html')
+  const fileRow = page.getByTestId('assignment-file-row').filter({
+    hasText: '003_公司年度可持续发展报告',
+  })
+  await fileRow.getByRole('button', { name: '高级拆分' }).click()
+
+  const splitPanel = page.getByTestId('assignment-auto-split')
+  await expect(splitPanel).toContainText('系统只会在完整句段或段落边界切分')
+  await page.getByRole('tab', { name: '手动指定范围' }).click()
+  await expect(page.getByText('逐条指定句段范围')).toBeVisible()
+  await page.getByRole('tab', { name: '智能均分' }).click()
+  await expect(page.getByTestId('assignment-smart-user-user-5')).toHaveCount(0)
+  await page.getByTestId('assignment-smart-user-user-1').click()
+  await page.getByTestId('assignment-smart-user-user-2').click()
+  await page.getByTestId('assignment-smart-user-user-3').click()
+  await expect(splitPanel).toContainText('已选 3 人，将自动生成 3 份')
+  await page.getByTestId('assignment-split-generate-button').click()
+  await expect(page.getByTestId('assignment-split-parts').locator(':scope > div')).toHaveCount(3)
+  await expect(splitPanel).toContainText('所有切点均位于完整句段边界')
+
+  await expect(splitPanel.getByLabel('第 1 份译者')).toHaveValue('user-1')
+  await expect(splitPanel.getByLabel('第 2 份译者')).toHaveValue('user-2')
+  await expect(splitPanel.getByLabel('第 3 份译者')).toHaveValue('user-3')
+  await page.getByTestId('assignment-split-apply-button').click()
+
+  await expect(page.getByText('已将 003_公司年度可持续发展报告_2.docx 的 3 份安全范围应用到草稿。')).toBeVisible()
+  const appliedRanges = page.locator('.assignment-current-ranges > div')
+  await expect(appliedRanges.locator(':scope > span')).toHaveCount(3)
+  await expect(appliedRanges).toContainText('1–271 段')
+  await expect(appliedRanges).toContainText('272–542 段')
+  await expect(appliedRanges).toContainText('543–814 段')
 })

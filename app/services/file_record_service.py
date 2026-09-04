@@ -10,7 +10,19 @@ from uuid import UUID
 from sqlalchemy import case, event, func, or_, update
 from sqlalchemy.orm import Session
 
-from app.models import FileRecord, FileSegmentStats, Segment, TranslationMemory, User
+from app.config import get_settings
+from app.models import (
+    DocumentAlignmentPair,
+    DocumentAlignmentUnit,
+    FileRecord,
+    FileSegmentStats,
+    ProofreadingBatch,
+    ProofreadingColumnBinding,
+    ProofreadingSegmentBaseline,
+    Segment,
+    TranslationMemory,
+    User,
+)
 from app.services.document_storage import (
     delete_source_file,
     load_source_file,
@@ -44,11 +56,27 @@ _DOCX_EXTENSIONS = {".docx"}
 _WORKSPACE_SOURCE_BYTES_KEY = "_source_bytes"
 _WORKSPACE_SOURCE_FILENAME_KEY = "_source_filename"
 
+# 运行中的校对批次不随文件删除联动清理，避免中断后台任务；可先取消再手动删除。
+_ACTIVE_PROOFREADING_STATUSES = {"aligning", "queued", "running", "canceling"}
+_ACTIVE_EXPORT_STATUSES = {"queued", "running"}
+
 
 SEGMENT_ORDERING = (
+    # 新导入文档的 sequence_index 是解析器按 Word 阅读顺序生成的权威位置。
+    # 必须先按它排序，否则嵌套表格的较大 block_index 会把表格内容排到
+    # 同一外层单元格的后续段落之后，造成句段编号跳跃和分页错位。
+    case((Segment.sequence_index >= 0, 0), else_=1).asc(),
+    Segment.sequence_index.asc(),
+    # 历史数据的 sequence_index 为 -1；这时继续按结构坐标稳定回退。
     Segment.block_index.asc(),
     Segment.row_index.asc().nullsfirst(),
     Segment.cell_index.asc().nullsfirst(),
+    Segment.sentence_id.asc(),
+)
+
+# 双文档校对的 block/row/cell 分别来自原文和译文两份独立文档，不能互相比较。
+# 其唯一权威顺序是对齐物化时写入的 sequence_index（即 alignment pair order）。
+DOCUMENT_PAIR_SEGMENT_ORDERING = (
     case((Segment.sequence_index >= 0, 0), else_=1).asc(),
     Segment.sequence_index.asc(),
     Segment.sentence_id.asc(),
@@ -199,6 +227,14 @@ def _count_confirmed_segments(items: list[dict]) -> int:
 
 
 def get_segment_ordering_for_file_record(file_record: FileRecord | None):
+    if file_record is not None:
+        raw_options = file_record.document_parse_options
+        try:
+            parse_options = json.loads(raw_options or "{}") if isinstance(raw_options, str) else raw_options or {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parse_options = {}
+        if isinstance(parse_options, dict) and parse_options.get("alignment_mode") == "document_pair":
+            return DOCUMENT_PAIR_SEGMENT_ORDERING
     if file_record is not None and Path(file_record.filename or "").suffix.lower() == ".pptx":
         return PPTX_SEGMENT_ORDERING
     return SEGMENT_ORDERING
@@ -1226,9 +1262,11 @@ def _normalize_segment_target_for_save(
 
 MACHINE_SEGMENT_SOURCES = {
     "llm",
+    "llm_review",
     "tm",
     "project_sync",
     "english_variant_conversion",
+    "imported_translation",
     "none",
     "",
 }
@@ -1299,7 +1337,7 @@ def update_segment_target(
     _mark_segment_modified_by(segment, current_user)
     segment.version = int(segment.version or 1) + 1
     segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
-    if source == "llm":
+    if source in {"llm", "llm_review"}:
         segment.llm_provider = llm_provider
         segment.llm_model = llm_model
     else:
@@ -1581,11 +1619,70 @@ def delete_file_record(db: Session, file_record_id: UUID) -> bool:
     if not file_record:
         return False
 
+    affected_batch_ids = [
+        row[0]
+        for row in db.query(ProofreadingColumnBinding.batch_id)
+        .filter(ProofreadingColumnBinding.file_record_id == file_record_id)
+        .distinct()
+    ]
+    binding_ids = [
+        row[0]
+        for row in db.query(ProofreadingColumnBinding.id)
+        .filter(ProofreadingColumnBinding.file_record_id == file_record_id)
+    ]
+    if binding_ids:
+        db.query(ProofreadingSegmentBaseline).filter(
+            ProofreadingSegmentBaseline.binding_id.in_(binding_ids)
+        ).delete(synchronize_session=False)
+        db.query(ProofreadingColumnBinding).filter(
+            ProofreadingColumnBinding.id.in_(binding_ids)
+        ).delete(synchronize_session=False)
     db.delete(file_record)
     db.commit()
     if file_record.filename:
         delete_source_file(file_record.id, file_record.filename)
+    for batch_id in affected_batch_ids:
+        batch = db.query(ProofreadingBatch).filter(ProofreadingBatch.id == batch_id).first()
+        if not batch:
+            continue
+        if (
+            batch.status in _ACTIVE_PROOFREADING_STATUSES
+            or batch.export_status in _ACTIVE_EXPORT_STATUSES
+        ):
+            continue
+        has_remaining_binding = db.query(ProofreadingColumnBinding.id).filter(
+            ProofreadingColumnBinding.batch_id == batch_id
+        ).first()
+        if has_remaining_binding is None:
+            delete_proofreading_batch(db, batch)
     return True
+
+
+def delete_proofreading_batch(db: Session, batch: ProofreadingBatch) -> None:
+    """删除校对批次及其绑定、基线、对齐数据，并清理绑定文件与磁盘缓存。"""
+    file_record_ids = [
+        row[0]
+        for row in db.query(ProofreadingColumnBinding.file_record_id)
+        .filter(ProofreadingColumnBinding.batch_id == batch.id)
+        .distinct()
+    ]
+    if batch.export_path:
+        export_path = Path(batch.export_path)
+        if export_path.is_file():
+            try:
+                export_path.unlink()
+            except OSError:
+                logger.warning("无法删除校对导出文件：%s", export_path)
+    db.delete(batch)
+    db.commit()
+    cache_dir = Path(get_settings().file_storage_dir) / "alignment_sources"
+    for stale in cache_dir.glob(f"{batch.id}*"):
+        try:
+            stale.unlink()
+        except OSError:
+            logger.warning("无法删除对齐原文缓存：%s", stale)
+    for file_record_id in file_record_ids:
+        delete_file_record(db, file_record_id)
 
 
 def _is_docx_filename(filename: str) -> bool:

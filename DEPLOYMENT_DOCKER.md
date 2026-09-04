@@ -51,6 +51,7 @@ nano .env.prod
 |------|------|------|
 | `UPLOAD_MAX_TOTAL_SIZE_MB` | 500 | 单次上传总大小 |
 | `UPLOAD_MAX_FILES_PER_BATCH` | 50 | 单次文件数 |
+| `UPLOAD_MAX_FILES_PER_SELECTION` | 200 | 前端一次最多选择的文件数；超出单批上限时自动顺序分批 |
 | `UPLOAD_MAX_EXPANDED_FILES` | 100 | zip/rar 解压后文件数 |
 | `IMPORT_TASK_DIR` | `/app/data/import_tasks` | 导入暂存（app 与各 worker 共享卷） |
 | `GUNICORN_TIMEOUT` | 600 | 大文件上传超时（秒） |

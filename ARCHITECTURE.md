@@ -1,12 +1,12 @@
-# 项目基本框架
+# 项目架构（Architecture）
 
-> 项目名称：**AI Translation System**（项目化翻译工作台 + TM/术语/词汇表资产管理）
+> 项目名称：**AI Translation System**（项目化翻译工作台 + TM/术语/词汇表资产管理 + 翻译内容校对）
 >
-> 更新时间：**2026-07-22**
+> 更新时间：**2026-08-07**
 >
 > 技术栈：**FastAPI + SQLAlchemy 2 + PostgreSQL(pg_trgm/pgvector) + Redis/ARQ + Vue 3 + Vite + Pinia + vue-i18n + Naive UI + ECharts**
 >
-> 定位：一个面向内部翻译流程的 Web 工作台，支持项目创建、文件上传、多格式句段抽取、多阶段指派、TM/术语/词汇表辅助、AI 预翻译与修正、参考资料分析、术语与拼写语法 QA、批注协作、修订确认、项目合并视图、英美式英语副本、数据看板和译后文件导出。
+> 定位：一个面向内部翻译流程的 Web 工作台，支持项目创建、文件上传、多格式句段抽取、多阶段指派、TM/术语/词汇表辅助、AI 预翻译与修正、参考资料分析、术语与拼写语法 QA、翻译内容校对（基于项目规则 + LLM）、多语种 Excel 校对工作流、批注协作、修订确认、项目合并视图、英美式英语副本、数据看板和译后文件导出。
 
 ---
 
@@ -19,20 +19,22 @@ AI_translation_system12312/
 │   ├── config.py                # pydantic-settings 配置：DB、JWT、Redis、LLM、上传、导入导出队列等
 │   ├── database.py              # SQLAlchemy engine / SessionLocal / Base / get_db
 │   ├── logging.py               # 后端日志配置
-│   ├── models.py                # ORM 模型：项目、文件、句段、TM、术语、词汇表、QA、通知、参考资料等
+│   ├── models.py                # ORM 模型：项目、文件、句段、TM、术语、词汇表、QA、校对、通知、参考资料等
 │   ├── schemas.py               # 认证、匹配候选、导入导出等共享 Pydantic Schema
-│   ├── auth.py                  # 密码哈希、JWT、角色/译者类型、权限依赖
+│   ├── auth.py                  # 密码哈希、JWT、角色/译者类型、权限依赖（含 require_business_manager）
 │   ├── routers/
 │   │   ├── auth.py              # /api/auth/*：初始化、登录、当前用户、用户管理
-│   │   ├── api.py               # 主业务 API：项目、任务、句段、预翻译、TM、QA、导出、通知等
+│   │   ├── api.py               # 主业务 API：项目、任务、句段、预翻译、TM、QA、翻译内容校对、导出、通知等
 │   │   ├── term_base.py         # /api/term-bases*：译后检查术语库
 │   │   ├── glossary_base.py     # /api/glossary-bases*：AI 预翻译词汇表
 │   │   ├── reference.py         # /api/reference/*：参考资料上传、分析、匹配和应用
+│   │   ├── proofreading.py      # /api/.../proofreading*：多语种 Excel 校对工作流
 │   │   └── tools.py             # /api/tools/*：独立文档工具（当前为引号转换）
 │   ├── services/                # 业务服务层
 │   ├── services/adapters/       # 多格式解析与原格式导出适配器
 │   ├── services/export_settings/# DOCX 导出样式提取、调整、渲染与接入
-│   └── services/reference_analyzer/ # 参考资料解析、分类、对齐、匹配和 LLM 辅助分析
+│   ├── services/reference_analyzer/ # 参考资料解析、分类、对齐、匹配和 LLM 辅助分析
+│   └── services/translation_review/ # 翻译内容校对：规则解析、LLM 批次检查、锚点定位、应用/撤销、Web 验证
 │
 ├── frontend/                    # Vue 3 + Vite 前端
 │   ├── package.json             # Vue / Pinia / Router / i18n / Axios / Naive UI / ECharts / Playwright
@@ -46,11 +48,11 @@ AI_translation_system12312/
 │       ├── styles.css           # 全局 UI 样式
 │       ├── i18n.ts              # vue-i18n 初始化
 │       ├── locales/             # 中文/英文文案
-│       ├── api/                 # axios 实例、导入任务、合并视图 API 封装
+│       ├── api/                 # axios 实例、导入任务、合并视图、校对批次 API 封装
 │       ├── router/              # 路由与登录/角色守卫
 │       ├── stores/              # Pinia：auth / task / segment / comment / shell / preferences
 │       ├── views/               # 项目、任务、工作台、资源库、看板、用户等页面
-│       ├── components/          # 工作台、预览、资源导入、批注、QA、分页等组件
+│       ├── components/          # 工作台、预览、资源导入、批注、QA、校对面板、分页等组件
 │       ├── composables/         # toast、confirm、页头、富文本编辑器、工作台快捷键
 │       ├── constants/           # 支持格式、语言、状态、LLM 常量
 │       ├── utils/               # 预览渲染、下载、SSE、diff、进度、术语匹配等工具
@@ -58,7 +60,7 @@ AI_translation_system12312/
 │
 ├── scripts/                     # 数据库初始化、增量迁移、导入、诊断、部署脚本
 │   ├── init_db.sql              # 新库主初始化脚本
-│   ├── migrations/              # 容器启动时按顺序幂等执行的 SQL 迁移
+│   ├── migrations/              # 容器启动时按顺序幂等执行的 SQL 迁移（0001—0023）
 │   ├── run_migrations.sh        # Docker db-migrate 服务入口
 │   ├── deploy_prod.sh           # 生产部署辅助脚本
 │   ├── import_tm*.py            # TM 导入脚本
@@ -68,8 +70,8 @@ AI_translation_system12312/
 ├── tests/                       # pytest 测试与测试素材
 ├── tools/                       # 批量上传、浏览器下载、XLSX 转 CSV 等运维工具
 ├── docker/                      # nginx、mihomo、PostgreSQL 初始化等容器配置
-├── docs/                        # 开发/测试补充文档
-├── data/                        # 运行期文件存储：file_records / export_tasks / import_tasks
+├── docs/                        # 开发/测试补充文档（如 e2e-browser-agent 指南）
+├── data/                        # 运行期文件存储：file_records / export_tasks / import_tasks / proofreading_exports
 ├── logs/                        # 后端日志和 pytest 临时目录
 ├── outputs/                     # 调试导出文件
 ├── migrations/                  # 历史 SQL 补丁
@@ -85,9 +87,9 @@ AI_translation_system12312/
 ├── README.md                    # 使用说明与 API 速查
 ├── DEPLOYMENT_DOCKER.md         # Docker 部署说明
 ├── DATABASE_MIGRATION.md        # 数据库迁移说明
+├── ARCHITECTURE.md              # 本文件（原 项目基本框架.md）
 ├── .env.example                 # 开发环境变量模板
-├── .env.prod.example            # 生产环境变量模板
-└── 项目基本框架.md              # 本文件
+└── .env.prod.example            # 生产环境变量模板
 ```
 
 > 根目录下的 `tm_*.json`、`term_*.json`、下载目录、日志和部分截图是近期资源导出/探测/调试产物，不属于核心代码框架。
@@ -100,16 +102,18 @@ AI_translation_system12312/
 ┌─────────────────────────────────────────────────────────────────────┐
 │ Browser / Vue 3 SPA                                                  │
 │ Router + Pinia + vue-i18n + axios + lucide-vue-next                  │
-│ 看板 / 项目 / 任务 / 工作台 / TM / 术语库 / 词汇表 / 用户 / 指派记录 │
+│ 看板 / 项目 / 任务 / 工作台 / TM / 术语库 / 词汇表 / 校对 / 用户 / 指派 │
 └─────────────────────────────┬───────────────────────────────────────┘
                               │ HTTP + Bearer JWT / SSE / 文件下载
 ┌─────────────────────────────▼───────────────────────────────────────┐
 │ FastAPI (app/main.py)                                                │
 │ ├── /api/auth/*                    app/routers/auth.py               │
 │ ├── /api/projects / file-records / translation-memory / ... api.py   │
+│ │   含翻译内容校对：translation-review-tasks / -reports / -items     │
 │ ├── /api/term-bases*               app/routers/term_base.py          │
 │ ├── /api/glossary-bases*           app/routers/glossary_base.py      │
 │ ├── /api/reference/*               app/routers/reference.py          │
+│ ├── /api/.../proofreading*         app/routers/proofreading.py       │
 │ ├── /api/tools/*                   app/routers/tools.py              │
 │ ├── /api/health / app-version      健康检查与前端版本                │
 │ └── /assets 与 /*                  frontend/dist 生产托管            │
@@ -118,16 +122,18 @@ AI_translation_system12312/
 ┌─────────────────────────────▼───────────────────────────────────────┐
 │ Service 层                                                           │
 │ 文件解析/导出、句段保存、匹配、预翻译、英美式转换、修订、批注、指派、│
-│ 通知、QA、文档统计、阶段进度、项目同步、参考资料分析、缓存与任务队列 │
+│ 通知、QA、翻译内容校对（规则+LLM+Web 验证）、多语种 Excel 校对、     │
+│ 文档统计、阶段进度、项目同步、参考资料分析、缓存与任务队列          │
 └───────────────┬─────────────────────┬───────────────────────────────┘
                 │                     │
 ┌───────────────▼────────────┐ ┌──────▼───────────────────────────────┐
 │ PostgreSQL                  │ │ 外部/可选服务                         │
 │ pg_trgm + pgvector          │ │ DeepSeek / OpenRouter                  │
-│ 项目、文件、句段、TM、术语  │ │ Redis + ARQ（导入导出队列/缓存）       │
-│ 词汇表、参考资料、QA、通知  │ │ LanguageTool（拼写/语法 QA）           │
-│ 批注、修订、统计、指派      │ │ LibreOffice / Aspose.Words（文档处理） │
-└─────────────────────────────┘ └───────────────────────────────────────┘
+│ 项目、文件、句段、TM、术语  │ │ Redis + ARQ（导入/导出/auto-TM/同步/  │
+│ 词汇表、参考资料、QA、校对  │ │   预翻译/翻译内容校对 队列与缓存）     │
+│ 批注、修订、统计、指派      │ │ LanguageTool（拼写/语法 QA）           │
+└─────────────────────────────┘ │ LibreOffice / Aspose.Words（文档处理） │
+                                └───────────────────────────────────────┘
 ```
 
 ---
@@ -136,10 +142,10 @@ AI_translation_system12312/
 
 | 文件 | 作用 |
 | --- | --- |
-| `app/main.py` | 校验运行配置；调用 `ensure_runtime_schema()`；挂载 `auth`、主业务、术语库、参考资料、词汇表和工具路由；初始化导入任务存储；可调大 anyio 线程池；提供 `/api/health` 和 `/api/app-version`；生产环境托管 `frontend/dist` |
+| `app/main.py` | 校验运行配置；调用 `ensure_runtime_schema()`；挂载 `auth`、主业务、术语库、参考资料、词汇表、校对和工具路由；初始化导入任务存储；可调大 anyio 线程池；提供 `/api/health` 和 `/api/app-version`；生产环境托管 `frontend/dist` |
 | `app/config.py` | 管理 `DATABASE_URL`、连接池、PgBouncer 事务池模式、上传限制、导入/导出目录、Redis/ARQ、LibreOffice/Aspose、TM 向量、DeepSeek/OpenRouter、LanguageTool、JWT、CORS、日志级别等 |
 | `app/database.py` | 创建 SQLAlchemy engine；配置连接池、`application_name`、时区或 PgBouncer `prepare_threshold=None`；提供 `SessionLocal`、`Base`、`get_db()` |
-| `app/auth.py` | `passlib[bcrypt]` 密码哈希；`python-jose` JWT；角色 `super_admin/admin/user`；译者类型 `internal/external`；项目访问权限判断；管理员依赖 |
+| `app/auth.py` | `passlib[bcrypt]` 密码哈希；`python-jose` JWT；角色 `super_admin/admin/user`；译者类型 `internal/external`；项目访问权限判断；权限依赖 `require_admin` / `require_resource_creator` / `require_business_manager`（管理员或内部译者） |
 | `app/logging.py` | 后端日志格式与级别 |
 | `app/services/schema_setup.py` | 启动时检查关键表/列和历史命名；必要时补齐部分运行时 schema |
 
@@ -148,8 +154,9 @@ AI_translation_system12312/
 - `JWT_SECRET_KEY` 不能保留默认值 `change-me-in-production`，否则后端拒绝启动。
 - 生产推荐通过 PgBouncer 事务池连接数据库，并设置 `DATABASE_PGBOUNCER_TRANSACTION_MODE=true`。
 - `REDIS_URL` 未配置时部分缓存和队列能力会退回本地模式；生产建议配置 Redis。
-- AI 修正至少需要配置 `DEEPSEEK_API_KEY` 或 `OPENROUTER_API_KEY`。
+- AI 修正与翻译内容校对至少需要配置 `DEEPSEEK_API_KEY` 或 `OPENROUTER_API_KEY`。
 - 拼写/语法 QA 依赖可选的自托管 LanguageTool：`LANGUAGETOOL_BASE_URL`。
+- 翻译内容校对的 Web 验证能力依赖可选的 `OPENROUTER_API_KEY`（Web 搜索 provider）。
 
 ---
 
@@ -200,6 +207,7 @@ AI_translation_system12312/
 | 术语抽取 | `POST /api/file-records/{id}/term-extraction`、`POST /api/file-records/{id}/term-extraction/save` |
 | 术语 QA | 项目/文件/合并视图生成术语报告；报告查询、忽略项、XLSX 导出 |
 | 拼写语法 QA | `POST /api/file-records/{id}/qa-checks/spelling-grammar`、QA 结果查询/保存/导出、忽略项 |
+| 翻译内容校对 | 文件/合并视图建任务：`POST /api/file-records/{id}/translation-review-tasks`、`POST /api/merge-views/{view_id}/translation-review-tasks`；报告查询、单项 apply/restore/reject、批量 apply/undo、忽略项、重跑、DOCX/XLSX 导出（详见 4.7） |
 | 问题标记 | `GET/POST /api/projects/{project_id}/issue-markers`、`PATCH/DELETE /api/issue-markers/{id}` |
 | 文档统计 | `POST /api/projects/{project_id}/document-statistics`、报告列表和详情 |
 | 修订 | `GET /api/file-records/{id}/revisions`、显示设置、单条接受/拒绝、批量接受/拒绝 |
@@ -262,6 +270,46 @@ AI_translation_system12312/
 
 该工具是独立文件转换能力，不进入项目、任务、句段或 TM 流程，也不写数据库。前端入口为 `/tools/quote-converter`。
 
+### 4.7 多语种 Excel 校对 API（`app/routers/proofreading.py`）
+
+校对工作流面向“表格型 XLSX”：用户上传一个含原文列与多语种译文列的工作簿，显式映射列后按目标语言生成统一校对版。所有接口要求 `require_business_manager`（管理员或内部译者），且项目 `workflow_template_id` 必须为 `proofread`。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/projects/{project_id}/proofreading/preview` | 上传 `.xlsx` 预览工作表、表头行、列角色与语言建议，返回 `preview_token` |
+| `POST` | `/api/projects/{project_id}/proofreading-batches` | 基于预览令牌和列映射创建校对批次，按目标语言生成 FileRecord/Segment 与基线 |
+| `GET` | `/api/projects/{project_id}/proofreading-batches` | 项目下校对批次列表 |
+| `GET` | `/api/proofreading-batches/{batch_id}` | 批次详情（含列绑定与统计） |
+| `POST` | `/api/proofreading-batches/{batch_id}/generate` | 排队 LLM 校对（后台任务；支持提示词与模型选择，不走 TM/词汇表） |
+| `POST` | `/api/proofreading-batches/{batch_id}/cancel` | 取消进行中的 LLM 校对（`queued` 立即结束；`running` 协作退出，已写入句段保留） |
+| `POST` | `/api/proofreading-batches/{batch_id}/exports` | 排队合并 Excel 生成（后台任务） |
+| `GET` | `/api/proofreading-batches/{batch_id}/exports/latest` | 下载合并后的校对版 Excel |
+| `GET` | `/api/file-records/{file_record_id}/proofreading-baselines` | 工作台读取该文件的校对基线（原译文、单元格引用），用于校对前后对比 |
+
+### 4.8 翻译内容校对 API（`app/routers/api.py` 内 `translation-review-*`）
+
+基于项目规则文件（`projects.translation_rules`）+ LLM 的统一内容检查。规则文件为纯文本/Markdown，检查时把规则 + 批次句段一起喂给 LLM，由模型判断违规类别并返回问题列表，程序层负责锚点定位、去重、落库和应用/撤销。报告同时支持可选的 Web 验证（Web 搜索复核）。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/file-records/{file_record_id}/translation-review-tasks` | 基于文件创建校对任务（异步 ARQ） |
+| `POST` | `/api/merge-views/{view_id}/translation-review-tasks` | 基于合并视图创建校对任务 |
+| `GET` | `/api/file-records/{file_record_id}/translation-review-reports` | 文件级校对报告列表 |
+| `GET` | `/api/merge-views/{view_id}/translation-review-reports` | 合并视图级校对报告列表 |
+| `GET` | `/api/translation-review-tasks/{task_id}` | 校对任务状态 |
+| `GET` | `/api/translation-review-reports/{report_id}` | 报告详情（含问题项） |
+| `POST` | `/api/translation-review-reports/{report_id}/rerun` | 重跑报告 |
+| `POST` | `/api/translation-review-report-items/{item_id}/apply` | 应用单项建议到句段 |
+| `POST` | `/api/translation-review-report-items/{item_id}/restore` | 撤销单项应用 |
+| `POST` | `/api/translation-review-report-items/{item_id}/reject` | 驳回单项 |
+| `PATCH` | `/api/translation-review-report-items/ignore` | 批量忽略/取消忽略 |
+| `POST` | `/api/translation-review-reports/{report_id}/apply-batch` | 批量应用 |
+| `POST` | `/api/translation-review-reports/{report_id}/undo-batch` | 批量撤销 |
+| `GET` | `/api/translation-review-reports/{report_id}/export-docx` | 导出 DOCX 报告 |
+| `GET` | `/api/translation-review-reports/{report_id}/export-xlsx` | 导出 XLSX 报告 |
+
+> 多语种 Excel 校对（4.7）也复用 `translation_review_reports` / `translation_review_report_items` 落库校对结果，其 `report_mode='proofread_generate'`、`scope='proofreading_batch'`，并通过 `proofreading_batch_id` 关联批次。
+
 ---
 
 ## 5. 数据模型
@@ -270,7 +318,7 @@ AI_translation_system12312/
 
 | 表 / 模型 | 说明 |
 | --- | --- |
-| `projects` / `Project` | 翻译项目，含语言对、状态、截止时间、访问级别、创建人、翻译规则、默认 TM/术语/词汇表配置 |
+| `projects` / `Project` | 翻译项目，含语言对、状态、截止时间、访问级别、创建人、翻译规则、`workflow_template_id`（`custom`/`proofread` 等工作流模板）、默认 TM/术语/词汇表配置 |
 | `project_workflow_steps` / `ProjectWorkflowStep` | 项目自定义工作流步骤 |
 | `project_merge_views` / `ProjectMergeView` | 项目内多文件合并工作台视图 |
 | `file_records` / `FileRecord` | 项目下任务文件，保存源文件、状态、语言对、解析选项、绑定资源、TM 检索范围、操作锁和指派信息 |
@@ -282,6 +330,12 @@ AI_translation_system12312/
 | `segment_qa_issues` / `SegmentQAIssue` | 拼写/语法等 QA 问题明细 |
 | `term_qa_reports` / `TermQAReport` | 术语 QA 报告 |
 | `term_qa_report_items` / `TermQAReportItem` | 术语 QA 报告项 |
+| `translation_review_reports` / `TranslationReviewReport` | 翻译内容校对报告，支持 file / merge_view / proofreading_batch 等范围，含 `report_mode`、`proofreading_batch_id`、Web 验证 provider 与统计 |
+| `translation_review_report_items` / `TranslationReviewReportItem` | 校对问题项，含分类、严重度、锚点定位、建议值、置信度、应用状态与忽略信息 |
+| `translation_review_agent_runs` / `TranslationReviewAgentRun` | 校对过程中的 Agent 运行记录（含 Web 验证步骤） |
+| `proofreading_batches` / `ProofreadingBatch` | 多语种 Excel 校对批次，聚合列映射、生成状态、统计与导出状态 |
+| `proofreading_column_bindings` / `ProofreadingColumnBinding` | 批次内列映射：原文列、译文列、输出列、目标语言，绑定到 FileRecord |
+| `proofreading_segment_baselines` / `ProofreadingSegmentBaseline` | 校对不可变基线：句段、单元格引用与原译文，用于“校对前 vs 校对后”对比与导出 |
 | `document_statistics_reports` / `DocumentStatisticsReport` | 文档统计报告 |
 | `document_statistics_report_items` / `DocumentStatisticsReportItem` | 文档统计明细 |
 | `users` / `User` | 用户账号，含昵称、角色、译者类型、启用状态 |
@@ -357,6 +411,8 @@ AI_translation_system12312/
 | `quote_converter.py` | 引号宽度/形状转换；按文件类型处理纯文本、DOCX、XLSX、PPTX 和 HTML，供 `/api/tools/quote-convert` 调用 |
 | `export_settings/*` | DOCX 导出样式提取、直接样式编辑、样式调整和渲染；通过 `style_export_integration.py` 接入文件导出队列 |
 | `reference_analyzer/*` | 参考资料解析、分类、相似度、对齐、LLM 辅助、进度记录和服务编排 |
+| `translation_review/*` | 翻译内容校对：`service.py`（建报告/批次 LLM 检查/应用撤销/序列化/ARQ 入口）、`agent_runner.py`（Agent 编排）、`checker.py`（锚点定位/去重）、`llm_gate.py`（LLM 调用并发闸门）、`payload.py`（批次组装）、`program_rules/*`（规则解析）、`prompts/*`（提示词）、`web_verify/*`（Web 搜索验证：base/noop/openrouter/custom） |
+| `proofreading.py` | 多语种 Excel 校对批次：工作簿预览、列映射校验、按目标语言生成 FileRecord/Segment 与基线、LLM 校对生成、合并 Excel 导出（插列 + 复制样式） |
 
 `beautifulsoup4`（导入名 `bs4`）的当前依赖边界：
 
@@ -446,9 +502,9 @@ DOCX 解析、预翻译、编辑和导出对换行采用“双文本轨道”：
 | `/` | `AppLayout.vue` | 应用壳层，默认跳转项目列表或外部译者任务页 |
 | `/dashboard` | `DashboardView.vue` | 数据看板，管理员/内部用户使用；外部译者会被拦截 |
 | `/projects` | `ProjectListView.vue` | 项目列表、创建项目、进度概览 |
-| `/projects/:id` | `ProjectDetailView.vue` | 项目详情、上传文档、指派、统计、预翻译、英美式英语副本和文件列表 |
+| `/projects/:id` | `ProjectDetailView.vue` | 项目详情、上传文档、指派、统计、预翻译、英美式英语副本、多语种校对、文件列表 |
 | `/tasks` | `TaskListView.vue` | 我的任务、直接上传任务文件 |
-| `/tasks/:id` | `WorkbenchView.vue` | 翻译工作台：编辑、预览、TM、术语、词汇表、参考资料、QA、批注、历史、导出 |
+| `/tasks/:id` | `WorkbenchView.vue` | 翻译工作台：编辑、预览、TM、术语、词汇表、参考资料、QA、校对、批注、历史、导出 |
 | `/tasks/:id/focus` | `WorkbenchView.vue` | 独立专注工作台 |
 | `/merge/:viewId/focus` | `WorkbenchView.vue` | 合并视图独立工作台 |
 | `/tm` | `TMManagementView.vue` | 记忆库列表、创建、导入、合并为新库、追加到已有库、导出 |
@@ -475,7 +531,7 @@ DOCX 解析、预翻译、编辑和导出对换行采用“双文本轨道”：
 | --- | --- |
 | `auth.ts` | token、当前用户、初始化状态、登录、初始化管理员、用户注册、角色/译者类型判断 |
 | `task.ts` | 任务列表、上传进度、直接上传任务文件、删除任务 |
-| `segment.ts` | 工作台文件详情、句段分页、预览、自动保存、实时阶段进度、LLM SSE、修订、导出、QA/术语等工作台状态 |
+| `segment.ts` | 工作台文件详情、句段分页、预览、自动保存、实时阶段进度、LLM SSE、修订、导出、QA/术语/校对等工作台状态 |
 | `comment.ts` | 批注加载、轮询刷新、新建、回复、更新、删除、活动批注与草稿锚点 |
 | `shell.ts` | 应用壳层状态、最近访问项等 |
 | `preferences.ts` | 语言和主题偏好，本地存储 |
@@ -499,6 +555,7 @@ DOCX 解析、预翻译、编辑和导出对换行采用“双文本轨道”：
 | `ResourceImportPanel.vue` / `ResourceImportDialog.vue` | TM / 术语 / 词汇表导入 |
 | `ResourceDetailPage.vue` | TM/术语/词汇表详情页通用布局 |
 | `PreTranslateDialog.vue` | 项目文件批量预处理：TM 重匹配、LLM 修正、词汇表/术语绑定 |
+| `ProofreadingPanel.vue` | 多语种 Excel 校对：上传预览、列与语言映射、创建批次、启动 LLM 校对、轮询进度、生成并下载合并 Excel |
 | `WorkflowProgressSummary.vue` | 项目/文件工作流进度概览；项目页显示总流程，工作台底栏显示当前阶段百分比与已完成/总句段数 |
 | `AppUpdatePrompt.vue` | 前端版本更新提示 |
 
@@ -525,7 +582,7 @@ Docker 生产环境由 `docker-compose.prod.yml` 完成：
 
 - `postgres` 首次启动挂载 `scripts/init_db.sql`、`scripts/create_reference_profiles.sql` 等初始化脚本。
 - `db-migrate` 每次启动执行 `scripts/run_migrations.sh`，按文件名顺序运行 `scripts/migrations/*.sql`。
-- 当前幂等迁移链已覆盖 `0001`—`0021`，主要包括：句段 trigram 与稳定顺序索引、项目合并视图、修订显示设置、分段指派范围、翻译规则、资源创建者、TMX 元数据、pgvector、Auto-TM、TM 检索投影、参考资料同步、句段元数据、文件级句段统计、项目同步 outbox、TM 检索范围、TM/术语库持久化条目数及 LLM 模型看板索引。
+- 当前幂等迁移链已覆盖 `0001`—`0023`，主要包括：句段 trigram 与稳定顺序索引、项目合并视图、修订显示设置、分段指派范围、翻译规则、资源创建者、TMX 元数据、pgvector、Auto-TM、TM 检索投影、参考资料同步、句段元数据、文件级句段统计、项目同步 outbox、TM 检索范围、TM/术语库持久化条目数、LLM 模型看板索引、文件译后文件名字段，以及多语种 Excel 校对工作流（`0023`：`projects.workflow_template_id`、`proofreading_batches`、`proofreading_column_bindings`、`proofreading_segment_baselines` 与校对报告扩展列）。
 - 目录中目前同时存在两组 `0005` 和两组 `0021` 文件；部署脚本按完整文件名排序，并在每次启动时重新执行全部幂等脚本，因此两组文件都会独立执行。新增迁移不得仅凭数字前缀判断顺序，也必须保持可重复执行。
 
 历史库升级时仍可能需要按现场状态执行 `scripts/add_*.sql`、`scripts/create_*.sql`、`scripts/rename_translation_memory_tables.sql`、`scripts/migrate_primary_keys_to_uuid.sql` 等补丁。
@@ -544,6 +601,8 @@ Docker 生产环境由 `docker-compose.prod.yml` 完成：
 - `file_segment_stats`：以触发器增量维护文件状态统计，确认、轮询和进度计算不再重复全文件聚合。
 - `project_segment_sync_outbox(status, last_enqueued_at)`：项目重复句段同步 worker 的待办扫描。
 - `segment_revisions(file_record_id/segment_id/status)`、`segment_comments(file_record_id/segment_id/parent_id)`：工作台协作加载。
+- `translation_review_reports(scope, created_at)`、`...(proofreading_batch_id)`、`translation_review_report_items(report_id, sentence_id)` 与 `...(report_id, file_order, block_index, row_index, cell_index, sequence_index, sentence_id, category_index)`：校对报告分页与排序。
+- `proofreading_batches(project_id/status/created_by_id/created_at)`、`proofreading_column_bindings(batch_id/file_record_id)`、`proofreading_segment_baselines(batch_id/binding_id/segment_id)`：校对批次与基线查询。
 - `project_assignments`、`file_assignments`、`assignment_events`、`notifications`：项目权限和通知查询；`file_assignments.segment_range_start/end` 用于外部译者分段可见/可写判断。
 
 ---
@@ -574,6 +633,7 @@ ARQ_MAINTENANCE_MAX_JOBS=0
 ARQ_AUTO_TM_MAX_JOBS=0
 ARQ_SEGMENT_SYNC_MAX_JOBS=0
 ARQ_PRETRANSLATION_MAX_JOBS=0
+ARQ_TRANSLATION_REVIEW_MAX_JOBS=0
 PRETRANSLATION_RUN_FILE_CONCURRENCY=2
 AUTO_TM_OUTBOX_MAX_BATCHES_PER_RUN=5
 AUTO_TM_REMATCH_MAX_FILES_PER_RUN=1
@@ -622,6 +682,7 @@ IMPORT_TASK_DIR=data/import_tasks
 IMPORT_TASK_STAGING_TTL_SECONDS=86400
 UPLOAD_MAX_SIZE_MB=100
 UPLOAD_MAX_FILES_PER_BATCH=50
+UPLOAD_MAX_FILES_PER_SELECTION=200
 UPLOAD_MAX_TOTAL_SIZE_MB=500
 UPLOAD_MAX_EXPANDED_FILES=100
 DEFAULT_SIMILARITY_THRESHOLD=0.60
@@ -648,7 +709,7 @@ ProjectListView
   │ POST /api/projects
   ▼
 api.py.create_project
-  └─ 写入 projects、默认工作流和资源设置
+  └─ 写入 projects（含 workflow_template_id）、默认工作流和资源设置
 
 ProjectDetailView
   │ POST /api/projects/{project_id}/source-document
@@ -706,7 +767,7 @@ pretranslation_runs + pretranslation_tasks
 - `PreTranslateDialog.vue` 提交 `llm_translation_unit` 时默认使用 `sentence`。句段模式不依赖模型返回段落级严格 JSON，能避免某一组 `sentence_id/source_hash` 校验失败导致整组句段全部失败。
 - 后端仍支持 `paragraph`，但它属于上下文增强模式：会按段落/表格单元格组装上下文并要求模型返回严格 JSON，适合确认模型能稳定遵守 `translations`、`sentence_id`、`source_hash` 合同后再启用。
 - Word 句段如带版式换行，LLM 阶段使用 `source_layout_text` 并把换行显式标记为 `⟦LB_n⟧`；结果写回前还原为 `\n`，校验失败会触发重试或记录错误。
-- 后台 ARQ 队列按职责隔离：`arq:import` 处理上传和资源导入，`arq:auto-tm` 处理 auto-TM outbox 和自动重匹配，`arq:segment-sync` 处理项目重复句段同步，`arq:maintenance` 保留给手动 QA 和遗留维护任务，`arq:pretranslation` 处理预翻译 run。
+- 后台 ARQ 队列按职责隔离：`arq:import` 处理上传和资源导入，`arq:auto-tm` 处理 auto-TM outbox 和自动重匹配，`arq:segment-sync` 处理项目重复句段同步，`arq:maintenance` 保留给手动 QA 和遗留维护任务，`arq:pretranslation` 处理预翻译 run，`arq:translation-review` 处理翻译内容校对任务。
 - 预翻译队列分两层限流：`ARQ_PRETRANSLATION_MAX_JOBS` 控制同时执行多少个 run，`PRETRANSLATION_RUN_FILE_CONCURRENCY` 控制单个 run 内同时处理多少个文件；每个文件的 LLM 阶段还受 `LLM_MAX_CONCURRENCY` 限制。
 - 预翻译任务即使整体状态为 `completed`，只要 `error_segments > 0`，前端也必须展示 `pretranslation_tasks.error`。不要只展示“成功/失败计数”，否则会掩盖真实原因，例如 JSON 校验失败、符号/数字保护失败或数据库写回失败。
 
@@ -774,12 +835,75 @@ reference_analyzer
 WorkbenchView
   ├─ 术语 QA：生成 term_qa_reports / term_qa_report_items
   ├─ 拼写语法 QA：手动生成时调用 LanguageTool -> segment_qa_issues
+  ├─ 翻译内容校对：见 11.8
   ├─ 问题标记：issue_markers
   ├─ 批注：segment_comments 支持选区和回复
   └─ 修订：segment_revisions 支持接受/拒绝/批量处理
 ```
 
-### 11.8 译后文件导出
+### 11.8 翻译内容校对
+
+```text
+WorkbenchView / MergeView
+  │ POST /api/file-records/{id}/translation-review-tasks
+  │ 或 POST /api/merge-views/{view_id}/translation-review-tasks
+  ▼
+translation_review.service.run_review_with_rules（arq:translation-review）
+  ├─ 读取 projects.translation_rules 规则文件
+  ├─ 按批次（约 50 条）组装句段 + 规则喂给 LLM
+  ├─ LLM 返回违规类别与问题列表
+  ├─ 程序层锚点定位、去重、置信度归类
+  ├─ 可选 Web 验证（web_verify）复核事实类问题
+  ├─ 落库 translation_review_reports / _report_items / _agent_runs
+  └─ 前端逐项 apply / restore / reject 或批量 apply / undo
+```
+
+校对结果可通过 `GET /api/translation-review-reports/{id}/export-docx` 和 `.../export-xlsx` 导出。应用建议会写回 `segments.target_text` 并生成 `segment_revisions`，便于追溯。
+
+### 11.9 多语种 Excel 校对工作流
+
+```text
+ProjectDetailView（workflow_template_id === 'proofread'）
+  │ ProofreadingPanel 上传 .xlsx
+  │ POST /api/projects/{project_id}/proofreading/preview
+  ▼
+proofreading.preview_workbook
+  ├─ 检测表头行、列角色与语言建议
+  ├─ 标记不安全结构（公式/合并单元格/图表/数据验证/透视表）阻止插列
+  └─ 返回 preview_token（暂存于 import_tasks）
+
+用户映射原文列与各目标语言译文列
+  │ POST /api/projects/{project_id}/proofreading-batches
+  ▼
+proofreading.create_batch_from_workbook
+  ├─ 校验列映射、语言对一致、同表目标语言不重复
+  ├─ 每个目标语言生成一个 FileRecord（xlsx_mode=proofread）并复用现有 Segment
+  ├─ 写 proofreading_batches / proofreading_column_bindings / proofreading_segment_baselines（原译文基线）
+  └─ 句段 source=imported_translation，status=none，等待校对
+
+启动 LLM 校对
+  │ POST /api/proofreading-batches/{batch_id}/generate
+  ▼
+proofreading.generate_batch（后台任务）
+  ├─ 按目标语言分组，同 source_hash 的重复原文合并去重
+  ├─ 注入 glossary 命中与 TM 参考（仅供参考，不覆盖）
+  ├─ LLM 返回 reviewed_target_text + changed/reason/category/confidence
+  ├─ 校验目标语言文字系统，写回 segment.target_text + segment_revisions
+  ├─ 落 translation_review_reports（report_mode=proofread_generate）+ _report_items
+  └─ 进度通过批次轮询；partial_failed 在 error_segments>0 时也要展示
+
+导出合并 Excel
+  │ POST /api/proofreading-batches/{batch_id}/exports
+  │ GET  /api/proofreading-batches/{batch_id}/exports/latest
+  ▼
+proofreading.export_batch_xlsx
+  ├─ 在每个译文列右侧插一列“（校对版）”
+  ├─ 复制源列宽度、样式、数字格式、对齐和保护
+  ├─ 写回校对后译文，扩展自动筛选范围
+  └─ 落盘 data/proofreading_exports/{batch_id}.xlsx
+```
+
+### 11.10 译后文件导出
 
 ```text
 WorkbenchView
@@ -796,7 +920,7 @@ task_file_service.export_translated_task_file
   └─ 异步任务写入 data/export_tasks
 ```
 
-### 11.9 英美式英语副本
+### 11.11 英美式英语副本
 
 ```text
 ProjectDetailView 选中一个中文→英语文件
@@ -858,7 +982,7 @@ docker compose -f docker-compose.prod.yml -f docker-compose.nginx.yml up -d --bu
 | 服务 | 说明 |
 | --- | --- |
 | `app` | FastAPI + 已构建 SPA，Gunicorn/UvicornWorker 在 Docker 内网监听 `19013` |
-| `import-worker` / `worker` / `auto-tm-worker` / `segment-sync-worker` / `pretranslation-worker` | 分别处理上传与资源导入、普通维护、auto-TM、项目重复句段同步、预翻译队列 |
+| `import-worker` / `worker` / `auto-tm-worker` / `segment-sync-worker` / `pretranslation-worker` / `translation-review-worker` | 分别处理上传与资源导入、普通维护、auto-TM、项目重复句段同步、预翻译队列、翻译内容校对队列 |
 | `postgres` | `pgvector/pgvector:pg17`，初始化扩展和核心 schema |
 | `db-migrate` | 启动时执行 `scripts/run_migrations.sh` 后退出 |
 | `pgbouncer` | PostgreSQL 事务级连接池 |
@@ -903,6 +1027,8 @@ python scripts/rebuild_tm_embeddings.py --database-url "$env:DATABASE_URL" --bat
 - 大规模 TM/TB：检索投影、持久化条目计数、文件句段统计与项目同步 outbox。
 - 术语导入、词汇表导入、术语抽取、术语 QA。
 - LLM：provider fallback、规则模板、临时提示词、符号/数学占位符/版式换行保护、语言对传递。
+- 翻译内容校对：规则解析、批次 LLM 检查、锚点定位、应用/撤销、报告导出。
+- 多语种 Excel 校对：工作簿预览、列映射、批次生成、合并 Excel 导出。
 - 英美式英语转换：词典/规则转换、HTML 保真、双向副本、文件名去重和语言对限制。
 - 项目状态、项目复制、任务删除级联、项目文件 ZIP 导出。
 - 文件操作锁、导入任务存储、异步导出队列。
@@ -916,14 +1042,14 @@ python scripts/rebuild_tm_embeddings.py --database-url "$env:DATABASE_URL" --bat
 
 ## 14. 关键约定
 
-1. **接口命名**：新开发优先使用 `/api/projects`、`/api/file-records`、`/api/translation-memory`、`/api/term-bases`、`/api/glossary-bases`、`/api/reference`；`/api/documents`、`/api/tm`、部分 `/api/termbase` 属于兼容路径。
+1. **接口命名**：新开发优先使用 `/api/projects`、`/api/file-records`、`/api/translation-memory`、`/api/term-bases`、`/api/glossary-bases`、`/api/reference`、`/api/.../proofreading*`、`/api/translation-review-*`；`/api/documents`、`/api/tm`、部分 `/api/termbase` 属于兼容路径。
 2. **语言对**：项目、任务、TM、术语库、词汇表都要保持源语言/目标语言一致；后端通过 `language_pairs.py` 规范化别名。
-3. **角色权限**：`super_admin` / `admin` 可管理用户；管理员和内部译者均可管理项目、指派、项目设置、资源库及统计等业务功能；外部译者默认只进入分配给自己的任务，并按文件指派的流程阶段与句段范围获得逐段可见/写权限。新增用户及修改用户表单信息仅限管理员。
+3. **角色权限**：`super_admin` / `admin` 可管理用户；管理员和内部译者均可管理项目、指派、项目设置、资源库及统计等业务功能；外部译者默认只进入分配给自己的任务，并按文件指派的流程阶段与句段范围获得逐段可见/写权限。校对批次和翻译内容校对接口默认要求 `require_business_manager`（管理员或内部译者）。新增用户及修改用户表单信息仅限管理员。
 4. **解析模式**：Word 支持 `full` 和 `body_only`，并带页眉页脚、脚注尾注、批注、超链接保留等解析选项。
 5. **任务文件白名单**：前后端开放格式以 `frontend/src/constants/taskFiles.ts` 和 `task_file_service.get_supported_task_extensions()` 为准。
 6. **大文档策略**：工作台句段、预览、修订、批注、搜索、替换都优先走服务端分页或后端全文处理，避免前端加载全文。
-7. **句段状态与来源**：状态包括 `exact`、`fuzzy`、`none`、`confirmed`；`source` 记录 `tm`、`manual`、`llm`、`project_sync`、`english_variant_conversion` 等来源。看板和状态统计将 `project_sync` 独立成桶，不再计作 TM 精确匹配。
-8. **修订机制**：人工编辑和 LLM 写回都会创建 `segment_revisions`，前端可接受或拒绝。
+7. **句段状态与来源**：状态包括 `exact`、`fuzzy`、`none`、`confirmed`；`source` 记录 `tm`、`manual`、`llm`、`project_sync`、`english_variant_conversion`、`llm_review`、`imported_translation` 等来源。看板和状态统计将 `project_sync` 独立成桶，不再计作 TM 精确匹配。
+8. **修订机制**：人工编辑、LLM 写回和校对应用都会创建 `segment_revisions`，前端可接受或拒绝。
 9. **批注机制**：批注支持句段级和选区级锚点，回复通过 `parent_id` 形成线程。
 10. **操作锁**：长耗时操作应先持有 file operation lock，完成或失败后释放。
 11. **TM 匹配策略**：精确匹配只认 `source_hash`；模糊匹配混合 trigram、字符串相似度和可选 pgvector 得分。
@@ -931,15 +1057,18 @@ python scripts/rebuild_tm_embeddings.py --database-url "$env:DATABASE_URL" --bat
 13. **Word 换行保留**：`source_text` 只用于匹配和 hash，不承载版式换行；Word 解析保留 `source_layout_text`，译文换行统一保存为 `\n`，导出 DOCX 时再转换成 `<w:br/>` 或表格单元格 `<w:p>` 结构。
 14. **预翻译 LLM 默认粒度**：批量预翻译默认传 `llm_translation_unit="sentence"`；`paragraph` 只作为可选上下文增强模式使用，避免模型未稳定遵守严格 JSON 合同时出现整组句段失败。
 15. **预翻译错误可见性**：`pretranslation_tasks.error` 不只在任务 `failed` 时展示；当 `error_segments > 0` 时也要在前端状态中展示，便于直接定位模型输出校验、写回数据库或锁状态问题。
-16. **翻译规则来源**：可复用规则使用 UTF-8 Markdown；用户在工作台或预翻译中手动输入的内容只作为本次临时提示词。
+16. **翻译规则来源**：可复用规则使用 UTF-8 Markdown；用户在工作台或预翻译中手动输入的内容只作为本次临时提示词。翻译内容校对读取的是 `projects.translation_rules` 规则文件。
 17. **资源类型区分**：TM 用于句段级记忆匹配；术语库用于译后术语一致性检查；词汇表用于 AI 预翻译上下文注入。
 18. **TM 检索范围**：`selected` 只检索选中的库；`language_pair_all` 按语言对覆盖所有库并避免超长 ID 列表。无论哪种范围，都必须先校验任务与资源语言对一致。
-19. **项目同步链路**：确认后的同源句段通过 `project_segment_sync_outbox` 异步传播；同步译文保留来源句段/文件 ID，`PROJECT_SYNC_CONFIRMED_ONLY` 控制是否只同步已确认内容。
+19. **项目同步链路**：确认后的同源句段通过 `project_segment_sync_outbox` 异步传播；`PROJECT_SYNC_BLUR_PROJECT_IDS` 白名单项目还会在编辑单元格失焦且保存成功后，以源句段版本触发一次传播。同步只覆盖空值或未确认的 `none/llm/llm_review/tm/project_sync` 结果，人工稿、导入稿和已确认译文均受保护；Outbox 的 `generation` 阻止旧任务提交。`PROJECT_SYNC_CONFIRMED_ONLY` 仍只控制普通保存是否入队，默认保持开启。
 20. **阶段进度口径**：项目页显示全流程汇总进度，工作台底栏显示活动句段所属阶段进度；接口写回后必须同步刷新 `workflow_progress`，不能只在首次加载文件时计算。
-21. **导入导出队列**：大文件导入、资源导出、文件导出优先走任务状态接口；生产建议使用 Redis + ARQ worker。
+21. **导入导出队列**：大文件导入、资源导出、文件导出、翻译内容校对优先走任务状态接口；生产建议使用 Redis + ARQ worker。
 22. **安全配置**：`.env` 不入库；`JWT_SECRET_KEY` 必须替换；LLM API Key、数据库密码等只放环境变量。
 23. **中文编码**：代码和文档按 UTF-8 处理，中文注释、错误提示、前端文案和 Markdown 文档统一避免乱码。
 24. **独立工具边界**：`/api/tools/quote-convert` 是无数据库写入的即时文件转换接口；其多格式处理不属于项目任务 adapters，`bs4` 也只服务于该工具的 HTML 分支。
+25. **工作流模板**：`projects.workflow_template_id` 标识项目工作流类型，当前主要取值 `custom`（默认常规翻译流程）和 `proofread`（多语种 Excel 校对流程）。校对工作流在项目详情页用 `ProofreadingPanel` 替代常规上传入口，文件操作仍复用现有 FileRecord/Segment/工作台/修订链路。
+26. **校对基线不可变**：`proofreading_segment_baselines.original_target_text` 在创建批次时固化，作为“校对前译文”对比基准；LLM 校对只改 `segments.target_text`，基线不随后续编辑变化，导出与统计据此判定 `changed_segments`。
+27. **校对复用校对报告表**：多语种 Excel 校对与翻译内容校对共用 `translation_review_reports` / `_report_items`，通过 `report_mode` 与 `scope` 区分；不要为校对工作流另起一套报告表。
 
 ---
 
@@ -951,5 +1080,6 @@ python scripts/rebuild_tm_embeddings.py --database-url "$env:DATABASE_URL" --bat
 - 完善项目权限模型，尤其是外部译者可见范围和资源库访问边界。
 - 扩展 TM 向量检索的 embedding 来源，当前为本地确定性向量。
 - 增强多格式导出的视觉/结构一致性，尤其是复杂 DOCX、PPTX、XLSX、IDML、MIF、DXF。
-- 为预翻译、参考资料应用、合并视图、QA 和异步导出补充更多端到端测试。
+- 为预翻译、翻译内容校对、多语种 Excel 校对、参考资料应用、合并视图、QA 和异步导出补充更多端到端测试。
 - 为引号转换工具补充单元测试和接口测试，并评估是否将外部工具移植说明、格式处理器进一步拆分为更清晰的模块。
+- 评估多语种 Excel 校对工作流对含公式/合并单元格工作簿的插列写回安全策略，必要时提供受控降级导出。

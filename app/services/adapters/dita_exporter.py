@@ -262,20 +262,43 @@ class DitaExporter:
         translations: Dict[str, str],
     ) -> None:
         """递归替换元素中的文本内容"""
+        # 注释和处理指令也会出现在 element 的子节点列表中，但它们自身的
+        # 内容不是待翻译文本；真正的正文可能保存在这些节点的 tail 中。
+        if not isinstance(element.tag, str):
+            return
+
         # 跳过 conref
         if element.get("conref"):
             return
         
         # 替换元素的直接文本
-        if element.text and element.text.strip():
-            text = element.text.strip()
-            if text in translations:
-                # 保留原始空白
-                original = element.text
-                leading = original[:len(original) - len(original.lstrip())]
-                trailing = original[len(original.rstrip()):]
-                element.text = leading + translations[text] + trailing
+        element.text = self._replace_text_value(element.text, translations)
         
-        # 递归处理子元素
+        # 递归处理子元素，并替换子元素、注释或处理指令之后的 tail 文本。
+        # Arbortext DITA 常使用 ``<?Pub ...?>正文``，其中正文正是 PI 的 tail。
         for child in element:
             self._replace_text_content(child, translations)
+            child.tail = self._replace_text_value(child.tail, translations)
+
+    @staticmethod
+    def _replace_text_value(
+        original: Optional[str],
+        translations: Dict[str, str],
+    ) -> Optional[str]:
+        """替换单个 XML 文本槽，同时保留其首尾空白。"""
+        if not original or not original.strip():
+            return original
+
+        stripped = original.strip()
+        if stripped in translations:
+            translated = translations[stripped]
+        else:
+            # 解析阶段会把连续空白规范为单个空格，导出时使用相同规则匹配。
+            normalized = " ".join(stripped.split())
+            if normalized not in translations:
+                return original
+            translated = translations[normalized]
+
+        leading = original[:len(original) - len(original.lstrip())]
+        trailing = original[len(original.rstrip()):]
+        return leading + translated + trailing

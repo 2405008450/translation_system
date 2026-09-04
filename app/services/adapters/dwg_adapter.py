@@ -32,7 +32,13 @@ class DwgAdapter(FormatAdapter):
         return [".dwg"]
 
     def parse(self, raw_bytes: bytes) -> ParseResult:
-        return self._parse(raw_bytes, skip_non_translatable=False, filename="<unknown>")
+        return self._parse(
+            raw_bytes,
+            skip_non_translatable=False,
+            enable_spatial_merge=False,
+            enable_llm_layout=True,
+            filename="<unknown>",
+        )
 
     def parse_with_options(
         self,
@@ -41,13 +47,24 @@ class DwgAdapter(FormatAdapter):
         options: dict | None = None,
     ) -> ParseResult:
         self.validate_file_size(raw_bytes, filename)
+        opts = options or {}
         return self._parse(
             raw_bytes,
-            skip_non_translatable=bool((options or {}).get("skip_non_translatable", True)),
+            skip_non_translatable=bool(opts.get("skip_non_translatable", True)),
+            enable_spatial_merge=bool(opts.get("enable_spatial_merge", False)),
+            enable_llm_layout=bool(opts.get("enable_llm_layout", True)),
             filename=filename,
         )
 
-    def _parse(self, raw_bytes: bytes, *, skip_non_translatable: bool, filename: str) -> ParseResult:
+    def _parse(
+        self,
+        raw_bytes: bytes,
+        *,
+        skip_non_translatable: bool,
+        enable_spatial_merge: bool,
+        enable_llm_layout: bool,
+        filename: str,
+    ) -> ParseResult:
         settings = get_settings()
         if not raw_bytes:
             return self._dxf_adapter._parse_with_options(
@@ -56,7 +73,8 @@ class DwgAdapter(FormatAdapter):
                 filename=filename,
                 extract_extra_entities=settings.dwg_handle_extra_entities,
                 skip_dimension_like=settings.dwg_skip_dimension_like,
-                enable_spatial_merge=settings.dwg_enable_spatial_merge,
+                enable_spatial_merge=enable_spatial_merge,
+                enable_llm_layout=enable_llm_layout,
             )
         try:
             dxf_bytes = dwg_to_dxf(raw_bytes)
@@ -74,7 +92,8 @@ class DwgAdapter(FormatAdapter):
             filename=filename,
             extract_extra_entities=settings.dwg_handle_extra_entities,
             skip_dimension_like=settings.dwg_skip_dimension_like,
-            enable_spatial_merge=settings.dwg_enable_spatial_merge,
+            enable_spatial_merge=enable_spatial_merge,
+            enable_llm_layout=enable_llm_layout,
         )
         result.ast.source_format = ".dwg"
         result.metadata = {**result.metadata, "converted_from": ".dwg"}

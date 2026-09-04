@@ -18,7 +18,9 @@ from typing import Optional, Set, Tuple
 
 from bs4 import BeautifulSoup, Comment, NavigableString
 from docx import Document
+from docx.oxml import parse_xml as _docx_parse_xml
 from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
 from lxml import etree
 from openpyxl import load_workbook
 from pptx import Presentation
@@ -356,6 +358,267 @@ def _set_curly_font_hint(rPr_elem, target_width: str) -> None:
         rFonts.set(qn("w:hint"), "eastAsia")
 
 
+def _collect_docx_paragraphs(doc) -> list:
+    """收集 DOCX 中所有需要处理引号的段落。
+
+    覆盖：
+    - 正文段落
+    - 表格中的段落（含任意层级嵌套的表格）
+    - 页眉、页脚（默认 / 首页 / 奇偶页）及其中的表格段落
+    - 文本框（w:txbxContent）里的段落，包括正文和页眉页脚里的文本框
+    对同一段落做去重，避免 mc:Fallback 分支或其它路径重复处理。
+    """
+
+    seen: set = set()
+    result: list = []
+
+    def add(para) -> None:
+        pid = id(para._element)
+        if pid in seen:
+            return
+        seen.add(pid)
+        result.append(para)
+
+    def walk_container(container) -> None:
+        """递归遍历带 .paragraphs / .tables 的容器（Document / _Cell / _Header / _Footer）。"""
+        try:
+            paragraphs = container.paragraphs
+        except Exception:
+            paragraphs = []
+        for p in paragraphs:
+            add(p)
+        try:
+            tables = container.tables
+        except Exception:
+            tables = []
+        for tbl in tables:
+            for row in tbl.rows:
+                for cell in row.cells:
+                    walk_container(cell)
+
+    # 1) 正文（含表格 / 嵌套表格）
+    walk_container(doc)
+
+    # 2) 页眉页脚（含其中的表格）
+    hf_parts: list = []
+    for section in doc.sections:
+        for attr in (
+            "header", "footer",
+            "first_page_header", "first_page_footer",
+            "even_page_header", "even_page_footer",
+        ):
+            try:
+                hf = getattr(section, attr, None)
+            except Exception:
+                hf = None
+            if hf is None:
+                continue
+            try:
+                walk_container(hf)
+            except Exception:
+                pass
+            hf_parts.append(hf)
+
+    # 3) 文本框：扫描主文档 + 每个页眉/页脚 XML 里的 w:txbxContent//w:p
+    #    过滤掉 mc:Fallback 分支，避免与 mc:Choice 重复。
+    def scan_txbx(root_element, host_part) -> None:
+        if root_element is None:
+            return
+        try:
+            elems = list(_TXBX_P_XPATH(root_element))
+        except Exception:
+            return
+        for p_elem in elems:
+            try:
+                add(Paragraph(p_elem, host_part))
+            except Exception:
+                continue
+
+    scan_txbx(doc.element, doc.part)
+    for hf in hf_parts:
+        elem = getattr(hf, "_element", None)
+        part = getattr(hf, "part", None)
+        scan_txbx(elem, part)
+
+    return result
+
+
+def _convert_docx_paragraph(para, doc, scope_width: str, scope_shape: str,
+                            target_width: str, target_shape: str,
+                            need_font_adjust: bool) -> None:
+    """转换单个段落里的引号。逻辑与原实现一致，抽出便于在多种容器上复用。"""
+
+    open_double = True
+    open_single = True
+
+    if not need_font_adjust:
+        for run in para.runs:
+            is_curly_half = _is_curly_half_width(run, doc)
+            new_text, _, open_double, open_single = _convert_text(
+                run.text, scope_width, scope_shape,
+                target_width, target_shape, is_curly_half,
+                open_double, open_single,
+            )
+            run.text = new_text
+        return
+
+    p_element = para._element
+    original_runs = list(para.runs)
+    new_elements = []
+
+    for run in original_runs:
+        old_text = run.text
+        is_curly_half = _is_curly_half_width(run, doc)
+        new_text, converted_pos, open_double, open_single = _convert_text(
+            old_text, scope_width, scope_shape,
+            target_width, target_shape, is_curly_half,
+            open_double, open_single,
+        )
+
+        if not converted_pos:
+            new_r = deepcopy(run._element)
+            for t in new_r.findall(f".//{{{W_NS}}}t"):
+                t.getparent().remove(t)
+            t_elem = etree.SubElement(new_r, f"{{{W_NS}}}t")
+            t_elem.text = new_text
+            if new_text and (new_text[0] == " " or new_text[-1] == " "):
+                t_elem.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            new_elements.append(new_r)
+            continue
+
+        segments = []
+        current_chars = []
+        current_is_converted: Optional[bool] = None
+        for i, ch in enumerate(new_text):
+            is_conv = (i in converted_pos) and (ch in CURLY)
+            if current_is_converted is not None and is_conv != current_is_converted:
+                segments.append(("".join(current_chars), current_is_converted))
+                current_chars = []
+            current_chars.append(ch)
+            current_is_converted = is_conv
+        if current_chars:
+            segments.append((
+                "".join(current_chars),
+                current_is_converted if current_is_converted is not None else False,
+            ))
+
+        for seg_text, is_conv in segments:
+            new_r = deepcopy(run._element)
+            for t in new_r.findall(f".//{{{W_NS}}}t"):
+                t.getparent().remove(t)
+            t_elem = etree.SubElement(new_r, f"{{{W_NS}}}t")
+            t_elem.text = seg_text
+            if seg_text and (seg_text[0] == " " or seg_text[-1] == " "):
+                t_elem.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            if is_conv:
+                rPr = new_r.find(f"{{{W_NS}}}rPr")
+                if rPr is None:
+                    rPr = etree.Element(f"{{{W_NS}}}rPr")
+                    new_r.insert(0, rPr)
+                _set_curly_font_hint(rPr, target_width)
+            new_elements.append(new_r)
+
+    for run in original_runs:
+        p_element.remove(run._element)
+    for elem in new_elements:
+        p_element.append(elem)
+
+
+# 预编译的 lxml XPath：BaseOxmlElement.xpath 不接受 namespaces 关键字，
+# 用 etree.XPath 绕开、对普通 _Element 和 BaseOxmlElement 都能用。
+_TXBX_P_XPATH = etree.XPath(
+    ".//w:txbxContent//w:p[not(ancestor::mc:Fallback)]",
+    namespaces={
+        "w": W_NS,
+        "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
+    },
+)
+_ANY_P_XPATH = etree.XPath(
+    ".//w:p[not(ancestor::mc:Fallback)]",
+    namespaces={
+        "w": W_NS,
+        "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
+    },
+)
+
+
+def _convert_docx_extra_parts(doc, scope_width: str, scope_shape: str,
+                              target_width: str, target_shape: str,
+                              need_font_adjust: bool) -> None:
+    """处理脚注/尾注/批注这些独立 part 里的段落。
+
+    这些内容不在 word/document.xml 里，而是各自的 word/footnotes.xml、endnotes.xml、
+    comments.xml。python-docx 版本差异较大，Comments 可能被识别为 XmlPart 并提供
+    .element（改动随 doc.save 自动写回），Footnotes/Endnotes 常常是普通 Part
+    只暴露只读 blob。这里两种路径都兼容：能拿 .element 就直接改；只有 blob 时
+    解析成 CT_XXX 定制 element，原地修改后再写回到 part._blob（Part.blob 无 setter）。
+    """
+
+    target_ct_suffixes = (
+        "wordprocessingml.footnotes+xml",
+        "wordprocessingml.endnotes+xml",
+        "wordprocessingml.comments+xml",
+    )
+
+    try:
+        parts = list(doc.part.package.iter_parts())
+    except Exception:
+        return
+
+    for part in parts:
+        content_type = getattr(part, "content_type", "") or ""
+        if not content_type.endswith(target_ct_suffixes):
+            continue
+
+        element = getattr(part, "element", None)
+        needs_writeback = False
+        if element is None:
+            try:
+                blob = part.blob
+            except Exception:
+                blob = None
+            if not blob:
+                continue
+            try:
+                # 必须用 python-docx 的 oxml 解析器，得到带 r_lst 等属性的定制 element，
+                # 否则 Paragraph.runs 等属性会因缺属性而报错。
+                element = _docx_parse_xml(blob)
+            except Exception:
+                continue
+            needs_writeback = True
+
+        try:
+            p_elems = list(_ANY_P_XPATH(element))
+        except Exception:
+            p_elems = []
+
+        for p_elem in p_elems:
+            try:
+                para = Paragraph(p_elem, part)
+            except Exception:
+                continue
+            _convert_docx_paragraph(
+                para, doc, scope_width, scope_shape,
+                target_width, target_shape, need_font_adjust,
+            )
+
+        if needs_writeback:
+            try:
+                new_blob = etree.tostring(
+                    element,
+                    xml_declaration=True,
+                    standalone=True,
+                    encoding="UTF-8",
+                )
+            except Exception:
+                continue
+            # Part.blob 是只读属性，opc 内部把字节缓存在 _blob 里，这里直接改。
+            try:
+                part._blob = new_blob
+            except Exception:
+                pass
+
+
 def _convert_docx(raw: bytes, scope_width: str, scope_shape: str,
                   target_width: str, target_shape: str) -> bytes:
     try:
@@ -365,81 +628,16 @@ def _convert_docx(raw: bytes, scope_width: str, scope_shape: str,
 
     need_font_adjust = target_shape == "弯引号"
 
-    for para in doc.paragraphs:
-        open_double = True
-        open_single = True
+    for para in _collect_docx_paragraphs(doc):
+        _convert_docx_paragraph(
+            para, doc, scope_width, scope_shape,
+            target_width, target_shape, need_font_adjust,
+        )
 
-        if not need_font_adjust:
-            for run in para.runs:
-                is_curly_half = _is_curly_half_width(run, doc)
-                new_text, _, open_double, open_single = _convert_text(
-                    run.text, scope_width, scope_shape,
-                    target_width, target_shape, is_curly_half,
-                    open_double, open_single,
-                )
-                run.text = new_text
-            continue
-
-        p_element = para._element
-        original_runs = list(para.runs)
-        new_elements = []
-
-        for run in original_runs:
-            old_text = run.text
-            is_curly_half = _is_curly_half_width(run, doc)
-            new_text, converted_pos, open_double, open_single = _convert_text(
-                old_text, scope_width, scope_shape,
-                target_width, target_shape, is_curly_half,
-                open_double, open_single,
-            )
-
-            if not converted_pos:
-                new_r = deepcopy(run._element)
-                for t in new_r.findall(f".//{{{W_NS}}}t"):
-                    t.getparent().remove(t)
-                t_elem = etree.SubElement(new_r, f"{{{W_NS}}}t")
-                t_elem.text = new_text
-                if new_text and (new_text[0] == " " or new_text[-1] == " "):
-                    t_elem.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-                new_elements.append(new_r)
-                continue
-
-            segments = []
-            current_chars = []
-            current_is_converted: Optional[bool] = None
-            for i, ch in enumerate(new_text):
-                is_conv = (i in converted_pos) and (ch in CURLY)
-                if current_is_converted is not None and is_conv != current_is_converted:
-                    segments.append(("".join(current_chars), current_is_converted))
-                    current_chars = []
-                current_chars.append(ch)
-                current_is_converted = is_conv
-            if current_chars:
-                segments.append((
-                    "".join(current_chars),
-                    current_is_converted if current_is_converted is not None else False,
-                ))
-
-            for seg_text, is_conv in segments:
-                new_r = deepcopy(run._element)
-                for t in new_r.findall(f".//{{{W_NS}}}t"):
-                    t.getparent().remove(t)
-                t_elem = etree.SubElement(new_r, f"{{{W_NS}}}t")
-                t_elem.text = seg_text
-                if seg_text and (seg_text[0] == " " or seg_text[-1] == " "):
-                    t_elem.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-                if is_conv:
-                    rPr = new_r.find(f"{{{W_NS}}}rPr")
-                    if rPr is None:
-                        rPr = etree.Element(f"{{{W_NS}}}rPr")
-                        new_r.insert(0, rPr)
-                    _set_curly_font_hint(rPr, target_width)
-                new_elements.append(new_r)
-
-        for run in original_runs:
-            p_element.remove(run._element)
-        for elem in new_elements:
-            p_element.append(elem)
+    _convert_docx_extra_parts(
+        doc, scope_width, scope_shape,
+        target_width, target_shape, need_font_adjust,
+    )
 
     buffer = io.BytesIO()
     doc.save(buffer)

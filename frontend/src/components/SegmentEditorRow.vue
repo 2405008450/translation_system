@@ -1,15 +1,22 @@
 <script setup lang="ts">
-import { Copy, CornerDownLeft, Link2, Link2Off } from 'lucide-vue-next'
+import { CheckSquare2, Copy, CornerDownLeft, Link2, Link2Off, Square } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from 'vue'
 
 import InteractiveDiffText from './InteractiveDiffText.vue'
 
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
+import { getLanguageDirection } from '../constants/languages'
 import { useAuthStore } from '../stores/auth'
 import type { LiveSpellingIssue, RevisionDisplaySettings, Segment, SegmentQAIssue, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
 import { findTermTextRanges } from '../utils/termMatching'
 import { computeDiff } from '../utils/textDiff'
 import type { TextFormat } from '../composables/useRichTextEditor'
+
+type ProofreadingSuggestion = {
+  text: string
+  label: string
+  tone: 'changed' | 'unchanged' | 'error' | 'pending'
+}
 
 const props = withDefaults(defineProps<{
   segment: Segment
@@ -34,6 +41,15 @@ const props = withDefaults(defineProps<{
   pendingFormats?: Record<TextFormat, boolean> & { _overrideActive?: boolean }
   /** 句段对外标识：单文件模式即 sentence_id；合并模式为复合键 ${file_record_id}:${sentence_id} */
   segmentKey?: string
+  sourceLanguage?: string | null
+  targetLanguage?: string | null
+  /** Excel 校对导入时的不可变原译文；非校对任务为 null。 */
+  originalTargetText?: string | null
+  /** 校对任务中是否显示原译文与校对版的行内差异。 */
+  showProofreadingDiff?: boolean
+  /** 校对工作台专用的 LLM 修改建议；非校对任务为 null。 */
+  proofreadingSuggestion?: ProofreadingSuggestion | null
+  alignmentMode?: boolean
 }>(), {
   disabled: false,
   sourceEditing: false,
@@ -59,6 +75,12 @@ const props = withDefaults(defineProps<{
     _overrideActive: false,
   }),
   segmentKey: '',
+  sourceLanguage: null,
+  targetLanguage: null,
+  originalTargetText: null,
+  showProofreadingDiff: true,
+  proofreadingSuggestion: null,
+  alignmentMode: false,
 })
 
 const emit = defineEmits<{
@@ -66,12 +88,14 @@ const emit = defineEmits<{
   updateSource: [sentenceId: string, value: string]
   updateTargetLayout: [sentenceId: string, targetLayoutText: string]
   focus: [sentenceId: string]
+  blurCommit: [sentenceId: string]
   activateTarget: [sentenceId: string]
   activateSource: [sentenceId: string]
   sourceCaretChange: [sentenceId: string, offset: number]
   copySourceToTarget: [sentenceId: string]
   applyPartialRevision: [revisionId: string, newText: string]
   ctrlClick: [sentenceId: string, event: MouseEvent]
+  toggleSelection: [sentenceId: string, event: MouseEvent]
   toggleProjectSync: [sentenceId: string, disabled: boolean]
 }>()
 
@@ -82,11 +106,15 @@ const isFocused = ref(false)
 const isSourceFocused = ref(false)
 const isComposing = ref(false)
 const editorDirtySinceFocus = ref(false)
+const targetTextAtFocus = ref('')
+const targetHtmlAtFocus = ref<string | null>(null)
 const pendingSourceFocus = ref(false)
 const pendingSourceFocusPoint = ref<{ x: number; y: number } | null>(null)
 
 // 对外标识：合并视图使用复合键，单文件回退为 sentence_id
 const segmentKey = computed(() => props.segmentKey || props.segment.sentence_id)
+const sourceDirection = computed(() => getLanguageDirection(props.sourceLanguage))
+const targetDirection = computed(() => getLanguageDirection(props.targetLanguage))
 const MAX_EDITOR_HISTORY_SIZE = 100
 const EDITOR_HISTORY_GROUP_TIMEOUT_MS = 1200
 const REVISION_RERENDER_DEBOUNCE_MS = 150
@@ -251,6 +279,22 @@ const isEmptyTarget = computed(() => {
   const targetText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
   return targetText.length === 0
 })
+const isAlignmentTranslationOnly = computed(() => (
+  props.alignmentMode && props.segment.alignment_translation_only === true
+))
+const isAlignmentMissingTranslation = computed(() => (
+  props.alignmentMode && !props.segment.alignment_translation_only && isEmptyTarget.value
+))
+const isAlignmentCrossCell = computed(() => (
+  props.alignmentMode && props.segment.alignment_cross_cell === true
+))
+const proofreadingTargetText = computed(() => (
+  props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
+))
+const isProofreadingChanged = computed(() => (
+  props.originalTargetText !== null
+  && proofreadingTargetText.value !== (props.originalTargetText || '')
+))
 const statusMeta = computed(() => getSegmentStatusMeta(effectiveSegmentStatus.value))
 const sourceMeta = computed(() => getSegmentSourceMeta(props.segment.source))
 const isProjectSynced = computed(() => props.segment.source === 'project_sync')
@@ -303,6 +347,22 @@ const sourceTitle = computed(() => {
 const revisionSourceMeta = computed(() => getSegmentSourceMeta(props.pendingRevision?.source || 'manual'))
 const revisionAuthorRole = computed(() => props.pendingRevision?.author?.role || 'admin')
 const hasPendingRevision = computed(() => Boolean(props.pendingRevision))
+const visibleRevisionText = computed<{ before: string; after: string } | null>(() => {
+  if (props.pendingRevision) {
+    return {
+      before: props.pendingRevision.before_text || '',
+      after: props.pendingRevision.after_text || '',
+    }
+  }
+  if (props.showProofreadingDiff && isProofreadingChanged.value && props.originalTargetText !== null) {
+    return {
+      before: props.originalTargetText || '',
+      after: proofreadingTargetText.value,
+    }
+  }
+  return null
+})
+const hasVisibleRevisionMarks = computed(() => Boolean(visibleRevisionText.value))
 const revisionAuthorClass = computed(() => (
   revisionAuthorRole.value === 'user' ? 'is-revision-author-user' : 'is-revision-author-admin'
 ))
@@ -317,7 +377,7 @@ const revisionDeleteColor = computed(() => {
   return settings?.author_colors?.[authorId]?.delete || settings?.default_delete_color || '#dc2626'
 })
 const revisionColorStyle = computed(() => (
-  hasPendingRevision.value
+  hasVisibleRevisionMarks.value
     ? {
       '--rev-insert-color': revisionInsertColor.value,
       '--rev-delete-color': revisionDeleteColor.value,
@@ -325,6 +385,9 @@ const revisionColorStyle = computed(() => (
     : {}
 ))
 const revisionTooltip = computed(() => {
+  if (!props.pendingRevision && hasVisibleRevisionMarks.value) {
+    return '原译文 → 校对版'
+  }
   if (!props.pendingRevision || props.revisionSettings?.show_author_time === false) {
     return ''
   }
@@ -469,6 +532,32 @@ function highlightSearchText(text: string, keyword: string, caseSensitive = fals
 const automaticNumberingTitle = 'Word 自动编号，导出时会自动生成，译文无需输入编号'
 const automaticNumberingText = computed(() => (props.segment.automatic_numbering_text || '').trim())
 const hasAutomaticNumbering = computed(() => automaticNumberingText.value.length > 0)
+
+// DWG/DXF 合并信心提示：仅对合并句段显示；低于 0.7 才提醒
+const mergeConfidence = computed<number | null>(() => {
+  const raw = props.segment.merge_confidence
+  return typeof raw === 'number' && Number.isFinite(raw) ? raw : null
+})
+const isMergedSegment = computed(() => Boolean(props.segment.is_merged))
+const showMergeConfidenceBadge = computed(() => (
+  isMergedSegment.value && mergeConfidence.value !== null && mergeConfidence.value < 0.7
+))
+const mergeConfidenceLevel = computed(() => {
+  const c = mergeConfidence.value ?? 1
+  if (c < 0.5) return 'low'
+  if (c < 0.7) return 'mid'
+  return 'high'
+})
+const mergeConfidenceLabel = computed(() => {
+  const level = mergeConfidenceLevel.value
+  if (level === 'low') return '合并信心低'
+  if (level === 'mid') return '合并信心一般'
+  return '合并信心高'
+})
+const mergeConfidenceTitle = computed(() => {
+  const pct = Math.round((mergeConfidence.value ?? 0) * 100)
+  return `${mergeConfidenceLabel.value}（${pct}%）\n此句由 DWG/DXF 空间合并自动生成，可能拆错，请核对`
+})
 const targetAutomaticNumberingText = computed(() => (
   props.segment.target_automatic_numbering_text || automaticNumberingText.value
 ).trim())
@@ -565,11 +654,11 @@ const targetHtmlContent = computed(() => {
 })
 
 const editorHtmlContent = computed(() => {
-  const revision = props.pendingRevision
+  const revision = visibleRevisionText.value
   if (!revision) {
     return targetHtmlContent.value
   }
-  return computeDiff(revision.before_text || '', revision.after_text || '')
+  return computeDiff(revision.before, revision.after)
     .map((segment) => {
       const editableAttr = segment.type === 'delete' ? ' contenteditable="false"' : ''
       const titleAttr = revisionTooltip.value ? ` title="${escapeHtml(revisionTooltip.value)}"` : ''
@@ -949,7 +1038,10 @@ function hasRenderedTargetHighlights(): boolean {
 }
 
 function hasRenderedEditorDecorations(): boolean {
-  return Boolean(props.pendingRevision) || props.showVisibleChars || hasRenderedTargetHighlights()
+  return hasVisibleRevisionMarks.value
+    || props.showVisibleChars
+    || hasRenderedTargetHighlights()
+    || containsCheckboxGlyph(getTargetStateText())
 }
 
 function editorHasDecorationNodes(editor: HTMLElement): boolean {
@@ -959,6 +1051,7 @@ function editorHasDecorationNodes(editor: HTMLElement): boolean {
     '.segment-row__term-highlight',
     '.segment-row__search-highlight',
     '.segment-row__qa-highlight',
+    '.segment-row__checkbox-glyph',
     '.visible-char',
   ].join(',')))
 }
@@ -995,6 +1088,7 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
       || element.classList.contains('segment-row__term-highlight')
       || element.classList.contains('segment-row__search-highlight')
       || element.classList.contains('segment-row__qa-highlight')
+      || element.classList.contains('segment-row__checkbox-glyph')
     ) {
       return
     }
@@ -1007,10 +1101,7 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
 }
 
 function renderTargetHtmlWithHighlights(targetHtml: string): string {
-  if (
-    (!hasRenderedTargetHighlights() && !props.showVisibleChars)
-    || typeof document === 'undefined'
-  ) {
+  if (typeof document === 'undefined') {
     return targetHtml
   }
 
@@ -1047,6 +1138,7 @@ function renderTargetHtmlWithHighlights(targetHtml: string): string {
       || element.classList.contains('segment-row__term-highlight')
       || element.classList.contains('segment-row__search-highlight')
       || element.classList.contains('segment-row__qa-highlight')
+      || element.classList.contains('segment-row__checkbox-glyph')
     ) {
       return
     }
@@ -1071,12 +1163,35 @@ const sourceHtmlContent = computed(() => {
  * 将文本转换为显示标记模式（显示空格、制表符、换行符）
  */
 function textToVisibleChars(text: string): string {
-  const escaped = escapeHtml(text)
-  if (!props.showVisibleChars) return escaped
-  return escaped
-    .replace(/ /g, '<span class="visible-char visible-char--space" contenteditable="false">·</span>')
-    .replace(/\t/g, '<span class="visible-char visible-char--tab" contenteditable="false">→</span>')
-    .replace(/\n/g, '<span class="visible-char visible-char--newline" contenteditable="false">¶</span>\n')
+  let rendered = escapeHtml(text)
+  if (props.showVisibleChars) {
+    rendered = rendered
+      .replace(/ /g, '<span class="visible-char visible-char--space" contenteditable="false">·</span>')
+      .replace(/\t/g, '<span class="visible-char visible-char--tab" contenteditable="false">→</span>')
+      .replace(/\n/g, '<span class="visible-char visible-char--newline" contenteditable="false">¶</span>\n')
+  }
+  return renderCheckboxGlyphs(rendered)
+}
+
+const CHECKBOX_GLYPH_PATTERN = /[\uF052\u25A1\u2610\u2611\u2612]/
+const CHECKBOX_GLYPH_PATTERN_GLOBAL = /[\uF052\u25A1\u2610\u2611\u2612]/g
+
+function containsCheckboxGlyph(text: string): boolean {
+  return CHECKBOX_GLYPH_PATTERN.test(text)
+}
+
+/**
+ * 只统一复选框的视觉外观，子节点仍保留原字符，避免影响保存和 Word 导出。
+ */
+function renderCheckboxGlyphs(escapedText: string): string {
+  return escapedText.replace(CHECKBOX_GLYPH_PATTERN_GLOBAL, (glyph) => {
+    const state = glyph === '\uF052' || glyph === '\u2611'
+      ? 'checked'
+      : glyph === '\u2612'
+        ? 'crossed'
+        : 'empty'
+    return `<span class="segment-row__checkbox-glyph segment-row__checkbox-glyph--${state}"><span class="segment-row__checkbox-raw">${glyph}</span></span>`
+  })
 }
 
 function renderTargetTextHtml(text: string): string {
@@ -1745,6 +1860,8 @@ function redoEditorChange() {
 function handleFocus() {
   isFocused.value = true
   editorDirtySinceFocus.value = false
+  targetTextAtFocus.value = getTargetStateText()
+  targetHtmlAtFocus.value = getTargetStateHtml()
   emit('focus', segmentKey.value)
   cacheTargetSelectionFromDom()
 }
@@ -1752,11 +1869,23 @@ function handleFocus() {
 function handleBlur() {
   clearRevisionRerenderTimer()
   cacheTargetSelectionFromDom()
-  commitEditorContent()
+  const wasEdited = editorDirtySinceFocus.value
+  const committed = commitEditorContent()
+  const contentChanged = Boolean(
+    wasEdited
+    && committed
+    && (
+      committed.text !== targetTextAtFocus.value
+      || committed.html !== targetHtmlAtFocus.value
+    ),
+  )
   isFocused.value = false
   editorDirtySinceFocus.value = false
   resetHistoryGroup()
   void nextTick(() => syncEditorHtmlFromState(false))
+  if (contentChanged) {
+    emit('blurCommit', segmentKey.value)
+  }
 }
 
 function isSegmentMultiSelectEvent(event?: MouseEvent) {
@@ -2849,11 +2978,15 @@ watch(
 
 // 进入原文编辑模式时聚焦
 watch(
-  () => props.sourceEditing && props.active,
-  (shouldEdit) => {
+  () => [props.sourceEditing, props.active] as const,
+  ([shouldEdit, isActive], previousState) => {
+    const wasEditing = previousState?.[0] ?? false
     nextTick(() => {
       syncSourceEditorFromState(false)
-      if (shouldEdit) {
+      // 只在当前行真正“进入原文编辑模式”时自动聚焦原文。
+      // 对齐工作台会让 sourceEditing 始终为 true；此时点击未激活行的译文
+      // 只会改变 active，不能因此把浏览器刚落在译文上的焦点抢回原文。
+      if (shouldEdit && isActive && !wasEditing) {
         if (sourceEditorRef.value) {
           sourceEditorRef.value.focus()
           moveCursorToEnd(sourceEditorRef.value)
@@ -2880,7 +3013,7 @@ watch(
 <template>
   <article
     class="segment-row"
-    :class="[statusClass, parityClass, { 'is-active': active, 'is-selected': selected, 'has-pending-revision': hasPendingRevision, 'is-empty-target': isEmptyTarget }]"
+    :class="[statusClass, parityClass, { 'is-active': active, 'is-selected': selected, 'has-pending-revision': hasPendingRevision, 'is-empty-target': isEmptyTarget, 'is-proofreading-changed': isProofreadingChanged, 'is-alignment-mode': alignmentMode, 'is-alignment-translation-only': isAlignmentTranslationOnly, 'is-alignment-missing-translation': isAlignmentMissingTranslation }]"
     :id="`segment-${segmentKey}`"
     data-testid="segment-row"
     :data-sentence-id="segmentKey"
@@ -2890,6 +3023,21 @@ watch(
   >
     <div class="segment-row__meta">
       <span class="segment-row__index">{{ index + 1 }}</span>
+      <span v-if="isAlignmentTranslationOnly" class="segment-row__alignment-issue-badge is-translation-only">增译</span>
+      <span v-else-if="isAlignmentMissingTranslation" class="segment-row__alignment-issue-badge is-missing">漏译</span>
+      <span v-if="isAlignmentCrossCell" class="segment-row__alignment-issue-badge is-cross-cell" title="同一侧包含多个表格单元格">跨格</span>
+      <button
+        class="segment-row__selection-toggle"
+        type="button"
+        :class="{ 'is-selected': selected }"
+        :title="selected ? '取消选择句段' : '选择句段；按住 Shift 可连续选择'"
+        :aria-label="selected ? '取消选择句段' : '选择句段'"
+        :aria-pressed="selected"
+        @click.stop="emit('toggleSelection', segmentKey, $event)"
+      >
+        <CheckSquare2 v-if="selected" :size="15" aria-hidden="true" />
+        <Square v-else :size="15" aria-hidden="true" />
+      </button>
       <button
         v-if="showProjectSyncToggle"
         class="segment-row__sync-toggle"
@@ -2926,12 +3074,24 @@ watch(
         >
           {{ automaticNumberingText }}
         </span>
+        <span
+          v-if="showMergeConfidenceBadge"
+          class="segment-row__merge-confidence-badge"
+          :class="`is-${mergeConfidenceLevel}`"
+          :title="mergeConfidenceTitle"
+          aria-hidden="true"
+          contenteditable="false"
+        >
+          合并
+        </span>
         <div
           v-if="active"
           ref="sourceEditorRef"
           class="segment-row__source-editor"
           :class="{ 'is-focused': isSourceFocused, 'is-readonly': !sourceEditing }"
           :contenteditable="!disabled"
+          :dir="sourceDirection"
+          :lang="sourceLanguage || undefined"
           tabindex="0"
           spellcheck="false"
           @focus="handleSourceFocus"
@@ -2942,14 +3102,29 @@ watch(
           @mouseup="emitSourceCaret"
           @keyup="emitSourceCaret"
         ></div>
-        <div v-else class="segment-row__text" v-html="sourceHtmlContent"></div>
+        <div
+          v-else
+          class="segment-row__text"
+          :dir="sourceDirection"
+          :lang="sourceLanguage || undefined"
+          v-html="sourceHtmlContent"
+        ></div>
+      </div>
+    </div>
+
+    <div v-if="originalTargetText !== null" class="segment-row__cell segment-row__cell--original-target">
+      <div v-if="isProofreadingChanged" class="segment-row__original-target-label">
+        <strong>已修订</strong>
+      </div>
+      <div class="segment-row__original-target-text" :dir="targetDirection" :lang="targetLanguage || undefined">
+        {{ originalTargetText || '（空）' }}
       </div>
     </div>
 
     <div class="segment-row__cell segment-row__cell--target" :class="{ 'is-pending': hasPendingRevision }">
       <div
         class="segment-row__editor-shell"
-        :class="{ 'is-focused': isFocused, 'is-disabled': disabled, 'has-revision': hasPendingRevision }"
+        :class="{ 'is-focused': isFocused, 'is-disabled': disabled, 'has-revision': hasVisibleRevisionMarks }"
         @mousedown="handleSelectMouseDown"
         @click="handleEditorShellClick"
       >
@@ -2975,6 +3150,7 @@ watch(
       </div>
       <div class="segment-row__target-content">
         <button
+          v-if="originalTargetText === null"
           class="segment-row__copy-source-button"
           type="button"
           data-testid="segment-copy-source-to-target"
@@ -3010,14 +3186,16 @@ watch(
           ref="editorRef"
           class="segment-row__editor"
           :class="[
-            { 'is-focused': isFocused, 'has-revision': hasPendingRevision },
+            { 'is-focused': isFocused, 'has-revision': hasVisibleRevisionMarks },
             revisionAuthorClass,
           ]"
           :style="revisionColorStyle"
           :contenteditable="!disabled"
+          :dir="targetDirection"
+          :lang="targetLanguage || undefined"
           tabindex="0"
           data-testid="segment-target-editor"
-          :data-revision-visible="hasPendingRevision ? 'true' : 'false'"
+          :data-revision-visible="hasVisibleRevisionMarks ? 'true' : 'false'"
           data-segment-target="true"
           :data-sentence-id="segmentKey"
           :aria-label="`translation for segment ${index + 1}`"
@@ -3044,6 +3222,8 @@ watch(
           class="segment-row__target-preview"
           :class="{ 'is-tag-edit-mode': tagEditMode }"
           data-testid="segment-target-preview"
+          :dir="targetDirection"
+          :lang="targetLanguage || undefined"
           :aria-label="`translation style preview for segment ${index + 1}`"
           tabindex="0"
           @click="handleTargetPreviewClick"
@@ -3095,7 +3275,17 @@ watch(
       </div>
     </Teleport>
 
-    <div class="segment-row__cell segment-row__cell--state" :title="stateCellTitle">
+    <div
+      v-if="proofreadingSuggestion !== null"
+      class="segment-row__cell segment-row__cell--suggestion"
+      :class="`is-${proofreadingSuggestion.tone}`"
+      :title="proofreadingSuggestion.text"
+    >
+      <span class="segment-row__suggestion-label">{{ proofreadingSuggestion.label }}</span>
+      <span class="segment-row__suggestion-text">{{ proofreadingSuggestion.text }}</span>
+    </div>
+
+    <div v-else-if="!alignmentMode" class="segment-row__cell segment-row__cell--state" :title="stateCellTitle">
       <span
         v-if="segment.status === 'confirmed' && !isProjectSynced"
         class="segment-row__confirm-mark"
@@ -3128,13 +3318,60 @@ watch(
       </span>
     </div>
 
-    <div class="segment-row__cell segment-row__cell--workflow">
+    <div v-if="proofreadingSuggestion === null && !alignmentMode" class="segment-row__cell segment-row__cell--workflow">
       <span class="segment-row__workflow-label">{{ workflowLabel }}</span>
     </div>
   </article>
 </template>
 
 <style scoped>
+.segment-row.is-alignment-mode.is-alignment-translation-only {
+  --segment-row-bg: linear-gradient(90deg, #fff5d6 0%, #fffaf0 48%, #fffdf7 100%);
+  --segment-row-border: #e1b955;
+  --segment-row-accent: #c48708;
+  --segment-meta-bg: #ffedb7;
+  --segment-source-bg: #fff7df;
+  --segment-source-hover-bg: #ffefbd;
+  --segment-target-bg: #fffaf0;
+}
+
+.segment-row.is-alignment-mode.is-alignment-missing-translation {
+  --segment-row-bg: linear-gradient(90deg, #ffe7e7 0%, #fff4f4 48%, #fffafa 100%);
+  --segment-row-border: #df8d8d;
+  --segment-row-accent: #c44747;
+  --segment-meta-bg: #ffd6d6;
+  --segment-source-bg: #ffeded;
+  --segment-source-hover-bg: #ffdddd;
+  --segment-target-bg: #fff3f3;
+}
+
+.segment-row__alignment-issue-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.segment-row__alignment-issue-badge.is-translation-only {
+  background: #d79000;
+  color: #fff;
+}
+
+.segment-row__alignment-issue-badge.is-missing {
+  background: #c44747;
+  color: #fff;
+}
+
+.segment-row__alignment-issue-badge.is-cross-cell {
+  background: #8b5cf6;
+  color: #fff;
+}
+
 .segment-row.is-selected {
   background-color: rgba(13, 122, 104, 0.12);
   outline: 2px solid rgba(13, 122, 104, 0.45);
@@ -3142,8 +3379,65 @@ watch(
   border-radius: 4px;
 }
 
+.segment-row__selection-toggle {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  place-items: center;
+  color: var(--ink-400);
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.segment-row__selection-toggle:hover,
+.segment-row__selection-toggle.is-selected {
+  color: var(--brand);
+  background: rgba(13, 122, 104, 0.1);
+}
+
+.segment-row__cell--original-target {
+  min-width: 0;
+  padding: 12px;
+  background: #f8fafc;
+  color: var(--ink-700);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.segment-row__original-target-label {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-bottom: 5px;
+  color: var(--ink-500);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.segment-row__original-target-label strong {
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #dbeafe;
+  color: #0759b8;
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.segment-row__original-target-text {
+  line-height: 1.55;
+}
+
 .segment-row__cell--target.is-pending {
   box-shadow: inset 2px 0 0 rgba(0, 122, 204, 0.36);
+}
+
+.segment-row.is-proofreading-changed .segment-row__cell--target {
+  background: linear-gradient(0deg, rgba(219, 234, 254, 0.38), rgba(239, 246, 255, 0.5));
+  box-shadow: inset 3px 0 0 #3b82f6;
 }
 
 .segment-row__source-content,
@@ -3192,6 +3486,31 @@ watch(
   margin-top: 9px;
 }
 
+.segment-row__merge-confidence-badge {
+  flex: 0 0 auto;
+  margin-top: 8px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.45;
+  white-space: nowrap;
+  user-select: none;
+  cursor: help;
+}
+
+.segment-row__merge-confidence-badge.is-mid {
+  background: #fff7d6;
+  color: #8a5d0b;
+  border: 1px solid rgba(217, 152, 8, 0.4);
+}
+
+.segment-row__merge-confidence-badge.is-low {
+  background: #fde2e2;
+  color: #a02929;
+  border: 1px solid rgba(200, 40, 40, 0.4);
+}
+
 .segment-row__copy-source-button,
 .segment-row__line-break-button {
   flex: 0 0 auto;
@@ -3235,7 +3554,8 @@ watch(
 }
 
 .segment-row__cell--state,
-.segment-row__cell--workflow {
+.segment-row__cell--workflow,
+.segment-row__cell--suggestion {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -3260,6 +3580,69 @@ watch(
   font-weight: 500;
   line-height: 1;
   white-space: nowrap;
+}
+
+.segment-row__cell--suggestion {
+  align-items: flex-start;
+  justify-content: center;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 10px;
+  background: #fffdf5;
+  color: #5f4b18;
+  line-height: 1.4;
+}
+
+.segment-row__cell--suggestion.is-unchanged {
+  background: #f6fbf8;
+  color: #426257;
+}
+
+.segment-row__cell--suggestion.is-error {
+  background: #fff5f5;
+  color: #9f2d2d;
+}
+
+.segment-row__cell--suggestion.is-pending {
+  background: #f7f9fb;
+  color: #667784;
+}
+
+.segment-row__suggestion-label {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(197, 143, 25, 0.13);
+  color: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.segment-row__cell--suggestion.is-unchanged .segment-row__suggestion-label {
+  background: rgba(22, 101, 52, 0.1);
+}
+
+.segment-row__cell--suggestion.is-error .segment-row__suggestion-label {
+  background: rgba(190, 24, 93, 0.1);
+}
+
+.segment-row__suggestion-text {
+  display: -webkit-box;
+  width: 100%;
+  overflow: hidden;
+  color: inherit;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.segment-row.is-active .segment-row__suggestion-text {
+  display: block;
+  overflow: visible;
 }
 
 .segment-row__workflow-label {
@@ -3641,30 +4024,130 @@ watch(
 /* 显示标记样式 */
 .segment-row__text :deep(.visible-char),
 .segment-row__source-editor :deep(.visible-char),
-.segment-row__editor :deep(.visible-char) {
-  color: #64748b;
-  font-size: 0.85em;
-  font-weight: 700;
+.segment-row__editor :deep(.visible-char),
+.segment-row__target-preview :deep(.visible-char) {
+  display: inline-block;
+  color: #087667;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+  font-weight: 800;
+  line-height: 1.05;
+  text-align: center;
+  vertical-align: 0.04em;
   user-select: none;
   pointer-events: none;
 }
 
 .segment-row__text :deep(.visible-char--space),
 .segment-row__source-editor :deep(.visible-char--space),
-.segment-row__editor :deep(.visible-char--space) {
-  color: #6b7280;
+.segment-row__editor :deep(.visible-char--space),
+.segment-row__target-preview :deep(.visible-char--space) {
+  min-width: 0.52em;
+  margin-inline: 0.02em;
+  border-radius: 0.2em;
+  background: #dff5ef;
+  color: #067565;
+  box-shadow: inset 0 0 0 1px rgba(6, 117, 101, 0.24);
 }
 
 .segment-row__text :deep(.visible-char--tab),
 .segment-row__source-editor :deep(.visible-char--tab),
-.segment-row__editor :deep(.visible-char--tab) {
-  color: #3b82f6;
+.segment-row__editor :deep(.visible-char--tab),
+.segment-row__target-preview :deep(.visible-char--tab) {
+  min-width: 1.35em;
+  margin-inline: 0.04em;
+  border-radius: 0.2em;
+  background: #e8f1ff;
+  color: #2563b8;
+  box-shadow: inset 0 -1px 0 rgba(37, 99, 184, 0.38);
 }
 
 .segment-row__text :deep(.visible-char--newline),
 .segment-row__source-editor :deep(.visible-char--newline),
-.segment-row__editor :deep(.visible-char--newline) {
-  color: #ef4444;
+.segment-row__editor :deep(.visible-char--newline),
+.segment-row__target-preview :deep(.visible-char--newline) {
+  min-width: 1.05em;
+  margin-inline: 0.04em;
+  border-radius: 0.2em;
+  background: #fff0ed;
+  color: #c24132;
+  box-shadow: inset 0 0 0 1px rgba(194, 65, 50, 0.2);
+}
+
+/*
+ * Word 的 Wingdings 复选框与普通 Unicode 方框字面尺寸不同。
+ * 界面统一绘制外框，但隐藏节点中继续保存原字符，保证复制、编辑和导出语义不变。
+ */
+.segment-row__text :deep(.segment-row__checkbox-glyph),
+.segment-row__source-editor :deep(.segment-row__checkbox-glyph),
+.segment-row__editor :deep(.segment-row__checkbox-glyph),
+.segment-row__target-preview :deep(.segment-row__checkbox-glyph) {
+  position: relative;
+  display: inline-block;
+  width: 0.88em;
+  height: 0.88em;
+  margin-inline: 0.04em;
+  border: 0.075em solid currentColor;
+  border-radius: 0.06em;
+  box-sizing: border-box;
+  line-height: 1;
+  vertical-align: -0.08em;
+  pointer-events: none;
+}
+
+.segment-row__text :deep(.segment-row__checkbox-raw),
+.segment-row__source-editor :deep(.segment-row__checkbox-raw),
+.segment-row__editor :deep(.segment-row__checkbox-raw),
+.segment-row__target-preview :deep(.segment-row__checkbox-raw) {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  font-size: 0;
+  line-height: 0;
+}
+
+.segment-row__text :deep(.segment-row__checkbox-glyph--checked::after),
+.segment-row__source-editor :deep(.segment-row__checkbox-glyph--checked::after),
+.segment-row__editor :deep(.segment-row__checkbox-glyph--checked::after),
+.segment-row__target-preview :deep(.segment-row__checkbox-glyph--checked::after) {
+  content: '';
+  position: absolute;
+  left: 0.25em;
+  top: 0.03em;
+  width: 0.25em;
+  height: 0.5em;
+  border-right: 0.105em solid currentColor;
+  border-bottom: 0.105em solid currentColor;
+  transform: rotate(42deg);
+  transform-origin: center;
+}
+
+.segment-row__text :deep(.segment-row__checkbox-glyph--crossed::before),
+.segment-row__text :deep(.segment-row__checkbox-glyph--crossed::after),
+.segment-row__source-editor :deep(.segment-row__checkbox-glyph--crossed::before),
+.segment-row__source-editor :deep(.segment-row__checkbox-glyph--crossed::after),
+.segment-row__editor :deep(.segment-row__checkbox-glyph--crossed::before),
+.segment-row__editor :deep(.segment-row__checkbox-glyph--crossed::after),
+.segment-row__target-preview :deep(.segment-row__checkbox-glyph--crossed::before),
+.segment-row__target-preview :deep(.segment-row__checkbox-glyph--crossed::after) {
+  content: '';
+  position: absolute;
+  left: 0.12em;
+  top: 0.37em;
+  width: 0.58em;
+  height: 0.09em;
+  border-radius: 0.05em;
+  background: currentColor;
+  transform: rotate(45deg);
+  transform-origin: center;
+}
+
+.segment-row__text :deep(.segment-row__checkbox-glyph--crossed::after),
+.segment-row__source-editor :deep(.segment-row__checkbox-glyph--crossed::after),
+.segment-row__editor :deep(.segment-row__checkbox-glyph--crossed::after),
+.segment-row__target-preview :deep(.segment-row__checkbox-glyph--crossed::after) {
+  transform: rotate(-45deg);
 }
 
 /* 译文只读样式预览：只读、非编辑框，展示逐词样式（开关开+非编辑态时替代编辑框的

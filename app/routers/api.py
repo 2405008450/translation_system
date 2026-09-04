@@ -22,7 +22,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, case, func, literal, or_
+from sqlalchemy import and_, case, exists, func, literal, or_, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, aliased, object_session
 
@@ -43,6 +43,7 @@ from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models import (
     AssignmentEvent,
+    DocumentAlignmentPair,
     DocumentStatisticsReport,
     DocumentStatisticsReportItem,
     FileAssignment,
@@ -62,6 +63,9 @@ from app.models import (
     PretranslationRun,
     PretranslationTask,
     ProjectWorkflowStep,
+    ProofreadingBatch,
+    ProofreadingColumnBinding,
+    ProofreadingSegmentBaseline,
     Segment,
     SegmentQAIssue,
     SegmentRevision,
@@ -73,6 +77,8 @@ from app.models import (
     TermBase,
     TermEntry,
     TranslationMemory,
+    TranslationReviewReport,
+    TranslationReviewReportItem,
     User,
 )
 from app.services.adapters import (
@@ -104,6 +110,10 @@ from app.services.auto_tm_sync import (
     run_auto_tm_background_once,
     run_auto_tm_rematch_background_once,
 )
+from app.services.assignment_split import (
+    AssignmentSplitError,
+    build_assignment_split_preview,
+)
 from app.services.adapters.dita_exporter import DitaExporter
 from app.services.adapters.svg_exporter import SvgExporter
 from app.services.adapters.tmx_exporter import TmxExporter
@@ -121,6 +131,11 @@ from app.services.document_statistics import (
     compute_document_statistics,
     normalize_document_statistics,
     serialize_document_statistics,
+)
+from app.services.document_alignment.service import merge_alignment_pair_range
+from app.services.document_alignment.segments import (
+    TRANSLATION_ONLY_SOURCE_LABEL,
+    ensure_document_pair_segments_complete,
 )
 from app.services.document_match_analysis import (
     DocumentMatchSegment,
@@ -246,6 +261,11 @@ from app.services.tm_match_state import (
     is_tm_match_signature_current,
     mark_tm_match_signature_current,
 )
+from app.services.tm_numeric_cleanup import (
+    count_numeric_only_tm_entries,
+    delete_numeric_only_tm_entries,
+    list_numeric_only_tm_entry_examples,
+)
 from app.services.notification_service import (
     build_resource_import_notification,
     build_save_to_tm_notification,
@@ -256,15 +276,33 @@ from app.services.spelling_grammar_qa import (
     LanguageToolUnavailableError,
     QA_ISSUE_STATUS_IGNORED,
     QA_ISSUE_STATUS_OPEN,
+    QA_RULE_CONSECUTIVE_DUPLICATE_WORDS,
+    QA_RULE_CONTEXT_TRANSLATION_MISMATCH,
+    QA_RULE_EMAIL_MISMATCH,
     QA_RULE_ENDING_PUNCTUATION_MISMATCH,
     QA_RULE_EXTRA_SPACE_AFTER_PUNCTUATION,
+    QA_RULE_LINK_MISMATCH,
     QA_RULE_MISSING_SPACE_AFTER_PUNCTUATION,
+    QA_RULE_MULTIPLE_SPACES,
+    QA_RULE_NUMBER_MISMATCH,
     QA_RULE_PAIRED_PUNCTUATION_MISSING,
+    QA_RULE_PARAMETER_MISMATCH,
+    QA_RULE_PUNCTUATION_LEADING_EXTRA_SPACE,
+    QA_RULE_PUNCTUATION_LEADING_MISSING_SPACE,
     QA_RULE_REPEATED_PUNCTUATION,
+    QA_RULE_SEGMENT_TRAILING_EXTRA_SPACE,
+    QA_RULE_SOURCE_TARGET_IDENTICAL,
+    QA_RULE_SOURCE_TARGET_INITIAL_CASE_MISMATCH,
+    QA_RULE_SOURCE_TARGET_SAME_WORD_CASE_MISMATCH,
+    QA_RULE_SOURCE_TARGET_WORD_COUNT_GAP_TOO_LARGE,
+    QA_RULE_SPECIAL_SYMBOL_MISMATCH,
     QA_RULE_SPELLING_GRAMMAR,
     QA_RULE_TARGET_PLACEHOLDER_MISSING,
     QA_RULE_TARGET_TAG_MISSING,
     QA_RULE_TARGET_WITHOUT_TAG,
+    QA_RULE_TARGET_WORD_COUNT_BELOW_SOURCE,
+    QA_RULE_TARGET_WORD_COUNT_EXCEEDS_SOURCE,
+    QA_RULE_TARGET_WORD_MULTIPLE_UPPER_INITIALS,
     QA_RULE_TERM_INCONSISTENCY,
     QA_RULE_UNMATCHED_CLOSING_TAG,
     QA_RULE_UNMATCHED_OPENING_TAG,
@@ -321,7 +359,9 @@ from app.services.project_segment_sync import (
     sync_project_repeated_segments_from_file,
 )
 from app.services.project_sync_outbox import (
+    PROJECT_SYNC_TRIGGER_BLUR,
     enqueue_project_segment_sync,
+    project_sync_blur_enabled_for_project,
     run_project_sync_outbox_once,
 )
 from app.services.segment_events import (
@@ -1479,6 +1519,7 @@ class AutoTMWorkerSettings:
 class SegmentSyncWorkerSettings:
     queue_name = ARQ_SEGMENT_SYNC_QUEUE_NAME
     keep_result = 0
+    poll_delay = 0.1
     max_jobs = _resolve_arq_worker_max_jobs(
         get_settings().arq_segment_sync_max_jobs,
         1,
@@ -1562,6 +1603,17 @@ class LiveSpellingPreviewRequest(BaseModel):
 
 class SegmentProjectSyncUpdate(BaseModel):
     disabled: bool
+
+
+class SegmentProjectSyncTrigger(BaseModel):
+    expected_version: int = Field(ge=1)
+    trigger: Literal["blur"] = "blur"
+
+
+class SegmentProjectSyncTriggerResponse(BaseModel):
+    enabled: bool
+    queued_count: int
+    source_version: int
 
 
 class ProjectSyncDisableResponse(BaseModel):
@@ -2831,6 +2883,15 @@ class ProjectAssignmentFileRangeRequest(BaseModel):
     range_end: int | None = Field(default=None, ge=1)
 
 
+class AssignmentSplitPreviewRequest(BaseModel):
+    file_record_id: UUID
+    mode: Literal["by_part_count", "by_words_per_part"]
+    part_count: int | None = Field(default=None, ge=1, le=1000)
+    words_per_part: int | None = Field(default=None, ge=1, le=10_000_000)
+    range_start: int | None = Field(default=None, ge=1)
+    range_end: int | None = Field(default=None, ge=1)
+
+
 class ProjectAssignmentEntryRequest(BaseModel):
     assignee_id: UUID
     workflow_step_id: UUID | None = None
@@ -3283,6 +3344,13 @@ def _can_manage_workflow(current_user: User | None) -> bool:
 
 WORKFLOW_TEMPLATE_DEFINITIONS: list[dict[str, Any]] = [
     {
+        "id": "proofread",
+        "name": "校对",
+        "steps": [
+            {"step_key": "proofread", "name": "校对", "step_type": "proofread"},
+        ],
+    },
+    {
         "id": "translate",
         "name": "翻译",
         "steps": [
@@ -3391,20 +3459,32 @@ def _create_project_workflow_steps(
     if len(source_steps) > 8:
         raise HTTPException(status_code=400, detail="工作流阶段最多支持 8 个。")
 
+    is_proofread_template = str(template["id"]) == "proofread"
+    if is_proofread_template and len(source_steps) != 1:
+        raise HTTPException(status_code=400, detail="校对工作流只能包含一个“校对”阶段。")
+
     normalized: list[ProjectWorkflowStep] = []
     used_keys: set[str] = set()
     for index, item in enumerate(source_steps):
         name = (item.name or "").strip()
         if not name:
             raise HTTPException(status_code=400, detail="工作流阶段名称不能为空。")
-        if index == 0 and name != "翻译":
+        if index == 0 and not is_proofread_template and name != "翻译":
             raise HTTPException(status_code=400, detail="工作流第一个阶段必须是“翻译”。")
+        if index == 0 and is_proofread_template and name != "校对":
+            raise HTTPException(status_code=400, detail="校对工作流阶段名称必须是“校对”。")
 
         raw_key = (item.step_key or "").strip().lower()
-        step_key = raw_key or ("translate" if index == 0 else f"step_{index + 1}")
+        step_key = raw_key or (
+            "proofread" if is_proofread_template and index == 0
+            else "translate" if index == 0
+            else f"step_{index + 1}"
+        )
         step_key = re.sub(r"[^a-z0-9_]+", "_", step_key).strip("_") or f"step_{index + 1}"
-        if index == 0:
+        if index == 0 and not is_proofread_template:
             step_key = "translate"
+        elif index == 0:
+            step_key = "proofread"
         base_key = step_key
         suffix = 2
         while step_key in used_keys:
@@ -3412,9 +3492,15 @@ def _create_project_workflow_steps(
             suffix += 1
         used_keys.add(step_key)
 
-        step_type = (item.step_type or ("translation" if index == 0 else "custom")).strip().lower()
-        if index == 0:
+        step_type = (item.step_type or (
+            "proofread" if is_proofread_template and index == 0
+            else "translation" if index == 0
+            else "custom"
+        )).strip().lower()
+        if index == 0 and not is_proofread_template:
             step_type = "translation"
+        elif index == 0:
+            step_type = "proofread"
 
         normalized.append(
             ProjectWorkflowStep(
@@ -3785,32 +3871,13 @@ def _apply_segment_assignment_visibility_filter(
     if _file_has_unindexed_display_segments(db, file_record.id):
         refresh_segment_display_indexes(db, file_record)
 
-    # 流程阶段限制的是编辑权，而不是审阅上下文的读取权。后续阶段的译者需要
-    # 看到当前阶段及之前阶段的内容，否则在管理员尚未执行流程流转时，任务页会
-    # 返回 0 个句段并呈现空白。编辑接口仍通过
-    # ``_can_write_segment_with_assignments`` 严格校验为“当前阶段完全匹配”。
-    workflow_steps = _load_project_workflow_steps(db, file_record.project_id)
-    workflow_step_by_id = {step.id: step for step in workflow_steps}
-    first_step_id = workflow_steps[0].id if workflow_steps else None
-
+    # 流程阶段只限制编辑权，不限制已分配范围的读取权。句段推进到审校/校对后，
+    # 原翻译人员仍应能看到自己处理过的范围，否则任务仍显示在“我的任务”中，
+    # 打开后却会得到 0 个句段。编辑接口继续通过
+    # ``_can_write_segment_with_assignments`` 严格校验“当前阶段完全匹配”。
     visibility_conditions = []
     for assignment in visible_assignments:
-        assigned_step = workflow_step_by_id.get(assignment.workflow_step_id)
-        if assigned_step is None:
-            readable_step_ids = [assignment.workflow_step_id]
-        else:
-            assigned_order = int(assigned_step.sort_order or 0)
-            readable_step_ids = [
-                step.id
-                for step in workflow_steps
-                if int(step.sort_order or 0) <= assigned_order
-            ]
-
-        step_condition = Segment.workflow_step_id.in_(readable_step_ids)
-        if first_step_id in readable_step_ids:
-            # 兼容尚未完成历史数据回填的句段；正常详情接口会先将其归到首阶段。
-            step_condition = or_(step_condition, Segment.workflow_step_id.is_(None))
-        condition = step_condition
+        condition = literal(True)
         if assignment.range_start is not None and assignment.range_end is not None:
             condition = and_(
                 condition,
@@ -4036,6 +4103,8 @@ def _get_active_project_assignees(db: Session, project_ids: list[UUID]) -> dict[
     )
     result: dict[UUID, list[User]] = {}
     for project_id, user in rows:
+        if not is_external_translator(user):
+            continue
         result.setdefault(project_id, []).append(user)
     return result
 
@@ -4056,6 +4125,8 @@ def _get_active_file_assignees(db: Session, file_record_ids: list[UUID]) -> dict
     result: dict[UUID, list[User]] = {}
     seen: set[tuple[UUID, UUID]] = set()
     for file_record_id, user in rows:
+        if not is_external_translator(user):
+            continue
         key = (file_record_id, user.id)
         if key in seen:
             continue
@@ -4311,8 +4382,13 @@ def _validate_assignment_payload(
     validated_boundary_ranges: set[tuple[UUID, int, int]] = set()
     for entry in payload.assignments:
         assignee = get_user_by_id(db, entry.assignee_id)
-        if assignee is None or not assignee.is_active or assignee.role != USER_ROLE:
-            raise HTTPException(status_code=400, detail="只能指派给启用中的普通译者账号。")
+        if (
+            assignee is None
+            or not assignee.is_active
+            or assignee.role != USER_ROLE
+            or not is_external_translator(assignee)
+        ):
+            raise HTTPException(status_code=400, detail="只能指派给启用中的外部译者账号。")
         workflow_step_id = entry.workflow_step_id or first_step_id
         if workflow_step_id not in workflow_step_ids:
             raise HTTPException(status_code=400, detail="存在不属于当前项目的流程阶段授权。")
@@ -4365,6 +4441,15 @@ def _validate_assignment_payload(
                     )
                     validated_boundary_ranges.add(range_key)
             file_range_targets.add((file_range.file_record_id, range_start, range_end))
+        # 合并视图会展开成整文件授权；若调用方同时提交了显式分段范围，
+        # 以分段范围为准，避免同一用户在同一文件上同时出现“整文件 + 分段”目标，
+        # 并进一步与其他用户的合法分段产生伪重叠。
+        ranged_file_ids_for_entry = {
+            file_record_id
+            for file_record_id, range_start, range_end in file_range_targets
+            if range_start is not None or range_end is not None
+        }
+        file_ids.difference_update(ranged_file_ids_for_entry)
         desired_user_ids.add(assignee.id)
         targets = desired.setdefault((assignee.id, workflow_step_id), set())
         targets.update((file_record_id, None, None) for file_record_id in file_ids)
@@ -4632,25 +4717,46 @@ def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, A
     workflow_steps = _load_project_workflow_steps(db, project_id)
     workflow_step_by_id = {step.id: step for step in workflow_steps}
     first_step_id = workflow_steps[0].id if workflow_steps else None
-    assignments = (
-        db.query(ProjectAssignment)
-        .join(User, User.id == ProjectAssignment.assignee_id)
-        .filter(
-            ProjectAssignment.project_id == project_id,
-            ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+    assignments = [
+        assignment
+        for assignment in (
+            db.query(ProjectAssignment)
+            .join(User, User.id == ProjectAssignment.assignee_id)
+            .filter(
+                ProjectAssignment.project_id == project_id,
+                ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .order_by(ProjectAssignment.assigned_at.asc(), User.username.asc())
+            .all()
         )
-        .order_by(ProjectAssignment.assigned_at.asc(), User.username.asc())
-        .all()
-    )
-    file_rows = (
-        db.query(FileAssignment)
-        .filter(
-            FileAssignment.project_id == project_id,
-            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        if is_external_translator(assignment.assignee)
+    ]
+    external_assignee_ids = {assignment.assignee_id for assignment in assignments}
+    file_rows = [
+        assignment
+        for assignment in (
+            db.query(FileAssignment)
+            .filter(
+                FileAssignment.project_id == project_id,
+                FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .order_by(FileAssignment.assigned_at.asc(), FileAssignment.id.asc())
+            .all()
         )
-        .order_by(FileAssignment.assigned_at.asc(), FileAssignment.id.asc())
-        .all()
-    )
+        if assignment.assignee_id in external_assignee_ids
+    ]
+    file_ids = {row.file_record_id for row in file_rows}
+    segment_counts_by_file_id = {
+        file_record_id: int(segment_count or 0)
+        for file_record_id, segment_count in (
+            db.query(Segment.file_record_id, func.count(Segment.id))
+            .filter(Segment.file_record_id.in_(file_ids))
+            .group_by(Segment.file_record_id)
+            .all()
+            if file_ids
+            else []
+        )
+    }
     files_by_user_step: dict[tuple[UUID, UUID], list[str]] = {}
     file_ranges_by_user_step: dict[tuple[UUID, UUID], list[dict[str, Any]]] = {}
     first_file_assignment_by_user_step: dict[tuple[UUID, UUID], FileAssignment] = {}
@@ -4658,12 +4764,29 @@ def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, A
         workflow_step_id = file_assignment.workflow_step_id or first_step_id
         if workflow_step_id is None:
             continue
+        range_start = file_assignment.segment_range_start
+        range_end = file_assignment.segment_range_end
+        if range_start is not None or range_end is not None:
+            segment_count = segment_counts_by_file_id.get(file_assignment.file_record_id, 0)
+            # 文件拆分/合并或删除句段后，历史范围可能仍指向旧的总句段数。
+            # GET 响应先把尾部越界范围收缩到当前文件末尾；管理员下次保存时，
+            # 现有差异更新流程会将规范化后的范围持久化，避免无关的新分配被旧数据拦截。
+            if (
+                range_start is None
+                or range_end is None
+                or segment_count <= 0
+                or range_start > segment_count
+            ):
+                continue
+            range_end = min(range_end, segment_count)
+            if range_end < range_start:
+                continue
         key = (file_assignment.assignee_id, workflow_step_id)
         files_by_user_step.setdefault(key, []).append(str(file_assignment.file_record_id))
         file_ranges_by_user_step.setdefault(key, []).append({
             "file_record_id": str(file_assignment.file_record_id),
-            "range_start": file_assignment.segment_range_start,
-            "range_end": file_assignment.segment_range_end,
+            "range_start": range_start,
+            "range_end": range_end,
         })
         first_file_assignment_by_user_step.setdefault(key, file_assignment)
 
@@ -6609,6 +6732,7 @@ def create_project(
         status="draft",
         source_language=source_language,
         target_language=target_language,
+        workflow_template_id=(payload.workflow_template_id or "custom").strip() or "custom",
         creator_id=current_user.id,
         deadline=deadline_dt,
         access_level=payload.access_level,
@@ -6629,6 +6753,7 @@ def create_project(
         "name": project.name,
         "filename": project.name,
         "status": project.status,
+        "workflow_template_id": project.workflow_template_id,
         "source_language": project.source_language,
         "target_language": project.target_language,
         "creator": get_user_display_name(current_user),
@@ -6683,6 +6808,7 @@ def duplicate_project(
         document_parse_mode=source_project.document_parse_mode,
         source_language=source_language,
         target_language=target_language,
+        workflow_template_id=getattr(source_project, "workflow_template_id", "custom") or "custom",
         creator_id=current_user.id,
         deadline=deadline_dt,
         access_level=payload.access_level or source_project.access_level or "team",
@@ -6744,6 +6870,7 @@ def _build_project_summary_payload(
         "pretranslation_progress": pretranslation_progress,
         "source_language": project.source_language,
         "target_language": project.target_language,
+        "workflow_template_id": getattr(project, "workflow_template_id", "custom") or "custom",
         "creator": creator_name,
         "deadline": project.deadline.isoformat() if project.deadline else None,
         "access_level": project.access_level,
@@ -6771,6 +6898,7 @@ def _build_project_file_payload(
     assignees: list[User] | None = None,
     workflow_steps: list[ProjectWorkflowStep] | None = None,
     workflow_progress: list[dict[str, Any]] | None = None,
+    proofreading: dict[str, Any] | None = None,
 ) -> dict:
     source_bytes = load_file_record_source(file_record)
     operation_state = (
@@ -6795,6 +6923,12 @@ def _build_project_file_payload(
     assignee_id = getattr(file_record, "assignee_id", None)
     assignee = getattr(file_record, "assignee", None)
     assigned_at = getattr(file_record, "assigned_at", None)
+    if assignees is not None:
+        # 内部译者天然拥有全部文件权限，不应再作为文件“被分配人”展示。
+        assignee = assignees[0] if assignees else None
+        assignee_id = assignee.id if assignee is not None else None
+        if assignee is None:
+            assigned_at = None
     deadline = getattr(file_record, "deadline", None)
     collection_ids = _load_file_record_collection_ids(file_record)
     term_base_ids = _load_file_record_term_base_ids(file_record)
@@ -6844,8 +6978,38 @@ def _build_project_file_payload(
         "open_issue_count": issue_stats.get("open_issue_count", 0),
         "can_manage": _can_manage_workflow(current_user),
         "can_write": _can_write_file_record(file_record, current_user),
+        "proofreading": proofreading,
         **operation_state,
     }
+
+
+def _serialize_file_proofreading_summary(batch: ProofreadingBatch) -> dict[str, Any]:
+    from app.services.document_alignment.export import target_revision_export_available
+
+    return {
+        "batch_id": str(batch.id),
+        "batch_kind": getattr(batch, "batch_kind", "xlsx_columns"),
+        "workflow_stage": getattr(batch, "workflow_stage", "not_applicable"),
+        "alignment_status": getattr(batch, "alignment_status", "not_applicable"),
+        "batch_status": batch.status,
+        "target_revision_export_available": target_revision_export_available(batch),
+    }
+
+
+def _load_proofreading_by_file_ids(db: Session, file_record_ids: list[UUID]) -> dict[UUID, dict[str, Any]]:
+    if not file_record_ids:
+        return {}
+    rows = (
+        db.query(ProofreadingColumnBinding, ProofreadingBatch)
+        .join(ProofreadingBatch, ProofreadingColumnBinding.batch_id == ProofreadingBatch.id)
+        .filter(ProofreadingColumnBinding.file_record_id.in_(file_record_ids))
+        .order_by(ProofreadingColumnBinding.created_at.asc())
+        .all()
+    )
+    result: dict[UUID, dict[str, Any]] = {}
+    for binding, batch in rows:
+        result.setdefault(binding.file_record_id, _serialize_file_proofreading_summary(batch))
+    return result
 
 
 def _get_file_segment_stats(db: Session, file_record_ids: list[UUID]) -> dict[UUID, dict]:
@@ -7570,6 +7734,24 @@ WORKBENCH_QA_SUPPORTED_RULES = (
     QA_RULE_REPEATED_PUNCTUATION,
     QA_RULE_EXTRA_SPACE_AFTER_PUNCTUATION,
     QA_RULE_MISSING_SPACE_AFTER_PUNCTUATION,
+    QA_RULE_PUNCTUATION_LEADING_EXTRA_SPACE,
+    QA_RULE_PUNCTUATION_LEADING_MISSING_SPACE,
+    QA_RULE_MULTIPLE_SPACES,
+    QA_RULE_SEGMENT_TRAILING_EXTRA_SPACE,
+    QA_RULE_CONSECUTIVE_DUPLICATE_WORDS,
+    QA_RULE_SOURCE_TARGET_INITIAL_CASE_MISMATCH,
+    QA_RULE_TARGET_WORD_MULTIPLE_UPPER_INITIALS,
+    QA_RULE_SOURCE_TARGET_SAME_WORD_CASE_MISMATCH,
+    QA_RULE_SOURCE_TARGET_IDENTICAL,
+    QA_RULE_TARGET_WORD_COUNT_EXCEEDS_SOURCE,
+    QA_RULE_TARGET_WORD_COUNT_BELOW_SOURCE,
+    QA_RULE_SOURCE_TARGET_WORD_COUNT_GAP_TOO_LARGE,
+    QA_RULE_NUMBER_MISMATCH,
+    QA_RULE_PARAMETER_MISMATCH,
+    QA_RULE_EMAIL_MISMATCH,
+    QA_RULE_LINK_MISMATCH,
+    QA_RULE_SPECIAL_SYMBOL_MISMATCH,
+    QA_RULE_CONTEXT_TRANSLATION_MISMATCH,
 )
 WORKBENCH_QA_RULE_LABELS = {
     QA_RULE_TARGET_WITHOUT_TAG: "译文无标记",
@@ -7584,6 +7766,24 @@ WORKBENCH_QA_RULE_LABELS = {
     QA_RULE_REPEATED_PUNCTUATION: "重复标点",
     QA_RULE_EXTRA_SPACE_AFTER_PUNCTUATION: "标点符号后有多余空格",
     QA_RULE_MISSING_SPACE_AFTER_PUNCTUATION: "标点符号后遗漏空格",
+    QA_RULE_PUNCTUATION_LEADING_EXTRA_SPACE: "标点符号前有多余空格",
+    QA_RULE_PUNCTUATION_LEADING_MISSING_SPACE: "标点符号前遗漏空格",
+    QA_RULE_MULTIPLE_SPACES: "多个空格",
+    QA_RULE_SEGMENT_TRAILING_EXTRA_SPACE: "句段结束后有多余空格",
+    QA_RULE_CONSECUTIVE_DUPLICATE_WORDS: "连续重复单词",
+    QA_RULE_SOURCE_TARGET_INITIAL_CASE_MISMATCH: "原文和译文首字母大小写不一致",
+    QA_RULE_TARGET_WORD_MULTIPLE_UPPER_INITIALS: "译文一个单词中有多个大写首字母",
+    QA_RULE_SOURCE_TARGET_SAME_WORD_CASE_MISMATCH: "原文和译文的同一单词首字母有不同的大小写",
+    QA_RULE_SOURCE_TARGET_IDENTICAL: "原文和译文相同",
+    QA_RULE_TARGET_WORD_COUNT_EXCEEDS_SOURCE: "译文字数超过原文字数",
+    QA_RULE_TARGET_WORD_COUNT_BELOW_SOURCE: "译文字数少于原文字数",
+    QA_RULE_SOURCE_TARGET_WORD_COUNT_GAP_TOO_LARGE: "译文与原文字数相差过大",
+    QA_RULE_NUMBER_MISMATCH: "原文和译文数字不一致",
+    QA_RULE_PARAMETER_MISMATCH: "原文与译文参数不一致",
+    QA_RULE_EMAIL_MISMATCH: "原文与译文邮件信息不一致",
+    QA_RULE_LINK_MISMATCH: "原文和译文链接信息不一致",
+    QA_RULE_SPECIAL_SYMBOL_MISMATCH: "特殊符号不一致",
+    QA_RULE_CONTEXT_TRANSLATION_MISMATCH: "翻译与上下文匹配不一致",
 }
 WORKBENCH_QA_PUNCTUATION_RULES: frozenset[str] = frozenset(PUNCTUATION_QA_RULE_KEYS)
 WORKBENCH_QA_TAG_RULES: frozenset[str] = frozenset(TAG_QA_RULE_KEYS)
@@ -8152,6 +8352,11 @@ def _build_project_detail_payload(
         workflow_progress=workflow_progress,
     )
     file_assignees = file_assignees or {}
+    proofreading_by_file = (
+        _load_proofreading_by_file_ids(db, [file_record.id for file_record in files])
+        if db is not None
+        else {}
+    )
     payload["files"] = [
         _build_project_file_payload(
             file_record=file_record,
@@ -8163,6 +8368,7 @@ def _build_project_detail_payload(
             assignees=file_assignees.get(file_record.id),
             workflow_steps=workflow_steps,
             workflow_progress=file_workflow_progress.get(file_record.id, []),
+            proofreading=proofreading_by_file.get(file_record.id),
         )
         for file_record in files
     ]
@@ -8189,6 +8395,42 @@ def get_project_assignments(
 ):
     _get_project_or_404(db, project_id)
     return _serialize_project_assignments(db, project_id)
+
+
+@router.post("/projects/{project_id}/assignment-split-preview")
+def preview_project_assignment_split(
+    project_id: UUID,
+    payload: AssignmentSplitPreviewRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_project_assignment_manager),
+):
+    _get_project_or_404(db, project_id)
+    file_record = (
+        db.query(FileRecord)
+        .filter(
+            FileRecord.id == payload.file_record_id,
+            FileRecord.project_id == project_id,
+        )
+        .first()
+    )
+    if file_record is None:
+        raise HTTPException(status_code=404, detail="项目中不存在该文件。")
+    if payload.mode == "by_part_count" and payload.part_count is None:
+        raise HTTPException(status_code=400, detail="按份数拆分时必须填写份数。")
+    if payload.mode == "by_words_per_part" and payload.words_per_part is None:
+        raise HTTPException(status_code=400, detail="按每份字数拆分时必须填写每份字数。")
+    try:
+        return build_assignment_split_preview(
+            db,
+            file_record,
+            mode=payload.mode,
+            part_count=payload.part_count,
+            words_per_part=payload.words_per_part,
+            range_start=payload.range_start,
+            range_end=payload.range_end,
+        )
+    except AssignmentSplitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.patch("/projects/{project_id}/assignments")
@@ -10157,7 +10399,11 @@ def compute_project_document_statistics(
         source_bytes = load_file_record_source(file_record)
         source_filename = get_file_record_source_filename(file_record)
         if source_bytes and Path(source_filename).suffix.lower() in SUPPORTED_EXTENSIONS:
-            statistics = compute_document_statistics(source_bytes, source_filename)
+            statistics = compute_document_statistics(
+                source_bytes,
+                source_filename,
+                options=_get_file_record_document_parse_options(file_record),
+            )
         else:
             statistics = unavailable_statistics
         normalized_statistics = normalize_document_statistics(statistics)
@@ -10855,6 +11101,7 @@ def get_file_records(
     )
     workflow_steps_by_project = _load_workflow_steps_by_project(db, project_ids)
     file_workflow_progress = _get_file_workflow_progress(db, file_record_ids)
+    proofreading_by_file = _load_proofreading_by_file_ids(db, file_record_ids)
     return [
         {
             "id": file_record.id,
@@ -10897,6 +11144,7 @@ def get_file_records(
             "can_write": _can_write_file_record(file_record, current_user, db),
             "created_at": file_record.created_at.isoformat(),
             "updated_at": file_record.updated_at.isoformat(),
+            "proofreading": proofreading_by_file.get(file_record.id),
         }
         for file_record in file_records
     ]
@@ -11050,6 +11298,31 @@ def _serialize_workbench_segment(
                 writable_workflow_assignments,
             )
         )
+    alignment_pair_id = None
+    alignment_pair_order = None
+    alignment_translation_only = False
+    alignment_src_indices: list[int] = []
+    alignment_tgt_indices: list[int] = []
+    alignment_cross_cell = False
+    try:
+        alignment_metadata = json.loads(seg.segment_metadata or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        alignment_metadata = {}
+    if isinstance(alignment_metadata, dict):
+        raw_alignment_pair_id = alignment_metadata.get("alignment_pair_id")
+        raw_alignment_pair_order = alignment_metadata.get("alignment_pair_order")
+        alignment_pair_id = str(raw_alignment_pair_id) if raw_alignment_pair_id else None
+        if isinstance(raw_alignment_pair_order, int) and not isinstance(raw_alignment_pair_order, bool):
+            alignment_pair_order = raw_alignment_pair_order
+        alignment_translation_only = bool(alignment_metadata.get("translation_only"))
+        raw_src_indices = alignment_metadata.get("src_indices")
+        raw_tgt_indices = alignment_metadata.get("tgt_indices")
+        if isinstance(raw_src_indices, list):
+            alignment_src_indices = [value for value in raw_src_indices if isinstance(value, int) and not isinstance(value, bool)]
+        if isinstance(raw_tgt_indices, list):
+            alignment_tgt_indices = [value for value in raw_tgt_indices if isinstance(value, int) and not isinstance(value, bool)]
+        alignment_cross_cell = bool(alignment_metadata.get("cross_cell"))
+
     payload = {
         "id": str(seg.id),
         "sentence_id": seg.sentence_id,
@@ -11084,6 +11357,14 @@ def _serialize_workbench_segment(
         "row_index": seg.row_index,
         "cell_index": seg.cell_index,
         "sequence_index": seg.sequence_index,
+        # 双文档校对人工纠偏时，前端必须按底层配对顺序判断相邻，不能依赖
+        # block/row/cell 或筛选后的可见顺序。
+        "alignment_pair_id": alignment_pair_id,
+        "alignment_pair_order": alignment_pair_order,
+        "alignment_translation_only": alignment_translation_only,
+        "alignment_src_indices": alignment_src_indices,
+        "alignment_tgt_indices": alignment_tgt_indices,
+        "alignment_cross_cell": alignment_cross_cell,
         "workflow_step_id": str(resolved_workflow_step_id) if resolved_workflow_step_id else None,
         "workflow_step_name": workflow_step.name if workflow_step else "翻译",
         "workflow_step_order": int(workflow_step.sort_order or 0) if workflow_step else 0,
@@ -11097,6 +11378,20 @@ def _serialize_workbench_segment(
     }
     if display_index is not None:
         payload["display_index"] = display_index
+
+    # 从 segment_metadata 中挑出前端 UX 需要的字段（DWG/DXF 合并信心分数等）
+    raw_meta = getattr(seg, "segment_metadata", None)
+    if raw_meta:
+        try:
+            meta = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+            if isinstance(meta, dict):
+                if "merge_confidence" in meta:
+                    payload["merge_confidence"] = meta.get("merge_confidence")
+                if "is_merged" in meta:
+                    payload["is_merged"] = bool(meta.get("is_merged"))
+        except (ValueError, TypeError):
+            pass
+
     return payload
 
 
@@ -11249,6 +11544,47 @@ def _apply_segment_scope_filter(query, scope: str):
         )
     if normalized_scope == "empty_target":
         return query.filter(func.coalesce(Segment.target_text, "") == "")
+    if normalized_scope == "proofreading_translation_only":
+        # 双文档校对中的“增译”没有对应原文，物化时使用固定占位文本。
+        # 这里在数据库侧筛选，确保分页、计数和跨页跳转都只针对增译句段。
+        return query.filter(Segment.source_text == TRANSLATION_ONLY_SOURCE_LABEL)
+    if normalized_scope == "proofreading_missing_translation":
+        # 双文档校对中的“漏译”（导出报告称“缺译”）表现为有原文但译文为空。
+        return query.filter(
+            Segment.source_text != TRANSLATION_ONLY_SOURCE_LABEL,
+            func.coalesce(Segment.target_text, "") == "",
+        )
+    if normalized_scope == "proofreading_changed":
+        return query.join(
+            ProofreadingSegmentBaseline,
+            ProofreadingSegmentBaseline.segment_id == Segment.id,
+        ).filter(
+            func.coalesce(Segment.target_text, "")
+            != func.coalesce(ProofreadingSegmentBaseline.original_target_text, ""),
+        )
+    if normalized_scope == "proofreading_failed":
+        latest_report_id = (
+            select(TranslationReviewReport.id)
+            .where(
+                TranslationReviewReport.proofreading_batch_id
+                == ProofreadingSegmentBaseline.batch_id,
+            )
+            .order_by(TranslationReviewReport.created_at.desc())
+            .limit(1)
+            .correlate(ProofreadingSegmentBaseline)
+            .scalar_subquery()
+        )
+        has_latest_generation_error = exists(
+            select(1).where(
+                TranslationReviewReportItem.segment_id == Segment.id,
+                TranslationReviewReportItem.report_id == latest_report_id,
+                TranslationReviewReportItem.category_key == "generation_error",
+            )
+        )
+        return query.join(
+            ProofreadingSegmentBaseline,
+            ProofreadingSegmentBaseline.segment_id == Segment.id,
+        ).filter(has_latest_generation_error)
     return query
 
 
@@ -12583,6 +12919,7 @@ def get_file_record_next_unconfirmed_segment_position(
     after_sentence_id: str | None = None,
     page_size: int = 100,
     wrap: bool = True,
+    require_unconfirmed: bool = True,
     scope: str = "all",
     source_query: str | None = None,
     target_query: str | None = None,
@@ -12662,7 +12999,7 @@ def get_file_record_next_unconfirmed_segment_position(
     display_index_map = _get_segment_display_index_map(db, file_record_id, filtered_segments)
 
     def is_target_unconfirmed(item: Any) -> bool:
-        return getattr(item, "status", None) != "confirmed"
+        return not require_unconfirmed or getattr(item, "status", None) != "confirmed"
 
     def get_display_position(item: Any, fallback_index: int) -> int:
         return display_index_map.get(item.id, fallback_index) + 1
@@ -12684,7 +13021,7 @@ def get_file_record_next_unconfirmed_segment_position(
                 break
 
     if not row:
-        return {"target": None, "wrapped": False}
+        return {"target": None, "wrapped": False, "matched_count": 0}
 
     filtered_index = max(filtered_index, 0)
     display_position = get_display_position(row, filtered_index)
@@ -12700,6 +13037,11 @@ def get_file_record_next_unconfirmed_segment_position(
             "page_index": filtered_index % safe_page_size,
         },
         "wrapped": wrapped,
+        "matched_count": (
+            sum(1 for item in filtered_segments if is_target_unconfirmed(item))
+            if require_unconfirmed
+            else len(filtered_segments)
+        ),
     }
 
 
@@ -12824,6 +13166,7 @@ def _create_english_variant_copy_task_response(
             "unsupported_language_pair": 422,
             "active_operation": 409,
             "empty_translation": 409,
+            "semantic_review_failed": 503,
         }[exc.code]
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except Exception:
@@ -12851,6 +13194,7 @@ def _create_english_variant_copy_task_response(
             "processed_segments": result.summary.processed_segments,
             "changed_segments": result.summary.changed_segments,
             "replacement_count": result.summary.replacement_count,
+            "llm_review_count": result.summary.llm_review_count,
         },
     }
 
@@ -12907,8 +13251,13 @@ def assign_file_record_task(
     assignee: User | None = None
     if payload.assignee_id is not None:
         assignee = get_user_by_id(db, payload.assignee_id)
-        if assignee is None or not assignee.is_active or assignee.role != USER_ROLE:
-            raise HTTPException(status_code=400, detail="只能指派给启用中的普通译者账号。")
+        if (
+            assignee is None
+            or not assignee.is_active
+            or assignee.role != USER_ROLE
+            or not is_external_translator(assignee)
+        ):
+            raise HTTPException(status_code=400, detail="只能指派给启用中的外部译者账号。")
 
     file_record.assignee_id = assignee.id if assignee else None
     file_record.assigned_by_id = current_user.id if assignee else None
@@ -13554,6 +13903,8 @@ def create_project_file_export_zip_task(
         project_id=project.id,
         project_name=getattr(project, "name", None) or getattr(project, "filename", None) or "项目",
         file_ids=[file_record.id for file_record in files],
+        requested_by_id=current_user.id,
+        requested_by_name=(current_user.nickname or current_user.username),
     )
     return JSONResponse(status_code=202, content=task)
 
@@ -14962,6 +15313,58 @@ def update_segment_project_sync(
     )
 
 
+@router.post("/file-records/{file_record_id}/segments/{sentence_id}/project-sync", status_code=202)
+def trigger_segment_project_sync(
+    file_record_id: UUID,
+    sentence_id: str,
+    payload: SegmentProjectSyncTrigger,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+) -> SegmentProjectSyncTriggerResponse:
+    """当前单元格保存成功后，显式触发一次失焦同步。"""
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not segment:
+        raise HTTPException(status_code=404, detail="句段不存在。")
+    _require_segment_work_access(db, file_record, segment, current_user)
+
+    current_version = int(segment.version or 1)
+    if current_version != payload.expected_version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "句段版本已变化，已取消本次失焦同步。",
+                "current_version": current_version,
+                "expected_version": payload.expected_version,
+            },
+        )
+
+    enabled = project_sync_blur_enabled_for_project(file_record.project_id)
+    queued_count = 0
+    if enabled:
+        queued_count = enqueue_project_segment_sync(
+            db,
+            file_record=file_record,
+            segments=[segment],
+            current_user=current_user,
+            trigger_kind=PROJECT_SYNC_TRIGGER_BLUR,
+        )
+        db.commit()
+        _schedule_project_segment_sync_processing(background_tasks, queued_count)
+
+    return SegmentProjectSyncTriggerResponse(
+        enabled=enabled,
+        queued_count=queued_count,
+        source_version=current_version,
+    )
+
+
 @router.post("/file-records/{file_record_id}/segments/project-sync/disable")
 def disable_file_record_project_sync(
     file_record_id: UUID,
@@ -15255,11 +15658,24 @@ def merge_segment(
     if first_seg.id == second_seg.id:
         raise HTTPException(status_code=400, detail="不能将句段与自身合并。")
 
+    # 双文档校对的每个对齐项天然可能来自不同段落或表格单元格，但人工合并仍必须保证全文相邻。
+    document_pair_batch: ProofreadingBatch | None = None
+    parse_options = _get_file_record_document_parse_options(file_record)
+    proofreading_batch_id = str(parse_options.get("proofreading_batch_id") or "").strip()
+    if parse_options.get("alignment_mode") == "document_pair" and proofreading_batch_id:
+        try:
+            candidate_batch = db.get(ProofreadingBatch, UUID(proofreading_batch_id))
+        except (TypeError, ValueError):
+            candidate_batch = None
+        if candidate_batch is not None and candidate_batch.batch_kind == "document_pair":
+            document_pair_batch = candidate_batch
+
     # DWG/DXF 文件允许跨 block 合并（CAD 图纸中相邻实体可能是独立 block）
     file_ext = (file_record.filename or "").lower().rsplit(".", 1)[-1] if file_record.filename else ""
     is_cad_file = file_ext in ("dwg", "dxf")
+    allow_cross_block = is_cad_file or document_pair_batch is not None
 
-    if not is_cad_file:
+    if not allow_cross_block:
         if not _segments_in_same_merge_block(first_seg, second_seg):
             raise HTTPException(status_code=400, detail="只能合并同一区块内相邻的句段。")
 
@@ -15270,17 +15686,93 @@ def merge_segment(
     second_position = sequence_positions.get(second_seg.id)
     if first_position is None or second_position is None:
         raise HTTPException(status_code=404, detail="待合并片段不存在。")
-    if second_position <= first_position:
+    if document_pair_batch is None and second_position <= first_position:
         raise HTTPException(status_code=400, detail="请按文档从上到下的顺序合并句段。")
-    if not is_cad_file and second_position != first_position + 1:
+    if document_pair_batch is None and not is_cad_file and second_position != first_position + 1:
         raise HTTPException(status_code=400, detail="普通文档只能合并前后相邻的句段。")
 
     # 合并文本
-    separator = "" if _is_cjk_text(first_seg.source_text) else " "
-    merged_source = first_seg.source_text.rstrip() + separator + second_seg.source_text.lstrip()
+    use_document_pair_separator = document_pair_batch is not None
+    source_separator = "\n" if use_document_pair_separator else "" if _is_cjk_text(first_seg.source_text) else " "
+    target_separator = "\n" if use_document_pair_separator else "" if _is_cjk_text(first_seg.target_text) else " "
+    merged_source = first_seg.source_text.rstrip() + source_separator + second_seg.source_text.lstrip()
     merged_target = ""
     if (first_seg.target_text or "").strip() or (second_seg.target_text or "").strip():
-        merged_target = (first_seg.target_text or "").rstrip() + separator + (second_seg.target_text or "").lstrip()
+        merged_target = (first_seg.target_text or "").rstrip() + target_separator + (second_seg.target_text or "").lstrip()
+
+    # 已确认的双文档批次必须同步合并底层配对和基线，否则导出预检会把被删句段重新补齐。
+    if document_pair_batch is not None:
+        try:
+            first_metadata = json.loads(first_seg.segment_metadata or "{}")
+            second_metadata = json.loads(second_seg.segment_metadata or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="双文档句段缺少有效的对齐元数据，无法安全合并。") from exc
+        first_pair_id = first_metadata.get("alignment_pair_id")
+        second_pair_id = second_metadata.get("alignment_pair_id")
+        if not first_pair_id or not second_pair_id:
+            raise HTTPException(status_code=400, detail="双文档句段缺少配对标识，无法安全合并。")
+        try:
+            first_pair_uuid = UUID(str(first_pair_id))
+            second_pair_uuid = UUID(str(second_pair_id))
+            selected_pairs = db.query(DocumentAlignmentPair).filter(
+                DocumentAlignmentPair.batch_id == document_pair_batch.id,
+                DocumentAlignmentPair.id.in_([first_pair_uuid, second_pair_uuid]),
+            ).order_by(DocumentAlignmentPair.pair_order).all()
+            if len(selected_pairs) != 2:
+                raise ValueError("部分待合并配对不存在或不属于当前校对批次。")
+            if selected_pairs[0].id != first_pair_uuid or selected_pairs[1].id != second_pair_uuid:
+                raise ValueError("请按校对对齐顺序从上到下选择句段。")
+            if selected_pairs[1].pair_order != selected_pairs[0].pair_order + 1:
+                raise ValueError("只能合并校对对齐序列中前后相邻的句段。")
+            merged_pair = merge_alignment_pair_range(
+                db,
+                document_pair_batch.id,
+                [first_pair_uuid, second_pair_uuid],
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        first_baseline = db.query(ProofreadingSegmentBaseline).filter_by(segment_id=first_seg.id).first()
+        second_baseline = db.query(ProofreadingSegmentBaseline).filter_by(segment_id=second_seg.id).first()
+        if first_baseline is not None and second_baseline is not None:
+            first_baseline.original_target_text = "\n".join(
+                value for value in (
+                    first_baseline.original_target_text.strip(),
+                    second_baseline.original_target_text.strip(),
+                ) if value
+            )
+            db.delete(second_baseline)
+        elif second_baseline is not None:
+            second_baseline.segment_id = first_seg.id
+            first_baseline = second_baseline
+        if first_baseline is not None:
+            first_baseline.row_index = merged_pair.pair_order
+            first_baseline.source_cell_ref = f"S{merged_pair.pair_order}"
+            first_baseline.target_cell_ref = f"T{merged_pair.pair_order}"
+
+        src_indices = json.loads(merged_pair.src_indices or "[]")
+        tgt_indices = json.loads(merged_pair.tgt_indices or "[]")
+        merged_metadata = {
+            **first_metadata,
+            "proofreading_batch_id": str(document_pair_batch.id),
+            "alignment_pair_id": str(merged_pair.id),
+            "alignment_pair_order": merged_pair.pair_order,
+            "src_indices": src_indices,
+            "tgt_indices": tgt_indices,
+            "translation_only": not bool(src_indices),
+            "confidence": merged_pair.confidence,
+            "method": merged_pair.method,
+            "manual_merged": True,
+        }
+        first_seg.segment_metadata = json.dumps(merged_metadata, ensure_ascii=False)
+        first_seg.block_type = merged_pair.block_type
+        first_seg.block_index = merged_pair.block_index
+        first_seg.row_index = merged_pair.row_index
+        first_seg.cell_index = merged_pair.cell_index
+        merged_source = merged_pair.source_text or TRANSLATION_ONLY_SOURCE_LABEL
+        document_pair_batch.total_segments = db.query(DocumentAlignmentPair).filter_by(
+            batch_id=document_pair_batch.id,
+        ).count()
 
     # 对于 CAD 文件，保存合并信息到 metadata（用于导出时清空被合并的实体）
     if is_cad_file:
@@ -15409,6 +15901,10 @@ def merge_segment(
     )
 
     db.flush()
+    if document_pair_batch is not None:
+        # merge_alignment_pair_range 会压紧底层 pair_order；同步刷新所有剩余句段的
+        # alignment_pair_order 与 sequence/display 顺序，避免下一次人工合并仍拿到旧序号。
+        ensure_document_pair_segments_complete(db, document_pair_batch)
     refresh_segment_display_indexes(db, file_record)
     sync_file_record_status(db, file_record_id)
     db.commit()
@@ -18088,6 +18584,47 @@ def list_tm_collection_entries(
         "total": total,
         "skip": safe_skip,
         "limit": safe_limit,
+    }
+
+
+@router.get("/translation-memory/collections/{collection_id}/numeric-only-entries/preview")
+def preview_numeric_only_tm_entries(
+    collection_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    collection = _get_collection_or_404(db, collection_id)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
+
+    return {
+        "matched_entries": count_numeric_only_tm_entries(db, collection.id),
+        "examples": list_numeric_only_tm_entry_examples(db, collection.id),
+    }
+
+
+@router.delete("/translation-memory/collections/{collection_id}/numeric-only-entries")
+def cleanup_numeric_only_tm_entries(
+    collection_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_business_manager),
+):
+    collection = _get_collection_or_404(db, collection_id)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
+
+    try:
+        deleted_entries = delete_numeric_only_tm_entries(db, collection.id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    db.refresh(collection)
+    return {
+        "message": "纯数字 TM 条目已清理。",
+        "deleted_entries": deleted_entries,
+        "remaining_entries": int(collection.entry_count or 0),
     }
 
 

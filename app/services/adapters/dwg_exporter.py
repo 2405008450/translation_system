@@ -50,6 +50,7 @@ class DwgExporter:
         *,
         prefer_dwg: Optional[bool] = None,
         merged_text_info: List[Dict] | None = None,
+        mtext_split_info: List[Dict] | None = None,
     ) -> bytes:
         """与其他 Exporter 接口对齐，仅返回字节流。
 
@@ -61,12 +62,14 @@ class DwgExporter:
             translations: 源文本 -> 目标文本的映射
             prefer_dwg: 是否优先输出 DWG 格式
             merged_text_info: 空间合并文本信息（用于 MTEXT 重建）
+            mtext_split_info: MTEXT 拆段信息（每段独立锚定 y）
         """
         return self.export_with_extension(
             original_bytes,
             translations,
             prefer_dwg=prefer_dwg,
             merged_text_info=merged_text_info,
+            mtext_split_info=mtext_split_info,
         ).content
 
     def export_with_extension(
@@ -76,6 +79,7 @@ class DwgExporter:
         *,
         prefer_dwg: Optional[bool] = None,
         merged_text_info: List[Dict] | None = None,
+        mtext_split_info: List[Dict] | None = None,
     ) -> DwgExportResult:
         """导出翻译后的 DWG/DXF，同时返回扩展名。
         
@@ -104,11 +108,8 @@ class DwgExporter:
         except DwgConverterError as exc:
             raise RuntimeError(f"DWG 转 DXF 失败：{exc}") from exc
 
-        # 判断是否有合并文本需要处理
-        has_merged_groups = bool(
-            merged_text_info and 
-            any(len(info.get("merged_handles", [])) > 1 for info in merged_text_info)
-        )
+        # 合并组和闭合框内的单实体都需要重建为可换行 MTEXT。
+        has_merged_groups = bool(merged_text_info)
 
         dxf_options = DxfExportOptions(
             enable_overflow_shrink=settings.dwg_enable_overflow_shrink,
@@ -124,13 +125,28 @@ class DwgExporter:
             translations,
             options=dxf_options,
             merged_text_info=merged_text_info,
+            mtext_split_info=mtext_split_info,
         )
+        intermediate_size = len(dxf_bytes)
+        del dxf_bytes
 
         if not want_dwg:
+            logger.info(
+                "DWG 导出保留 DXF：源文件=%d bytes，中间 DXF=%d bytes，输出=%d bytes",
+                len(original_bytes),
+                intermediate_size,
+                len(translated_dxf),
+            )
             return DwgExportResult(content=translated_dxf, extension=".dxf", fallback_used=False)
 
         try:
             dwg_bytes = dxf_to_dwg(translated_dxf)
+            logger.info(
+                "DWG 导出完成：源文件=%d bytes，中间 DXF=%d bytes，输出 DWG=%d bytes",
+                len(original_bytes),
+                intermediate_size,
+                len(dwg_bytes),
+            )
             return DwgExportResult(content=dwg_bytes, extension=".dwg", fallback_used=False)
         except (DwgConverterUnavailable, DwgConverterError) as exc:
             logger.warning("DXF 回写 DWG 失败，降级返回 DXF：%s", exc)

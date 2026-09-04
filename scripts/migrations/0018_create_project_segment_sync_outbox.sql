@@ -23,7 +23,4 @@ CREATE TABLE IF NOT EXISTS project_segment_sync_outbox (
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_project_sync_outbox_scope
     ON project_segment_sync_outbox (project_id, source_language, target_language, source_hash);
-CREATE INDEX IF NOT EXISTS ix_project_sync_outbox_status_enqueued
-    ON project_segment_sync_outbox (status, last_enqueued_at);
-
 COMMIT;

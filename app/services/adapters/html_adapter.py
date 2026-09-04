@@ -140,6 +140,20 @@ class HtmlContentParser(HTMLParser):
         self.skip_depth = 0
         self.tag_stack = []
         self.inline_tags = []
+        self.table_stack: list[dict[str, int]] = []
+        self.next_table_index = 0
+
+    def _active_table_metadata(self) -> dict[str, int]:
+        if not self.table_stack:
+            return {}
+        table = self.table_stack[-1]
+        if table["row_index"] < 0 or table["cell_index"] < 0:
+            return {}
+        return {
+            "table_index": table["table_index"],
+            "row_index": table["row_index"],
+            "cell_index": table["cell_index"],
+        }
     
     def handle_starttag(self, tag: str, attrs: list):
         tag_lower = tag.lower()
@@ -151,6 +165,26 @@ class HtmlContentParser(HTMLParser):
         
         if self.skip_depth > 0:
             return
+
+        if tag_lower == 'table':
+            self._flush_text()
+            self.table_stack.append({
+                "table_index": self.next_table_index,
+                "row_index": -1,
+                "cell_index": -1,
+            })
+            self.next_table_index += 1
+            return
+
+        if tag_lower == 'tr':
+            self._flush_text()
+            if self.table_stack:
+                self.table_stack[-1]["row_index"] += 1
+                self.table_stack[-1]["cell_index"] = -1
+            return
+
+        if tag_lower in {'td', 'th'} and self.table_stack:
+            self.table_stack[-1]["cell_index"] += 1
         
         # 块级元素开始前，保存当前文本
         if tag_lower in BLOCK_ELEMENTS:
@@ -158,7 +192,9 @@ class HtmlContentParser(HTMLParser):
             self.current_metadata = {
                 "tag": tag_lower,
                 "attrs": dict(attrs),
+                "preserve_dotted_names": True,
             }
+            self.current_metadata.update(self._active_table_metadata())
         elif tag_lower in INLINE_ELEMENTS:
             # 记录内联标签位置
             self.inline_tags.append({
@@ -188,6 +224,13 @@ class HtmlContentParser(HTMLParser):
                     break
         elif tag_lower in BLOCK_ELEMENTS:
             self._flush_text()
+
+        if tag_lower == 'tr':
+            self._flush_text()
+        elif tag_lower == 'table':
+            self._flush_text()
+            if self.table_stack:
+                self.table_stack.pop()
     
     def handle_data(self, data: str):
         if self.skip_depth > 0:
@@ -204,6 +247,13 @@ class HtmlContentParser(HTMLParser):
         """保存当前累积的文本"""
         text = self.current_text.strip()
         if text:
+            if not self.current_metadata:
+                self.current_metadata = {
+                    "tag": "td" if self._active_table_metadata() else "",
+                    "attrs": {},
+                    "preserve_dotted_names": True,
+                    **self._active_table_metadata(),
+                }
             node_type = NodeType.PARAGRAPH
             tag = self.current_metadata.get("tag", "")
             
@@ -213,7 +263,7 @@ class HtmlContentParser(HTMLParser):
                 self.current_metadata["level"] = level
             elif tag in ('li',):
                 node_type = NodeType.LIST_ITEM
-            elif tag in ('td', 'th'):
+            elif tag in ('td', 'th') or "table_index" in self.current_metadata:
                 node_type = NodeType.TABLE_CELL
             
             metadata = self.current_metadata.copy()
@@ -261,7 +311,7 @@ class HtmlAdapter(FormatAdapter):
         return ParseResult(
             ast=ast,
             segments=segments,
-            metadata={"node_count": len(nodes)},
+            metadata={"node_count": len(nodes), "table_count": parser.next_table_index},
         )
 
     def _decode_content(self, raw_bytes: bytes) -> str:

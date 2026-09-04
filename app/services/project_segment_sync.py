@@ -23,11 +23,13 @@ PROJECT_SYNC_SOURCE = "project_sync"
 PROJECT_SYNC_STATUS = "exact"
 logger = logging.getLogger(__name__)
 
-_SOURCE_PRIORITY = {
-    "manual": 30,
-    "llm": 20,
-    "tm": 10,
-    PROJECT_SYNC_SOURCE: 0,
+_SAFE_PROJECT_SYNC_TARGET_SOURCES = {
+    "",
+    "none",
+    "llm",
+    "llm_review",
+    "tm",
+    PROJECT_SYNC_SOURCE,
 }
 
 
@@ -36,6 +38,8 @@ class ProjectSegmentSyncSummary:
     filled_count: int = 0
     updated_count: int = 0
     conflict_count: int = 0
+    protected_count: int = 0
+    stale_source_count: int = 0
     affected_file_ids: set[UUID] = field(default_factory=set)
     current_file_segments: list[Segment] = field(default_factory=list)
 
@@ -47,6 +51,8 @@ class ProjectSegmentSyncSummary:
         self.filled_count += other.filled_count
         self.updated_count += other.updated_count
         self.conflict_count += other.conflict_count
+        self.protected_count += other.protected_count
+        self.stale_source_count += other.stale_source_count
         self.affected_file_ids.update(other.affected_file_ids)
         self.current_file_segments.extend(other.current_file_segments)
 
@@ -55,6 +61,8 @@ class ProjectSegmentSyncSummary:
             "filled_count": self.filled_count,
             "updated_count": self.updated_count,
             "conflict_count": self.conflict_count,
+            "protected_count": self.protected_count,
+            "stale_source_count": self.stale_source_count,
             "affected_file_count": self.affected_file_count,
         }
 
@@ -97,7 +105,7 @@ class _SyncCandidate:
     segment: Segment
     source_hash: str
     target_text: str
-    rank: tuple[int, int, datetime, str]
+    rank: tuple[int, datetime, str]
 
 
 def empty_project_segment_sync_summary() -> ProjectSegmentSyncSummary:
@@ -298,6 +306,59 @@ def sync_project_segments_for_hash(
         targets=targets,
         summary=summary,
         current_file_id=resolved.segment.file_record_id,
+        current_user=current_user,
+    )
+    if summary.filled_count or summary.updated_count:
+        db.flush()
+    return summary
+
+
+def sync_project_segments_from_source(
+    db: Session,
+    *,
+    project_id: UUID,
+    source_language: str,
+    target_language: str,
+    source_hash: str,
+    source_segment_id: UUID,
+    source_version: int,
+    current_user=None,
+) -> ProjectSegmentSyncSummary:
+    """使用一次失焦保存的确切句段版本传播，绝不重新选择旧的“最佳候选”。"""
+    summary = ProjectSegmentSyncSummary()
+    if not source_hash:
+        return summary
+
+    rows = (
+        db.query(Segment)
+        .join(FileRecord, Segment.file_record_id == FileRecord.id)
+        .filter(
+            FileRecord.project_id == project_id,
+            func.coalesce(FileRecord.source_language, "") == (source_language or ""),
+            func.coalesce(FileRecord.target_language, "") == (target_language or ""),
+            Segment.source_hash == source_hash,
+            _segment_project_sync_enabled(),
+        )
+        .order_by(Segment.id.asc())
+        .with_for_update(of=Segment)
+        .all()
+    )
+    source_segment = next((row for row in rows if row.id == source_segment_id), None)
+    if source_segment is None or int(source_segment.version or 1) != int(source_version):
+        summary.stale_source_count += 1
+        return summary
+
+    candidate = _build_candidate(source_segment)
+    if candidate is None:
+        summary.stale_source_count += 1
+        return summary
+
+    _apply_candidate_to_targets(
+        db,
+        candidate=candidate,
+        targets=[row for row in rows if row.id != source_segment.id],
+        summary=summary,
+        current_file_id=source_segment.file_record_id,
         current_user=current_user,
     )
     if summary.filled_count or summary.updated_count:
@@ -701,6 +762,9 @@ def _apply_candidate_to_targets(
             continue
         if target.project_sync_disabled:
             continue
+        if not _is_safe_project_sync_target(target):
+            summary.protected_count += 1
+            continue
 
         before_text = target.target_text or ""
         before_text_is_empty = not normalize_text(before_text)
@@ -753,8 +817,8 @@ def _build_candidate(segment: Segment) -> _SyncCandidate | None:
     if not source_hash:
         return None
     confirmed_priority = 1 if segment.status == "confirmed" else 0
-    source_priority = _SOURCE_PRIORITY.get(segment.source or "", -1)
     # 已确认句段以确认时间决胜（最新确认胜出）；未确认沿用更新时间。
+    # 来源类型不再参与排序，避免旧 MT/人工来源优先级把更新内容回退。
     if confirmed_priority:
         updated_at = getattr(segment, "confirmed_at", None) or segment.updated_at or datetime.min
     else:
@@ -775,8 +839,17 @@ def _build_candidate(segment: Segment) -> _SyncCandidate | None:
         segment=segment,
         source_hash=source_hash,
         target_text=target_text,
-        rank=(confirmed_priority, source_priority, updated_at, str(segment.id)),
+        rank=(confirmed_priority, updated_at, str(segment.id)),
     )
+
+
+def _is_safe_project_sync_target(segment: Segment) -> bool:
+    """同步只能覆盖空值或自动生成值；所有确认内容和人工/导入稿均受保护。"""
+    if segment.status == "confirmed":
+        return False
+    if not normalize_text(segment.target_text):
+        return True
+    return (segment.source or "").strip().lower() in _SAFE_PROJECT_SYNC_TARGET_SOURCES
 
 
 def _set_project_sync_origin(segment: Segment, candidate: _SyncCandidate) -> bool:

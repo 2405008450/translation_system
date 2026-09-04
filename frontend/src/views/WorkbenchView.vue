@@ -15,6 +15,8 @@ import {
   Copy,
   Download,
   ExternalLink,
+  Eye,
+  EyeOff,
   FileCheck,
   FileText,
   Flag,
@@ -29,6 +31,7 @@ import {
   Minimize2,
   Palette,
   Pilcrow,
+  Plus,
   Redo2,
   RotateCcw,
   Save,
@@ -42,8 +45,10 @@ import {
   Strikethrough,
   Subscript,
   Superscript,
+  TableCellsSplit,
   Tag as TagIcon,
   Tags,
+  Trash2,
   Type,
   Underline,
   Undo2,
@@ -79,7 +84,28 @@ import ReferencePanel from '../components/ReferencePanel.vue'
 import TranslationReviewPanel from '../components/TranslationReviewPanel.vue'
 import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { http } from '../api/http'
+import {
+  deleteAlignmentPair,
+  replaceAlignmentPairRange,
+  splitAlignmentPairsByCell,
+  updateAlignmentPairText,
+  type AlignmentPairReplacement,
+} from '../api/documentAlignment'
 import { queryOnlineTerms, type OnlineTermSource } from '../api/onlineTerms'
+import {
+  completeAlignment,
+  createProofreadingExportTask,
+  downloadProofreadingBatchExport,
+  downloadProofreadingExportTask,
+  exportProofreadingBatch,
+  generateProofreadingBatch,
+  getProofreadingBatch,
+  getProofreadingExportReadiness,
+  getProofreadingExportTask,
+  reopenAlignment,
+  type ProofreadingBatch,
+  type ProofreadingExportFormat,
+} from '../api/proofreading'
 import {
   createMergeViewQAResult,
   fetchMergeViewSegmentPosition,
@@ -162,6 +188,7 @@ import type {
 } from '../types/api'
 import { buildDocumentPreviewHtml } from '../utils/documentPreview'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import { getApiErrorMessage } from '../utils/apiError'
 import {
   getExportOptionExtensionLabel,
   groupExportOptions,
@@ -181,7 +208,8 @@ type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes' | 'refer
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
-type SegmentDisplayScope = 'all' | 'project_sync_only' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'pending_confirmation' | 'confirmed_only' | 'empty_target'
+type SegmentDisplayScope = 'all' | 'project_sync_only' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'pending_confirmation' | 'confirmed_only' | 'empty_target' | 'proofreading_changed' | 'proofreading_failed' | 'proofreading_translation_only' | 'proofreading_missing_translation'
+type ProofreadingAlignmentScope = 'proofreading_translation_only' | 'proofreading_missing_translation'
 type RevisionMenuKind = 'track' | 'accept' | 'reject'
 type ResourceSearchMode = 'exact' | 'fuzzy'
 type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
@@ -286,8 +314,43 @@ type ResourceSearchResponse = {
   query: string
   mode: ResourceSearchMode
 }
+type ProofreadingBaselineResponse = {
+  is_proofreading: boolean
+  proofreading_context: {
+    batch_id: string
+    batch_kind: 'xlsx_columns' | 'document_pair'
+    workflow_stage?: 'not_applicable' | 'import' | 'alignment' | 'proofreading'
+    alignment_status?: string
+    batch_status: string
+    sheet_name: string
+    target_language: string
+    provider: string
+    model: string
+    user_instructions: string
+    actual_provider: string
+    actual_model: string
+    failed_segments: number
+    target_revision_export_available: boolean
+  } | null
+  items: Array<{
+    segment_id: string
+    sentence_id: string
+    original_target_text: string
+    review_suggestion: string
+    review_category: string
+    review_confidence: string
+  }>
+}
+
+type ProofreadingSuggestion = {
+  text: string
+  label: string
+  tone: 'changed' | 'unchanged' | 'error' | 'pending'
+}
 
 const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceEnabled'
+const PROOFREADING_REVISION_VISIBLE_STORAGE_KEY = 'workbench.proofreadingRevisionVisible'
+const PROOFREADING_HIDE_UNCHANGED_STORAGE_KEY = 'workbench.proofreadingHideUnchanged'
 const WORKBENCH_RIBBON_COLLAPSED_STORAGE_KEY = 'workbench.ribbonCollapsed'
 const SEGMENT_EDITOR_FONT_SCALE_STORAGE_KEY = 'workbench.segmentEditorFontScale'
 const QA_RESULT_PAGE_SIZE = 50
@@ -305,6 +368,20 @@ function getInitialRevisionTraceVisible() {
     return false
   }
   return window.localStorage.getItem(REVISION_TRACE_VISIBLE_STORAGE_KEY) === '1'
+}
+
+function getInitialProofreadingRevisionVisible() {
+  if (typeof window === 'undefined') {
+    return true
+  }
+  return window.localStorage.getItem(PROOFREADING_REVISION_VISIBLE_STORAGE_KEY) !== '0'
+}
+
+function getInitialProofreadingHideUnchanged() {
+  if (typeof window === 'undefined') {
+    return false
+  }
+  return window.localStorage.getItem(PROOFREADING_HIDE_UNCHANGED_STORAGE_KEY) === '1'
 }
 
 function clampSegmentEditorFontScale(value: number) {
@@ -347,6 +424,469 @@ const workbenchPageRef = ref<HTMLElement | null>(null)
 const segmentEditorResultsRef = ref<HTMLElement | null>(null)
 const segmentEditorRowRefs = new Map<string, SegmentEditorRowPublic>()
 const matchPanelRef = ref<WorkbenchMatchPanelPublic | null>(null)
+const proofreadingBaselines = ref<Record<string, string>>({})
+const proofreadingReviewItems = ref<Record<string, {
+  reason: string
+  category: string
+  confidence: string
+}>>({})
+// 在校对上下文接口返回前不渲染任何一种工具栏，防止通用工作台先闪现。
+const workbenchModeResolved = ref(Boolean(props.mergeViewId))
+const isProofreadingWorkbench = ref(false)
+const proofreadingContext = ref<ProofreadingBaselineResponse['proofreading_context']>(null)
+const proofreadingDiffVisible = ref(getInitialProofreadingRevisionVisible())
+const proofreadingExporting = ref(false)
+const proofreadingExportProgress = ref(0)
+const proofreadingExportStatus = ref<ProofreadingBatch['export_status']>('idle')
+const showProofreadingExportMenu = ref(false)
+type ProofreadingProvider = 'auto' | 'deepseek' | 'openrouter'
+type ProofreadingRetryScope = 'all' | 'failed_only'
+const showProofreadingGenerateDialog = ref(false)
+const proofreadingGenerating = ref(false)
+const proofreadingGenerateError = ref('')
+const proofreadingGenerationDraft = reactive<{
+  provider: ProofreadingProvider
+  model: string
+  userInstructions: string
+  retryScope: ProofreadingRetryScope
+}>({
+  provider: 'auto',
+  model: '',
+  userInstructions: '',
+  retryScope: 'all',
+})
+let proofreadingGenerationPollTimer: number | null = null
+const hasProofreadingBaselines = computed(() => Object.keys(proofreadingBaselines.value).length > 0)
+const proofreadingChangedCount = computed(() => segmentStore.segments.filter((segment) => {
+  const original = proofreadingBaselines.value[segment.id]
+  return original !== undefined && (segment.target_text || '') !== original
+}).length)
+const proofreadingCurrentPageCount = computed(() => segmentStore.segments.filter(
+  (segment) => proofreadingBaselines.value[segment.id] !== undefined,
+).length)
+const proofreadingUnchangedCount = computed(() => Math.max(
+  0,
+  proofreadingCurrentPageCount.value - proofreadingChangedCount.value,
+))
+const proofreadingConfirmedCount = computed(() => segmentStore.segments.filter((segment) => segment.status === 'confirmed').length)
+const proofreadingModelLabel = computed(() => {
+  const context = proofreadingContext.value
+  if (!context) return '尚未生成'
+  if (context.actual_provider || context.actual_model) {
+    return `${context.actual_provider || '默认提供方'} / ${context.actual_model || '默认模型'}`
+  }
+  if (context.provider === 'deepseek') return `DeepSeek / ${context.model || 'deepseek-chat'}`
+  if (context.provider === 'openrouter') return `OpenRouter / ${context.model || '默认模型'}`
+  return '自动：优先 DeepSeek Chat，失败回退 OpenRouter'
+})
+const proofreadingExportButtonLabel = computed(() => {
+  if (proofreadingExporting.value) {
+    if (proofreadingExportProgress.value > 0 && proofreadingExportProgress.value < 100) {
+      return `导出 ${Math.round(proofreadingExportProgress.value)}%`
+    }
+    return proofreadingExportStatus.value === 'completed' ? '下载中' : '生成中'
+  }
+  return proofreadingContext.value?.batch_kind === 'document_pair' ? '导出译文' : '导出校对版'
+})
+const canStartProofreadingGeneration = computed(() => (
+  ['ready', 'partial_failed', 'failed', 'canceled'].includes(proofreadingContext.value?.batch_status || '')
+))
+const proofreadingGenerationButtonLabel = computed(() => {
+  const status = proofreadingContext.value?.batch_status || ''
+  if (status === 'canceled') return '重新开始校对'
+  if (status === 'partial_failed' || status === 'failed') return '重试 LLM 校对'
+  if (status === 'queued' || status === 'running' || status === 'canceling') return 'LLM 校对中'
+  return '开始 LLM 校对'
+})
+
+function handleProofreadingProviderChange() {
+  proofreadingGenerationDraft.model = proofreadingGenerationDraft.provider === 'deepseek'
+    ? 'deepseek-chat'
+    : proofreadingGenerationDraft.provider === 'openrouter'
+      ? 'google/gemini-3-flash-preview'
+      : ''
+}
+
+function proofreadingProviderDescription(provider: ProofreadingProvider) {
+  if (provider === 'deepseek') return '固定使用 DeepSeek Chat，不自动切换其他提供方。'
+  if (provider === 'openrouter') return '通过 OpenRouter 使用指定模型。'
+  return '自动模式优先 DeepSeek Chat；请求失败时回退到 OpenRouter。'
+}
+
+function openProofreadingGenerateDialog() {
+  const context = proofreadingContext.value
+  if (!context || !canStartProofreadingGeneration.value) return
+  proofreadingGenerationDraft.provider = ['auto', 'deepseek', 'openrouter'].includes(context.provider)
+    ? context.provider as ProofreadingProvider
+    : 'auto'
+  proofreadingGenerationDraft.model = context.model || ''
+  proofreadingGenerationDraft.userInstructions = context.user_instructions || ''
+  proofreadingGenerationDraft.retryScope = context.failed_segments > 0 ? 'failed_only' : 'all'
+  proofreadingGenerateError.value = ''
+  showProofreadingGenerateDialog.value = true
+}
+
+function clearProofreadingGenerationPollTimer() {
+  if (proofreadingGenerationPollTimer !== null) {
+    window.clearTimeout(proofreadingGenerationPollTimer)
+    proofreadingGenerationPollTimer = null
+  }
+}
+
+async function pollProofreadingGeneration(batchId: string) {
+  clearProofreadingGenerationPollTimer()
+  try {
+    const batch = await getProofreadingBatch(batchId)
+    if (proofreadingContext.value?.batch_id === batchId) {
+      proofreadingContext.value.batch_status = batch.status
+      proofreadingContext.value.failed_segments = batch.failed_segments
+    }
+    if (['queued', 'running', 'canceling'].includes(batch.status)) {
+      proofreadingGenerationPollTimer = window.setTimeout(() => {
+        void pollProofreadingGeneration(batchId)
+      }, 2000)
+      return
+    }
+    const fileRecordId = activeWorkbenchFileId.value || props.id
+    if (fileRecordId) {
+      await loadProofreadingBaselines(fileRecordId)
+    }
+    if (batch.status === 'completed') {
+      toast.success('LLM 校对已完成')
+    } else if (batch.status === 'partial_failed') {
+      toast.warn('LLM 校对已完成，但部分句段生成失败')
+    } else if (batch.status === 'failed') {
+      pageError.value = batch.error_message || 'LLM 校对失败，请调整设置后重试。'
+    }
+  } catch {
+    // 轮询失败不打断当前编辑，稍后继续刷新批次状态。
+    proofreadingGenerationPollTimer = window.setTimeout(() => {
+      void pollProofreadingGeneration(batchId)
+    }, 3000)
+  }
+}
+
+async function submitProofreadingGeneration() {
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId || proofreadingGenerating.value) return
+  proofreadingGenerating.value = true
+  proofreadingGenerateError.value = ''
+  try {
+    if (!await saveNow()) {
+      throw new Error('当前编辑尚未保存，已取消生成。')
+    }
+    await generateProofreadingBatch(batchId, {
+      provider: proofreadingGenerationDraft.provider,
+      model: proofreadingGenerationDraft.model || undefined,
+      user_instructions: proofreadingGenerationDraft.userInstructions.trim(),
+      retry_scope: proofreadingGenerationDraft.retryScope,
+    })
+    if (proofreadingContext.value) {
+      proofreadingContext.value.batch_status = 'queued'
+      proofreadingContext.value.provider = proofreadingGenerationDraft.provider
+      proofreadingContext.value.model = proofreadingGenerationDraft.model
+      proofreadingContext.value.user_instructions = proofreadingGenerationDraft.userInstructions.trim()
+    }
+    showProofreadingGenerateDialog.value = false
+    toast.success('LLM 校对任务已开始')
+    void pollProofreadingGeneration(batchId)
+  } catch (error) {
+    proofreadingGenerateError.value = getErrorMessage(error, '启动 LLM 校对失败。')
+  } finally {
+    proofreadingGenerating.value = false
+  }
+}
+
+function proofreadingOriginalTarget(segment: Segment) {
+  return proofreadingBaselines.value[segment.id] ?? null
+}
+
+function proofreadingCategoryLabel(category: string) {
+  const labels: Record<string, string> = {
+    accuracy: '准确性',
+    consistency: '一致性',
+    format: '格式',
+    fluency: '流畅性',
+    grammar: '语法',
+    mistranslation: '误译',
+    omission: '漏译',
+    style: '表达',
+    terminology: '术语',
+    translation: '翻译完整性',
+    untranslated: '未翻译',
+    generation_error: '生成失败',
+  }
+  const normalizedCategory = category.trim().toLowerCase()
+  return labels[normalizedCategory] || category || '修改建议'
+}
+
+function proofreadingSuggestionFor(segment: Segment): ProofreadingSuggestion {
+  const reviewItem = proofreadingReviewItems.value[segment.id]
+  if (reviewItem?.category === 'generation_error') {
+    return {
+      text: reviewItem.reason || '本条校对生成失败，请重试或进行人工审查。',
+      label: '生成失败',
+      tone: 'error',
+    }
+  }
+  if (reviewItem) {
+    return {
+      text: reviewItem.reason || '译文已由模型调整，请结合原文进行人工复核。',
+      label: proofreadingCategoryLabel(reviewItem.category),
+      tone: 'changed',
+    }
+  }
+
+  const originalTarget = proofreadingBaselines.value[segment.id]
+  const batchStatus = proofreadingContext.value?.batch_status || ''
+  if (['ready', 'queued', 'running'].includes(batchStatus)) {
+    return {
+      text: batchStatus === 'ready' ? '尚未开始生成校对建议。' : '正在生成校对建议。',
+      label: '等待校对',
+      tone: 'pending',
+    }
+  }
+  if (originalTarget !== undefined && (segment.target_text || '') !== originalTarget) {
+    return {
+      text: '当前译文已发生人工调整，请结合修订差异进行复核。',
+      label: '人工调整',
+      tone: 'changed',
+    }
+  }
+  return {
+    text: '模型校对后未发现需要修改的内容。',
+    label: '无需修改',
+    tone: 'unchanged',
+  }
+}
+
+function toggleProofreadingRevisionVisible() {
+  proofreadingDiffVisible.value = !proofreadingDiffVisible.value
+  try {
+    window.localStorage.setItem(
+      PROOFREADING_REVISION_VISIBLE_STORAGE_KEY,
+      proofreadingDiffVisible.value ? '1' : '0',
+    )
+  } catch {}
+}
+
+function syncProofreadingExportState(batch: ProofreadingBatch) {
+  proofreadingExportStatus.value = batch.export_status
+  proofreadingExportProgress.value = Number(batch.export_progress || 0)
+}
+
+async function downloadCompletedProofreadingExport(batch: ProofreadingBatch) {
+  const response = await downloadProofreadingBatchExport(batch.id)
+  const fallback = `${batch.filename.replace(/\.xlsx$/i, '')}_校对版.xlsx`
+  downloadBlob(
+    response.data,
+    resolveDownloadFilename(response.headers['content-disposition'], fallback),
+  )
+}
+
+async function exportProofreadingWorkbook() {
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId || proofreadingExporting.value) return
+
+  proofreadingExporting.value = true
+  proofreadingExportProgress.value = 0
+  pageError.value = ''
+  try {
+    if (!await saveNow()) {
+      throw new Error('当前编辑尚未保存，已取消导出。')
+    }
+    let batch = await getProofreadingBatch(batchId)
+    syncProofreadingExportState(batch)
+
+    if (batch.export_status !== 'completed' && !['queued', 'running'].includes(batch.export_status)) {
+      try {
+        await exportProofreadingBatch(batch.id)
+      } catch (error) {
+        if (!axios.isAxiosError(error) || error.response?.status !== 409) {
+          throw error
+        }
+      }
+      batch = await getProofreadingBatch(batch.id)
+      syncProofreadingExportState(batch)
+    }
+
+    for (let attempt = 0; ['queued', 'running'].includes(batch.export_status) && attempt < 240; attempt += 1) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 1500))
+      batch = await getProofreadingBatch(batch.id)
+      syncProofreadingExportState(batch)
+    }
+
+    if (batch.export_status === 'failed') {
+      throw new Error(batch.export_error_message || '生成校对版 Excel 失败。')
+    }
+    if (batch.export_status !== 'completed') {
+      throw new Error('生成校对版 Excel 超时，请稍后重试。')
+    }
+
+    proofreadingExportProgress.value = 100
+    await downloadCompletedProofreadingExport(batch)
+    toast.success('校对版 Excel 已导出')
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '导出校对版 Excel 失败。')
+  } finally {
+    proofreadingExporting.value = false
+  }
+}
+
+const proofreadingExportChoices = computed<Array<{
+  format: ProofreadingExportFormat
+  name: string
+  description: string
+}>>(() => (
+  proofreadingContext.value?.batch_kind === 'document_pair'
+    ? proofreadingContext.value?.workflow_stage === 'proofreading'
+      ? [
+          ...(proofreadingContext.value?.target_revision_export_available ? [{
+            format: 'proofreading_docx_target_revisions' as const,
+            name: '目标原格式（含修订）',
+            description: '以导入的译文 DOCX 为母版，保留其排版并写入可接受或拒绝的 Word 修订。',
+          }] : []),
+          {
+            format: 'proofreading_docx_layout',
+            name: '源格式双语 Word',
+            description: '沿用原文排版，按原文在前导出原文与校对后译文。',
+          },
+          {
+            format: 'proofreading_docx_ordered',
+            name: '顺序优先 Word',
+            description: '按对齐顺序导出原文与校对后译文。',
+          },
+          {
+            format: 'proofreading_audit_xlsx',
+            name: '一一对照表',
+            description: '原文与译文逐条对照的 Excel 表格。',
+          },
+        ]
+      : [
+          {
+            format: 'proofreading_audit_xlsx',
+            name: '一一对照表',
+            description: '原文与原始译文逐条对照，不生成校对后译文。',
+          },
+        ]
+    : [
+        {
+          format: 'proofreading_xlsx_original',
+          name: '校对版 Excel',
+          description: '保留工作簿、工作表和原始行序，导出经校对修改后的译文。',
+        },
+      ]
+))
+
+async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId || proofreadingExporting.value) return
+  showProofreadingExportMenu.value = false
+  proofreadingExporting.value = true
+  proofreadingExportProgress.value = 0
+  pageError.value = ''
+  try {
+    if (!await saveNow()) {
+      throw new Error('当前编辑尚未保存，已取消导出。')
+    }
+    const readiness = await getProofreadingExportReadiness(batchId)
+    if (!readiness.available_formats.includes(format)) {
+      throw new Error(format === 'proofreading_docx_target_revisions'
+        ? '该批次未保存目标 DOCX 原件，无法导出目标原格式修订版。请重新导入双文档。'
+        : '当前批次不支持所选导出格式。')
+    }
+    let acknowledgeWarnings = false
+    if (readiness.has_warnings && format !== 'proofreading_audit_xlsx') {
+      acknowledgeWarnings = await confirm({
+        title: '校对版仍有待处理内容',
+        message: [
+          `总计 ${readiness.total} 条，未确认 ${readiness.unconfirmed} 条。`,
+          `缺译 ${readiness.missing_translation} 条，增译 ${readiness.translation_only} 条，`,
+          `其中未校对增译 ${readiness.translation_only_unreviewed} 条，LLM 失败 ${readiness.llm_failed} 条。`,
+          '仍然导出时，缺译会被明确标记。',
+        ].join(''),
+        confirmText: '仍然导出',
+        cancelText: '返回检查',
+      })
+      if (!acknowledgeWarnings) return
+    }
+    let task = await createProofreadingExportTask(batchId, format, acknowledgeWarnings)
+    proofreadingExportStatus.value = task.status
+    proofreadingExportProgress.value = Number(task.progress || 0)
+    for (let attempt = 0; ['queued', 'running'].includes(task.status) && attempt < 240; attempt += 1) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 1500))
+      task = await getProofreadingExportTask(task.task_id)
+      proofreadingExportStatus.value = task.status
+      proofreadingExportProgress.value = Number(task.progress || 0)
+    }
+    if (task.status === 'failed') throw new Error(task.error || task.message || '导出失败。')
+    if (task.status !== 'completed') throw new Error('导出超时，请稍后重试。')
+    const response = await downloadProofreadingExportTask(task.task_id)
+    const filename = resolveDownloadFilename(
+      response.headers['content-disposition'],
+      task.filename || '双语校对版',
+    )
+    downloadBlob(response.data, filename)
+    const successMessage = format === 'proofreading_docx_target_revisions'
+      ? '已导出目标原格式 Word（含修订）'
+      : format === 'proofreading_docx_layout'
+      ? filename.includes('顺序优先')
+        ? '原排版校验未通过，已自动导出顺序优先 Word'
+        : '已导出双语 Word（保留源排版）'
+      : format === 'proofreading_docx_ordered'
+        ? '已导出双语 Word（顺序优先）'
+        : format === 'proofreading_audit_xlsx'
+          ? '已导出原文译文对齐表'
+          : '已导出校对版 Excel（保留原工作簿）'
+    toast.success(successMessage)
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '导出校对版失败。')
+  } finally {
+    proofreadingExporting.value = false
+  }
+}
+
+async function loadProofreadingBaselines(fileRecordId: string) {
+  proofreadingBaselines.value = {}
+  proofreadingReviewItems.value = {}
+  isProofreadingWorkbench.value = false
+  proofreadingContext.value = null
+  segmentStore.setLiveSpellingEnabled(true)
+  try {
+    const { data } = await http.get<ProofreadingBaselineResponse>(`/file-records/${fileRecordId}/proofreading-baselines`)
+    isProofreadingWorkbench.value = data.is_proofreading
+    segmentStore.setLiveSpellingEnabled(!data.is_proofreading)
+    proofreadingContext.value = data.proofreading_context
+    proofreadingBaselines.value = Object.fromEntries(
+      data.items.map((item) => [item.segment_id, item.original_target_text]),
+    )
+    proofreadingReviewItems.value = Object.fromEntries(
+      data.items
+        .filter((item) => item.review_suggestion || item.review_category)
+        .map((item) => [item.segment_id, {
+          reason: item.review_suggestion,
+          category: item.review_category,
+          confidence: item.review_confidence,
+        }]),
+    )
+    if (data.is_proofreading) {
+      activeBottomTool.value = null
+      setSegmentDisplayScope(
+        getInitialProofreadingHideUnchanged() ? 'proofreading_changed' : 'all',
+      )
+    } else if (segmentDisplayScope.value === 'proofreading_changed') {
+      setSegmentDisplayScope('all')
+    }
+  } catch {
+    segmentStore.setLiveSpellingEnabled(true)
+    if (segmentDisplayScope.value === 'proofreading_changed') {
+      setSegmentDisplayScope('all')
+    }
+    // 普通翻译任务没有校对基线，保持原有两列工作台。
+  } finally {
+    workbenchModeResolved.value = true
+  }
+}
 
 const bottomPanelRef = ref<HTMLElement | null>(null)
 const bottomDrawerRef = ref<HTMLElement | null>(null)
@@ -550,6 +1090,18 @@ const sourceSearchInputRef = ref<HTMLInputElement | null>(null)
 const targetSearchInputRef = ref<HTMLInputElement | null>(null)
 const guidelinesEditorRef = ref<HTMLTextAreaElement | null>(null)
 const segmentDisplayScope = ref<SegmentDisplayScope>('all')
+const proofreadingHideUnchanged = computed(() => segmentDisplayScope.value === 'proofreading_changed')
+const activeProofreadingAlignmentScope = ref<ProofreadingAlignmentScope | null>(null)
+const proofreadingAlignmentNavigationIndex = ref(0)
+const proofreadingAlignmentNavigationTotal = ref(0)
+const proofreadingAlignmentNavigationLoading = ref(false)
+const proofreadingAlignmentPositionLabel = computed(() => {
+  const scope = activeProofreadingAlignmentScope.value
+  if (!scope) return ''
+  const label = scope === 'proofreading_translation_only' ? '增译' : '漏译'
+  const total = proofreadingAlignmentNavigationTotal.value
+  return total > 0 ? `${label} ${proofreadingAlignmentNavigationIndex.value}/${total}` : `${label} 0 条`
+})
 const sourceSearchQuery = ref('')
 const targetSearchQuery = ref('')
 const sourceExcludeQuery = ref('')
@@ -938,6 +1490,7 @@ const exportProgress = ref(0)
 const exportMessage = ref('')
 let exportPollTimer: number | null = null
 const groupedExportOptions = computed(() => groupExportOptions(exportOptions.value))
+type WordExportMode = 'standard' | 'revision'
 
 // 导出样式设置（DOCX 文字样式 / PPTX 版式优化）
 const EXPORT_STYLE_SETTINGS_STORAGE_KEY = 'workbench.exportStyleSettings'
@@ -1010,6 +1563,37 @@ const isOfficeFormat = computed(() => {
   return ['.doc', '.docx', '.xlsx', '.pptx', '.pdf'].includes(ext)
 })
 
+const isWordFormat = computed(() => {
+  const filename = segmentStore.fileRecord?.filename || ''
+  const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase()
+  return ['.doc', '.docx'].includes(ext)
+})
+
+function isWordTargetExportOption(option: FileExportOption) {
+  return option.id === 'original' && isWordFormat.value
+}
+
+function getWorkbenchExportOptionName(option: FileExportOption, mode: WordExportMode = 'standard') {
+  if (!isWordTargetExportOption(option)) {
+    return option.name
+  }
+  return mode === 'revision'
+    ? t('workbench.exportModes.revisionName')
+    : t('workbench.exportModes.standardName')
+}
+
+function getWorkbenchExportOptionDescription(option: FileExportOption, mode: WordExportMode = 'standard') {
+  if (!isWordTargetExportOption(option)) {
+    return option.description
+  }
+  if (mode === 'revision' && segmentStore.pendingRevisionCount === 0) {
+    return t('workbench.exportModes.revisionUnavailable')
+  }
+  return mode === 'revision'
+    ? t('workbench.exportModes.revisionDescription')
+    : t('workbench.exportModes.standardDescription')
+}
+
 function resolveItemHeight() {
   const stableGrid = Boolean(props.standalone)
   if (stableGrid && window.innerWidth > 1180) {
@@ -1078,10 +1662,7 @@ function observeSegmentEditorResults() {
 }
 
 function getErrorMessage(error: unknown, fallback: string) {
-  if (axios.isAxiosError(error)) {
-    return String(error.response?.data?.detail || fallback)
-  }
-  return error instanceof Error ? error.message : fallback
+  return getApiErrorMessage(error, fallback)
 }
 
 function normalizeTextForSaveToTM(value: string | null | undefined) {
@@ -1640,6 +2221,24 @@ const qualityQARules = [
   { key: 'repeated_punctuation', label: '重复标点', defaultEnabled: false },
   { key: 'extra_space_after_punctuation', label: '标点符号后有多余空格', defaultEnabled: false },
   { key: 'missing_space_after_punctuation', label: '标点符号后遗漏空格', defaultEnabled: false },
+  { key: 'punctuation_leading_extra_space', label: '标点符号前有多余空格', defaultEnabled: false },
+  { key: 'punctuation_leading_missing_space', label: '标点符号前遗漏空格', defaultEnabled: false },
+  { key: 'multiple_spaces', label: '多个空格', defaultEnabled: false },
+  { key: 'segment_trailing_extra_space', label: '句段结束后有多余空格', defaultEnabled: false },
+  { key: 'source_target_initial_case_mismatch', label: '原文和译文首字母大小写不一致', defaultEnabled: false },
+  { key: 'target_word_multiple_upper_initials', label: '译文一个单词中有多个大写首字母', defaultEnabled: false },
+  { key: 'source_target_same_word_case_mismatch', label: '原文和译文的同一单词首字母有不同的大小写', defaultEnabled: false },
+  { key: 'consecutive_duplicate_words', label: '连续重复单词', defaultEnabled: false },
+  { key: 'source_target_identical', label: '原文和译文相同', defaultEnabled: false },
+  { key: 'target_word_count_exceeds_source', label: '译文字数超过原文字数的 50%', defaultEnabled: false },
+  { key: 'target_word_count_below_source', label: '译文字数少于原文字数的 50%', defaultEnabled: false },
+  { key: 'source_target_word_count_gap_too_large', label: '译文与原文字数相差过大', defaultEnabled: false },
+  { key: 'number_mismatch', label: '原文和译文数字不一致', defaultEnabled: false },
+  { key: 'parameter_mismatch', label: '原文与译文参数不一致', defaultEnabled: false },
+  { key: 'email_mismatch', label: '原文与译文邮件信息不一致', defaultEnabled: false },
+  { key: 'link_mismatch', label: '原文和译文链接信息不一致', defaultEnabled: false },
+  { key: 'special_symbol_mismatch', label: '特殊符号不一致', defaultEnabled: false },
+  { key: 'context_translation_mismatch', label: '翻译与上下文匹配不一致', defaultEnabled: false },
 ] as const
 
 type QualityQARuleKey = typeof qualityQARules[number]['key']
@@ -1831,6 +2430,10 @@ function shouldShowMergeGroupHeader(segment: Segment, index: number) {
 function getMergeGroupFile(segment: Segment) {
   const fileId = segment.file_record_id || ''
   return segmentStore.mergeViewDetail?.files.find((file) => file.id === fileId) ?? null
+}
+
+function getSegmentLanguageContext(segment: Segment) {
+  return isMergeWorkbench.value ? getMergeGroupFile(segment) : segmentStore.fileRecord
 }
 function getMergeGroupProgressText(segment: Segment) {
   const file = getMergeGroupFile(segment)
@@ -2188,16 +2791,46 @@ function countTargetReplaceOccurrences(segment: Segment) {
   return (segment.target_text || '').match(regexp)?.length || 0
 }
 
-const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; label: string }>>(() => [
-  { value: 'all', label: t('workbench.search.scopes.all') },
-  { value: 'project_sync_only', label: t('workbench.statusSummary.projectSync') },
-  { value: 'exact_only', label: t('workbench.statusSummary.exact') },
-  { value: 'fuzzy_only', label: t('workbench.search.scopes.fuzzyOnly') },
-  { value: 'none_only', label: t('workbench.search.scopes.noneOnly') },
-  { value: 'pending_confirmation', label: '待确认译文' },
-  { value: 'confirmed_only', label: '已确认译文' },
-  { value: 'empty_target', label: '空译文' },
-])
+const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; label: string }>>(() => {
+  const options: Array<{ value: SegmentDisplayScope; label: string }> = [
+    { value: 'all', label: t('workbench.search.scopes.all') },
+    { value: 'project_sync_only', label: t('workbench.statusSummary.projectSync') },
+    { value: 'exact_only', label: t('workbench.statusSummary.exact') },
+    { value: 'fuzzy_only', label: t('workbench.search.scopes.fuzzyOnly') },
+    { value: 'none_only', label: t('workbench.search.scopes.noneOnly') },
+    { value: 'pending_confirmation', label: '待确认译文' },
+    { value: 'confirmed_only', label: '已确认译文' },
+    { value: 'empty_target', label: '空译文' },
+    { value: 'proofreading_translation_only', label: '仅显示增译' },
+    { value: 'proofreading_missing_translation', label: '仅显示漏译' },
+    { value: 'proofreading_changed', label: '仅显示已修改' },
+    { value: 'proofreading_failed', label: '仅显示生成失败' },
+  ]
+  const proofreadingScopes: SegmentDisplayScope[] = [
+    'all',
+    'proofreading_translation_only',
+    'proofreading_missing_translation',
+    'proofreading_failed',
+    'proofreading_changed',
+    'pending_confirmation',
+    'confirmed_only',
+  ]
+  if (isAlignmentWorkbench.value) {
+    return options.filter(option => [
+      'all',
+      'proofreading_translation_only',
+      'proofreading_missing_translation',
+    ].includes(option.value))
+  }
+  return isProofreadingWorkbench.value
+    ? options.filter((option) => proofreadingScopes.includes(option.value))
+    : options.filter((option) => ![
+      'proofreading_translation_only',
+      'proofreading_missing_translation',
+      'proofreading_changed',
+      'proofreading_failed',
+    ].includes(option.value))
+})
 
 function normalizeWorkbenchMatchText(value: string | null | undefined) {
   return (value || '').trim().replace(/\s+/g, ' ').replace(/[\u3002\uff01\uff1f!?.]+$/u, '')
@@ -2260,10 +2893,21 @@ function matchesSegmentDisplayScope(segment: Segment) {
     return isEmptyTargetForWorkbench(segment.target_text)
       || retainedEmptyTargetSentenceIds.value.has(segment.sentence_id)
   }
+  if (segmentDisplayScope.value === 'proofreading_changed') {
+    const originalTarget = proofreadingBaselines.value[segment.id]
+    return originalTarget !== undefined && (segment.target_text || '') !== originalTarget
+  }
+  if (segmentDisplayScope.value === 'proofreading_failed') {
+    return proofreadingReviewItems.value[segment.id]?.category === 'generation_error'
+  }
   return true
 }
 
-const editorSegments = computed(() => segmentStore.segments)
+const editorSegments = computed(() => (
+  ['proofreading_changed', 'proofreading_failed'].includes(segmentDisplayScope.value)
+    ? segmentStore.segments.filter(matchesSegmentDisplayScope)
+    : segmentStore.segments
+))
 
 const replaceableOccurrenceCount = computed(() => (
   editorSegments.value.reduce((count, segment) => count + countTargetReplaceOccurrences(segment), 0)
@@ -2540,13 +3184,18 @@ function handleBottomPreviewRenderingChange(rendering: boolean) {
   previewPanelRendering.value = rendering
 }
 
-const sideToolButtons = computed(() => ([
-  { key: 'match-info' as const, label: t('workbench.tools.matchInfo'), icon: Info, tone: 'info' },
-  { key: 'terms' as const, label: t('workbench.tools.terms'), icon: Languages, tone: 'language' },
-  { key: 'resource-search' as const, label: '搜索', icon: Search, tone: 'search' },
-  { key: 'notes' as const, label: t('workbench.tools.notes'), icon: MessageSquare, tone: 'note' },
-  { key: 'reference' as const, label: '参考文件', icon: FileText, tone: 'reference' },
-]))
+const sideToolButtons = computed(() => {
+  const items = [
+    { key: 'match-info' as const, label: t('workbench.tools.matchInfo'), icon: Info, tone: 'info' },
+    { key: 'terms' as const, label: t('workbench.tools.terms'), icon: Languages, tone: 'language' },
+    { key: 'resource-search' as const, label: '搜索', icon: Search, tone: 'search' },
+    { key: 'notes' as const, label: t('workbench.tools.notes'), icon: MessageSquare, tone: 'note' },
+    { key: 'reference' as const, label: '参考文件', icon: FileText, tone: 'reference' },
+  ]
+  return isProofreadingWorkbench.value
+    ? items.filter((item) => ['terms', 'resource-search', 'notes'].includes(item.key))
+    : items
+})
 
 const isMergeWorkbench = computed(() => Boolean(segmentStore.mergeViewId || props.mergeViewId))
 const workbenchHeaderTitle = computed(() => (
@@ -3564,6 +4213,70 @@ function setSegmentDisplayScope(scope: SegmentDisplayScope) {
     retainedEmptyTargetSentenceIds.value = new Set()
   }
   segmentDisplayScope.value = scope
+  if (isProofreadingWorkbench.value) {
+    try {
+      window.localStorage.setItem(
+        PROOFREADING_HIDE_UNCHANGED_STORAGE_KEY,
+        scope === 'proofreading_changed' ? '1' : '0',
+      )
+    } catch {}
+  }
+}
+
+function toggleProofreadingHideUnchanged() {
+  setSegmentDisplayScope(proofreadingHideUnchanged.value ? 'all' : 'proofreading_changed')
+}
+
+async function jumpToNextProofreadingAlignmentIssue(scope: ProofreadingAlignmentScope) {
+  if (proofreadingAlignmentNavigationLoading.value || isMergeWorkbench.value) return
+  const fileRecordId = segmentStore.fileRecord?.id || props.id
+  if (!fileRecordId) return
+  proofreadingAlignmentNavigationLoading.value = true
+  try {
+    const synced = await syncPendingWorkbenchEdits()
+    if (!synced) return
+    const pageSize = Math.max(segmentStore.pageSize, 1)
+    const afterSentenceId = activeSegment.value?.sentence_id || undefined
+    const { data } = await http.get<SegmentNextUnconfirmedPositionResponse>(
+      `/file-records/${fileRecordId}/segments/next-unconfirmed-position`,
+      {
+        params: {
+          after_sentence_id: afterSentenceId,
+          page_size: pageSize,
+          wrap: true,
+          require_unconfirmed: false,
+          scope,
+        },
+      },
+    )
+    activeProofreadingAlignmentScope.value = scope
+    proofreadingAlignmentNavigationTotal.value = data.matched_count || 0
+    if (!data.target) {
+      proofreadingAlignmentNavigationIndex.value = 0
+      toast.info(scope === 'proofreading_translation_only' ? '没有增译句段。' : '没有漏译句段。')
+      return
+    }
+    proofreadingAlignmentNavigationIndex.value = data.target.index + 1
+    const globalIndex = Math.max(data.target.display_index - 1, 0)
+    const target = {
+      ...data.target,
+      index: globalIndex,
+      page: Math.floor(globalIndex / pageSize) + 1,
+      page_size: pageSize,
+      page_index: globalIndex % pageSize,
+    }
+    if (segmentDisplayScope.value !== 'all') {
+      suppressSegmentFilterWatch = true
+      setSegmentDisplayScope('all')
+      await nextTick()
+      suppressSegmentFilterWatch = false
+    }
+    await focusSegmentPosition(target)
+  } catch (error) {
+    toast.error({ message: getErrorMessage(error, '无法定位下一条异常句段。') })
+  } finally {
+    proofreadingAlignmentNavigationLoading.value = false
+  }
 }
 
 function handleSegmentDisplayScopeChange(event: Event) {
@@ -6171,6 +6884,400 @@ const isCadFile = computed(() => {
   return ext === '.dwg' || ext === '.dxf'
 })
 
+const isDocumentPairProofreading = computed(() => (
+  isProofreadingWorkbench.value && proofreadingContext.value?.batch_kind === 'document_pair'
+))
+const isAlignmentWorkbench = computed(() => {
+  const stage = proofreadingContext.value?.workflow_stage
+  if (stage === 'alignment') return true
+  if (stage === 'proofreading' || stage === 'import') return false
+  return route.query.mode === 'alignment' && (
+    !workbenchModeResolved.value || isDocumentPairProofreading.value
+  )
+})
+const canReopenAlignment = computed(() => (
+  isDocumentPairProofreading.value
+  && proofreadingContext.value?.workflow_stage === 'proofreading'
+  && proofreadingContext.value?.batch_status === 'ready'
+))
+const reopenAlignmentDisabledReason = computed(() => {
+  if (!isDocumentPairProofreading.value || proofreadingContext.value?.workflow_stage !== 'proofreading') {
+    return ''
+  }
+  if (proofreadingContext.value?.batch_status === 'ready') return ''
+  return '已开始校对生成，不能退回对齐，以免覆盖已有校对成果。'
+})
+
+interface AlignmentWorkbenchCommand {
+  startOrder: number
+  before: AlignmentPairReplacement[]
+  after: AlignmentPairReplacement[]
+  label: string
+}
+const alignmentUndoStack = ref<AlignmentWorkbenchCommand[]>([])
+const alignmentRedoStack = ref<AlignmentWorkbenchCommand[]>([])
+const alignmentAdvancing = ref(false)
+type AlignmentTextPatch = { source_text?: string; target_text?: string }
+const pendingAlignmentTextPatches = new Map<string, AlignmentTextPatch>()
+const alignmentTextSaveTimers = new Map<string, number>()
+const alignmentTextSavePromises = new Set<Promise<void>>()
+
+function alignmentSegmentByKey(sentenceId: string) {
+  return segmentStore.segments.find(item => segmentKeyOf(item) === sentenceId)
+}
+
+async function persistAlignmentTextPatch(pairId: string) {
+  const payload = pendingAlignmentTextPatches.get(pairId)
+  if (!payload) return
+  pendingAlignmentTextPatches.delete(pairId)
+  const request = updateAlignmentPairText(pairId, payload).then(() => undefined)
+  alignmentTextSavePromises.add(request)
+  try {
+    await request
+  } catch (error) {
+    pendingAlignmentTextPatches.set(pairId, {
+      ...payload,
+      ...(pendingAlignmentTextPatches.get(pairId) || {}),
+    })
+    throw error
+  } finally {
+    alignmentTextSavePromises.delete(request)
+  }
+}
+
+function queueAlignmentTextPatch(pairId: string, payload: AlignmentTextPatch) {
+  pendingAlignmentTextPatches.set(pairId, {
+    ...(pendingAlignmentTextPatches.get(pairId) || {}),
+    ...payload,
+  })
+  const previousTimer = alignmentTextSaveTimers.get(pairId)
+  if (previousTimer != null) window.clearTimeout(previousTimer)
+  alignmentTextSaveTimers.set(pairId, window.setTimeout(() => {
+    alignmentTextSaveTimers.delete(pairId)
+    void persistAlignmentTextPatch(pairId).catch((error) => {
+      toast.error({ message: getErrorMessage(error, '对齐文本保存失败，请重试。') })
+    })
+  }, 600))
+}
+
+async function flushAlignmentTextPatches() {
+  for (const timer of alignmentTextSaveTimers.values()) window.clearTimeout(timer)
+  alignmentTextSaveTimers.clear()
+  let succeeded = true
+  while (pendingAlignmentTextPatches.size || alignmentTextSavePromises.size) {
+    const pendingIds = [...pendingAlignmentTextPatches.keys()]
+    const newRequests = pendingIds.map(pairId => persistAlignmentTextPatch(pairId))
+    const results = await Promise.allSettled([...alignmentTextSavePromises, ...newRequests])
+    if (results.some(result => result.status === 'rejected')) {
+      succeeded = false
+      break
+    }
+  }
+  return succeeded
+}
+
+function handleSegmentTargetUpdate(
+  sentenceId: string,
+  targetText: string,
+  targetHtml?: string,
+  options: UpdateSegmentTargetOptions = {},
+) {
+  if (!isAlignmentWorkbench.value) {
+    updateSegmentTarget(sentenceId, targetText, targetHtml, options)
+    return
+  }
+  const segment = alignmentSegmentByKey(sentenceId)
+  if (!segment?.alignment_pair_id) return
+  segment.target_text = targetText
+  segment.target_html = null
+  queueAlignmentTextPatch(segment.alignment_pair_id, { target_text: targetText })
+}
+
+async function handleSegmentSourceUpdate(sentenceId: string, sourceText: string) {
+  if (!isAlignmentWorkbench.value) {
+    await updateSegmentSource(sentenceId, sourceText)
+    return
+  }
+  const segment = alignmentSegmentByKey(sentenceId)
+  if (!segment?.alignment_pair_id || segment.alignment_translation_only) return
+  segment.source_text = sourceText
+  segment.display_text = sourceText
+  segment.source_body_text = sourceText
+  queueAlignmentTextPatch(segment.alignment_pair_id, { source_text: sourceText })
+}
+
+async function enterProofreadingFromAlignment() {
+  if (alignmentAdvancing.value) return
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId) {
+    toast.error({ message: '缺少对齐批次，无法进入校对。' })
+    return
+  }
+  alignmentAdvancing.value = true
+  try {
+    const saved = await flushAlignmentTextPatches()
+    if (!saved) {
+      toast.error({ message: '仍有对齐文本未保存，请检查后重试。' })
+      return
+    }
+    const batch = await completeAlignment(batchId)
+    if (proofreadingContext.value) {
+      proofreadingContext.value = {
+        ...proofreadingContext.value,
+        workflow_stage: batch.workflow_stage || 'proofreading',
+        batch_status: batch.status,
+      }
+    }
+    const query = { ...route.query }
+    delete query.mode
+    await router.replace({ name: 'workbench-focus', params: { id: props.id }, query })
+    // 切换阶段的接口会按最新对齐结果重建受影响句段和基线；必须立即重新读取，
+    // 不能继续复用对齐模式下的本地 Segment/修订缓存。
+    if (props.id) await loadProofreadingBaselines(props.id)
+    await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize, { includeStats: true })
+    toast.success({ message: '已完成对齐，进入校对工作流。' })
+  } catch (error) {
+    toast.error({ message: getErrorMessage(error, '进入校对失败，请重试。') })
+  } finally {
+    alignmentAdvancing.value = false
+  }
+}
+
+async function reopenAlignmentFromProofreading() {
+  if (alignmentAdvancing.value || !canReopenAlignment.value) return
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId) return
+  alignmentAdvancing.value = true
+  try {
+    const batch = await reopenAlignment(batchId)
+    if (proofreadingContext.value) {
+      proofreadingContext.value = {
+        ...proofreadingContext.value,
+        workflow_stage: batch.workflow_stage || 'alignment',
+        batch_status: batch.status,
+      }
+    }
+    await router.replace({
+      name: 'workbench-focus',
+      params: { id: props.id },
+      query: { ...route.query, mode: 'alignment' },
+    })
+    toast.success({ message: '已退回对齐阶段，可继续调整边界。' })
+  } catch (error) {
+    toast.error({ message: getErrorMessage(error, '退回对齐失败。') })
+  } finally {
+    alignmentAdvancing.value = false
+  }
+}
+
+function alignmentReplacement(segment: Segment): AlignmentPairReplacement {
+  return {
+    src_indices: [...(segment.alignment_src_indices || [])],
+    tgt_indices: [...(segment.alignment_tgt_indices || [])],
+    locked: true,
+  }
+}
+
+function cloneAlignmentReplacements(items: AlignmentPairReplacement[]) {
+  return items.map(item => ({
+    src_indices: [...item.src_indices],
+    tgt_indices: [...item.tgt_indices],
+    locked: item.locked,
+  }))
+}
+
+async function applyAlignmentReplacement(
+  startOrder: number,
+  before: AlignmentPairReplacement[],
+  after: AlignmentPairReplacement[],
+  label: string,
+  recordHistory = true,
+) {
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId) return
+  await replaceAlignmentPairRange(batchId, {
+    start_order: startOrder,
+    delete_count: before.length,
+    replacements: after,
+  })
+  if (recordHistory) {
+    alignmentUndoStack.value.push({
+      startOrder,
+      before: cloneAlignmentReplacements(before),
+      after: cloneAlignmentReplacements(after),
+      label,
+    })
+    if (alignmentUndoStack.value.length > 50) alignmentUndoStack.value.shift()
+    alignmentRedoStack.value = []
+  }
+  selectedSentenceIds.value = new Set()
+  await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize, { includeStats: false })
+  toast.success({ message: `${label}完成，已自动保存。` })
+}
+
+function nextAlignmentSegment(current: Segment) {
+  const order = current.alignment_pair_order
+  if (typeof order !== 'number') return null
+  return editorSegments.value.find(item => item.alignment_pair_order === order + 1) || null
+}
+
+async function shiftAlignmentBoundaryInWorkbench(
+  side: 'source' | 'target',
+  direction: 'next_into_current' | 'current_into_next',
+) {
+  const current = activeSegment.value
+  if (!current || typeof current.alignment_pair_order !== 'number') return
+  const next = nextAlignmentSegment(current)
+  if (!next) {
+    toast.warn({ message: '当前句段没有可调整的下一项。' })
+    return
+  }
+  const before = [alignmentReplacement(current), alignmentReplacement(next)]
+  const after = cloneAlignmentReplacements(before)
+  const field = side === 'source' ? 'src_indices' : 'tgt_indices'
+  const moved = direction === 'next_into_current' ? after[1][field].shift() : after[0][field].pop()
+  if (moved == null) {
+    toast.warn({ message: '所选方向没有可移动的解析单元。' })
+    return
+  }
+  if (direction === 'next_into_current') after[0][field].push(moved)
+  else after[1][field].unshift(moved)
+  await applyAlignmentReplacement(
+    current.alignment_pair_order,
+    before,
+    after,
+    `${side === 'source' ? '原文' : '译文'}${direction === 'next_into_current' ? '上移' : '下移'}`,
+  )
+}
+
+async function splitAlignmentPairInWorkbench() {
+  const current = activeSegment.value
+  if (!current || typeof current.alignment_pair_order !== 'number') return
+  const before = [alignmentReplacement(current)]
+  const srcAt = Math.ceil(before[0].src_indices.length / 2)
+  const tgtAt = Math.ceil(before[0].tgt_indices.length / 2)
+  const after = [
+    { src_indices: before[0].src_indices.slice(0, srcAt), tgt_indices: before[0].tgt_indices.slice(0, tgtAt), locked: true },
+    { src_indices: before[0].src_indices.slice(srcAt), tgt_indices: before[0].tgt_indices.slice(tgtAt), locked: true },
+  ]
+  if (after.some(item => !item.src_indices.length && !item.tgt_indices.length)) {
+    toast.warn({ message: '当前配对只有一个解析单元，无法继续拆分。' })
+    return
+  }
+  await applyAlignmentReplacement(current.alignment_pair_order, before, after, '拆分')
+}
+
+async function splitAlignmentPairsByCellInWorkbench() {
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId || alignmentAdvancing.value) return
+  const pairIds = [...selectedSentenceIds.value]
+    .map(sentenceId => alignmentSegmentByKey(sentenceId)?.alignment_pair_id)
+    .filter((value): value is string => Boolean(value))
+  alignmentAdvancing.value = true
+  try {
+    const result = await splitAlignmentPairsByCell(batchId, [...new Set(pairIds)])
+    selectedSentenceIds.value = new Set()
+    // 批量单元格修复可能跨越多个分页，旧的局部撤回命令不再对应当前 pair_order。
+    alignmentUndoStack.value = []
+    alignmentRedoStack.value = []
+    await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize, { includeStats: false })
+    if (result.changed_pairs) {
+      toast.success({
+        message: `已拆分 ${result.changed_pairs} 个跨单元格配对，并回收 ${result.merged_gaps} 组相邻错位。`,
+      })
+    } else {
+      toast.info({ message: '所选范围内未发现跨单元格粘连。' })
+    }
+  } catch (error) {
+    toast.error({ message: getErrorMessage(error, '按单元格拆分失败。') })
+  } finally {
+    alignmentAdvancing.value = false
+  }
+}
+
+async function insertAlignmentPairInWorkbench() {
+  const current = activeSegment.value
+  if (!current || typeof current.alignment_pair_order !== 'number') return
+  await applyAlignmentReplacement(
+    current.alignment_pair_order + 1,
+    [],
+    [{ src_indices: [], tgt_indices: [], locked: true }],
+    '插入空行',
+  )
+}
+
+async function deleteAlignmentPairInWorkbench() {
+  const current = activeSegment.value
+  if (!current || typeof current.alignment_pair_order !== 'number') return
+  const before = alignmentReplacement(current)
+  const isTranslationOnly = !before.src_indices.length && before.tgt_indices.length > 0
+  if (before.src_indices.length || (before.tgt_indices.length && !isTranslationOnly)) {
+    toast.warn({ message: '只能删除空行或无对应原文的增译行。' })
+    return
+  }
+  if (isTranslationOnly) {
+    if ((current.target_text || '').trim()) {
+      const confirmed = await confirm({
+        title: '删除增译行',
+        message: '该行仍有译文。删除后，其底层目标文档单元会并入相邻配对，但该段增译内容不会进入校对结果。',
+        confirmText: '删除增译行',
+        danger: true,
+      })
+      if (!confirmed) return
+    }
+    const saved = await flushAlignmentTextPatches()
+    if (!saved) {
+      toast.error({ message: '仍有对齐文本未保存，暂未删除。' })
+      return
+    }
+    if (!current.alignment_pair_id) return
+    alignmentAdvancing.value = true
+    try {
+      await deleteAlignmentPair(current.alignment_pair_id)
+      // 此删除会把目标解析单元吸收到相邻配对，不能用普通区间替换安全撤回。
+      alignmentUndoStack.value = []
+      alignmentRedoStack.value = []
+      selectedSentenceIds.value = new Set()
+      await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize, { includeStats: true })
+      toast.success({ message: '增译行已删除，后续句段顺序已自动更新。' })
+    } catch (error) {
+      toast.error({ message: getErrorMessage(error, '删除增译行失败。') })
+    } finally {
+      alignmentAdvancing.value = false
+    }
+    return
+  }
+  await applyAlignmentReplacement(current.alignment_pair_order, [before], [], '删除空行')
+}
+
+function handleSegmentTargetBlurCommit(sentenceId: string) {
+  void segmentStore.syncBlurredSegment(sentenceId)
+}
+
+async function undoAlignmentWorkbench() {
+  const command = alignmentUndoStack.value.pop()
+  if (!command) return
+  try {
+    await applyAlignmentReplacement(command.startOrder, command.after, command.before, `撤回：${command.label}`, false)
+    alignmentRedoStack.value.push(command)
+  } catch (error) {
+    alignmentUndoStack.value.push(command)
+    toast.error({ message: getErrorMessage(error, '撤回失败。') })
+  }
+}
+
+async function redoAlignmentWorkbench() {
+  const command = alignmentRedoStack.value.pop()
+  if (!command) return
+  try {
+    await applyAlignmentReplacement(command.startOrder, command.before, command.after, `重做：${command.label}`, false)
+    alignmentUndoStack.value.push(command)
+  } catch (error) {
+    alignmentRedoStack.value.push(command)
+    toast.error({ message: getErrorMessage(error, '重做失败。') })
+  }
+}
+
 // 切换激活句段时清除光标缓存
 watch(() => segmentStore.activeSentenceId, () => {
   lastSourceCaretOffset.value = null
@@ -6209,17 +7316,15 @@ function handleSegmentClick(sentenceId: string, event: MouseEvent) {
     return
   }
 
-  if (event.ctrlKey || event.metaKey) {
-    const next = new Set(selectedSentenceIds.value)
-    if (next.has(sentenceId)) {
-      next.delete(sentenceId)
-    } else {
-      next.add(sentenceId)
-    }
-    selectedSentenceIds.value = next
-    segmentSelectionAnchorId.value = sentenceId
-    segmentStore.setActiveSentence(sentenceId)
+  const next = new Set(selectedSentenceIds.value)
+  if (next.has(sentenceId)) {
+    next.delete(sentenceId)
+  } else {
+    next.add(sentenceId)
   }
+  selectedSentenceIds.value = next
+  segmentSelectionAnchorId.value = sentenceId
+  segmentStore.setActiveSentence(sentenceId)
 }
 
 /**
@@ -6286,6 +7391,15 @@ const selectedMergeSegmentsAreAdjacent = computed(() => {
   const orderedSegments = orderedSelectedMergeSegments.value
   if (orderedSegments.length < 2) return false
 
+  if (isDocumentPairProofreading.value) {
+    const pairOrders = orderedSegments.map((segment) => segment.alignment_pair_order)
+    if (pairOrders.some((order) => typeof order !== 'number' || !Number.isInteger(order))) {
+      return false
+    }
+    const firstPairOrder = pairOrders[0] as number
+    return pairOrders.every((order, offset) => order === firstPairOrder + offset)
+  }
+
   const firstIndex = editorSegments.value.findIndex(
     (segment) => segmentKeyOf(segment) === segmentKeyOf(orderedSegments[0]),
   )
@@ -6301,7 +7415,7 @@ const canMergeSegment = computed(() => {
   return (
     orderedSelectedMergeSegments.value.length >= 2
     && selectedMergeSegmentsCanWrite.value
-    && (isCadFile.value || selectedMergeSegmentsInSameBlock.value)
+    && (isCadFile.value || isDocumentPairProofreading.value || selectedMergeSegmentsInSameBlock.value)
     && selectedMergeSegmentsAreAdjacent.value
   )
 })
@@ -6313,16 +7427,23 @@ const mergeSegmentButtonTitle = computed(() => {
   if (!selectedMergeSegmentsCanWrite.value) {
     return t('workbench.messages.mergeReadonly')
   }
-  if (!isCadFile.value && !selectedMergeSegmentsInSameBlock.value) {
+  if (!isCadFile.value && !isDocumentPairProofreading.value && !selectedMergeSegmentsInSameBlock.value) {
     return t('workbench.messages.mergeDifferentBlock')
   }
   if (!selectedMergeSegmentsAreAdjacent.value) {
+    if (isDocumentPairProofreading.value) {
+      return '只能合并校对对齐序列中前后相邻的句段。请在“全部句段”中选择漏译及其紧邻的增译。'
+    }
     return t('workbench.messages.mergeNonAdjacent')
   }
   return t('workbench.ribbon.mergeSegment')
 })
 
 async function handleSplitSegment() {
+  if (isAlignmentWorkbench.value) {
+    await splitAlignmentPairInWorkbench()
+    return
+  }
   if (!activeSegment.value || !canSplitSegment.value) return
 
   // 点击工具栏前再读一次光标，避免 selectionchange 漏记
@@ -6373,7 +7494,7 @@ async function handleMergeSegment() {
   // CAD 文件（DWG/DXF）：允许跨 block 合并，不检查相邻性
   // 其他格式：必须同一 block
   const first = orderedSegments[0]
-  if (!isCadFile.value) {
+  if (!isCadFile.value && !isDocumentPairProofreading.value) {
     const notSameBlock = orderedSegments.some((segment) => !isSameMergeBlock(segment, first))
     if (notSameBlock) {
       toast.warn({ message: t('workbench.messages.mergeDifferentBlock') })
@@ -6382,11 +7503,26 @@ async function handleMergeSegment() {
   }
 
   try {
+    if (isAlignmentWorkbench.value && typeof first.alignment_pair_order === 'number') {
+      const before = orderedSegments.map(alignmentReplacement)
+      const after: AlignmentPairReplacement[] = [{
+        src_indices: before.flatMap(item => item.src_indices),
+        tgt_indices: before.flatMap(item => item.tgt_indices),
+        locked: true,
+      }]
+      await applyAlignmentReplacement(first.alignment_pair_order, before, after, `合并 ${before.length} 项`)
+      return
+    }
     const baseSentenceId = segmentKeyOf(orderedSegments[0])
     for (let i = 1; i < orderedSegments.length; i++) {
       await segmentStore.mergeSegment(baseSentenceId, segmentKeyOf(orderedSegments[i]))
     }
     selectedSentenceIds.value = new Set()
+    if (isDocumentPairProofreading.value) {
+      // 后端合并后会压紧全部 alignment_pair_order；重新读取当前页，确保后续连续
+      // 纠偏不会继续使用已失效的旧配对序号。
+      await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize, { includeStats: false })
+    }
     // 刷新预览（如果预览面板已打开）
     if (activeBottomTool.value === 'source-preview' || activeBottomTool.value === 'split-preview') {
       await segmentStore.ensurePreviewLoaded('source')
@@ -6584,6 +7720,7 @@ function closeAllMenus() {
 function closeRibbonMenus() {
   closeAllMenus()
   showExportMenu.value = false
+  showProofreadingExportMenu.value = false
   openConfirmMenu.value = false
   openRevisionMenu.value = null
 }
@@ -7054,6 +8191,7 @@ async function loadTask() {
     return
   }
   pageError.value = ''
+  workbenchModeResolved.value = false
   activeSideTool.value = null
   closeBottomDrawer()
   openRevisionMenu.value = null
@@ -7076,6 +8214,7 @@ async function loadTask() {
         Number(route.query.pageSize || segmentStore.pageSize || 100),
       ),
     })
+    await loadProofreadingBaselines(taskId)
     await replaceSegmentPageQueryIfNeeded()
     if (segmentStore.fileRecord?.is_edit_locked) {
       const message = segmentStore.fileRecord.active_operation_message || t('workbench.errors.editLocked')
@@ -7124,6 +8263,8 @@ async function loadTask() {
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.taskLoad'))
   } finally {
+    // 文件接口自身失败时也必须结束模式判定，才能显示错误信息。
+    workbenchModeResolved.value = true
     await nextTick()
     observeSegmentEditorResults()
     scheduleSegmentEditorScrollbarGutterUpdate()
@@ -7451,18 +8592,20 @@ function handleIssueSaved(_marker: IssueMarker) {
 
 async function saveNow() {
   if (manualSaving.value) {
-    return
+    return false
   }
   pageError.value = ''
   manualSaving.value = true
   try {
     const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
-      return
+      return false
     }
     toast.success(t('workbench.messages.synced'))
+    return true
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.save'))
+    return false
   } finally {
     manualSaving.value = false
   }
@@ -7660,14 +8803,20 @@ async function waitForFileExportTask(task: FileExportTask) {
   }
 }
 
-async function exportWithTypeForFile(exportType: string, fileRecordId?: string | null) {
+async function exportWithTypeForFile(
+  exportType: string,
+  fileRecordId?: string | null,
+  wordExportMode: WordExportMode = 'standard',
+) {
   const targetFileRecordId = fileRecordId || segmentStore.fileRecord?.id || ''
   if (!targetFileRecordId || exporting.value) return
 
   pageError.value = ''
   exporting.value = true
   exportProgress.value = 0
-  exportMessage.value = '导出任务提交中。'
+  exportMessage.value = wordExportMode === 'revision'
+    ? t('workbench.exportModes.revisionSubmitting')
+    : t('workbench.exportModes.standardSubmitting')
   showExportMenu.value = false
 
   try {
@@ -7680,7 +8829,7 @@ async function exportWithTypeForFile(exportType: string, fileRecordId?: string |
     const stylePayload = styleActive ? exportStyleSettings.value : null
     const includeRevisionMarks = (
       exportType === 'original'
-      && segmentStore.revisionTrackingEnabled
+      && wordExportMode === 'revision'
     )
     const exportPayload = (
       stylePayload || includeRevisionMarks
@@ -7704,7 +8853,11 @@ async function exportWithTypeForFile(exportType: string, fileRecordId?: string |
     // 从响应头获取文件名
     const resolvedFilename = resolveDownloadFilename(response.headers['content-disposition'], `export.${exportType}`)
     downloadBlob(response.data, resolvedFilename)
-    toast.success('导出完成，文件已开始下载。')
+    toast.success(
+      wordExportMode === 'revision'
+        ? t('workbench.exportModes.revisionSuccess')
+        : t('workbench.exportModes.standardSuccess'),
+    )
   } catch (error) {
     if (axios.isAxiosError(error)) {
       pageError.value = String(error.response?.data?.detail || '导出失败。')
@@ -7719,8 +8872,18 @@ async function exportWithTypeForFile(exportType: string, fileRecordId?: string |
   }
 }
 
-async function exportWithType(exportType: string) {
-  await exportWithTypeForFile(exportType, segmentStore.fileRecord?.id)
+async function exportWithType(exportType: string, wordExportMode: WordExportMode = 'standard') {
+  if (wordExportMode === 'revision') {
+    const confirmed = await confirm({
+      title: t('workbench.exportModes.revisionConfirmTitle'),
+      message: t('workbench.exportModes.revisionConfirmMessage'),
+      confirmText: t('workbench.exportModes.revisionConfirmAction'),
+    })
+    if (!confirmed) {
+      return
+    }
+  }
+  await exportWithTypeForFile(exportType, segmentStore.fileRecord?.id, wordExportMode)
 }
 
 const translatingFilename = ref(false)
@@ -7747,6 +8910,7 @@ function handleClickOutside(event: MouseEvent) {
   const target = event.target as HTMLElement
   if (!target.closest('.export-dropdown')) {
     showExportMenu.value = false
+    showProofreadingExportMenu.value = false
   }
 
   if (
@@ -8162,6 +9326,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  for (const timer of alignmentTextSaveTimers.values()) window.clearTimeout(timer)
+  alignmentTextSaveTimers.clear()
   stopBottomDrawerResize?.()
   segmentEditorResizeObserver?.disconnect()
   if (segmentEditorScrollbarFrame !== null) {
@@ -8173,11 +9339,15 @@ onBeforeUnmount(() => {
   document.removeEventListener('fullscreenchange', handleWorkbenchFullscreenChange)
   removeAiCapabilityMenuListeners()
   clearExportPollTimer()
+  clearProofreadingGenerationPollTimer()
   commentStore.stopPolling()
 })
 
 onBeforeRouteLeave(async () => {
   commentStore.stopPolling()
+  if (isAlignmentWorkbench.value) {
+    await flushAlignmentTextPatches()
+  }
   await syncPendingWorkbenchEdits()
 })
 </script>
@@ -8191,11 +9361,237 @@ onBeforeRouteLeave(async () => {
       'is-stable-grid': isStandaloneWorkbench,
       'is-ribbon-collapsed': isStandaloneWorkbench && workbenchRibbonCollapsed,
       'is-fullscreen': isWorkbenchFullscreen,
+      'has-proofreading-baseline': hasProofreadingBaselines,
+      'is-proofreading-workbench': isProofreadingWorkbench,
+      'is-alignment-workbench': isAlignmentWorkbench,
+      'is-workbench-mode-pending': !workbenchModeResolved,
     }"
     data-testid="workbench-page"
   >
+    <div v-if="!workbenchModeResolved" class="workbench-mode-loading" role="status">
+      <Loader2 class="lucide-spin" :size="30" />
+      <span>正在加载任务...</span>
+    </div>
     <section
-      v-if="isStandaloneWorkbench"
+      v-if="isStandaloneWorkbench && isProofreadingWorkbench"
+      class="toolbar-panel workbench-toolbar workbench-ribbon proofreading-workbench-toolbar"
+      data-testid="proofreading-workbench-toolbar"
+    >
+      <div class="workbench-ribbon__tabs proofreading-workbench-toolbar__main">
+        <button class="workbench-ribbon__tab is-active proofreading-workbench-toolbar__back" type="button" title="返回项目" @click="goBack">
+          <ArrowLeft :size="14" />
+          <span>{{ isAlignmentWorkbench ? '阶段 2/3 · 对齐' : '阶段 3/3 · 校对' }}</span>
+        </button>
+        <div class="workbench-ribbon__task">
+          <strong>{{ workbenchHeaderTitle }}</strong>
+          <span>{{ isAlignmentWorkbench ? '原文与原始译文边界调整' : '已有译文二次校对' }} · {{ currentLanguagePair }} · {{ proofreadingContext?.sheet_name || 'Excel' }}</span>
+        </div>
+        <div class="workbench-ribbon__top-actions" :aria-label="isAlignmentWorkbench ? '对齐编辑操作' : '校对编辑操作'">
+          <template v-if="isAlignmentWorkbench">
+            <button class="workbench-ribbon__top-action" type="button" :disabled="!alignmentUndoStack.length" @click="void undoAlignmentWorkbench()">
+              <Undo2 :size="15" /><span>撤回</span>
+            </button>
+            <button class="workbench-ribbon__top-action" type="button" :disabled="!alignmentRedoStack.length" @click="void redoAlignmentWorkbench()">
+              <Redo2 :size="15" /><span>前进</span>
+            </button>
+            <button class="workbench-ribbon__top-action" type="button" :disabled="!canMergeSegment" :title="mergeSegmentButtonTitle" @click="handleMergeSegment">
+              <Combine :size="15" /><span>合并</span>
+            </button>
+            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" @click="void splitAlignmentPairInWorkbench()">
+              <Split :size="15" /><span>拆分</span>
+            </button>
+            <button
+              class="workbench-ribbon__top-action"
+              type="button"
+              :disabled="alignmentAdvancing"
+              :title="selectedSentenceIds.size ? '按单元格拆分选中行' : '扫描整批并按单元格拆分'"
+              @click="void splitAlignmentPairsByCellInWorkbench()"
+            >
+              <TableCellsSplit :size="15" /><span>按单元格拆分</span>
+            </button>
+            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" title="下一项开头的译文移入当前项" @click="void shiftAlignmentBoundaryInWorkbench('target', 'next_into_current')">
+              <ChevronUp :size="15" /><span>上移</span>
+            </button>
+            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" title="当前项末尾的译文移入下一项" @click="void shiftAlignmentBoundaryInWorkbench('target', 'current_into_next')">
+              <ChevronDown :size="15" /><span>下移</span>
+            </button>
+            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" title="下一项开头的原文移入当前项" @click="void shiftAlignmentBoundaryInWorkbench('source', 'next_into_current')">
+              <ChevronUp :size="15" /><span>原文上移</span>
+            </button>
+            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" title="当前项末尾的原文移入下一项" @click="void shiftAlignmentBoundaryInWorkbench('source', 'current_into_next')">
+              <ChevronDown :size="15" /><span>原文下移</span>
+            </button>
+            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" @click="void insertAlignmentPairInWorkbench()">
+              <Plus :size="15" /><span>插入</span>
+            </button>
+            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" @click="void deleteAlignmentPairInWorkbench()">
+              <Trash2 :size="15" /><span>删除</span>
+            </button>
+            <button class="workbench-ribbon__top-action" type="button" @click="segmentSearchOpen = !segmentSearchOpen">
+              <Search :size="15" /><span>查找</span>
+            </button>
+            <button
+              class="workbench-ribbon__top-action"
+              data-testid="proofreading-export-alignment-button"
+              type="button"
+              :disabled="proofreadingExporting || !proofreadingContext?.batch_id || alignmentAdvancing"
+              title="导出原文与译文一一对照的 Excel 表格"
+              @click="void exportProofreadingWithFormat('proofreading_audit_xlsx')"
+            >
+              <Loader2 v-if="proofreadingExporting" class="lucide-spin" :size="15" />
+              <Download v-else :size="15" />
+              <span>{{ proofreadingExporting ? '导出中' : '导出对照表' }}</span>
+            </button>
+            <button
+              class="workbench-ribbon__top-action proofreading-workbench-toolbar__primary"
+              data-testid="proofreading-complete-alignment-button"
+              type="button"
+              :disabled="alignmentAdvancing"
+              @click="void enterProofreadingFromAlignment()"
+            >
+              <Loader2 v-if="alignmentAdvancing" class="lucide-spin" :size="15" />
+              <ArrowRight v-else :size="15" />
+              <span>{{ alignmentAdvancing ? '保存中' : '完成对齐，进入校对' }}</span>
+            </button>
+          </template>
+          <template v-else>
+          <button class="workbench-ribbon__top-action" data-testid="proofreading-save-button" type="button" :disabled="manualSaving" @click="saveNow">
+            <Loader2 v-if="manualSaving" class="lucide-spin" :size="15" />
+            <Save v-else :size="15" />
+            <span>{{ manualSaving ? '保存中' : '保存' }}</span>
+          </button>
+          <div class="export-dropdown">
+            <button
+              class="workbench-ribbon__top-action"
+              data-testid="proofreading-export-button"
+              type="button"
+              :disabled="manualSaving || proofreadingExporting || !proofreadingContext?.batch_id"
+              title="保存当前编辑并选择校对版导出格式"
+              @click.stop="showProofreadingExportMenu = !showProofreadingExportMenu"
+            >
+              <Loader2 v-if="proofreadingExporting" class="lucide-spin" :size="15" />
+              <Download v-else :size="15" />
+              <span>{{ proofreadingExportButtonLabel }}</span>
+              <ChevronDown :size="12" />
+            </button>
+            <div v-if="showProofreadingExportMenu" class="export-dropdown__menu">
+              <div class="export-dropdown__group">
+                <div class="export-dropdown__group-title">选择导出格式</div>
+                <button
+                  v-for="choice in proofreadingExportChoices"
+                  :key="choice.format"
+                  class="export-dropdown__item"
+                  type="button"
+                  :disabled="proofreadingExporting"
+                  @click="void exportProofreadingWithFormat(choice.format)"
+                >
+                  <span class="export-dropdown__item-name">{{ choice.name }}</span>
+                  <span class="export-dropdown__item-desc">{{ choice.description }}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+          <button
+            class="workbench-ribbon__top-action"
+            data-testid="proofreading-generate-button"
+            type="button"
+            :disabled="!canStartProofreadingGeneration || proofreadingGenerating"
+            :title="canStartProofreadingGeneration ? '配置提示词并调用 LLM 生成校对建议' : proofreadingGenerationButtonLabel"
+            @click="openProofreadingGenerateDialog"
+          >
+            <Loader2 v-if="proofreadingGenerating || ['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')" class="lucide-spin" :size="15" />
+            <Bot v-else :size="15" />
+            <span>{{ proofreadingGenerationButtonLabel }}</span>
+          </button>
+          <button
+            v-if="isDocumentPairProofreading"
+            class="workbench-ribbon__top-action"
+            data-testid="proofreading-reopen-alignment-button"
+            type="button"
+            :disabled="alignmentAdvancing || !canReopenAlignment"
+            :title="canReopenAlignment ? '退回对齐阶段，继续调整原文与译文边界' : reopenAlignmentDisabledReason"
+            @click="void reopenAlignmentFromProofreading()"
+          >
+            <Loader2 v-if="alignmentAdvancing" class="lucide-spin" :size="15" />
+            <Undo2 v-else :size="15" />
+            <span>退回对齐</span>
+          </button>
+          <button class="workbench-ribbon__top-action" type="button" title="撤回当前句段的编辑" @click="undoActiveSegmentEdit">
+            <Undo2 :size="15" /><span>撤回</span>
+          </button>
+          <button class="workbench-ribbon__top-action" type="button" title="恢复当前句段的编辑" @click="redoActiveSegmentEdit">
+            <Redo2 :size="15" /><span>恢复</span>
+          </button>
+          <button
+            v-if="isDocumentPairProofreading"
+            class="workbench-ribbon__top-action"
+            data-testid="proofreading-merge-segments-button"
+            type="button"
+            :disabled="!canMergeSegment"
+            :title="mergeSegmentButtonTitle"
+            @click="handleMergeSegment"
+          >
+            <Combine :size="15" />
+            <span>合并句段</span>
+          </button>
+          <button
+            class="workbench-ribbon__top-action"
+            type="button"
+            :class="{ 'is-active': proofreadingDiffVisible }"
+            :aria-pressed="proofreadingDiffVisible"
+            :title="proofreadingDiffVisible ? '关闭跟踪修订显示，只查看校对版' : '开启跟踪修订显示，查看删除和新增内容'"
+            @click="toggleProofreadingRevisionVisible"
+          >
+            <Columns :size="15" /><span>{{ proofreadingDiffVisible ? '隐藏修订' : '显示修订' }}</span>
+          </button>
+          <button class="workbench-ribbon__top-action proofreading-workbench-toolbar__primary" type="button" :disabled="!activeSegmentCanWrite" @click="confirmCurrentSentence">
+            <Check :size="15" /><span>确认当前</span>
+          </button>
+          <button class="workbench-ribbon__top-action proofreading-workbench-toolbar__primary" type="button" :disabled="!activeSegmentCanWrite" @click="void confirmAndMoveToNextUnconfirmed()">
+            <ArrowRight :size="15" /><span>确认并下一条</span>
+          </button>
+          </template>
+          <button class="workbench-ribbon__top-action" type="button" :title="workbenchFullscreenTitle" @click="void toggleWorkbenchFullscreen()">
+            <Minimize2 v-if="isWorkbenchFullscreen" :size="15" />
+            <Maximize2 v-else :size="15" />
+            <span>{{ workbenchFullscreenLabel }}</span>
+          </button>
+        </div>
+      </div>
+
+      <div
+        v-if="!isAlignmentWorkbench && proofreadingExporting"
+        class="proofreading-workbench-toolbar__export-progress"
+        role="progressbar"
+        aria-label="校对版导出进度"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        :aria-valuenow="Math.round(proofreadingExportProgress)"
+      >
+        <span :style="{ width: `${Math.max(2, proofreadingExportProgress)}%` }" />
+        <strong>{{ Math.round(proofreadingExportProgress) }}%</strong>
+      </div>
+
+      <div v-if="!isAlignmentWorkbench" class="proofreading-workbench-toolbar__info-strip">
+        <span class="proofreading-workbench-toolbar__info-item">
+          <Bot :size="13" />模型：<strong>{{ proofreadingModelLabel }}</strong>
+        </span>
+        <span class="proofreading-workbench-toolbar__info-item">
+          <History :size="13" />当前页修订：<strong>{{ proofreadingChangedCount }} 条</strong>
+        </span>
+        <span v-if="proofreadingContext?.user_instructions" class="proofreading-workbench-toolbar__info-item proofreading-workbench-toolbar__prompt" :title="proofreadingContext.user_instructions">
+          <Info :size="13" />提示词：<strong>{{ proofreadingContext.user_instructions }}</strong>
+        </span>
+        <span class="proofreading-workbench-toolbar__legend">蓝色下划线为新增，红色删除线为删除</span>
+      </div>
+      <div v-else class="proofreading-workbench-toolbar__info-strip">
+        <span class="proofreading-workbench-toolbar__info-item"><Info :size="13" />选择一条后调整边界；连续多选可合并</span>
+        <span class="proofreading-workbench-toolbar__legend">所有操作自动保存，不生成校对后译文</span>
+      </div>
+    </section>
+
+    <section
+      v-else-if="isStandaloneWorkbench"
       class="toolbar-panel workbench-toolbar workbench-ribbon"
       :class="{ 'is-collapsed': workbenchRibbonCollapsed }"
       data-testid="workbench-ribbon"
@@ -8276,25 +9672,48 @@ onBeforeRouteLeave(async () => {
                   class="export-dropdown__group"
                 >
                   <div class="export-dropdown__group-title">{{ group.label }}</div>
-                  <button
-                    v-for="option in group.options"
-                    :key="option.id"
-                    type="button"
-                    class="export-dropdown__item"
-                    :disabled="exporting"
-                    @click="exportWithType(option.id)"
-                  >
-                    <span class="export-dropdown__item-head">
-                      <span class="export-dropdown__item-name">{{ option.name }}</span>
-                      <span
-                        v-if="getExportOptionExtensionLabel(option)"
-                        class="export-dropdown__item-ext"
-                      >
-                        {{ getExportOptionExtensionLabel(option) }}
+                  <template v-for="option in group.options" :key="option.id">
+                    <button
+                      type="button"
+                      class="export-dropdown__item"
+                      :disabled="exporting"
+                      @click="exportWithType(option.id, 'standard')"
+                    >
+                      <span class="export-dropdown__item-head">
+                        <span class="export-dropdown__item-name">
+                          {{ getWorkbenchExportOptionName(option, 'standard') }}
+                        </span>
+                        <span
+                          v-if="getExportOptionExtensionLabel(option)"
+                          class="export-dropdown__item-ext"
+                        >
+                          {{ getExportOptionExtensionLabel(option) }}
+                        </span>
                       </span>
-                    </span>
-                    <span class="export-dropdown__item-desc">{{ option.description }}</span>
-                  </button>
+                      <span class="export-dropdown__item-desc">
+                        {{ getWorkbenchExportOptionDescription(option, 'standard') }}
+                      </span>
+                    </button>
+                    <button
+                      v-if="isWordTargetExportOption(option)"
+                      type="button"
+                      class="export-dropdown__item export-dropdown__item--revision"
+                      :disabled="exporting || segmentStore.pendingRevisionCount === 0"
+                      @click="exportWithType(option.id, 'revision')"
+                    >
+                      <span class="export-dropdown__item-head">
+                        <span class="export-dropdown__item-name">
+                          {{ getWorkbenchExportOptionName(option, 'revision') }}
+                        </span>
+                        <span class="export-dropdown__item-ext export-dropdown__item-ext--warning">
+                          {{ t('workbench.exportModes.experimentalBadge') }}
+                        </span>
+                      </span>
+                      <span class="export-dropdown__item-desc">
+                        {{ getWorkbenchExportOptionDescription(option, 'revision') }}
+                      </span>
+                    </button>
+                  </template>
                 </div>
               </template>
             </div>
@@ -8629,7 +10048,7 @@ onBeforeRouteLeave(async () => {
             <button class="style-item tool-button" type="button" data-testid="workbench-format-subscript" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
               <span class="icon-text-area"><span class="tool-item"><Subscript class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
+            <button class="style-item tool-button visible-characters-toggle" type="button" data-testid="workbench-visible-characters" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :aria-pressed="richTextEditor.visibleCharactersEnabled.value" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
               <span class="icon-text-area"><span class="tool-item"><Pilcrow class="tool-label-icon" :size="15" /></span></span>
             </button>
             <button class="style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.formatMarksVisible.value }" title="显示/隐藏原文与译文样式预览" @click="toggleFormatMarks">
@@ -9159,25 +10578,48 @@ onBeforeRouteLeave(async () => {
                   class="export-dropdown__group"
                 >
                   <div class="export-dropdown__group-title">{{ group.label }}</div>
-                  <button
-                    v-for="option in group.options"
-                    :key="option.id"
-                    type="button"
-                    class="export-dropdown__item"
-                    :disabled="exporting"
-                    @click="exportWithType(option.id)"
-                  >
-                    <span class="export-dropdown__item-head">
-                      <span class="export-dropdown__item-name">{{ option.name }}</span>
-                      <span
-                        v-if="getExportOptionExtensionLabel(option)"
-                        class="export-dropdown__item-ext"
-                      >
-                        {{ getExportOptionExtensionLabel(option) }}
+                  <template v-for="option in group.options" :key="option.id">
+                    <button
+                      type="button"
+                      class="export-dropdown__item"
+                      :disabled="exporting"
+                      @click="exportWithType(option.id, 'standard')"
+                    >
+                      <span class="export-dropdown__item-head">
+                        <span class="export-dropdown__item-name">
+                          {{ getWorkbenchExportOptionName(option, 'standard') }}
+                        </span>
+                        <span
+                          v-if="getExportOptionExtensionLabel(option)"
+                          class="export-dropdown__item-ext"
+                        >
+                          {{ getExportOptionExtensionLabel(option) }}
+                        </span>
                       </span>
-                    </span>
-                    <span class="export-dropdown__item-desc">{{ option.description }}</span>
-                  </button>
+                      <span class="export-dropdown__item-desc">
+                        {{ getWorkbenchExportOptionDescription(option, 'standard') }}
+                      </span>
+                    </button>
+                    <button
+                      v-if="isWordTargetExportOption(option)"
+                      type="button"
+                      class="export-dropdown__item export-dropdown__item--revision"
+                      :disabled="exporting || segmentStore.pendingRevisionCount === 0"
+                      @click="exportWithType(option.id, 'revision')"
+                    >
+                      <span class="export-dropdown__item-head">
+                        <span class="export-dropdown__item-name">
+                          {{ getWorkbenchExportOptionName(option, 'revision') }}
+                        </span>
+                        <span class="export-dropdown__item-ext export-dropdown__item-ext--warning">
+                          {{ t('workbench.exportModes.experimentalBadge') }}
+                        </span>
+                      </span>
+                      <span class="export-dropdown__item-desc">
+                        {{ getWorkbenchExportOptionDescription(option, 'revision') }}
+                      </span>
+                    </button>
+                  </template>
                 </div>
               </template>
             </div>
@@ -9378,12 +10820,18 @@ onBeforeRouteLeave(async () => {
       >
         <div class="panel-header panel-header--compact segment-editor-toolbar">
           <div class="segment-editor-toolbar__title">
-            <div class="section-title section-title--tight">{{ t('workbench.editorTitle') }}</div>
+            <div class="section-title section-title--tight">{{ isAlignmentWorkbench ? '对齐条目' : isProofreadingWorkbench ? '校对条目' : t('workbench.editorTitle') }}</div>
             <span class="hint-text">
               当前句段 {{ segmentStore.currentPageStart }}-{{ segmentStore.currentPageEnd }} / {{ segmentStore.matchedSegmentCount }}，总句段 {{ segmentStore.totalSegmentCount }}
             </span>
           </div>
-          <div class="segment-editor-toolbar__overview">
+          <div v-if="isProofreadingWorkbench && !isAlignmentWorkbench" class="segment-editor-toolbar__overview proofreading-editor-overview">
+            <span><strong>{{ proofreadingChangedCount }}</strong> 本页已修订</span>
+            <span><strong>{{ proofreadingUnchangedCount }}</strong> 本页未修改</span>
+            <span><strong>{{ proofreadingConfirmedCount }}</strong> 本页已确认</span>
+            <span class="segment-editor-toolbar__tip">蓝色条目表示校对版与原译文存在差异；展开“修订差异”可查看具体增删。</span>
+          </div>
+          <div v-else-if="!isAlignmentWorkbench" class="segment-editor-toolbar__overview">
             <button
               v-for="item in statusSummary"
               :key="item.key"
@@ -9456,7 +10904,51 @@ onBeforeRouteLeave(async () => {
                 </option>
               </select>
             </label>
+            <div
+              v-if="isDocumentPairProofreading"
+              class="proofreading-alignment-navigation"
+              role="group"
+              aria-label="增译和漏译句段跳转"
+            >
+              <button
+                class="proofreading-alignment-navigation__scope is-translation-only"
+                :class="{ 'is-active': activeProofreadingAlignmentScope === 'proofreading_translation_only' }"
+                type="button"
+                :disabled="proofreadingAlignmentNavigationLoading"
+                data-testid="proofreading-jump-translation-only"
+                title="跳转到下一条增译；首次点击会筛选增译"
+                @click="void jumpToNextProofreadingAlignmentIssue('proofreading_translation_only')"
+              ><ChevronDown :size="13" />下一个增译</button>
+              <button
+                class="proofreading-alignment-navigation__scope is-missing"
+                :class="{ 'is-active': activeProofreadingAlignmentScope === 'proofreading_missing_translation' }"
+                type="button"
+                :disabled="proofreadingAlignmentNavigationLoading"
+                data-testid="proofreading-jump-missing-translation"
+                title="跳转到下一条漏译；首次点击会筛选漏译"
+                @click="void jumpToNextProofreadingAlignmentIssue('proofreading_missing_translation')"
+              ><ChevronDown :size="13" />下一个漏译</button>
+              <template v-if="activeProofreadingAlignmentScope">
+                <span class="proofreading-alignment-navigation__position" aria-live="polite">
+                  {{ proofreadingAlignmentPositionLabel }}
+                </span>
+              </template>
+            </div>
             <button
+              v-if="isProofreadingWorkbench && !isAlignmentWorkbench"
+              class="button proofreading-hide-unchanged"
+              :class="{ 'is-active': proofreadingHideUnchanged }"
+              type="button"
+              :title="proofreadingHideUnchanged ? '恢复显示未修改的校对条目' : '隐藏校对版与原译文相同的条目'"
+              :aria-pressed="proofreadingHideUnchanged"
+              @click="toggleProofreadingHideUnchanged"
+            >
+              <Eye v-if="proofreadingHideUnchanged" :size="15" />
+              <EyeOff v-else :size="15" />
+              {{ proofreadingHideUnchanged ? '显示未修改' : '隐藏未修改' }}
+            </button>
+            <button
+              v-if="!isProofreadingWorkbench"
               class="button segment-editor-toolbar__screening"
               :class="{ 'is-active': segmentScreeningPopoverOpen || hasSegmentScreeningFilters }"
               type="button"
@@ -9920,9 +11412,13 @@ onBeforeRouteLeave(async () => {
             <div class="segment-table-head" aria-hidden="true">
               <span>句段</span>
               <span>原文</span>
-              <span>译文</span>
-              <span>状态</span>
-              <span>阶段</span>
+              <span v-if="hasProofreadingBaselines && !isAlignmentWorkbench">原译文</span>
+              <span>{{ isAlignmentWorkbench ? '原始译文' : hasProofreadingBaselines ? '校对版' : '译文' }}</span>
+              <span v-if="isProofreadingWorkbench && !isAlignmentWorkbench">修改建议</span>
+              <template v-else-if="!isAlignmentWorkbench">
+                <span>状态</span>
+                <span>阶段</span>
+              </template>
             </div>
 
             <div
@@ -9988,13 +11484,13 @@ onBeforeRouteLeave(async () => {
                       :index="getEditorSegmentDisplayIndex(segmentKeyOf(item), index)"
                       :active="segmentStore.activeSentenceId === segmentKeyOf(item)"
                       :disabled="!item.can_write"
-                      :source-editing="sourceEditing"
+                      :source-editing="sourceEditing || (isAlignmentWorkbench && !item.alignment_translation_only)"
                       :selected="selectedSentenceIds.has(segmentKeyOf(item))"
                       :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(segmentKeyOf(item)) : null"
                       :revision-settings="segmentStore.revisionSettings"
                       :revision-busy="revisionActionLoading"
                       :matched-terms="segmentStore.activeSentenceId === segmentKeyOf(item) ? activeMatchedTerms : []"
-                      :qa-issues="segmentStore.getInlineSpellingIssues(item)"
+                      :qa-issues="isProofreadingWorkbench ? [] : segmentStore.getInlineSpellingIssues(item)"
                       :source-search-query="sourceSearchQuery"
                       :target-search-query="targetSearchQuery"
                       :search-case-sensitive="searchCaseSensitive"
@@ -10002,17 +11498,25 @@ onBeforeRouteLeave(async () => {
                       :show-format-marks="richTextEditor.formatMarksVisible.value"
                       :tag-edit-mode="richTextEditor.tagEditModeEnabled.value"
                       :pending-formats="pendingFormatsForEditor"
+                      :source-language="getSegmentLanguageContext(item)?.source_language || null"
+                      :target-language="getSegmentLanguageContext(item)?.target_language || null"
+                      :original-target-text="isAlignmentWorkbench ? null : proofreadingOriginalTarget(item)"
+                      :alignment-mode="isAlignmentWorkbench"
+                      :show-proofreading-diff="proofreadingDiffVisible"
+                      :proofreading-suggestion="isProofreadingWorkbench && !isAlignmentWorkbench ? proofreadingSuggestionFor(item) : null"
                       @focus="segmentStore.setActiveSentence"
+                      @blur-commit="handleSegmentTargetBlurCommit"
                       @activate-target="handleSegmentTargetActivate"
                       @activate-source="handleSegmentSourceActivate"
                       @source-caret-change="handleSourceCaretChange"
                       @copy-source-to-target="copySourceToTargetForSegment"
-                      @update="updateSegmentTarget"
-                      @update-source="updateSegmentSource"
+                      @update="handleSegmentTargetUpdate"
+                      @update-source="handleSegmentSourceUpdate"
                       @update-target-layout="updateSegmentTargetLayout"
                       @toggle-project-sync="toggleProjectSegmentSync"
                       @apply-partial-revision="handleApplyPartialRevision"
                       @ctrl-click="handleSegmentClick"
+                      @toggle-selection="handleSegmentClick"
                     />
                   </div>
                 </template>
@@ -10052,6 +11556,7 @@ onBeforeRouteLeave(async () => {
           </div>
 
           <div
+            v-if="!isProofreadingWorkbench"
             ref="bottomPanelRef"
             class="segment-editor-bottom-tools"
             :class="{ 'is-docked': activeBottomTool }"
@@ -10273,6 +11778,8 @@ onBeforeRouteLeave(async () => {
                 :target-update-token="segmentStore.previewUpdateToken"
                 :comments="commentStore.comments"
                 :active-comment-id="commentStore.activeCommentId"
+                :source-language="activeWorkbenchFileContext?.source_language || null"
+                :target-language="activeWorkbenchFileContext?.target_language || null"
                 @close="closeBottomDrawer"
                 @focus-sentence="handlePreviewFocus"
                 @focus-comment="handleCommentFocus"
@@ -10292,6 +11799,9 @@ onBeforeRouteLeave(async () => {
                 :comments="commentStore.comments"
                 :active-comment-id="commentStore.activeCommentId"
                 :enable-comment-selection="true"
+                :language="activeBottomTool === 'source-preview'
+                  ? (activeWorkbenchFileContext?.source_language || null)
+                  : (activeWorkbenchFileContext?.target_language || null)"
                 :render-mode="activeBottomTool === 'target-preview' ? targetPreviewRenderMode : 'static'"
                 :segments="activeBottomTool === 'target-preview' && targetPreviewRenderMode === 'target' ? segmentStore.segments : []"
                 :updated-sentence-id="activeBottomTool === 'target-preview' ? segmentStore.lastPreviewUpdatedSentenceId : null"
@@ -11623,6 +13133,101 @@ onBeforeRouteLeave(async () => {
     />
 
     <Modal
+      :open="showProofreadingGenerateDialog"
+      title="LLM 校对设置"
+      description="调整本次校对使用的模型和临时提示词。"
+      width="min(640px, calc(100vw - 32px))"
+      :close-on-overlay="!proofreadingGenerating"
+      :close-on-esc="!proofreadingGenerating"
+      @close="showProofreadingGenerateDialog = false"
+    >
+      <div class="proofreading-generate-dialog">
+        <div class="proofreading-generate-dialog__fields">
+          <label class="field">
+            <span class="field__label">模型提供方</span>
+            <select
+              v-model="proofreadingGenerationDraft.provider"
+              class="field__control"
+              :disabled="proofreadingGenerating"
+              @change="handleProofreadingProviderChange"
+            >
+              <option value="auto">自动（优先 DeepSeek，失败回退）</option>
+              <option value="deepseek">DeepSeek</option>
+              <option value="openrouter">OpenRouter</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field__label">校对模型</span>
+            <select
+              v-model="proofreadingGenerationDraft.model"
+              class="field__control"
+              :disabled="proofreadingGenerating || proofreadingGenerationDraft.provider === 'auto'"
+            >
+              <option v-if="proofreadingGenerationDraft.provider === 'auto'" value="">自动选择默认模型</option>
+              <option v-if="proofreadingGenerationDraft.provider === 'deepseek'" value="deepseek-chat">DeepSeek Chat</option>
+              <option v-if="proofreadingGenerationDraft.provider === 'openrouter'" value="google/gemini-3-flash-preview">Gemini 3 Flash Preview</option>
+            </select>
+          </label>
+        </div>
+        <p class="proofreading-generate-dialog__hint">
+          {{ proofreadingProviderDescription(proofreadingGenerationDraft.provider) }}
+        </p>
+        <fieldset class="proofreading-generate-dialog__scope" :disabled="proofreadingGenerating">
+          <legend>校对范围</legend>
+          <label class="proofreading-generate-dialog__scope-option">
+            <input v-model="proofreadingGenerationDraft.retryScope" type="radio" value="all">
+            <span>
+              <strong>全部可校对句段</strong>
+              <small>重新处理当前批次中所有尚未确认的句段。</small>
+            </span>
+          </label>
+          <label
+            class="proofreading-generate-dialog__scope-option"
+            :class="{ 'is-disabled': !proofreadingContext?.failed_segments }"
+          >
+            <input
+              v-model="proofreadingGenerationDraft.retryScope"
+              type="radio"
+              value="failed_only"
+              :disabled="!proofreadingContext?.failed_segments"
+            >
+            <span>
+              <strong>仅重试生成失败项</strong>
+              <small v-if="proofreadingContext?.failed_segments">
+                仅提交最新一轮失败的 {{ proofreadingContext.failed_segments }} 个句段，已成功内容不会重复调用。
+              </small>
+              <small v-else>当前没有可重试的生成失败项。</small>
+            </span>
+          </label>
+        </fieldset>
+        <label class="field proofreading-generate-dialog__prompt">
+          <span class="field__label">本批次校对提示词</span>
+          <textarea
+            v-model="proofreadingGenerationDraft.userInstructions"
+            class="field__control"
+            rows="6"
+            maxlength="12000"
+            :disabled="proofreadingGenerating"
+            placeholder="例如：统一金融术语；保留机构英文全称；语气正式简洁；不要改写法规编号。"
+          />
+          <small>提示词会追加到系统和项目校对规则中；此流程直接调用 LLM，不使用 TM / 词汇表。</small>
+        </label>
+        <p v-if="proofreadingGenerateError" class="form-message is-error">{{ proofreadingGenerateError }}</p>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="proofreadingGenerating" @click="showProofreadingGenerateDialog = false">
+          取消
+        </button>
+        <button class="button button--primary" type="button" :disabled="proofreadingGenerating" @click="void submitProofreadingGeneration()">
+          <Loader2 v-if="proofreadingGenerating" class="lucide-spin" :size="14" />
+          <Bot v-else :size="14" />
+          {{ proofreadingGenerating ? '正在启动' : '开始 LLM 校对' }}
+        </button>
+      </template>
+    </Modal>
+
+    <Modal
       :open="showQualityQAAdjustDialog"
       title="质量保证调整"
       width="min(560px, calc(100vw - 32px))"
@@ -12071,6 +13676,17 @@ onBeforeRouteLeave(async () => {
 </template>
 
 <style scoped>
+.workbench-page.is-workbench-mode-pending > :not(.workbench-mode-loading) {
+  display: none !important;
+}
+.workbench-mode-loading {
+  display: grid;
+  min-height: min(520px, 70vh);
+  place-items: center;
+  align-content: center;
+  gap: 12px;
+  color: var(--ink-500, #64748b);
+}
 .workbench-toolbar,
 .workbench-toolbar__progress,
 .workbench-load-all,
@@ -12160,6 +13776,255 @@ onBeforeRouteLeave(async () => {
   background: #f3f6f8;
 }
 
+.proofreading-workbench-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 1200;
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: #f7f9fb;
+  box-shadow: 0 4px 10px rgba(17, 49, 42, 0.08);
+}
+
+.workbench-page.is-proofreading-workbench:not(.is-alignment-workbench) .proofreading-workbench-toolbar {
+  background: #eef7f4;
+  box-shadow: inset 4px 0 0 var(--brand-700, #0d7a68), 0 4px 10px rgba(17, 49, 42, 0.08);
+}
+
+.workbench-page.is-alignment-workbench .proofreading-workbench-toolbar {
+  background: #fbf6ee;
+  box-shadow: inset 4px 0 0 #d97706, 0 4px 10px rgba(120, 53, 15, 0.08);
+}
+
+.workbench-page.is-alignment-workbench .proofreading-workbench-toolbar__back svg {
+  color: #b45309;
+}
+
+.workbench-page.is-alignment-workbench .proofreading-workbench-toolbar__primary {
+  border-color: #d97706 !important;
+  background: #d97706 !important;
+  color: #fff !important;
+}
+
+.workbench-page.is-alignment-workbench .proofreading-workbench-toolbar__primary:hover:not(:disabled),
+.workbench-page.is-alignment-workbench .proofreading-workbench-toolbar__primary:focus-visible {
+  background: #b45309 !important;
+}
+
+.workbench-page.is-alignment-workbench .proofreading-workbench-toolbar__info-item svg {
+  color: #d97706;
+}
+
+.workbench-page.is-alignment-workbench .workbench-ribbon__top-action svg {
+  color: #d97706;
+}
+
+.proofreading-workbench-toolbar__main {
+  min-height: 38px;
+}
+
+.proofreading-workbench-toolbar__export-progress {
+  position: relative;
+  height: 4px;
+  overflow: visible;
+  background: #dfe9e6;
+}
+
+.proofreading-workbench-toolbar__export-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: 0 999px 999px 0;
+  background: var(--brand-700, #0d7a68);
+  transition: width 0.2s ease;
+}
+
+.proofreading-workbench-toolbar__export-progress > strong {
+  position: absolute;
+  top: 5px;
+  right: 8px;
+  z-index: 1;
+  color: #52635e;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.proofreading-workbench-toolbar__back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.proofreading-workbench-toolbar__back svg {
+  color: var(--brand-700, #0d7a68);
+}
+
+.proofreading-workbench-toolbar .workbench-ribbon__task strong {
+  max-width: min(420px, 30vw);
+}
+
+.proofreading-workbench-toolbar .workbench-ribbon__top-action.is-active {
+  border-color: #a9cec5;
+  background: #eef8f5;
+  color: var(--brand-800, #095f52);
+}
+
+.proofreading-workbench-toolbar__primary {
+  border-color: var(--brand-700, #0d7a68) !important;
+  background: var(--brand-700, #0d7a68) !important;
+  color: #fff !important;
+}
+
+.proofreading-workbench-toolbar__primary svg {
+  color: #fff !important;
+}
+
+.proofreading-workbench-toolbar__primary:hover:not(:disabled),
+.proofreading-workbench-toolbar__primary:focus-visible {
+  background: var(--brand-800, #095f52) !important;
+}
+
+.proofreading-workbench-toolbar__info-strip {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 28px;
+  padding: 4px 10px;
+  border-bottom: 1px solid #d8e0e5;
+  background: #fff;
+  color: #52616a;
+  font-size: 11px;
+}
+
+.proofreading-workbench-toolbar__info-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.proofreading-workbench-toolbar__info-item svg {
+  flex: 0 0 auto;
+  color: #6ba99a;
+}
+
+.proofreading-workbench-toolbar__info-item strong {
+  color: #24413b;
+  font-weight: 650;
+}
+
+.proofreading-workbench-toolbar__prompt {
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.proofreading-workbench-toolbar__prompt strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proofreading-workbench-toolbar__legend {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: #6b7d85;
+  white-space: nowrap;
+}
+
+.proofreading-generate-dialog {
+  display: grid;
+  gap: 14px;
+}
+
+.proofreading-generate-dialog__fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.proofreading-generate-dialog__hint,
+.proofreading-generate-dialog__prompt small {
+  margin: 0;
+  color: #65767d;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.proofreading-generate-dialog__scope {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+}
+
+.proofreading-generate-dialog__scope legend {
+  padding: 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.proofreading-generate-dialog__scope-option {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 9px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.proofreading-generate-dialog__scope-option:hover {
+  background: var(--color-surface-hover);
+}
+
+.proofreading-generate-dialog__scope-option.is-disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.proofreading-generate-dialog__scope-option span {
+  display: grid;
+  gap: 3px;
+}
+
+.proofreading-generate-dialog__scope-option small {
+  color: var(--color-text-muted);
+  line-height: 1.45;
+}
+
+.proofreading-generate-dialog__prompt {
+  display: grid;
+  gap: 7px;
+}
+
+.proofreading-generate-dialog__prompt textarea {
+  min-height: 140px;
+  resize: vertical;
+  line-height: 1.6;
+}
+
+@media (max-width: 640px) {
+  .proofreading-generate-dialog__fields {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 1280px) {
+  .proofreading-workbench-toolbar .workbench-ribbon__task span,
+  .proofreading-workbench-toolbar__legend {
+    display: none;
+  }
+  .proofreading-workbench-toolbar__info-strip {
+    gap: 8px;
+  }
+}
+
 .workbench-page.is-stable-grid .workbench-ribbon {
   box-shadow: 0 1px 0 #cfd8df;
 }
@@ -12187,6 +14052,10 @@ onBeforeRouteLeave(async () => {
 .workbench-page.is-stable-grid .segment-editor-results {
   --segment-editor-grid-template: 64px minmax(320px, 1fr) minmax(360px, 1fr) 78px 64px;
   --virtual-list-inline-end-gap: 0;
+}
+
+.workbench-page.is-alignment-workbench .segment-editor-results {
+  --segment-editor-grid-template: 64px minmax(360px, 1fr) minmax(360px, 1fr);
 }
 
 .workbench-page.is-stable-grid .segment-table-head {
@@ -12304,6 +14173,18 @@ onBeforeRouteLeave(async () => {
   flex: 0 0 auto;
   margin-left: auto;
   padding: 0 6px;
+}
+
+.workbench-page.is-alignment-workbench .workbench-ribbon__task {
+  flex: 0 1 300px;
+}
+
+.workbench-page.is-alignment-workbench .workbench-ribbon__top-actions {
+  flex: 1 1 auto;
+  justify-content: flex-start;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
 
 .workbench-ribbon__top-action {
@@ -14442,6 +16323,50 @@ onBeforeRouteLeave(async () => {
   min-height: 0;
 }
 
+.workbench-page.has-proofreading-baseline .segment-editor-results {
+  --segment-editor-grid-template: 64px minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(210px, 0.78fr);
+}
+
+.workbench-page.has-proofreading-baseline.is-alignment-workbench .segment-editor-results {
+  --segment-editor-grid-template: 64px minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.workbench-page.is-stable-grid.is-alignment-workbench :deep(.segment-row.is-alignment-translation-only) {
+  background: #fff9e9;
+  box-shadow: inset 4px 0 0 #d79000;
+}
+
+.workbench-page.is-stable-grid.is-alignment-workbench :deep(.segment-row.is-alignment-translation-only .segment-row__meta) {
+  background: #ffedb7;
+}
+
+.workbench-page.is-stable-grid.is-alignment-workbench :deep(.segment-row.is-alignment-translation-only .segment-row__cell--source),
+.workbench-page.is-stable-grid.is-alignment-workbench :deep(.segment-row.is-alignment-translation-only .segment-row__cell--target) {
+  background: #fff7df;
+}
+
+.workbench-page.is-stable-grid.is-alignment-workbench :deep(.segment-row.is-alignment-missing-translation) {
+  background: #fff2f2;
+  box-shadow: inset 4px 0 0 #c44747;
+}
+
+.workbench-page.is-stable-grid.is-alignment-workbench :deep(.segment-row.is-alignment-missing-translation .segment-row__meta) {
+  background: #ffd6d6;
+}
+
+.workbench-page.is-stable-grid.is-alignment-workbench :deep(.segment-row.is-alignment-missing-translation .segment-row__cell--source),
+.workbench-page.is-stable-grid.is-alignment-workbench :deep(.segment-row.is-alignment-missing-translation .segment-row__cell--target) {
+  background: #ffeded;
+}
+
+.workbench-page.is-stable-grid.is-alignment-workbench :deep(.segment-row.is-active.is-alignment-translation-only) {
+  box-shadow: inset 4px 0 0 #d79000, inset 0 0 0 2px rgba(184, 120, 0, 0.36);
+}
+
+.workbench-page.is-stable-grid.is-alignment-workbench :deep(.segment-row.is-active.is-alignment-missing-translation) {
+  box-shadow: inset 4px 0 0 #c44747, inset 0 0 0 2px rgba(196, 71, 71, 0.38);
+}
+
 .segment-editor-results.has-workflow-readonly-notice {
   grid-template-rows: auto auto minmax(390px, var(--workbench-editor-stage-height));
 }
@@ -15378,6 +17303,25 @@ onBeforeRouteLeave(async () => {
  * 按编辑区自身宽度切换成图标模式，为分页控件保留稳定空间；按钮文字仍供
  * 屏幕阅读器读取，并可通过原有 title 查看。
  */
+/*
+ * 半屏或侧栏展开时，默认表格列最小宽度之和会超过编辑区，导致“状态/阶段”列被裁掉。
+ * 按编辑器自身宽度收紧列宽，比 viewport 断点更可靠，也能覆盖可拖拽侧栏场景。
+ */
+@container segment-editor-shell (max-width: 940px) {
+  .workbench-page.is-stable-grid .segment-editor-results {
+    --segment-editor-grid-template: 56px minmax(190px, 0.9fr) minmax(230px, 1.1fr) 64px 56px;
+  }
+
+  .workbench-page.has-proofreading-baseline .segment-editor-results {
+    --segment-editor-grid-template: 56px minmax(150px, 1fr) minmax(150px, 1fr) minmax(170px, 1.1fr) minmax(170px, 0.9fr);
+  }
+
+  .workbench-page.has-proofreading-baseline.is-alignment-workbench .segment-editor-results,
+  .workbench-page.is-alignment-workbench .segment-editor-results {
+    --segment-editor-grid-template: 56px minmax(220px, 1fr) minmax(220px, 1fr);
+  }
+}
+
 @container segment-editor-shell (max-width: 860px) {
   .segment-editor-bottom-tools,
   .segment-editor-bottom-tools.is-docked {
@@ -16043,6 +17987,24 @@ onBeforeRouteLeave(async () => {
   overflow: hidden;
 }
 
+.proofreading-editor-overview > span:not(.segment-editor-toolbar__tip) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border: 1px solid rgba(59, 130, 246, 0.16);
+  border-radius: 999px;
+  background: rgba(239, 246, 255, 0.86);
+  color: #415b73;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.proofreading-editor-overview > span strong {
+  color: #1d4ed8;
+  font-size: 12px;
+}
+
 .segment-editor-toolbar__overview .workbench-stat--compact {
   flex: 0 0 auto;
   min-height: 28px;
@@ -16195,6 +18157,98 @@ onBeforeRouteLeave(async () => {
   border-color: #8db9c4;
   background: #edf8f6;
   color: #0b6658;
+}
+
+.proofreading-hide-unchanged {
+  flex: 0 0 auto;
+  min-height: 30px;
+  height: 30px;
+  padding: 0 10px;
+  gap: 5px;
+  border-color: #cbd9df;
+  border-radius: 4px;
+  background: #fff;
+  color: #2d4651;
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.proofreading-hide-unchanged:hover,
+.proofreading-hide-unchanged.is-active {
+  border-color: #8db9c4;
+  background: #edf8f6;
+  color: #0b6658;
+}
+
+.proofreading-alignment-navigation {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  overflow: hidden;
+  border: 1px solid #cbd9df;
+  border-radius: 4px;
+  background: #fff;
+}
+
+.proofreading-alignment-navigation button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-right: 1px solid #dbe5e9;
+  background: transparent;
+  color: #2d4651;
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.proofreading-alignment-navigation button:last-child {
+  border-right: 0;
+}
+
+.proofreading-alignment-navigation button:hover:not(:disabled),
+.proofreading-alignment-navigation button.is-active {
+  background: #edf8f6;
+  color: #0b6658;
+}
+
+.proofreading-alignment-navigation button.is-active {
+  font-weight: 700;
+}
+
+.proofreading-alignment-navigation__scope {
+  gap: 3px;
+}
+
+.proofreading-alignment-navigation__scope.is-translation-only:hover:not(:disabled),
+.proofreading-alignment-navigation__scope.is-translation-only.is-active {
+  background: #fff2c7;
+  color: #8a5a00;
+}
+
+.proofreading-alignment-navigation__scope.is-missing:hover:not(:disabled),
+.proofreading-alignment-navigation__scope.is-missing.is-active {
+  background: #ffe2e2;
+  color: #a83232;
+}
+
+.proofreading-alignment-navigation button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.proofreading-alignment-navigation__position {
+  padding: 0 7px;
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.proofreading-alignment-navigation__move {
+  width: 28px;
+  padding: 0 !important;
 }
 
 .segment-editor-toolbar__screening-count {
@@ -16586,6 +18640,7 @@ onBeforeRouteLeave(async () => {
     grid-row: 2;
   }
 
+  .workbench-layout .segment-editor-side-tools,
   .workbench-layout.has-active-tool .segment-editor-side-tools {
     grid-column: 1;
     grid-row: 1;
@@ -16668,6 +18723,28 @@ onBeforeRouteLeave(async () => {
     --workbench-toolbar-left: 12px;
     --workbench-drawer-left: 12px;
     --workbench-fixed-max: calc(100vw - 24px);
+  }
+
+  .workbench-ribbon__tab {
+    min-width: 72px;
+    padding-inline: 12px;
+  }
+
+  .workbench-ribbon__task {
+    padding-inline: 10px;
+  }
+
+  .workbench-ribbon__task strong {
+    max-width: min(300px, 32vw);
+  }
+
+  .workbench-ribbon__task span {
+    display: none;
+  }
+
+  .workbench-ribbon__top-actions {
+    gap: 2px;
+    padding-inline: 2px;
   }
 
   .segment-editor-footer {
@@ -17059,6 +19136,14 @@ onBeforeRouteLeave(async () => {
   background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
 }
 
+/* “显示标记”开启后使用更明确的品牌色反馈，避免只靠浅灰背景判断状态。 */
+.visible-characters-toggle.is-active {
+  border-color: #65ad9f;
+  background: linear-gradient(180deg, #effbf8 0%, #dff4ef 100%);
+  color: #087667;
+  box-shadow: inset 0 0 0 1px rgba(8, 118, 103, 0.12);
+}
+
 /* 特殊字符下拉菜单 */
 .special-char-menu {
   position: relative;
@@ -17230,6 +19315,16 @@ onBeforeRouteLeave(async () => {
   background: rgba(13, 122, 104, 0.08);
 }
 
+.export-dropdown__item--revision {
+  margin-top: 2px;
+  border: 1px solid #f2d3a2;
+  background: #fffaf2;
+}
+
+.export-dropdown__item--revision:hover {
+  background: #fff3df;
+}
+
 .export-dropdown__item:disabled {
   opacity: 0.5;
   cursor: not-allowed;
@@ -17261,6 +19356,12 @@ onBeforeRouteLeave(async () => {
   color: #4d5c65;
   font-size: 10px;
   font-weight: 700;
+}
+
+.export-dropdown__item-ext--warning {
+  border-color: #e8b665;
+  background: #fff0d5;
+  color: #8a4f00;
 }
 
 .export-dropdown__item-desc {

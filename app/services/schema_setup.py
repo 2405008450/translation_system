@@ -36,6 +36,9 @@ LEGACY_REQUIRED_EXISTING_TABLES = (
     "translation_memory_entries",
 )
 REQUIRED_SCHEMA = {
+    "projects": {
+        "workflow_template_id",
+    },
     "memory_bases": {
         "source_language",
         "target_language",
@@ -636,8 +639,51 @@ REQUIRED_SCHEMA = {
     "translation_review_reports": {
         "id",
         "scope",
+        "report_mode",
+        "proofreading_batch_id",
         "status",
         "created_at",
+    },
+    "proofreading_batches": {
+        "id",
+        "project_id",
+        "filename",
+        "source_language",
+        "status",
+        "progress",
+        "cancel_requested",
+        "export_status",
+        "export_progress",
+        "export_path",
+        "batch_kind",
+        "alignment_status",
+        "workflow_stage",
+        "target_language",
+    },
+    "proofreading_column_bindings": {
+        "id",
+        "batch_id",
+        "file_record_id",
+        "sheet_index",
+        "source_column",
+        "target_column",
+        "target_language",
+    },
+    "proofreading_segment_baselines": {
+        "id",
+        "batch_id",
+        "binding_id",
+        "segment_id",
+        "original_target_text",
+    },
+    "document_alignment_pairs": {
+        "id", "batch_id", "pair_order", "src_indices", "tgt_indices",
+        "source_text", "target_text", "confidence", "confidence_level",
+        "method", "features", "locked",
+    },
+    "document_alignment_units": {
+        "id", "batch_id", "side", "unit_index", "text", "para_index",
+        "block_type", "block_index", "numbering",
     },
     "translation_review_report_items": {
         "id",
@@ -778,6 +824,30 @@ REQUIRED_INDEXES = {
         "ix_translation_review_reports_created_by_id",
         "ix_translation_review_reports_task_id",
         "ix_translation_review_reports_created_at",
+        "ix_translation_review_reports_proofreading_batch_id",
+    },
+    "proofreading_batches": {
+        "ix_proofreading_batches_project_id",
+        "ix_proofreading_batches_status",
+        "ix_proofreading_batches_created_by_id",
+        "ix_proofreading_batches_created_at",
+        "ix_proofreading_batches_batch_kind",
+    },
+    "proofreading_column_bindings": {
+        "ix_proofreading_column_bindings_batch_id",
+        "ix_proofreading_column_bindings_file_record_id",
+    },
+    "proofreading_segment_baselines": {
+        "ix_proofreading_segment_baselines_batch_id",
+        "ix_proofreading_segment_baselines_binding_id",
+        "ix_proofreading_segment_baselines_segment_id",
+    },
+    "document_alignment_pairs": {
+        "ix_document_alignment_pairs_batch_id",
+        "ix_document_alignment_pairs_confidence",
+    },
+    "document_alignment_units": {
+        "ix_document_alignment_units_batch_side",
     },
     "translation_review_report_items": {
         "ix_translation_review_report_items_report_id",
@@ -808,6 +878,14 @@ def ensure_runtime_schema() -> None:
                 RUNTIME_SCHEMA_MAX_ATTEMPTS,
             )
             time.sleep(delay_seconds)
+
+
+def _is_insufficient_privilege_error(exc: ProgrammingError) -> bool:
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if sqlstate == "42501":
+        return True
+    message = str(exc)
+    return "InsufficientPrivilege" in message or "必须是表" in message or "must be owner" in message.lower()
 
 
 def _ensure_runtime_schema_once() -> None:
@@ -852,10 +930,22 @@ def _ensure_runtime_schema_once() -> None:
             )
         statements.extend(length_statements)
 
+    skipped_privilege_statements = 0
     try:
         with engine.begin() as connection:
             for statement in statements:
-                connection.execute(text(statement))
+                connection.execute(text("SAVEPOINT schema_stmt"))
+                try:
+                    connection.execute(text(statement))
+                except ProgrammingError as exc:
+                    connection.execute(text("ROLLBACK TO SAVEPOINT schema_stmt"))
+                    if not _is_insufficient_privilege_error(exc):
+                        raise
+                    skipped_privilege_statements += 1
+                    preview = " ".join(statement.split())[:160]
+                    logger.warning("skip schema statement due to insufficient privilege: %s", preview)
+                else:
+                    connection.execute(text("RELEASE SAVEPOINT schema_stmt"))
     except ProgrammingError as exc:
         missing_text = ", ".join(all_missing_items)
         raise RuntimeError(
@@ -863,6 +953,25 @@ def _ensure_runtime_schema_once() -> None:
             "或 scripts/rename_translation_memory_tables.sql 后再启动服务。"
             f" 当前缺失项: {missing_text}"
         ) from exc
+
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        remaining_items = [
+            *_collect_missing_schema(inspector),
+            *_collect_column_length_migrations(inspector)[0],
+        ]
+    if remaining_items:
+        remaining_text = ", ".join(remaining_items)
+        raise RuntimeError(
+            "数据库账号缺少结构升级权限，请使用有权限的账号执行 scripts/init_db.sql "
+            "或 scripts/rename_translation_memory_tables.sql 后再启动服务。"
+            f" 当前缺失项: {remaining_text}"
+        )
+    if skipped_privilege_statements:
+        logger.warning(
+            "runtime schema setup skipped %s privileged statements owned by another role",
+            skipped_privilege_statements,
+        )
 
 
 def _is_transient_schema_lock_error(exc: OperationalError) -> bool:
@@ -1567,6 +1676,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
                 name VARCHAR(200) NOT NULL,
                 status VARCHAR(20) NOT NULL DEFAULT 'draft',
+                workflow_template_id VARCHAR(40) NOT NULL DEFAULT 'custom',
                 document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full',
                 source_language VARCHAR(20),
                 target_language VARCHAR(20),
@@ -1578,6 +1688,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS workflow_template_id VARCHAR(40) NOT NULL DEFAULT 'custom'
             """,
             """
             ALTER TABLE IF EXISTS projects
@@ -3624,6 +3738,205 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             $$;
             """,
             # ─────────────────────────────────────────────────────────────
+            # 多语种 Excel 校对工作流
+            # ─────────────────────────────────────────────────────────────
+            f"""
+            CREATE TABLE IF NOT EXISTS proofreading_batches (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                filename VARCHAR(255) NOT NULL,
+                file_hash VARCHAR(64) NOT NULL DEFAULT '',
+                source_language VARCHAR(20) NOT NULL,
+                target_language VARCHAR(20) NOT NULL DEFAULT '',
+                batch_kind VARCHAR(30) NOT NULL DEFAULT 'xlsx_columns',
+                alignment_status VARCHAR(20) NOT NULL DEFAULT 'not_applicable',
+                workflow_stage VARCHAR(20) NOT NULL DEFAULT 'not_applicable',
+                status VARCHAR(20) NOT NULL DEFAULT 'ready',
+                progress INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                total_segments INTEGER NOT NULL DEFAULT 0,
+                changed_segments INTEGER NOT NULL DEFAULT 0,
+                skipped_segments INTEGER NOT NULL DEFAULT 0,
+                failed_segments INTEGER NOT NULL DEFAULT 0,
+                export_status VARCHAR(20) NOT NULL DEFAULT 'idle',
+                export_progress INTEGER NOT NULL DEFAULT 0,
+                export_error_message TEXT NOT NULL DEFAULT '',
+                export_filename VARCHAR(255) NOT NULL DEFAULT '',
+                export_path TEXT NOT NULL DEFAULT '',
+                config_json TEXT NOT NULL DEFAULT '{{}}',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                finished_at TIMESTAMP
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS export_status VARCHAR(20) NOT NULL DEFAULT 'idle'
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS export_progress INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS export_error_message TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS export_filename VARCHAR(255) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS export_path TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS target_language VARCHAR(20) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS batch_kind VARCHAR(30) NOT NULL DEFAULT 'xlsx_columns'
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS alignment_status VARCHAR(20) NOT NULL DEFAULT 'not_applicable'
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE
+            """,
+            """
+            ALTER TABLE IF EXISTS proofreading_batches
+            ADD COLUMN IF NOT EXISTS workflow_stage VARCHAR(20) NOT NULL DEFAULT 'not_applicable'
+            """,
+            """
+            UPDATE proofreading_batches
+            SET workflow_stage = CASE
+                WHEN batch_kind = 'xlsx_columns' THEN 'proofreading'
+                WHEN batch_kind = 'document_pair' AND alignment_status = 'confirmed'
+                    AND status IN ('queued', 'running', 'canceling', 'completed', 'partial_failed') THEN 'proofreading'
+                WHEN batch_kind = 'document_pair' AND alignment_status = 'confirmed' THEN 'alignment'
+                WHEN batch_kind = 'document_pair' THEN 'import'
+                ELSE workflow_stage
+            END
+            WHERE workflow_stage = 'not_applicable'
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS proofreading_column_bindings (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                batch_id UUID NOT NULL REFERENCES proofreading_batches(id) ON DELETE CASCADE,
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                sheet_index INTEGER NOT NULL,
+                sheet_name VARCHAR(255) NOT NULL,
+                header_row INTEGER NOT NULL,
+                source_column INTEGER NOT NULL,
+                target_column INTEGER NOT NULL,
+                output_column INTEGER NOT NULL,
+                source_header TEXT NOT NULL DEFAULT '',
+                target_header TEXT NOT NULL DEFAULT '',
+                target_language VARCHAR(20) NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_proofreading_binding_target
+                    UNIQUE (batch_id, sheet_index, target_column)
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS proofreading_segment_baselines (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                batch_id UUID NOT NULL REFERENCES proofreading_batches(id) ON DELETE CASCADE,
+                binding_id UUID NOT NULL REFERENCES proofreading_column_bindings(id) ON DELETE CASCADE,
+                segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+                sheet_index INTEGER NOT NULL,
+                row_index INTEGER NOT NULL,
+                source_cell_ref VARCHAR(20) NOT NULL,
+                target_cell_ref VARCHAR(20) NOT NULL,
+                original_target_text TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_proofreading_segment_baseline_segment UNIQUE (segment_id)
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS document_alignment_pairs (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                batch_id UUID NOT NULL REFERENCES proofreading_batches(id) ON DELETE CASCADE,
+                pair_order INTEGER NOT NULL, src_indices TEXT NOT NULL DEFAULT '[]',
+                tgt_indices TEXT NOT NULL DEFAULT '[]', source_text TEXT NOT NULL DEFAULT '',
+                target_text TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0,
+                confidence_level VARCHAR(10) NOT NULL DEFAULT 'medium', method VARCHAR(30) NOT NULL DEFAULT 'dp',
+                features TEXT NOT NULL DEFAULT '{{}}', locked BOOLEAN NOT NULL DEFAULT FALSE,
+                block_type VARCHAR(30) NOT NULL DEFAULT 'paragraph', block_index INTEGER NOT NULL DEFAULT 0,
+                row_index INTEGER, cell_index INTEGER, created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_alignment_pair_order UNIQUE (batch_id, pair_order)
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS document_alignment_units (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                batch_id UUID NOT NULL REFERENCES proofreading_batches(id) ON DELETE CASCADE,
+                side VARCHAR(10) NOT NULL, unit_index INTEGER NOT NULL, text TEXT NOT NULL DEFAULT '',
+                para_index INTEGER NOT NULL DEFAULT 0, block_type VARCHAR(30) NOT NULL DEFAULT 'paragraph',
+                block_index INTEGER NOT NULL DEFAULT 0, row_index INTEGER, cell_index INTEGER,
+                numbering VARCHAR(60) NOT NULL DEFAULT '',
+                CONSTRAINT uq_alignment_unit UNIQUE (batch_id, side, unit_index)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_proofreading_batches_project_id
+            ON proofreading_batches (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_proofreading_batches_status
+            ON proofreading_batches (status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_proofreading_batches_created_by_id
+            ON proofreading_batches (created_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_proofreading_batches_created_at
+            ON proofreading_batches (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_proofreading_batches_batch_kind
+            ON proofreading_batches (batch_kind)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_alignment_pairs_batch_id
+            ON document_alignment_pairs (batch_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_alignment_pairs_confidence
+            ON document_alignment_pairs (batch_id, confidence_level)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_alignment_units_batch_side
+            ON document_alignment_units (batch_id, side, unit_index)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_proofreading_column_bindings_batch_id
+            ON proofreading_column_bindings (batch_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_proofreading_column_bindings_file_record_id
+            ON proofreading_column_bindings (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_proofreading_segment_baselines_batch_id
+            ON proofreading_segment_baselines (batch_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_proofreading_segment_baselines_binding_id
+            ON proofreading_segment_baselines (binding_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_proofreading_segment_baselines_segment_id
+            ON proofreading_segment_baselines (segment_id)
+            """,
+            # ─────────────────────────────────────────────────────────────
             # 翻译内容校对（Translation Review）— 3 张表
             # ─────────────────────────────────────────────────────────────
             f"""
@@ -3634,6 +3947,8 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 merge_view_id UUID REFERENCES project_merge_views(id) ON DELETE CASCADE,
                 created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 scope VARCHAR(20) NOT NULL DEFAULT 'file',
+                report_mode VARCHAR(30) NOT NULL DEFAULT 'issue_check',
+                proofreading_batch_id UUID REFERENCES proofreading_batches(id) ON DELETE CASCADE,
                 segment_scope VARCHAR(30) NOT NULL DEFAULT 'all',
                 enabled_categories TEXT NOT NULL DEFAULT '[]',
                 file_ids TEXT NOT NULL DEFAULT '[]',
@@ -3659,6 +3974,15 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 finished_at TIMESTAMP
             )
+            """,
+            """
+            ALTER TABLE IF EXISTS translation_review_reports
+            ADD COLUMN IF NOT EXISTS report_mode VARCHAR(30) NOT NULL DEFAULT 'issue_check'
+            """,
+            """
+            ALTER TABLE IF EXISTS translation_review_reports
+            ADD COLUMN IF NOT EXISTS proofreading_batch_id UUID
+                REFERENCES proofreading_batches(id) ON DELETE CASCADE
             """,
             f"""
             CREATE TABLE IF NOT EXISTS translation_review_report_items (
@@ -3750,6 +4074,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_translation_review_reports_created_at
             ON translation_review_reports (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_review_reports_proofreading_batch_id
+            ON translation_review_reports (proofreading_batch_id)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_translation_review_reports_scope_created_at

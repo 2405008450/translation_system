@@ -19,6 +19,8 @@ from app.routers.glossary_base import router as glossary_base_router
 from app.routers.term_base import router as term_base_router
 from app.routers.reference import router as reference_router
 from app.routers.tools import router as tools_router
+from app.routers.proofreading import router as proofreading_router
+from app.routers.document_alignment import router as document_alignment_router
 from app.services.guideline_repository import seed_guideline_templates_from_files
 from app.services.import_task_storage import initialize_import_task_storage
 from app.services.schema_setup import ensure_runtime_schema
@@ -105,6 +107,8 @@ app.include_router(term_base_router, prefix="/api")
 app.include_router(reference_router, prefix="/api")
 app.include_router(glossary_base_router, prefix="/api")
 app.include_router(tools_router, prefix="/api")
+app.include_router(proofreading_router, prefix="/api")
+app.include_router(document_alignment_router, prefix="/api")
 
 
 @app.on_event("startup")

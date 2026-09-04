@@ -40,6 +40,7 @@ import {
   waitForImportTask,
   type ImportTaskAccepted,
 } from '../api/importTasks'
+import { previewProjectAssignmentSplit } from '../api/assignmentSplit'
 import {
   createProjectMergeView,
   deleteMergeView,
@@ -55,6 +56,7 @@ import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import Modal from '../components/base/Modal.vue'
 import PreTranslateDialog from '../components/PreTranslateDialog.vue'
 import Pagination from '../components/Pagination.vue'
+import ProofreadingPanel from '../components/ProofreadingPanel.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import StateView from '../components/base/StateView.vue'
 import TermExtractionDialog from '../components/TermExtractionDialog.vue'
@@ -67,13 +69,28 @@ import { getFileStatusMeta } from '../constants/status'
 import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
 import { useAuthStore } from '../stores/auth'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import { getApiErrorMessage } from '../utils/apiError'
 import {
   getExportOptionExtensionLabel,
   groupExportOptions,
   type FileExportOption,
 } from '../utils/exportOptions'
+import {
+  createProofreadingExportTask,
+  downloadProofreadingExportTask,
+  getProofreadingExportReadiness,
+  getProofreadingExportTask,
+  type ProofreadingExportFormat,
+} from '../api/proofreading'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import { matchesSearchKeyword, normalizeSearchKeyword, splitSearchKeywords } from '../utils/search'
+import {
+  buildUploadBatches,
+  calculateOverallUploadProgress,
+  getRemainingUploadFiles,
+  getUploadBatchCapacity,
+  isUploadSelectionWithinLimit,
+} from '../utils/uploadBatching'
 import type {
   AssignmentDraft,
   AssignmentFileRangeDraft,
@@ -81,6 +98,7 @@ import type {
   AssignmentWorkflowTransitionRequired,
 } from '../types/assignment'
 import type {
+  AssignmentSplitPreviewRequest,
   DocumentParseMode,
   DocumentParseOptions,
   DocumentMatchAnalysis,
@@ -148,6 +166,7 @@ type DocumentStatisticNumberKey =
 
 interface ProjectDetail {
   id: string
+  workflow_template_id: string
   name: string
   filename: string
   status: string
@@ -226,6 +245,14 @@ interface ProjectFileItem {
   term_base_write_ids: string[]
   qa_term_base_ids: string[]
   glossary_base_ids: string[]
+  proofreading?: {
+    batch_id: string
+    batch_kind: 'xlsx_columns' | 'document_pair'
+    workflow_stage: 'not_applicable' | 'import' | 'alignment' | 'proofreading'
+    alignment_status: string
+    batch_status: string
+    target_revision_export_available: boolean
+  } | null
 }
 
 interface EnglishVariantCopyResponse {
@@ -234,6 +261,7 @@ interface EnglishVariantCopyResponse {
     processed_segments: number
     changed_segments: number
     replacement_count: number
+    llm_review_count: number
   }
 }
 
@@ -295,6 +323,7 @@ const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
   translate_code_blocks: true,
   extract_links: false,
   skip_non_translatable: true,
+  enable_spatial_merge: false,
   xml_inline_elements_no_split: true,
   custom_parse_config: false,
   translate_idml_comments: false,
@@ -404,15 +433,18 @@ interface FileExportTask {
   error?: string | null
   filename?: string | null
   size_bytes?: number | null
+  requested_by_name?: string | null
 }
 const confirm = useConfirm()
 const authStore = useAuthStore()
 const route = useRoute()
 const router = useRouter()
 const toast = useToast()
+const proofreadingPanelRef = ref<InstanceType<typeof ProofreadingPanel> | null>(null)
 const { t } = useI18n()
 
-const loading = ref(false)
+// 首次渲染即进入加载态，避免项目类型返回前短暂显示通用项目布局。
+const loading = ref(true)
 const deleting = ref(false)
 const duplicating = ref(false)
 const creatingEnglishVariantCopy = ref(false)
@@ -436,6 +468,7 @@ const documentParseOptions = ref<DocumentParseOptions>({ ...DEFAULT_DOCUMENT_PAR
 const uploadCapabilities = ref<UploadCapability[]>([])
 const uploadLimits = ref<UploadBatchLimits>({
   max_files_per_batch: 50,
+  max_files_per_selection: 200,
   max_total_size_mb: 500,
   max_expanded_files: 100,
 })
@@ -681,7 +714,32 @@ const qualityQARules = [
   { key: 'repeated_punctuation', label: '重复标点', defaultEnabled: false },
   { key: 'extra_space_after_punctuation', label: '标点符号后有多余空格', defaultEnabled: false },
   { key: 'missing_space_after_punctuation', label: '标点符号后遗漏空格', defaultEnabled: false },
+  { key: 'punctuation_leading_extra_space', label: '标点符号前有多余空格', defaultEnabled: false },
+  { key: 'punctuation_leading_missing_space', label: '标点符号前遗漏空格', defaultEnabled: false },
+  { key: 'multiple_spaces', label: '多个空格', defaultEnabled: false },
+  { key: 'segment_trailing_extra_space', label: '句段结束后有多余空格', defaultEnabled: false },
+  { key: 'source_target_initial_case_mismatch', label: '原文和译文首字母大小写不一致', defaultEnabled: false },
+  { key: 'target_word_multiple_upper_initials', label: '译文一个单词中有多个大写首字母', defaultEnabled: false },
+  { key: 'source_target_same_word_case_mismatch', label: '原文和译文的同一单词首字母有不同的大小写', defaultEnabled: false },
+  { key: 'consecutive_duplicate_words', label: '连续重复单词', defaultEnabled: false },
+  { key: 'source_target_identical', label: '原文和译文相同', defaultEnabled: false },
+  { key: 'target_word_count_exceeds_source', label: '译文字数超过原文字数的', defaultEnabled: false, defaultThreshold: 50, suffix: '%' },
+  { key: 'target_word_count_below_source', label: '译文字数少于原文字数的', defaultEnabled: false, defaultThreshold: 50, suffix: '%' },
+  { key: 'source_target_word_count_gap_too_large', label: '译文与原文字数相差过大', defaultEnabled: false },
+  { key: 'number_mismatch', label: '原文和译文数字不一致', defaultEnabled: false },
+  { key: 'parameter_mismatch', label: '原文与译文参数不一致', defaultEnabled: false },
+  { key: 'email_mismatch', label: '原文与译文邮件信息不一致', defaultEnabled: false },
+  { key: 'link_mismatch', label: '原文和译文链接信息不一致', defaultEnabled: false },
+  { key: 'special_symbol_mismatch', label: '特殊符号不一致', defaultEnabled: false },
+  { key: 'context_translation_mismatch', label: '翻译与上下文匹配不一致', defaultEnabled: false },
 ] as const
+
+// 可调阈值的规则 key，用于前端 draft.thresholds 类型 & payload 组装。
+const qualityQAThresholdRuleKeys = [
+  'target_word_count_exceeds_source',
+  'target_word_count_below_source',
+] as const
+type QualityQAThresholdRuleKey = typeof qualityQAThresholdRuleKeys[number]
 
 type QualityQAPlaceholderRule = {
   key: string
@@ -690,29 +748,55 @@ type QualityQAPlaceholderRule = {
   suffix?: string
 }
 
-const qualityQAPlaceholderRules: readonly QualityQAPlaceholderRule[] = [
-  { key: 'punctuation_leading_extra_space', label: '标点符号前有多余空格' },
-  { key: 'punctuation_leading_missing_space', label: '标点符号前遗漏空格' },
-  { key: 'multiple_spaces', label: '多个空格' },
-  { key: 'segment_trailing_extra_space', label: '句段结束后有多余空格' },
-  { key: 'source_target_initial_case_mismatch', label: '原文和译文首字母大小写不一致' },
-  { key: 'target_word_multiple_upper_initials', label: '译文一个单词中有多个大写首字母' },
-  { key: 'source_target_same_word_case_mismatch', label: '原文和译文的同一单词首字母有不同的大小写' },
-  { key: 'target_word_count_exceeds_source', label: '译文字数超过原文字数的', percent: 50, suffix: '%' },
-  { key: 'target_word_count_below_source', label: '译文字数少于原文字数的', percent: 50, suffix: '%' },
-  { key: 'source_target_word_count_gap_too_large', label: '译文与原文字数相差过大' },
-  { key: 'context_translation_mismatch', label: '翻译与上下文匹配不一致' },
-  { key: 'number_mismatch', label: '原文和译文数字不一致' },
-  { key: 'parameter_mismatch', label: '原文与译文参数不一致' },
-  { key: 'email_mismatch', label: '原文与译文邮件信息不一致' },
-  { key: 'link_mismatch', label: '原文和译文链接信息不一致' },
-  { key: 'consecutive_duplicate_words', label: '连续重复单词' },
-  { key: 'source_target_identical', label: '原文和译文相同' },
-  { key: 'special_symbol_mismatch', label: '特殊符号不一致' },
+const qualityQAPlaceholderRules: readonly QualityQAPlaceholderRule[] = []
+
+// 用于表格渲染的统一列表：按 1-30 数字编号顺序把实装项与占位项合并，
+// 让 UI 里的规则编号永远与设计文档对齐。
+type QualityQARuleDisplayItem =
+  | {
+      kind: 'rule'
+      key: typeof qualityQARules[number]['key']
+      label: string
+      thresholdKey?: QualityQAThresholdRuleKey
+      suffix?: string
+    }
+  | { kind: 'placeholder'; key: string; label: string; percent?: number; suffix?: string }
+
+const qualityQARuleDisplayItems: readonly QualityQARuleDisplayItem[] = [
+  ...qualityQARules.slice(0, 19).map((rule) => ({ kind: 'rule' as const, key: rule.key, label: rule.label })),
+  { kind: 'rule', key: 'target_word_count_exceeds_source', label: '译文字数超过原文字数的', thresholdKey: 'target_word_count_exceeds_source', suffix: '%' },
+  { kind: 'rule', key: 'target_word_count_below_source', label: '译文字数少于原文字数的', thresholdKey: 'target_word_count_below_source', suffix: '%' },
+  { kind: 'rule', key: 'source_target_word_count_gap_too_large', label: '译文与原文字数相差过大' },
+  { kind: 'rule', key: 'context_translation_mismatch', label: '翻译与上下文匹配不一致' },
+  { kind: 'rule', key: 'number_mismatch', label: '原文和译文数字不一致' },
+  { kind: 'rule', key: 'parameter_mismatch', label: '原文与译文参数不一致' },
+  { kind: 'rule', key: 'email_mismatch', label: '原文与译文邮件信息不一致' },
+  { kind: 'rule', key: 'link_mismatch', label: '原文和译文链接信息不一致' },
+  { kind: 'rule', key: 'consecutive_duplicate_words', label: '连续重复单词' },
+  { kind: 'rule', key: 'source_target_identical', label: '原文和译文相同' },
+  { kind: 'rule', key: 'special_symbol_mismatch', label: '特殊符号不一致' },
 ]
 
 type QualityQARuleKey = typeof qualityQARules[number]['key']
 type QualityQARuleDraft = Record<QualityQARuleKey, boolean>
+type QualityQAThresholdDraft = Record<QualityQAThresholdRuleKey, number>
+
+const QUALITY_QA_THRESHOLD_MIN = 1
+const QUALITY_QA_THRESHOLD_MAX = 500
+
+function clampQualityQAThreshold(value: number, fallback: number) {
+  if (!Number.isFinite(value)) return fallback
+  const rounded = Math.round(value)
+  if (rounded < QUALITY_QA_THRESHOLD_MIN) return QUALITY_QA_THRESHOLD_MIN
+  if (rounded > QUALITY_QA_THRESHOLD_MAX) return QUALITY_QA_THRESHOLD_MAX
+  return rounded
+}
+
+function getRuleDefaultThreshold(key: QualityQAThresholdRuleKey): number {
+  const rule = qualityQARules.find((r) => r.key === key)
+  const raw = rule && 'defaultThreshold' in rule ? (rule as { defaultThreshold?: number }).defaultThreshold : undefined
+  return typeof raw === 'number' ? raw : 50
+}
 
 function createQualityQARuleDraft(): QualityQARuleDraft {
   return qualityQARules.reduce((draft, rule) => {
@@ -721,9 +805,17 @@ function createQualityQARuleDraft(): QualityQARuleDraft {
   }, {} as QualityQARuleDraft)
 }
 
+function createQualityQAThresholdDraft(): QualityQAThresholdDraft {
+  return qualityQAThresholdRuleKeys.reduce((draft, key) => {
+    draft[key] = getRuleDefaultThreshold(key)
+    return draft
+  }, {} as QualityQAThresholdDraft)
+}
+
 const qualityQADraft = reactive({
   rules: createQualityQARuleDraft(),
   termQACaseSensitive: false,
+  thresholds: createQualityQAThresholdDraft(),
 })
 
 const enabledQualityQARuleCount = computed(() => (
@@ -744,12 +836,26 @@ function getSavedQualityQARuleEnabled(rule: typeof qualityQARules[number]) {
   }
   return rule.defaultEnabled
 }
-const qualityQASettingsDirty = computed(() => (
-  qualityQARules.some((rule) => qualityQADraft.rules[rule.key] !== getSavedQualityQARuleEnabled(rule))
-  || qualityQADraft.termQACaseSensitive !== Boolean(
+function getSavedQualityQARuleThreshold(key: QualityQAThresholdRuleKey) {
+  const raw = qualityQASettings.value?.settings.rules?.[key]?.threshold
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return clampQualityQAThreshold(raw, getRuleDefaultThreshold(key))
+  }
+  return getRuleDefaultThreshold(key)
+}
+const qualityQASettingsDirty = computed(() => {
+  const rulesChanged = qualityQARules.some(
+    (rule) => qualityQADraft.rules[rule.key] !== getSavedQualityQARuleEnabled(rule),
+  )
+  if (rulesChanged) return true
+  const termCaseChanged = qualityQADraft.termQACaseSensitive !== Boolean(
     qualityQASettings.value?.settings.rules?.term_inconsistency?.case_sensitive,
   )
-))
+  if (termCaseChanged) return true
+  return qualityQAThresholdRuleKeys.some(
+    (key) => qualityQADraft.thresholds[key] !== getSavedQualityQARuleThreshold(key),
+  )
+})
 const qualityQARuleStatusText = computed(() => {
   if (enabledQualityQARuleCount.value === 0) {
     return '全部关闭'
@@ -792,9 +898,11 @@ const exportingFileType = ref('')
 const exportFileProgress = ref(0)
 const exportFileMessage = ref('')
 const showProjectExportMenu = ref(false)
+const showProofreadingExportMenu = ref(false)
 const loadingProjectExportOptions = ref(false)
 const projectExportOptions = ref<FileExportOption[]>([])
 const groupedProjectExportOptions = computed(() => groupExportOptions(projectExportOptions.value))
+type WordExportMode = 'standard' | 'revision'
 let exportPollTimer: number | null = null
 let activePretranslationPollTimer: number | null = null
 const ACTIVE_PRETRANSLATION_STATUSES = new Set(['queued', 'running', 'canceling'])
@@ -891,21 +999,52 @@ function setFilePageSize(size: number) {
   currentPage.value = 1
 }
 
-const tabs = computed(() => ([
-  { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
-  { key: 'views' as const, label: t('projectDetail.tabs.views'), disabled: false },
-  {
-    key: 'issues' as const,
-    label: `${t('projectDetail.tabs.issues')}${openIssueCount.value > 0 ? ` (${openIssueCount.value})` : ''}`,
-    disabled: false,
-  },
-  { key: 'assignments' as const, label: '指派记录', disabled: !canAssignProject.value },
-  { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: !canManageProject.value },
-  { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: !canManageProject.value },
-  { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
-  { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
-]))
+const isProofreadingProject = computed(() => project.value?.workflow_template_id === 'proofread')
+const tabs = computed(() => {
+  const items = [
+    { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
+    { key: 'views' as const, label: t('projectDetail.tabs.views'), disabled: false },
+    {
+      key: 'issues' as const,
+      label: `${t('projectDetail.tabs.issues')}${openIssueCount.value > 0 ? ` (${openIssueCount.value})` : ''}`,
+      disabled: false,
+    },
+    { key: 'assignments' as const, label: '指派记录', disabled: !canAssignProject.value },
+    { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: !canManageProject.value },
+    { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: !canManageProject.value },
+    { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
+    { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
+  ]
+  return isProofreadingProject.value
+    ? items.filter((item) => item.key !== 'views')
+    : items
+})
 const tableRows = computed<ProjectFileItem[]>(() => project.value?.files ?? [])
+const proofreadingStageSteps = [
+  { key: 'import', label: '导入' },
+  { key: 'alignment', label: '对齐' },
+  { key: 'proofreading', label: '校对' },
+  { key: 'export', label: '导出' },
+] as const
+type ProofreadingProjectStage = (typeof proofreadingStageSteps)[number]['key']
+const projectProofreadingStage = computed<ProofreadingProjectStage>(() => {
+  const stages = tableRows.value
+    .map((row) => row.proofreading?.workflow_stage)
+    .filter((stage): stage is NonNullable<typeof stage> => Boolean(stage && stage !== 'not_applicable'))
+  if (!tableRows.value.length || stages.includes('import')) return 'import'
+  if (stages.includes('alignment')) return 'alignment'
+  if (stages.some((stage) => stage === 'proofreading')) {
+    const proofreadingRows = tableRows.value.filter((row) => row.proofreading?.workflow_stage === 'proofreading')
+    if (
+      proofreadingRows.length
+      && proofreadingRows.every((row) => row.proofreading?.batch_status === 'completed')
+    ) {
+      return 'export'
+    }
+    return 'proofreading'
+  }
+  return tableRows.value.length ? 'proofreading' : 'import'
+})
 const projectFileById = computed(() => new Map(tableRows.value.map((file) => [file.id, file])))
 const fileStatusFilterOptions = computed(() => {
   const counts = new Map<string, number>()
@@ -1061,6 +1200,10 @@ const fileSelectionRangeHint = computed(() => (
 ))
 const selectedProjectFiles = computed(() => (
   tableRows.value.filter((row) => selectedFileIds.value.has(row.id))
+))
+const selectedProjectFilesAreWord = computed(() => (
+  selectedProjectFiles.value.length > 0
+  && selectedProjectFiles.value.every((row) => isWordProjectFile(row))
 ))
 const hasSelectedLockedFile = computed(() => selectedProjectFiles.value.some((row) => row.is_edit_locked))
 const hasSelectedNonWritableFile = computed(() => selectedProjectFiles.value.some((row) => !row.can_write))
@@ -1331,6 +1474,34 @@ const canOpenProjectExportMenu = computed(() => (
   && !exportingFileId.value
   && !loadingProjectExportOptions.value
 ))
+const selectedProofreadingExportChoices = computed(() => {
+  const byFormat = new Map<ProofreadingExportFormat, ProofreadingExportChoice>()
+  for (const row of selectedProjectFiles.value) {
+    for (const choice of getProofreadingExportChoices(row)) {
+      if (!byFormat.has(choice.format)) {
+        byFormat.set(choice.format, choice)
+      }
+    }
+  }
+  return [...byFormat.values()]
+})
+const canOpenProofreadingExportMenu = computed(() => (
+  isProofreadingProject.value
+  && selectedProofreadingExportChoices.value.length > 0
+  && !exportingFileId.value
+))
+const proofreadingExportButtonTitle = computed(() => {
+  if (selectedProjectFiles.value.length === 0) {
+    return t('projectDetail.files.actions.exportSelectFirst')
+  }
+  if (selectedProofreadingExportChoices.value.length === 0) {
+    return '所选文件当前阶段还不能导出。'
+  }
+  if (exportingFileId.value) {
+    return exportFileMessage.value
+  }
+  return ''
+})
 const canExportSelectedProjectFilesAsZip = computed(() => (
   selectedProjectFiles.value.length > 1
   && projectExportOptions.value.some((option) => option.id === 'original')
@@ -1348,14 +1519,54 @@ const projectExportButtonTitle = computed(() => {
   return ''
 })
 
-const columns = computed<DataTableColumn[]>(() => ([
-  { key: 'filename', label: t('projectDetail.files.columns.details'), width: '300px', sortable: true },
-  { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '150px', sortable: true },
-  { key: 'pretranslation_progress', label: t('projectDetail.files.columns.pretranslationProgress'), width: '150px', sortable: true },
-  { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '140px', sortable: true },
-  { key: 'status', label: t('projectDetail.files.columns.status'), width: '100px', sortable: true },
-  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '90px', sortable: true },
-]))
+function isWordProjectFile(row: ProjectRow | null) {
+  const filename = String(row?.filename || '').toLowerCase()
+  return filename.endsWith('.doc') || filename.endsWith('.docx')
+}
+
+function isSelectedWordTargetExportOption(option: FileExportOption) {
+  return option.id === 'original' && selectedProjectFilesAreWord.value
+}
+
+function getProjectExportOptionName(option: FileExportOption, mode: WordExportMode = 'standard') {
+  if (!isSelectedWordTargetExportOption(option)) {
+    return option.name
+  }
+  return mode === 'revision'
+    ? t('workbench.exportModes.revisionName')
+    : t('workbench.exportModes.standardName')
+}
+
+function getProjectExportOptionDescription(option: FileExportOption, mode: WordExportMode = 'standard') {
+  if (!isSelectedWordTargetExportOption(option)) {
+    return option.description
+  }
+  return mode === 'revision'
+    ? t('workbench.exportModes.revisionDescription')
+    : t('workbench.exportModes.standardDescription')
+}
+
+async function confirmRevisionMarkedExport() {
+  return confirm({
+    title: t('workbench.exportModes.revisionConfirmTitle'),
+    message: t('workbench.exportModes.revisionConfirmMessage'),
+    confirmText: t('workbench.exportModes.revisionConfirmAction'),
+  })
+}
+
+const columns = computed<DataTableColumn[]>(() => {
+  const items: DataTableColumn[] = [
+    { key: 'filename', label: t('projectDetail.files.columns.details'), width: isProofreadingProject.value ? '420px' : '300px', sortable: true },
+    { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '150px', sortable: true },
+    { key: 'pretranslation_progress', label: t('projectDetail.files.columns.pretranslationProgress'), width: '150px', sortable: true },
+    { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '140px', sortable: true },
+    { key: 'status', label: t('projectDetail.files.columns.status'), width: '100px', sortable: true },
+    { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '90px', sortable: true },
+  ]
+  return isProofreadingProject.value
+    ? items.filter((item) => item.key !== 'pretranslation_progress')
+    : items
+})
 
 const statisticsFileColumns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('projectDetail.stats.columns.file'), width: '320px' },
@@ -1496,11 +1707,16 @@ const generatedUploadTaskCount = computed(() => (
   selectedFiles.value.length * effectiveUploadTargetLanguages.value.length
 ))
 const uploadGenerationValidationError = computed(() => {
-  if (generatedUploadTaskCount.value <= uploadLimits.value.max_expanded_files) {
+  const targetLanguageCount = effectiveUploadTargetLanguages.value.length
+  if (
+    selectedFiles.value.length === 0
+    || targetLanguageCount === 0
+    || getUploadBatchCapacity(uploadLimits.value, targetLanguageCount) > 0
+  ) {
     return ''
   }
-  return t('projectDetail.errors.tooManyGeneratedTasks', {
-    count: generatedUploadTaskCount.value,
+  return t('projectDetail.errors.tooManyTargetLanguages', {
+    count: targetLanguageCount,
     max: uploadLimits.value.max_expanded_files,
   })
 })
@@ -1551,10 +1767,7 @@ function getPlaceholder() {
 }
 
 function getErrorMessage(error: unknown, fallback: string) {
-  if (axios.isAxiosError(error)) {
-    return String(error.response?.data?.detail || fallback)
-  }
-  return error instanceof Error ? error.message : fallback
+  return getApiErrorMessage(error, fallback)
 }
 
 function formatDateParts(value: string | null) {
@@ -1633,6 +1846,80 @@ function getDerivedFileKindLabel(row: ProjectRow) {
     return t('projectDetail.files.kinds.americanCopy')
   }
   return ''
+}
+
+function getProofreadingStageBadge(row: ProjectRow): { key: 'alignment' | 'proofreading'; label: string } | null {
+  if (!isProofreadingProject.value) return null
+  const stage = row.proofreading?.workflow_stage
+  if (stage === 'alignment') return { key: 'alignment', label: '对齐中' }
+  if (stage === 'proofreading') return { key: 'proofreading', label: '校对中' }
+  return null
+}
+
+type ProofreadingExportChoice = {
+  format: ProofreadingExportFormat
+  name: string
+  description: string
+}
+
+function getProofreadingExportChoices(row: ProjectRow): ProofreadingExportChoice[] {
+  const info = row.proofreading
+  if (!info?.batch_id) return []
+  const stage = info.workflow_stage
+  if (info.batch_kind === 'document_pair') {
+    const alignmentTable: ProofreadingExportChoice = {
+      format: 'proofreading_audit_xlsx',
+      name: '一一对照表',
+      description: '原文与译文逐条对照的 Excel 表格。',
+    }
+    if (stage === 'proofreading') {
+      return [
+        ...(info.target_revision_export_available ? [{
+          format: 'proofreading_docx_target_revisions',
+          name: '目标原格式（含修订）',
+          description: '保留导入译文的排版，并写入可接受或拒绝的 Word 修订。',
+        } as ProofreadingExportChoice] : []),
+        {
+          format: 'proofreading_docx_layout',
+          name: '源格式双语 Word',
+          description: '沿用原文排版，按原文在前导出原文与校对后译文。',
+        },
+        {
+          format: 'proofreading_docx_ordered',
+          name: '顺序优先 Word',
+          description: '按对齐顺序导出原文与校对后译文。',
+        },
+        alignmentTable,
+      ]
+    }
+    if (stage === 'alignment' || stage === 'import' || info.alignment_status === 'confirmed' || info.alignment_status === 'draft') {
+      return [alignmentTable]
+    }
+    return []
+  }
+  return [{
+    format: 'proofreading_xlsx_original',
+    name: '校对版 Excel',
+    description: '保留原工作簿结构，导出经校对修改后的译文。',
+  }]
+}
+
+function getPrimaryProofreadingExport(row: ProjectRow) {
+  return getProofreadingExportChoices(row)[0] || null
+}
+
+function exportPrimaryProofreadingFile(row: ProjectRow) {
+  const choice = getPrimaryProofreadingExport(row)
+  if (!choice) return
+  void exportProofreadingFile(row, choice.format)
+}
+
+function proofreadingExportSuccessMessage(format: ProofreadingExportFormat) {
+  if (format === 'proofreading_audit_xlsx') return '已导出一一对照 Excel。'
+  if (format === 'proofreading_docx_target_revisions') return '已导出目标原格式 Word（含修订）。'
+  if (format === 'proofreading_docx_layout') return '已导出校对后译文。'
+  if (format === 'proofreading_docx_ordered') return '已导出顺序优先校对文档。'
+  return '已导出校对版 Excel。'
 }
 
 function getFileAssignees(row: ProjectRow): User[] {
@@ -2228,8 +2515,8 @@ function validateSelectedUploadFiles(files: File[]): string {
   }
 
   const limits = uploadLimits.value
-  if (files.length > limits.max_files_per_batch) {
-    return t('projectDetail.errors.tooManyFiles', { max: limits.max_files_per_batch })
+  if (!isUploadSelectionWithinLimit(files.length, limits.max_files_per_selection)) {
+    return t('projectDetail.errors.tooManyFiles', { max: limits.max_files_per_selection })
   }
 
   let totalBytes = 0
@@ -2367,7 +2654,11 @@ async function loadAssignableUsers() {
   loadingAssignableUsers.value = true
   try {
     const { data } = await http.get<User[]>('/auth/assignable-users')
-    assignableUsers.value = data.filter((user) => user.role === 'user' && user.is_active)
+    assignableUsers.value = data.filter((user) => (
+      user.role === 'user'
+      && user.is_active
+      && user.translator_type === 'external'
+    ))
   } catch (error) {
     toast.error(getErrorMessage(error, '译者列表加载失败。'))
   } finally {
@@ -2513,6 +2804,13 @@ async function saveAssignment(request: AssignmentSaveRequest) {
   } finally {
     savingAssignment.value = false
   }
+}
+
+async function previewAssignmentSplit(payload: AssignmentSplitPreviewRequest) {
+  if (!project.value) {
+    throw new Error('项目尚未加载。')
+  }
+  return previewProjectAssignmentSplit(project.value.id, payload)
 }
 
 async function closeTermExtractionDialog() {
@@ -2919,6 +3217,7 @@ function handleDocumentClick(ev: MouseEvent) {
   }
   if (!target.closest('.pd-export-dropdown')) {
     showProjectExportMenu.value = false
+    showProofreadingExportMenu.value = false
   }
   if (!target.closest('.pd-file-selection')) {
     closeFileSelectionMenu()
@@ -2932,6 +3231,7 @@ function handleDocumentClick(ev: MouseEvent) {
 function handleDocumentScroll() {
   closeUploadTargetMenu()
   showProjectExportMenu.value = false
+  showProofreadingExportMenu.value = false
   closeFileSelectionMenu()
   if (openActionMenuId.value) {
     closeActionMenu()
@@ -3058,6 +3358,7 @@ function openWorkbench(row: ProjectRow) {
 
   closeActionMenu()
   const rowId = String(row.id)
+  const stage = row.proofreading?.workflow_stage
   const resolved = router.resolve({
     name: 'workbench-focus',
     params: { id: rowId },
@@ -3065,6 +3366,7 @@ function openWorkbench(row: ProjectRow) {
       from: 'project',
       pid: props.id,
       ...(cameFromTasks.value ? { parent: 'tasks' } : {}),
+      ...(stage === 'alignment' ? { mode: 'alignment' } : {}),
     },
   })
   window.open(resolved.href, '_blank', 'noopener,noreferrer')
@@ -3300,18 +3602,32 @@ function syncQualityQADraftFromSettings(data: QualityQASettingsResponse) {
   qualityQADraft.termQACaseSensitive = Boolean(
     data.settings.rules?.term_inconsistency?.case_sensitive,
   )
+  for (const key of qualityQAThresholdRuleKeys) {
+    const raw = data.settings.rules?.[key]?.threshold
+    qualityQADraft.thresholds[key] = typeof raw === 'number' && Number.isFinite(raw)
+      ? clampQualityQAThreshold(raw, getRuleDefaultThreshold(key))
+      : getRuleDefaultThreshold(key)
+  }
 }
 
 function buildQualityQARulesPayload() {
   return qualityQARules.reduce((payload, rule) => {
-    payload[rule.key] = {
+    const entry: { enabled: boolean; threshold?: number } = {
       enabled: qualityQADraft.rules[rule.key],
       ...(rule.key === 'term_inconsistency'
         ? { case_sensitive: qualityQADraft.termQACaseSensitive }
         : {}),
     }
+    if ((qualityQAThresholdRuleKeys as readonly string[]).includes(rule.key)) {
+      entry.threshold = qualityQADraft.thresholds[rule.key as QualityQAThresholdRuleKey]
+    }
+    payload[rule.key] = entry
     return payload
-  }, {} as Record<QualityQARuleKey, { enabled: boolean; case_sensitive?: boolean }>)
+  }, {} as Record<QualityQARuleKey, {
+    enabled: boolean
+    case_sensitive?: boolean
+    threshold?: number
+  }>)
 }
 
 function toggleAllQualityQARules(event: Event) {
@@ -4632,6 +4948,7 @@ async function loadUploadCapabilities() {
     uploadCapabilities.value = data.formats
     uploadLimits.value = {
       max_files_per_batch: data.limits?.max_files_per_batch ?? 50,
+      max_files_per_selection: data.limits?.max_files_per_selection ?? 200,
       max_total_size_mb: data.limits?.max_total_size_mb ?? 500,
       max_expanded_files: data.limits?.max_expanded_files ?? 100,
     }
@@ -4815,32 +5132,60 @@ async function uploadSourceDocument() {
   pageError.value = ''
   uploading.value = true
   uploadPercent.value = 0
+  const uploadFiles = [...selectedFiles.value]
+  const uploadBatches = buildUploadBatches(
+    uploadFiles,
+    uploadLimits.value,
+    resolvedTargetLanguages.length,
+  )
+  let completedFileCount = 0
+
+  const updateOverallUploadProgress = (batchFileCount: number, batchProgress: number) => {
+    uploadPercent.value = calculateOverallUploadProgress(
+      completedFileCount,
+      uploadFiles.length,
+      batchFileCount,
+      batchProgress,
+      uploadPercent.value,
+    )
+  }
 
   try {
-    const formData = new FormData()
-    selectedFiles.value.forEach((file) => {
-      formData.append('files', file)
-    })
-    formData.append('threshold', '0.6')
-    formData.append('source_language', resolvedSourceLanguage)
-    resolvedTargetLanguages.forEach((language) => {
-      formData.append('target_languages', language)
-    })
-    formData.append('document_parse_mode', documentParseMode.value)
-    formData.append('document_parse_options', JSON.stringify(documentParseOptions.value))
-
-    const { data } = await http.post<unknown | ImportTaskAccepted>(`/projects/${props.id}/source-document`, formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-      onUploadProgress: (event) => {
-        const total = event.total || 0
-        const loaded = event.loaded || 0
-        uploadPercent.value = total > 0 ? Math.min(40, Math.round((loaded / total) * 40)) : 0
-      },
-    })
-    if (isImportTaskAccepted(data)) {
-      await waitForImportTask(data.task_id, (status) => {
-        uploadPercent.value = Math.min(100, 40 + Math.round(status.progress * 0.6))
+    for (const batch of uploadBatches) {
+      const formData = new FormData()
+      batch.forEach((file) => {
+        formData.append('files', file)
       })
+      formData.append('threshold', '0.6')
+      formData.append('source_language', resolvedSourceLanguage)
+      resolvedTargetLanguages.forEach((language) => {
+        formData.append('target_languages', language)
+      })
+      formData.append('document_parse_mode', documentParseMode.value)
+      formData.append('document_parse_options', JSON.stringify(documentParseOptions.value))
+
+      const { data } = await http.post<unknown | ImportTaskAccepted>(
+        `/projects/${props.id}/source-document`,
+        formData,
+        {
+          headers: { 'Content-Type': 'multipart/form-data' },
+          onUploadProgress: (event) => {
+            const total = event.total || 0
+            const loaded = event.loaded || 0
+            const uploadProgress = total > 0 ? loaded / total : 0
+            updateOverallUploadProgress(batch.length, uploadProgress * 0.4)
+          },
+        },
+      )
+      if (isImportTaskAccepted(data)) {
+        await waitForImportTask(data.task_id, (status) => {
+          updateOverallUploadProgress(batch.length, 0.4 + (status.progress / 100) * 0.6)
+        })
+      }
+
+      completedFileCount += batch.length
+      selectedFiles.value = getRemainingUploadFiles(uploadFiles, completedFileCount)
+      updateOverallUploadProgress(0, 1)
     }
 
     await loadProject()
@@ -4849,10 +5194,24 @@ async function uploadSourceDocument() {
     selectedFileIds.value = new Set<string>()
     toast.success(t('projectDetail.messages.uploaded'))
   } catch (error) {
-    uploadMessage.value = getErrorMessage(error, t('projectDetail.errors.upload'))
+    const errorMessage = getErrorMessage(error, t('projectDetail.errors.upload'))
+    if (completedFileCount > 0) {
+      await loadProject()
+      uploadInputKey.value += 1
+      uploadMessage.value = t('projectDetail.messages.partiallyUploaded', {
+        completed: completedFileCount,
+        total: uploadFiles.length,
+        remaining: uploadFiles.length - completedFileCount,
+        error: errorMessage,
+      })
+    } else {
+      uploadMessage.value = errorMessage
+    }
   } finally {
     uploading.value = false
-    uploadPercent.value = 0
+    if (!showUploadModal.value) {
+      uploadPercent.value = 0
+    }
   }
 }
 
@@ -4986,12 +5345,145 @@ async function toggleProjectExportMenu() {
   showProjectExportMenu.value = true
 }
 
-async function downloadProjectFileExport(row: ProjectRow, exportType: string) {
+function toggleProofreadingExportMenu() {
+  if (!canOpenProofreadingExportMenu.value) {
+    return
+  }
+  showProofreadingExportMenu.value = !showProofreadingExportMenu.value
+}
+
+async function downloadProofreadingBatchExportTask(batchId: string, format: ProofreadingExportFormat) {
+  const readiness = await getProofreadingExportReadiness(batchId)
+  if (!readiness.available_formats.includes(format)) {
+    throw new Error(format === 'proofreading_docx_target_revisions'
+      ? '该批次未保存目标 DOCX 原件，无法导出目标原格式修订版。请重新导入双文档。'
+      : '当前批次不支持所选导出格式。')
+  }
+  let acknowledgeWarnings = false
+  if (readiness.has_warnings && format !== 'proofreading_audit_xlsx') {
+    acknowledgeWarnings = await confirm({
+      title: '校对版仍有待处理内容',
+      message: [
+        `总计 ${readiness.total} 条，未确认 ${readiness.unconfirmed} 条。`,
+        `缺译 ${readiness.missing_translation} 条，增译 ${readiness.translation_only} 条，`,
+        `其中未校对增译 ${readiness.translation_only_unreviewed} 条，LLM 失败 ${readiness.llm_failed} 条。`,
+        '仍然导出时，缺译会被明确标记。',
+      ].join(''),
+      confirmText: '仍然导出',
+      cancelText: '返回检查',
+    })
+    if (!acknowledgeWarnings) {
+      return false
+    }
+  }
+  let task = await createProofreadingExportTask(batchId, format, acknowledgeWarnings)
+  exportFileProgress.value = Number(task.progress || 0)
+  exportFileMessage.value = task.message || '正在导出校对文件…'
+  for (let attempt = 0; ['queued', 'running'].includes(task.status) && attempt < 240; attempt += 1) {
+    await waitForExportPoll(1500)
+    task = await getProofreadingExportTask(task.task_id)
+    exportFileProgress.value = Number(task.progress || 0)
+    exportFileMessage.value = task.message || `导出处理中：${task.progress}%`
+  }
+  if (task.status === 'failed') {
+    throw new Error(task.error || task.message || '导出失败。')
+  }
+  if (task.status !== 'completed') {
+    throw new Error('导出超时，请稍后重试。')
+  }
+  const response = await downloadProofreadingExportTask(task.task_id)
+  const filename = resolveDownloadFilename(
+    response.headers['content-disposition'],
+    task.filename || '校对导出',
+  )
+  downloadBlob(response.data, filename)
+  return true
+}
+
+async function exportProofreadingFile(row: ProjectRow, format: ProofreadingExportFormat) {
+  const batchId = row.proofreading?.batch_id
+  if (!batchId || exportingFileId.value) {
+    return
+  }
+  closeActionMenu()
+  showProofreadingExportMenu.value = false
+  pageError.value = ''
+  exportingFileId.value = String(row.id)
+  exportingFileType.value = format
+  exportFileProgress.value = 0
+  exportFileMessage.value = '正在导出校对文件…'
+  try {
+    const downloaded = await downloadProofreadingBatchExportTask(batchId, format)
+    if (downloaded) {
+      toast.success(proofreadingExportSuccessMessage(format))
+    }
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '校对文件导出失败。')
+    toast.error(getErrorMessage(error, '校对文件导出失败。'))
+  } finally {
+    exportingFileId.value = ''
+    exportingFileType.value = ''
+    exportFileProgress.value = 0
+    exportFileMessage.value = ''
+  }
+}
+
+async function exportSelectedProofreadingFiles(format: ProofreadingExportFormat) {
+  const rows = uniqueProofreadingExportRows(selectedProjectFiles.value, format)
+  if (!rows.length || exportingFileId.value) {
+    return
+  }
+  showProofreadingExportMenu.value = false
+  pageError.value = ''
+  try {
+    for (const row of rows) {
+      exportingFileId.value = String(row.id)
+      exportingFileType.value = format
+      exportFileProgress.value = 0
+      exportFileMessage.value = `正在导出 ${row.filename}…`
+      const downloaded = await downloadProofreadingBatchExportTask(row.proofreading!.batch_id, format)
+      if (!downloaded) {
+        return
+      }
+    }
+    toast.success(proofreadingExportSuccessMessage(format))
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '校对文件导出失败。')
+    toast.error(getErrorMessage(error, '校对文件导出失败。'))
+  } finally {
+    exportingFileId.value = ''
+    exportingFileType.value = ''
+    exportFileProgress.value = 0
+    exportFileMessage.value = ''
+  }
+}
+
+function uniqueProofreadingExportRows(rows: ProjectRow[], format: ProofreadingExportFormat) {
+  const seen = new Set<string>()
+  return rows.filter((row) => {
+    const batchId = row.proofreading?.batch_id
+    if (!batchId || seen.has(batchId)) return false
+    if (!getProofreadingExportChoices(row).some((choice) => choice.format === format)) return false
+    seen.add(batchId)
+    return true
+  })
+}
+
+async function downloadProjectFileExport(
+  row: ProjectRow,
+  exportType: string,
+  wordExportMode: WordExportMode = 'standard',
+) {
   const rowId = String(row.id)
   const filename = String(row.filename || 'export')
+  const exportPayload = (
+    exportType === 'original' && wordExportMode === 'revision'
+      ? { include_revision_marks: true }
+      : null
+  )
   const { data: task } = await http.post<FileExportTask>(
     `/file-records/${rowId}/exports`,
-    null,
+    exportPayload,
     { params: { type: exportType } },
   )
   const completedTask = await waitForFileExportTask(task)
@@ -5026,8 +5518,15 @@ async function downloadProjectFileZipExport(rows: ProjectRow[]) {
   downloadBlob(response.data, downloadName)
 }
 
-async function exportProjectFile(row: ProjectRow, exportType = 'original') {
+async function exportProjectFile(
+  row: ProjectRow,
+  exportType = 'original',
+  wordExportMode: WordExportMode = 'standard',
+) {
   if (exportingFileId.value) {
+    return
+  }
+  if (wordExportMode === 'revision' && !(await confirmRevisionMarkedExport())) {
     return
   }
 
@@ -5037,11 +5536,17 @@ async function exportProjectFile(row: ProjectRow, exportType = 'original') {
   exportingFileId.value = String(row.id)
   exportingFileType.value = exportType
   exportFileProgress.value = 0
-  exportFileMessage.value = '导出任务提交中。'
+  exportFileMessage.value = wordExportMode === 'revision'
+    ? t('workbench.exportModes.revisionSubmitting')
+    : t('workbench.exportModes.standardSubmitting')
 
   try {
-    await downloadProjectFileExport(row, exportType)
-    toast.success(getProjectFileExportSuccessMessage(exportType, 1))
+    await downloadProjectFileExport(row, exportType, wordExportMode)
+    toast.success(
+      wordExportMode === 'revision'
+        ? t('workbench.exportModes.revisionSuccess')
+        : getProjectFileExportSuccessMessage(exportType, 1),
+    )
   } catch (error) {
     pageError.value = getErrorMessage(
       error,
@@ -5084,8 +5589,14 @@ async function exportSelectedProjectFilesAsZip() {
   }
 }
 
-async function exportSelectedProjectFiles(exportType: string) {
+async function exportSelectedProjectFiles(
+  exportType: string,
+  wordExportMode: WordExportMode = 'standard',
+) {
   if (selectedProjectFiles.value.length === 0 || exportingFileId.value) {
+    return
+  }
+  if (wordExportMode === 'revision' && !(await confirmRevisionMarkedExport())) {
     return
   }
 
@@ -5100,10 +5611,16 @@ async function exportSelectedProjectFiles(exportType: string) {
       exportingFileId.value = String(current.id)
       exportingFileType.value = exportType
       exportFileProgress.value = 0
-      exportFileMessage.value = `导出 ${index + 1}/${rows.length} 提交中。`
-      await downloadProjectFileExport(current, exportType)
+      exportFileMessage.value = wordExportMode === 'revision'
+        ? `修订痕迹版 ${index + 1}/${rows.length} 提交中。`
+        : `稳定版 ${index + 1}/${rows.length} 提交中。`
+      await downloadProjectFileExport(current, exportType, wordExportMode)
     }
-    toast.success(getProjectFileExportSuccessMessage(exportType, rows.length))
+    toast.success(
+      wordExportMode === 'revision'
+        ? t('workbench.exportModes.revisionSuccess')
+        : getProjectFileExportSuccessMessage(exportType, rows.length),
+    )
   } catch (error) {
     pageError.value = getErrorMessage(
       error,
@@ -5185,6 +5702,7 @@ async function deleteProjectFiles(rows: ProjectRow[]) {
       ? t('projectDetail.messages.fileDeleted', { name: firstFilename })
       : t('projectDetail.messages.filesDeleted', { count: fileCount }))
     await loadProject()
+    void proofreadingPanelRef.value?.refreshBatches()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.delete'))
   } finally {
@@ -5250,6 +5768,7 @@ async function createEnglishVariantCopy() {
       name: data.file.filename,
       changed: data.summary.changed_segments,
       replacements: data.summary.replacement_count,
+      reviews: data.summary.llm_review_count,
     }))
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.englishVariantCopy'))
@@ -5614,7 +6133,11 @@ onBeforeUnmount(() => {
     </main>
   </div>
 
-  <div v-else class="content-stack pd-layout workbench-page">
+  <div
+    v-else
+    class="content-stack pd-layout workbench-page"
+    :class="{ 'is-project-mode-pending': loading && !project }"
+  >
     <section class="panel pd-hero">
       <div class="pd-hero__main">
         <div class="pd-hero__left">
@@ -5634,6 +6157,25 @@ onBeforeUnmount(() => {
             <p class="panel-subtitle">{{ t('projectDetail.description') }}</p>
           </div>
         </div>
+
+        <ol
+          v-if="isProofreadingProject"
+          class="pd-stage-stepper"
+          data-testid="proofreading-stage-stepper"
+        >
+          <li
+            v-for="(step, index) in proofreadingStageSteps"
+            :key="step.key"
+            class="pd-stage-stepper__item"
+            :class="{
+              'is-current': step.key === projectProofreadingStage,
+              'is-done': proofreadingStageSteps.findIndex((item) => item.key === projectProofreadingStage) > index,
+            }"
+          >
+            <span class="pd-stage-stepper__index">{{ index + 1 }}</span>
+            <span>{{ step.label }}</span>
+          </li>
+        </ol>
 
         <div class="pd-hero__progress">
           <span class="pd-hero__progress-label">{{ t('projectDetail.totals.progressLabel') }}</span>
@@ -5666,7 +6208,7 @@ onBeforeUnmount(() => {
 
     <p v-if="pageError" class="form-message is-error">{{ pageError }}</p>
 
-    <section v-if="loading && !project" class="panel">
+    <section v-if="loading && !project" class="panel pd-route-loading">
       <div class="empty-state">
         <Loader2 class="lucide-spin" :size="32" />
         {{ t('projectDetail.loading') }}
@@ -6689,61 +7231,26 @@ onBeforeUnmount(() => {
                       </thead>
                       <tbody>
                         <tr
-                          v-for="(rule, index) in qualityQARules"
+                          v-for="(rule, index) in qualityQARuleDisplayItems"
                           :key="rule.key"
+                          :class="{ 'is-placeholder': rule.kind === 'placeholder' }"
                           :data-rule-key="rule.key"
                           :data-testid="`quality-qa-rule-${rule.key}`"
+                          :title="rule.kind === 'placeholder' ? '占位展示，后端暂未接入。' : undefined"
                         >
                           <td>{{ index + 1 }}</td>
                           <td class="quality-qa-settings__check-cell">
                             <label class="quality-qa-settings__rule-check">
                               <input
+                                v-if="rule.kind === 'rule'"
                                 v-model="qualityQADraft.rules[rule.key]"
                                 type="checkbox"
                                 :data-testid="`quality-qa-rule-toggle-${rule.key}`"
                                 :disabled="savingQualityQASettings || loadingQualityQASettings"
                                 :aria-label="`启用${rule.label}`"
                               />
-                            </label>
-                          </td>
-                          <td>
-                            <span class="quality-qa-settings__rule-content">
-                              <span>{{ rule.label }}</span>
-                              <label
-                                v-if="rule.key === 'term_inconsistency'"
-                                class="quality-qa-settings__case-switch"
-                                :class="{
-                                  'is-active': qualityQADraft.termQACaseSensitive,
-                                  'is-disabled': savingQualityQASettings || loadingQualityQASettings || !qualityQADraft.rules.term_inconsistency,
-                                }"
-                              >
-                                <input
-                                  v-model="qualityQADraft.termQACaseSensitive"
-                                  type="checkbox"
-                                  role="switch"
-                                  :disabled="savingQualityQASettings || loadingQualityQASettings || !qualityQADraft.rules.term_inconsistency"
-                                  aria-label="术语不一致检查区分大小写"
-                                />
-                                <span class="quality-qa-settings__case-switch-track" aria-hidden="true">
-                                  <span class="quality-qa-settings__case-switch-thumb"></span>
-                                </span>
-                                <span>{{ qualityQADraft.termQACaseSensitive ? '区分大小写' : '不区分大小写' }}</span>
-                              </label>
-                            </span>
-                          </td>
-                        </tr>
-                        <tr
-                          v-for="(rule, index) in qualityQAPlaceholderRules"
-                          :key="rule.key"
-                          class="is-placeholder"
-                          :data-rule-key="rule.key"
-                          :data-testid="`quality-qa-rule-${rule.key}`"
-                          title="占位展示，后端暂未接入。"
-                        >
-                          <td>{{ qualityQARules.length + index + 1 }}</td>
-                          <td class="quality-qa-settings__check-cell">
-                            <label class="quality-qa-settings__rule-check">
                               <input
+                                v-else
                                 type="checkbox"
                                 disabled
                                 :data-testid="`quality-qa-rule-toggle-${rule.key}`"
@@ -6753,7 +7260,22 @@ onBeforeUnmount(() => {
                           </td>
                           <td>
                             <span class="quality-qa-settings__rule-text">
-                              <template v-if="typeof rule.percent === 'number'">
+                              <template v-if="rule.kind === 'rule' && rule.thresholdKey">
+                                <span>{{ rule.label }}</span>
+                                <input
+                                  v-model.number="qualityQADraft.thresholds[rule.thresholdKey]"
+                                  class="quality-qa-settings__inline-number"
+                                  type="number"
+                                  :min="1"
+                                  :max="500"
+                                  step="1"
+                                  :disabled="savingQualityQASettings || loadingQualityQASettings || !qualityQADraft.rules[rule.key]"
+                                  :data-testid="`quality-qa-rule-threshold-${rule.key}`"
+                                  @blur="qualityQADraft.thresholds[rule.thresholdKey] = clampQualityQAThreshold(qualityQADraft.thresholds[rule.thresholdKey], getRuleDefaultThreshold(rule.thresholdKey))"
+                                />
+                                <span>{{ rule.suffix }}</span>
+                              </template>
+                              <template v-else-if="rule.kind === 'placeholder' && typeof rule.percent === 'number'">
                                 <span>{{ rule.label }}</span>
                                 <input
                                   class="quality-qa-settings__inline-number"
@@ -6763,7 +7285,29 @@ onBeforeUnmount(() => {
                                 />
                                 <span>{{ rule.suffix }}</span>
                               </template>
-                              <template v-else>{{ rule.label }}</template>
+                              <template v-else>
+                                <span>{{ rule.label }}</span>
+                                <label
+                                  v-if="rule.kind === 'rule' && rule.key === 'term_inconsistency'"
+                                  class="quality-qa-settings__case-switch"
+                                  :class="{
+                                    'is-active': qualityQADraft.termQACaseSensitive,
+                                    'is-disabled': savingQualityQASettings || loadingQualityQASettings || !qualityQADraft.rules.term_inconsistency,
+                                  }"
+                                >
+                                  <input
+                                    v-model="qualityQADraft.termQACaseSensitive"
+                                    type="checkbox"
+                                    role="switch"
+                                    :disabled="savingQualityQASettings || loadingQualityQASettings || !qualityQADraft.rules.term_inconsistency"
+                                    aria-label="术语不一致检查区分大小写"
+                                  />
+                                  <span class="quality-qa-settings__case-switch-track" aria-hidden="true">
+                                    <span class="quality-qa-settings__case-switch-thumb"></span>
+                                  </span>
+                                  <span>{{ qualityQADraft.termQACaseSensitive ? '区分大小写' : '不区分大小写' }}</span>
+                                </label>
+                              </template>
                             </span>
                           </td>
                         </tr>
@@ -7074,20 +7618,31 @@ onBeforeUnmount(() => {
         <div class="pd-panel-head">
           <div class="pd-panel-head__copy">
             <div class="section-title section-title--tight pd-files-title">
-              <span>{{ t('projectDetail.files.title') }}</span>
+              <span>{{ isProofreadingProject ? '校对语言任务' : t('projectDetail.files.title') }}</span>
               <span class="pd-files-count">
                 显示 {{ filteredTableRows.length }} / {{ tableRows.length }} 个文件
                 <template v-if="selectedFileIds.size > 0"> · 已选 {{ selectedFileIds.size }}</template>
               </span>
             </div>
-            <p class="panel-subtitle">{{ t('projectDetail.files.description') }}</p>
+            <p class="panel-subtitle">
+              {{ isProofreadingProject
+                ? '每个目标语言对应一个校对任务。对齐阶段可导出一一对照表，校对完成后可导出修改后的译文。'
+                : t('projectDetail.files.description') }}
+            </p>
           </div>
         </div>
+
+        <ProofreadingPanel
+          v-if="project.workflow_template_id === 'proofread' && project.can_manage"
+          ref="proofreadingPanelRef"
+          :project-id="project.id"
+          @refresh-project="loadProject"
+        />
 
         <div class="table-toolbar pd-toolbar">
           <div class="table-toolbar__left pd-toolbar__left">
             <button
-              v-if="canUploadProjectFiles"
+              v-if="canUploadProjectFiles && project.workflow_template_id !== 'proofread'"
               class="button button--primary pd-toolbar-primary"
               data-testid="project-upload-open"
               type="button"
@@ -7203,7 +7758,7 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <div class="pd-toolbar-action-strip" aria-label="文件批量操作">
-              <div class="pd-toolbar-action-group pd-toolbar-action-group--featured" aria-label="智能处理">
+              <div v-if="!isProofreadingProject" class="pd-toolbar-action-group pd-toolbar-action-group--featured" aria-label="智能处理">
                 <button
                   class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-action-button--accent"
                   type="button"
@@ -7230,7 +7785,7 @@ onBeforeUnmount(() => {
 
               <div class="pd-toolbar-action-group" aria-label="文件操作">
                 <button
-                  v-if="canManageProject && !authStore.isExternalTranslator"
+                  v-if="!isProofreadingProject && canManageProject && !authStore.isExternalTranslator"
                   class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-action-button--variant-copy"
                   :class="{
                     'pd-toolbar-action-button--british-copy': englishVariantCopyDirection !== 'to-american',
@@ -7248,7 +7803,7 @@ onBeforeUnmount(() => {
                   <span>{{ englishVariantCopyShortLabel }}</span>
                 </button>
                 <button
-                  v-if="canManageProject"
+                  v-if="!isProofreadingProject && canManageProject"
                   class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-action-button--template-copy"
                   data-testid="duplicate-file-template"
                   type="button"
@@ -7285,7 +7840,46 @@ onBeforeUnmount(() => {
                   <Users :size="15" />
                   <span>{{ t('projectDetail.files.actions.assign') }}</span>
                 </button>
-                <div class="pd-export-dropdown">
+                <div v-if="isProofreadingProject" class="pd-export-dropdown">
+                  <button
+                    class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-export-button"
+                    data-testid="project-file-proofreading-export-selected"
+                    type="button"
+                    :disabled="!canOpenProofreadingExportMenu"
+                    :title="proofreadingExportButtonTitle || (exportingFileId ? `导出中 ${exportFileProgress}%` : '导出校对文件')"
+                    aria-label="导出校对文件"
+                    aria-haspopup="menu"
+                    :aria-expanded="showProofreadingExportMenu"
+                    @click.stop="toggleProofreadingExportMenu"
+                  >
+                    <Loader2 v-if="exportingFileId" class="lucide-spin" :size="15" />
+                    <Download v-else :size="15" />
+                    <span>{{ exportingFileId ? `导出 ${exportFileProgress}%` : '导出' }}</span>
+                    <ChevronDown :size="12" />
+                  </button>
+                  <div v-if="showProofreadingExportMenu" class="pd-export-menu" role="menu" @click.stop>
+                    <div v-if="selectedProofreadingExportChoices.length === 0" class="pd-export-menu__loading">
+                      所选文件当前阶段还不能导出。
+                    </div>
+                    <div v-else class="pd-export-menu__group">
+                      <div class="pd-export-menu__group-title">按当前阶段导出</div>
+                      <button
+                        v-for="choice in selectedProofreadingExportChoices"
+                        :key="choice.format"
+                        class="pd-export-menu__item"
+                        type="button"
+                        :disabled="Boolean(exportingFileId)"
+                        @click="void exportSelectedProofreadingFiles(choice.format)"
+                      >
+                        <span class="pd-export-menu__item-head">
+                          <span class="pd-export-menu__item-name">{{ choice.name }}</span>
+                        </span>
+                        <span class="pd-export-menu__item-desc">{{ choice.description }}</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <div v-else class="pd-export-dropdown">
                   <button
                     class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-export-button"
                     data-testid="project-file-export-selected"
@@ -7299,7 +7893,7 @@ onBeforeUnmount(() => {
                   >
                     <Loader2 v-if="loadingProjectExportOptions || exportingFileId" class="lucide-spin" :size="15" />
                     <Download v-else :size="15" />
-                    <span>{{ t('projectDetail.files.actions.export') }}</span>
+                    <span>{{ exportingFileId ? `导出 ${exportFileProgress}%` : t('projectDetail.files.actions.export') }}</span>
                     <ChevronDown :size="12" />
                   </button>
                   <div v-if="showProjectExportMenu" class="pd-export-menu" role="menu" @click.stop>
@@ -7316,25 +7910,48 @@ onBeforeUnmount(() => {
                         class="pd-export-menu__group"
                       >
                         <div class="pd-export-menu__group-title">{{ group.label }}</div>
-                        <button
-                          v-for="option in group.options"
-                          :key="option.id"
-                          class="pd-export-menu__item"
-                          type="button"
-                          :disabled="Boolean(exportingFileId)"
-                          @click="exportSelectedProjectFiles(option.id)"
-                        >
-                          <span class="pd-export-menu__item-head">
-                            <span class="pd-export-menu__item-name">{{ option.name }}</span>
-                            <span
-                              v-if="getExportOptionExtensionLabel(option)"
-                              class="pd-export-menu__item-ext"
-                            >
-                              {{ getExportOptionExtensionLabel(option) }}
+                        <template v-for="option in group.options" :key="option.id">
+                          <button
+                            class="pd-export-menu__item"
+                            type="button"
+                            :disabled="Boolean(exportingFileId)"
+                            @click="exportSelectedProjectFiles(option.id, 'standard')"
+                          >
+                            <span class="pd-export-menu__item-head">
+                              <span class="pd-export-menu__item-name">
+                                {{ getProjectExportOptionName(option, 'standard') }}
+                              </span>
+                              <span
+                                v-if="getExportOptionExtensionLabel(option)"
+                                class="pd-export-menu__item-ext"
+                              >
+                                {{ getExportOptionExtensionLabel(option) }}
+                              </span>
                             </span>
-                          </span>
-                          <span class="pd-export-menu__item-desc">{{ option.description }}</span>
-                        </button>
+                            <span class="pd-export-menu__item-desc">
+                              {{ getProjectExportOptionDescription(option, 'standard') }}
+                            </span>
+                          </button>
+                          <button
+                            v-if="isSelectedWordTargetExportOption(option)"
+                            class="pd-export-menu__item pd-export-menu__item--revision"
+                            type="button"
+                            :disabled="Boolean(exportingFileId)"
+                            @click="exportSelectedProjectFiles(option.id, 'revision')"
+                          >
+                            <span class="pd-export-menu__item-head">
+                              <span class="pd-export-menu__item-name">
+                                {{ getProjectExportOptionName(option, 'revision') }}
+                              </span>
+                              <span class="pd-export-menu__item-ext pd-export-menu__item-ext--warning">
+                                {{ t('workbench.exportModes.experimentalBadge') }}
+                              </span>
+                            </span>
+                            <span class="pd-export-menu__item-desc">
+                              {{ getProjectExportOptionDescription(option, 'revision') }}
+                            </span>
+                          </button>
+                        </template>
                       </div>
                       <button
                         v-if="canExportSelectedProjectFilesAsZip"
@@ -7353,6 +7970,7 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
                 <button
+                  v-if="!isProofreadingProject"
                   class="button pd-toolbar-action-button pd-toolbar-action-button--labeled"
                   type="button"
                   :disabled="!canOpenMergeViewDialog"
@@ -7365,7 +7983,7 @@ onBeforeUnmount(() => {
                 </button>
               </div>
 
-              <div v-if="canManageProject" class="pd-toolbar-action-group pd-toolbar-action-group--reserved" aria-label="待开放操作">
+              <div v-if="canManageProject && !isProofreadingProject" class="pd-toolbar-action-group pd-toolbar-action-group--reserved" aria-label="待开放操作">
                 <button
                   class="button pd-toolbar-action-button"
                   type="button"
@@ -7395,7 +8013,7 @@ onBeforeUnmount(() => {
                 </button>
               </div>
 
-              <div class="pd-toolbar-action-group pd-toolbar-action-group--utility" aria-label="视图设置">
+              <div v-if="!isProofreadingProject" class="pd-toolbar-action-group pd-toolbar-action-group--utility" aria-label="视图设置">
                 <button
                   class="button pd-toolbar-action-button"
                   type="button"
@@ -7527,6 +8145,27 @@ onBeforeUnmount(() => {
                     {{ row.filename }}
                   </button>
                   <span v-else class="pd-file-cell__title" :title="row.filename">{{ row.filename }}</span>
+                  <span
+                    v-if="getProofreadingStageBadge(row)"
+                    class="pd-file-stage-badge"
+                    :class="`pd-file-stage-badge--${getProofreadingStageBadge(row)?.key}`"
+                    data-testid="project-file-stage-badge"
+                  >
+                    {{ getProofreadingStageBadge(row)?.label }}
+                  </span>
+                  <button
+                    v-if="getPrimaryProofreadingExport(row)"
+                    class="pd-file-export-button"
+                    data-testid="project-file-proofreading-export"
+                    type="button"
+                    :disabled="Boolean(exportingFileId)"
+                    :title="getPrimaryProofreadingExport(row)?.description"
+                    @click.stop="exportPrimaryProofreadingFile(row)"
+                  >
+                    <Loader2 v-if="isProjectFileExporting(row)" class="lucide-spin" :size="12" />
+                    <Download v-else :size="12" />
+                    {{ getPrimaryProofreadingExport(row)?.name }}
+                  </button>
                   <span
                     v-if="getDerivedFileKind(row)"
                     class="pd-file-kind-badge"
@@ -7962,13 +8601,40 @@ onBeforeUnmount(() => {
         >
           {{ t('projectDetail.files.task.assign') }}
         </button>
+        <template v-if="isProofreadingProject">
+          <button
+            v-for="choice in getProofreadingExportChoices(actionMenuRow)"
+            :key="choice.format"
+            type="button"
+            :disabled="Boolean(exportingFileId) || !actionMenuRow.proofreading?.batch_id"
+            :title="choice.description"
+            @click="void exportProofreadingFile(actionMenuRow, choice.format)"
+          >
+            {{ choice.name }}
+          </button>
+        </template>
+        <template v-else>
         <button
           type="button"
           :disabled="!actionMenuRow.has_source_document || Boolean(exportingFileId)"
           :title="isProjectFileExporting(actionMenuRow, 'original') ? exportFileMessage : (!actionMenuRow.has_source_document ? t('projectDetail.common.uploadRequired') : undefined)"
-          @click="exportProjectFile(actionMenuRow, 'original')"
+          @click="exportProjectFile(actionMenuRow, 'original', 'standard')"
         >
-          {{ getProjectFileExportLabel(actionMenuRow, 'original') }}
+          {{
+            isWordProjectFile(actionMenuRow)
+              ? t('workbench.exportModes.standardName')
+              : getProjectFileExportLabel(actionMenuRow, 'original')
+          }}
+        </button>
+        <button
+          v-if="isWordProjectFile(actionMenuRow)"
+          type="button"
+          class="is-warning"
+          :disabled="!actionMenuRow.has_source_document || Boolean(exportingFileId)"
+          :title="t('workbench.exportModes.revisionDescription')"
+          @click="exportProjectFile(actionMenuRow, 'original', 'revision')"
+        >
+          {{ t('workbench.exportModes.revisionName') }} · {{ t('workbench.exportModes.experimentalBadge') }}
         </button>
         <button
           type="button"
@@ -7978,6 +8644,7 @@ onBeforeUnmount(() => {
         >
           {{ getProjectFileExportLabel(actionMenuRow, 'source') }}
         </button>
+        </template>
         <button
           type="button"
           @click="openFileIssueDialog(actionMenuRow)"
@@ -8248,12 +8915,14 @@ onBeforeUnmount(() => {
       :loading="loadingAssignableUsers || loadingAssignments"
       :saving="savingAssignment"
       :initial-file-id="assignmentInitialFileId"
+      :preview-split="previewAssignmentSplit"
       @close="closeAssignmentDialog"
       @save="saveAssignment"
     />
 
 
     <PreTranslateDialog
+      v-if="!isProofreadingProject"
       :open="showPreTranslateDialog"
       :project-id="project?.id ?? null"
       :files="selectedProjectFiles"
@@ -8265,6 +8934,7 @@ onBeforeUnmount(() => {
       @progress="handlePreTranslateProgress"
     />
     <TermExtractionDialog
+      v-if="!isProofreadingProject"
       :open="showTermExtractionDialog"
       :file="selectedTermExtractionFile"
       :project-source-language="project?.source_language ?? null"
@@ -8896,6 +9566,12 @@ onBeforeUnmount(() => {
   outline: 1px solid #d7dde0;
 }
 
+.pd-layout.is-project-mode-pending > :not(.pd-route-loading) {
+  display: none !important;
+}
+.pd-route-loading {
+  min-height: min(420px, 55vh);
+}
 .pd-layout {
   align-content: start;
   align-items: start;
@@ -8924,6 +9600,60 @@ onBeforeUnmount(() => {
   gap: 8px;
   flex: 1 1 360px;
   min-width: 0;
+}
+
+.pd-stage-stepper {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex: 1 1 320px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pd-stage-stepper__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pd-stage-stepper__item + .pd-stage-stepper__item::before {
+  content: '';
+  width: 18px;
+  height: 1px;
+  margin: 0 8px 0 2px;
+  background: #d5dee4;
+}
+
+.pd-stage-stepper__index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #e8eef2;
+  color: #5b6b74;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pd-stage-stepper__item.is-done {
+  color: var(--brand-800, #095f52);
+}
+
+.pd-stage-stepper__item.is-done .pd-stage-stepper__index,
+.pd-stage-stepper__item.is-current .pd-stage-stepper__index {
+  background: var(--brand-700, #0d7a68);
+  color: #fff;
+}
+
+.pd-stage-stepper__item.is-current {
+  color: var(--brand-800, #095f52);
 }
 
 .pd-hero__back {
@@ -10000,6 +10730,16 @@ onBeforeUnmount(() => {
   background: var(--surface-muted);
 }
 
+.pd-export-menu__item--revision {
+  margin-top: 2px;
+  border: 1px solid #f2d3a2;
+  background: #fffaf2;
+}
+
+.pd-export-menu__item--revision:hover:not(:disabled) {
+  background: #fff3df;
+}
+
 .pd-export-menu__item:disabled {
   color: var(--text-muted);
   cursor: not-allowed;
@@ -10029,6 +10769,12 @@ onBeforeUnmount(() => {
   color: var(--text-secondary);
   font-size: 10px;
   font-weight: 700;
+}
+
+.pd-export-menu__item-ext--warning {
+  border-color: #e8b665;
+  background: #fff0d5;
+  color: #8a4f00;
 }
 
 .pd-export-menu__item-desc {
@@ -10379,6 +11125,56 @@ onBeforeUnmount(() => {
   font-size: 10px;
   font-weight: 700;
   line-height: 1.2;
+}
+
+.pd-file-stage-badge {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.pd-file-stage-badge--alignment {
+  border-color: color-mix(in srgb, #d97706 22%, transparent);
+  background: color-mix(in srgb, #d97706 8%, transparent);
+  color: #9a5b00;
+}
+
+.pd-file-stage-badge--proofreading {
+  border-color: color-mix(in srgb, #0d7a68 22%, transparent);
+  background: color-mix(in srgb, #0d7a68 8%, transparent);
+  color: #0d7a68;
+}
+
+.pd-file-export-button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--brand-700, #0d7a68) 22%, transparent);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--brand-800, #095f52);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.pd-file-export-button:hover:not(:disabled),
+.pd-file-export-button:focus-visible {
+  background: color-mix(in srgb, #0d7a68 8%, transparent);
+  outline: none;
+}
+
+.pd-file-export-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .pd-file-kind-badge--template-copy {
@@ -12762,6 +13558,11 @@ onBeforeUnmount(() => {
 
   .pd-hero__progress {
     width: 100%;
+  }
+
+  .pd-stage-stepper {
+    flex: 1 1 100%;
+    overflow-x: auto;
   }
 
   .pd-basic-grid {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import mimetypes
 import time
@@ -21,6 +22,7 @@ from app.config import get_settings
 from app.database import SessionLocal, engine
 from app.models import FileExportTask, FileRecord, User
 from app.services.adapters import export_file
+from app.services.document_exporter import apply_docx_rtl_direction
 from app.services.task_file_service import (
     BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS,
     BILINGUAL_PPTX_EXPORT_TYPE,
@@ -49,6 +51,13 @@ FILE_EXPORT_TASK_TTL_SECONDS = 24 * 60 * 60
 FILE_EXPORT_POLL_INTERVAL_SECONDS = 0.3
 FILE_EXPORT_WAIT_TIMEOUT_SECONDS = 30 * 60
 LANGUAGE_TAGGED_EXPORT_TYPES = {"tmx", "xliff", "xliff2"}
+PROOFREADING_EXPORT_TYPES = {
+    "proofreading_docx_target_revisions",
+    "proofreading_docx_layout",
+    "proofreading_docx_ordered",
+    "proofreading_audit_xlsx",
+    "proofreading_xlsx_original",
+}
 
 _FILE_EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="file-export")
 _SCHEMA_READY = False
@@ -305,7 +314,9 @@ def build_file_export_download_response(task: FileExportTask) -> FileResponse:
             "Content-Disposition": (
                 f'attachment; filename="{ascii_filename}"; '
                 f"filename*=UTF-8''{quoted_filename}"
-            )
+            ),
+            # FileResponse 本身会分块发送文件；同时禁止 Nginx 缓冲整个大文件响应。
+            "X-Accel-Buffering": "no",
         },
     )
 
@@ -400,46 +411,65 @@ def _resolve_file_record_export_language_pair(file_record: FileRecord) -> tuple[
 def _run_file_export_task(task_id: UUID) -> None:
     style_settings = _pop_style_settings(task_id)
     include_revision_marks = _pop_revision_mark_option(task_id)
+    temporary_output_path: Path | None = None
     try:
-        with SessionLocal() as db:
+        # 防止状态提交后读取 ORM 对象时隐式开启一个长期空闲事务。
+        with SessionLocal(expire_on_commit=False) as db:
             task = get_file_export_task(db, task_id)
             _set_file_export_task_status(db, task, "running", progress=5, message="导出任务开始处理。")
 
-            file_record = get_file_record_model(db, task.file_record_id)
+            file_record_id = task.file_record_id
+            export_type = task.export_type
+            created_by_id = task.created_by_id
+            export_task_id = task.id
+
+            file_record = get_file_record_model(db, file_record_id)
             if file_record is None:
                 raise ValueError("File record not found.")
 
             _set_file_export_task_status(db, task, "running", progress=20, message="正在读取文件和句段。")
             report_context = {
-                "file_record_id": task.file_record_id,
-                "export_task_id": task.id,
-                "created_by_id": task.created_by_id,
-                "export_type": task.export_type,
+                "file_record_id": file_record_id,
+                "export_task_id": export_task_id,
+                "created_by_id": created_by_id,
+                "export_type": export_type,
                 "filename": file_record.filename,
             }
             exported_file = build_file_record_exported_file(
                 db,
                 file_record,
-                task.export_type,
+                export_type,
                 style_settings=style_settings,
                 report_context=report_context,
                 include_revision_marks=include_revision_marks,
+                release_transaction_before_render=True,
             )
 
-            output_dir = _ensure_export_dir()
-            _cleanup_expired_export_files(output_dir)
-            suffix = Path(exported_file.filename).suffix or ".bin"
-            output_path = output_dir / f"{task.id}{suffix}"
-            output_path.write_bytes(exported_file.content)
+        output_dir = _ensure_export_dir()
+        _cleanup_expired_export_files(output_dir)
+        suffix = Path(exported_file.filename).suffix or ".bin"
+        output_path = output_dir / f"{task_id}{suffix}"
+        temporary_output_path = output_dir / f".{task_id}{suffix}.tmp"
+        temporary_output_path.write_bytes(exported_file.content)
+        temporary_output_path.replace(output_path)
+        temporary_output_path = None
+        size_bytes = output_path.stat().st_size
 
+        # 耗时导出完成后使用全新连接写回，不复用长任务开始前取得的连接。
+        with SessionLocal(expire_on_commit=False) as db:
+            task = db.query(FileExportTask).filter(FileExportTask.id == task_id).first()
+            if task is None:
+                raise ValueError("File export task not found.")
             task.result_path = str(output_path)
             task.filename = exported_file.filename
             task.media_type = exported_file.media_type
-            task.size_bytes = output_path.stat().st_size
+            task.size_bytes = size_bytes
             _set_file_export_task_status(db, task, "completed", progress=100, message="导出完成。")
     except Exception as exc:
         logger.exception("file export task failed task_id=%s", task_id)
-        with SessionLocal() as db:
+        if temporary_output_path is not None:
+            temporary_output_path.unlink(missing_ok=True)
+        with SessionLocal(expire_on_commit=False) as db:
             task = db.query(FileExportTask).filter(FileExportTask.id == task_id).first()
             if task is not None:
                 task.error = str(exc)
@@ -466,10 +496,71 @@ def build_file_record_exported_file(
     style_settings: dict[str, Any] | None = None,
     report_context: dict[str, Any] | None = None,
     include_revision_marks: bool = False,
+    release_transaction_before_render: bool = False,
 ):
     raw_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
     export_filename = _resolve_export_filename(file_record, source_filename)
+
+    if export_type in PROOFREADING_EXPORT_TYPES:
+        from app.models import ProofreadingBatch, ProofreadingColumnBinding
+        from app.services.document_alignment.export import (
+            export_document_pair_xlsx,
+            export_layout_bilingual_docx,
+            export_ordered_bilingual_docx,
+            export_target_docx_with_revisions,
+        )
+        from app.services.proofreading import export_batch_xlsx
+
+        batch_id = None
+        try:
+            parse_options = json.loads(file_record.document_parse_options or "{}")
+            batch_id = parse_options.get("proofreading_batch_id") if isinstance(parse_options, dict) else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            batch_id = None
+        batch = db.get(ProofreadingBatch, UUID(str(batch_id))) if batch_id else None
+        if batch is None:
+            batch = db.query(ProofreadingBatch).join(
+                ProofreadingColumnBinding,
+                ProofreadingColumnBinding.batch_id == ProofreadingBatch.id,
+            ).filter(ProofreadingColumnBinding.file_record_id == file_record.id).order_by(
+                ProofreadingBatch.created_at.desc(),
+            ).first()
+        if batch is None:
+            raise ValueError("当前文件没有可导出的校对批次。")
+
+        if export_type == "proofreading_docx_target_revisions":
+            content, filename = export_target_docx_with_revisions(db, batch)
+            return _GenericExportedFile(
+                content=content,
+                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                filename=filename,
+            )
+        if export_type == "proofreading_docx_layout":
+            content, filename, _ = export_layout_bilingual_docx(db, batch)
+            return _GenericExportedFile(
+                content=content,
+                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                filename=filename,
+            )
+        if export_type == "proofreading_docx_ordered":
+            content, filename = export_ordered_bilingual_docx(db, batch)
+            return _GenericExportedFile(
+                content=content,
+                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                filename=filename,
+            )
+        if export_type == "proofreading_audit_xlsx":
+            if batch.batch_kind != "document_pair":
+                raise ValueError("审计 Excel 仅用于双文档校对批次。")
+            content, filename = export_document_pair_xlsx(db, batch)
+        else:
+            content, filename = export_batch_xlsx(db, batch)
+        return _GenericExportedFile(
+            content=content,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=filename,
+        )
 
     if export_type == "source":
         if raw_bytes is None:
@@ -499,24 +590,33 @@ def build_file_record_exported_file(
             if word_revision_marks_enabled
             else None
         )
-        return _apply_style_settings_to_export(
+        target_language = _resolve_file_record_target_language(file_record)
+        _release_read_transaction(db, enabled=release_transaction_before_render)
+        exported_file = _apply_style_settings_to_export(
             export_translated_task_file(
                 raw_bytes=raw_bytes,
                 filename=export_filename,
                 segments=segments,
                 document_parse_mode=document_parse_mode,
                 document_parse_options=document_parse_options,
-                target_language=getattr(file_record, "target_language", None),
+                target_language=target_language,
                 revisions=revisions,
                 include_revision_marks=word_revision_marks_enabled,
             ),
             style_settings,
             report_context,
         )
+        return _apply_final_docx_rtl_direction(
+            exported_file,
+            target_language=target_language,
+            document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
+        )
 
     if export_type in BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS:
         if get_task_file_extension(source_filename) != ".docx":
             raise ValueError("Only DOCX source files support layout-preserving bilingual Word export.")
+        _release_read_transaction(db, enabled=release_transaction_before_render)
         return _apply_style_settings_to_export(
             export_bilingual_task_docx_with_layout(
                 raw_bytes=raw_bytes,
@@ -534,6 +634,7 @@ def build_file_record_exported_file(
     if export_type == "bilingual_excel_original":
         if get_task_file_extension(source_filename) != ".xlsx":
             raise ValueError("Only XLSX source files support original-format bilingual Excel export.")
+        _release_read_transaction(db, enabled=release_transaction_before_render)
         return export_bilingual_xlsx_task_file(
             raw_bytes=raw_bytes,
             filename=export_filename,
@@ -544,6 +645,7 @@ def build_file_record_exported_file(
     if export_type == BILINGUAL_PPTX_EXPORT_TYPE:
         if get_task_file_extension(source_filename) != ".pptx":
             raise ValueError("Only PPTX source files support original-format bilingual PPTX export.")
+        _release_read_transaction(db, enabled=release_transaction_before_render)
         return _apply_style_settings_to_export(
             export_bilingual_pptx_task_file(
                 raw_bytes=raw_bytes,
@@ -577,6 +679,7 @@ def build_file_record_exported_file(
         export_kwargs["source_lang"] = source_language
         export_kwargs["target_lang"] = target_language
 
+    _release_read_transaction(db, enabled=release_transaction_before_render)
     exported_bytes, media_type, export_filename = export_file(**export_kwargs)
     return _apply_style_settings_to_export(
         _GenericExportedFile(
@@ -608,6 +711,42 @@ def _apply_style_settings_to_export(
     if lowered.endswith(".pptx"):
         return _apply_pptx_layout_settings(exported_file, style_settings, filename, report_context)
     return exported_file
+
+
+def _resolve_file_record_target_language(file_record: FileRecord) -> str | None:
+    target_language = getattr(file_record, "target_language", None)
+    collection = getattr(file_record, "collection", None)
+    if not target_language and collection is not None:
+        target_language = getattr(collection, "target_language", None)
+    return target_language
+
+
+def _apply_final_docx_rtl_direction(
+    exported_file,
+    *,
+    target_language: str | None,
+    document_parse_mode: str,
+    document_parse_options: dict[str, object],
+):
+    """样式调整可能覆盖段落属性，因此 RTL 必须作为 DOCX 导出的最后一步。"""
+    filename = getattr(exported_file, "filename", "") or ""
+    if not filename.lower().endswith(".docx"):
+        return exported_file
+
+    adjusted = apply_docx_rtl_direction(
+        exported_file.content,
+        target_language=target_language,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
+    if adjusted is exported_file.content or adjusted == exported_file.content:
+        return exported_file
+    return _GenericExportedFile(
+        content=adjusted,
+        media_type=getattr(exported_file, "media_type", None)
+        or "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=filename,
+    )
 
 
 def _apply_docx_style_settings(exported_file, style_settings: dict[str, Any], filename: str):
@@ -664,6 +803,15 @@ class _GenericExportedFile:
         self.filename = filename
 
 
+def _release_read_transaction(db: Session, *, enabled: bool) -> None:
+    """在纯 CPU/文件导出前释放数据库连接，避免形成 idle in transaction。"""
+    if not enabled:
+        return
+    # 查询结果的模型列已经载入；先分离对象，再结束只读事务，后续导出不占连接池。
+    db.expunge_all()
+    db.rollback()
+
+
 def _set_file_export_task_status(
     db: Session,
     task: FileExportTask,
@@ -677,7 +825,6 @@ def _set_file_export_task_status(
     task.message = message
     task.updated_at = local_now()
     db.commit()
-    db.refresh(task)
 
 
 def _ensure_export_dir() -> Path:

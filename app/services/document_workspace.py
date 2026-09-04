@@ -82,7 +82,7 @@ CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 PAGE_BREAK_SENTINEL = "\uE001"
 PAGE_BREAK_HTML = '<span class="doc-page-break" aria-hidden="true"></span>'
 DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
-DOCX_PARSE_CACHE_VERSION = "13"
+DOCX_PARSE_CACHE_VERSION = "14"
 DOCUMENT_PARSE_MODE_FULL = "full"
 DOCUMENT_PARSE_MODE_BODY_ONLY = "body_only"
 SUPPORTED_DOCUMENT_PARSE_MODES = {
@@ -98,6 +98,7 @@ DEFAULT_DOCUMENT_PARSE_OPTIONS = {
     "translate_code_blocks": True,
     "extract_links": False,
     "skip_non_translatable": True,
+    "enable_spatial_merge": False,
     "xml_inline_elements_no_split": True,
     "custom_parse_config": False,
     "translate_idml_comments": False,
@@ -1257,6 +1258,38 @@ def _iter_block_nodes(container: ET.Element):
                 yield from _iter_block_nodes(preferred_branch)
 
 
+def _iter_table_structural_children(container: ET.Element, child_name: str):
+    """按文档顺序遍历表格结构节点，并展开 Word 允许的包装节点。"""
+    for child in list(container):
+        current_name = _local_name(child.tag)
+        if current_name == child_name:
+            yield child
+            continue
+
+        if current_name == "sdt":
+            content = child.find("w:sdtContent", NS)
+            if content is not None:
+                yield from _iter_table_structural_children(content, child_name)
+            continue
+
+        if current_name in {"customXml", "ins", "moveFrom", "moveTo", "smartTag"}:
+            yield from _iter_table_structural_children(child, child_name)
+            continue
+
+        if current_name == "AlternateContent":
+            preferred_branch = _select_preferred_alternate_content_branch(child)
+            if preferred_branch is not None:
+                yield from _iter_table_structural_children(preferred_branch, child_name)
+
+
+def _iter_table_rows(table: ET.Element):
+    yield from _iter_table_structural_children(table, "tr")
+
+
+def _iter_table_cells(row: ET.Element):
+    yield from _iter_table_structural_children(row, "tc")
+
+
 def _select_preferred_alternate_content_branch(node: ET.Element) -> ET.Element | None:
     choice_branch: ET.Element | None = None
     fallback_branch: ET.Element | None = None
@@ -1623,10 +1656,10 @@ def _render_table(
     row_html_parts: list[str] = []
     table_segments: list[dict] = []
 
-    for row_index, row in enumerate(table.findall("./w:tr", NS)):
+    for row_index, row in enumerate(_iter_table_rows(table)):
         cell_html_parts: list[str] = []
 
-        for cell_index, cell in enumerate(row.findall("./w:tc", NS)):
+        for cell_index, cell in enumerate(_iter_table_cells(row)):
             cell_inner_html_parts, cell_segments = _render_table_cell(
                 cell=cell,
                 story=story,
@@ -2218,7 +2251,14 @@ def _collect_inline_content(
             )
 
     if node.tag == _qn("w", "fldChar"):
-        _update_field_state(node, story.kind, parse_state)
+        field_text = _update_field_state(node, story.kind, parse_state)
+        if field_text:
+            return [InlineFragment(
+                display_text=field_text,
+                source_text=field_text,
+                css=inherited_css,
+                href=hyperlink,
+            )], [], []
         return [], [], []
 
     if node.tag == _qn("w", "instrText"):
@@ -2714,14 +2754,14 @@ def _update_field_state(
     node: ET.Element,
     story_kind: str,
     parse_state: InlineParseState,
-) -> None:
+) -> str | None:
     field_type = node.get(_qn("w", "fldCharType"))
     if field_type == "begin":
         parse_state.field_stack.append(TrackedField())
-        return
+        return None
 
     if not parse_state.field_stack:
-        return
+        return None
 
     current_field = parse_state.field_stack[-1]
     if field_type == "separate":
@@ -2734,10 +2774,49 @@ def _update_field_state(
         current_field.href = _resolve_internal_reference_field_target(instruction)
         if current_field.suppress_result:
             parse_state.suppressed_page_number_field = True
-        return
+        return None
 
     if field_type == "end":
-        parse_state.field_stack.pop()
+        completed_field = parse_state.field_stack.pop()
+        # 某些上市公司报告用宏按钮字段模拟复选框，没有 w:t 字段结果；
+        # Word 能显示，但普通文本提取器只会看到 instrText。这里将其物化为
+        # 稳定的可对齐文本，同时不影响具有 separate/result 的普通字段。
+        if completed_field.collecting_instruction:
+            return _checkbox_macro_field_text("".join(completed_field.instruction_parts))
+    return None
+
+
+def _checkbox_macro_field_text(instruction: str) -> str | None:
+    parsed = _parse_checkbox_macro_field(instruction)
+    if parsed is None:
+        return None
+    marker, label = parsed
+    return f"{marker} {label} "
+
+
+def _parse_checkbox_macro_field(instruction: str) -> tuple[str, str] | None:
+    normalized = " ".join((instruction or "").split())
+    match = re.match(
+        r"^MACROBUTTON\s+SnrToggleCheckbox\s+(.+?)$",
+        normalized,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    field_text = match.group(1).strip()
+    marker_map = {
+        "ĄĖ": "√",
+        "Ąõ": "□",
+        "√": "√",
+        "□": "□",
+    }
+    for raw_marker in sorted(marker_map, key=len, reverse=True):
+        if not field_text.startswith(raw_marker):
+            continue
+        label = field_text[len(raw_marker):].strip()
+        if label:
+            return marker_map[raw_marker], label
+    return None
 
 
 def _should_suppress_page_number_field(instruction: str, story_kind: str) -> bool:

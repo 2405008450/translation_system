@@ -145,6 +145,10 @@ ALTER TABLE IF EXISTS memory_entries
     ADD COLUMN IF NOT EXISTS tmx_metadata JSONB;
 ALTER TABLE IF EXISTS memory_entries
     ADD COLUMN IF NOT EXISTS import_batch_id UUID REFERENCES resource_import_batches(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS memory_entries
+    ADD COLUMN IF NOT EXISTS source_embedding vector(128);
+ALTER TABLE IF EXISTS memory_entries
+    ADD COLUMN IF NOT EXISTS source_embedding_version INTEGER;
 
 CREATE INDEX IF NOT EXISTS ix_memory_entries_creator_id
     ON memory_entries (creator_id);
@@ -159,14 +163,15 @@ CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_id
     ON memory_entries (collection_id);
 CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_source_hash
     ON memory_entries (collection_id, source_hash);
-CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_source_normalized
-    ON memory_entries (collection_id, source_normalized);
 CREATE INDEX IF NOT EXISTS ix_memory_entries_source_hash
     ON memory_entries (source_hash);
-CREATE INDEX IF NOT EXISTS ix_memory_entries_source_text
-    ON memory_entries (source_text);
-CREATE INDEX IF NOT EXISTS ix_memory_entries_source_normalized
-    ON memory_entries (source_normalized);
+
+-- TEXT 全值不能安全地使用 B-tree：较长的 TM 句段会超过 PostgreSQL
+-- 单个索引项约 2704 字节的上限，进而导致导入事务失败。
+DROP INDEX IF EXISTS ix_memory_entries_collection_source_normalized;
+DROP INDEX IF EXISTS ix_memory_entries_source_text;
+DROP INDEX IF EXISTS ix_memory_entries_source_normalized;
+
 CREATE INDEX IF NOT EXISTS ix_memory_entries_language_pair
     ON memory_entries (source_language, target_language);
 CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_language_pair
@@ -610,6 +615,7 @@ CREATE TABLE IF NOT EXISTS projects (
     )::uuid,
     name VARCHAR(200) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'draft',
+    workflow_template_id VARCHAR(40) NOT NULL DEFAULT 'custom',
     document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full',
     source_language VARCHAR(20),
     target_language VARCHAR(20),
@@ -623,6 +629,8 @@ CREATE TABLE IF NOT EXISTS projects (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE IF EXISTS projects
+    ADD COLUMN IF NOT EXISTS workflow_template_id VARCHAR(40) NOT NULL DEFAULT 'custom';
 ALTER TABLE IF EXISTS projects
     ADD COLUMN IF NOT EXISTS document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full';
 ALTER TABLE IF EXISTS projects
@@ -1481,6 +1489,25 @@ CREATE INDEX IF NOT EXISTS ix_glossary_bases_project_id
     ON glossary_bases (project_id);
 CREATE INDEX IF NOT EXISTS ix_glossary_bases_origin
     ON glossary_bases (origin);
+
+ALTER TABLE IF EXISTS proofreading_batches
+    ADD COLUMN IF NOT EXISTS workflow_stage VARCHAR(20) NOT NULL DEFAULT 'not_applicable';
+
+DO $$
+BEGIN
+    IF to_regclass('public.proofreading_batches') IS NOT NULL THEN
+        UPDATE proofreading_batches
+        SET workflow_stage = CASE
+            WHEN batch_kind = 'xlsx_columns' THEN 'proofreading'
+            WHEN batch_kind = 'document_pair' AND alignment_status = 'confirmed'
+                AND status IN ('queued', 'running', 'canceling', 'completed', 'partial_failed') THEN 'proofreading'
+            WHEN batch_kind = 'document_pair' AND alignment_status = 'confirmed' THEN 'alignment'
+            WHEN batch_kind = 'document_pair' THEN 'import'
+            ELSE workflow_stage
+        END
+        WHERE workflow_stage = 'not_applicable';
+    END IF;
+END $$;
 
 -- =============================================================================
 -- 完成。首次运行后请通过前端 "/login" 页面使用首次初始化接口创建管理员账号：

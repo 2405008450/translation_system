@@ -174,6 +174,32 @@ export interface ProjectAssignmentFileRange {
   range_end: number | null
 }
 
+export interface AssignmentSplitPreviewRequest {
+  file_record_id: string
+  mode: 'by_part_count' | 'by_words_per_part'
+  part_count?: number
+  words_per_part?: number
+  range_start?: number
+  range_end?: number
+}
+
+export interface AssignmentSplitPart {
+  index: number
+  range_start: number
+  range_end: number
+  segment_count: number
+  word_count: number
+  word_percent: number
+}
+
+export interface AssignmentSplitPreviewResponse {
+  total_segments: number
+  segment_words: number
+  document_words: number | null
+  parts: AssignmentSplitPart[]
+  warnings: string[]
+}
+
 export interface ProjectAssignmentsResponse {
   project_id: string
   workflow_steps?: WorkflowStep[]
@@ -244,6 +270,7 @@ export interface DocumentParseOptions {
   translate_code_blocks: boolean
   extract_links: boolean
   skip_non_translatable: boolean
+  enable_spatial_merge: boolean
   xml_inline_elements_no_split: boolean
   custom_parse_config: boolean
   translate_idml_comments: boolean
@@ -409,6 +436,7 @@ export interface UploadCapability {
 
 export interface UploadBatchLimits {
   max_files_per_batch: number
+  max_files_per_selection: number
   max_total_size_mb: number
   max_expanded_files: number
 }
@@ -503,6 +531,13 @@ export interface Segment {
   row_index?: number | null
   cell_index?: number | null
   sequence_index?: number | null
+  /** 双文档校对底层配对信息，用于跨 block 的人工错位合并。 */
+  alignment_pair_id?: string | null
+  alignment_pair_order?: number | null
+  alignment_translation_only?: boolean
+  alignment_src_indices?: number[]
+  alignment_tgt_indices?: number[]
+  alignment_cross_cell?: boolean
   workflow_step_id?: string | null
   workflow_step_name?: string | null
   workflow_step_order?: number | null
@@ -512,6 +547,10 @@ export interface Segment {
   /** 合并视图聚合读取时附带：句段所属文件 id 与文件名 */
   file_record_id?: string
   filename?: string
+  /** DWG/DXF 空间合并信心分数 (0-1)。<0.7 通常需要人工复核。仅合并句段有此字段。 */
+  merge_confidence?: number | null
+  /** 该句段是否由 DWG/DXF 空间合并生成，携带多个原始实体 */
+  is_merged?: boolean | null
 }
 
 export type SegmentQAIssueSeverity = 'low' | 'medium' | 'high'
@@ -583,6 +622,24 @@ export type WorkbenchQAResultRuleKey =
   | 'repeated_punctuation'
   | 'extra_space_after_punctuation'
   | 'missing_space_after_punctuation'
+  | 'punctuation_leading_extra_space'
+  | 'punctuation_leading_missing_space'
+  | 'multiple_spaces'
+  | 'segment_trailing_extra_space'
+  | 'consecutive_duplicate_words'
+  | 'source_target_initial_case_mismatch'
+  | 'target_word_multiple_upper_initials'
+  | 'source_target_same_word_case_mismatch'
+  | 'source_target_identical'
+  | 'target_word_count_exceeds_source'
+  | 'target_word_count_below_source'
+  | 'source_target_word_count_gap_too_large'
+  | 'number_mismatch'
+  | 'parameter_mismatch'
+  | 'email_mismatch'
+  | 'link_mismatch'
+  | 'special_symbol_mismatch'
+  | 'context_translation_mismatch'
   | 'target_without_tag'
   | 'target_tag_missing'
   | 'unmatched_closing_tag'
@@ -766,6 +823,7 @@ export interface TranslationReviewReportItem {
   origin: 'program' | 'ai'
   source_text: string
   target_text: string
+  original_target_text?: string
   quote: string
   quote_start: number
   quote_end: number
@@ -828,6 +886,8 @@ export interface TranslationReviewProgress {
 
 export interface TranslationReviewReport {
   id: string
+  report_mode?: 'issue_check' | 'proofread_generate'
+  proofreading_batch_id?: string | null
   project_id: string | null
   file_record_id: string | null
   merge_view_id: string | null
@@ -864,6 +924,8 @@ export interface ProjectSegmentSyncSummary {
   filled_count: number
   updated_count: number
   conflict_count: number
+  protected_count?: number
+  stale_source_count?: number
   affected_file_count: number
 }
 
@@ -976,6 +1038,7 @@ export interface SegmentPositionResponse {
 export interface SegmentNextUnconfirmedPositionResponse {
   target: SegmentPositionResponse | null
   wrapped: boolean
+  matched_count?: number
 }
 
 /** 合并视图摘要（列表项） */
@@ -1208,6 +1271,7 @@ export interface QualityQASettingsResponse {
     rules: Record<string, {
       enabled: boolean
       case_sensitive?: boolean
+      threshold?: number
     }>
     spelling_grammar: {
       enabled: boolean

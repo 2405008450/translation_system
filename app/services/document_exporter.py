@@ -4,6 +4,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from hashlib import sha1
 from html import escape as escape_html
@@ -14,6 +15,7 @@ from pathlib import Path
 import logging
 import os
 import re
+import unicodedata
 from typing import Any
 from zipfile import ZipFile
 from xml.etree import ElementTree as ET
@@ -31,25 +33,29 @@ from app.services.document_workspace import (
     NumberingSchema,
     OMML_ATOMIC_TAGS,
     StoryPart,
-    get_cached_docx_workspace,
     _build_numbering_schema,
     _build_story_parts,
     _build_trimmed_span,
     _decode_symbol,
     _iter_chart_text_elements,
     _iter_block_nodes,
+    _iter_table_cells,
+    _iter_table_rows,
     _iter_related_chart_parts,
     _local_name,
     _normalize_segment_source_text,
+    _parse_checkbox_macro_field,
     _qn,
     _resolve_internal_reference_field_target,
     _resolve_paragraph_numbering_reference,
     _select_preferred_alternate_content_branch,
     normalize_document_parse_options,
     normalize_document_parse_mode,
+    parse_docx_workspace,
     should_merge_table_cell_paragraph_texts,
 )
 from app.services.normalizer import compact_match_core, normalize_text
+from app.services.language_pairs import is_right_to_left_language
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
 
 
@@ -156,11 +162,27 @@ ENGLISH_BOUNDARY_TRAILING_RE = re.compile(r"[,;:.!?][\"')\]\}]*$")
 ENGLISH_WORD_LEADING_RE = re.compile(r"^[\"'“‘(\[]*[A-Za-z0-9]")
 # 支持的格式标签
 FORMAT_TAG_RE = re.compile(r"<(/?)(b|strong|i|em|u|s|strike|del|sub|sup)>", re.IGNORECASE)
+_REVISION_DIFF_IDEOGRAPHIC = (
+    "\u3040-\u30ff"  # 日文假名
+    "\u3400-\u4dbf"  # CJK 扩展 A
+    "\u4e00-\u9fff"  # CJK 基本区
+    "\uf900-\ufaff"  # CJK 兼容区
+    "\uac00-\ud7af"  # 韩文音节
+)
 REVISION_DIFF_TOKEN_RE = re.compile(
-    r"[a-zA-Z0-9]+(?:[-'][a-zA-Z0-9]+)*|[\u4e00-\u9fff]|\s+|[^\s\w\u4e00-\u9fff]+"
+    rf"[^\W{_REVISION_DIFF_IDEOGRAPHIC}]+(?:[-'\u2019][^\W{_REVISION_DIFF_IDEOGRAPHIC}]+)*"
+    rf"|\s+"
+    rf"|.",
+    re.DOTALL,
 )
 REVISION_MARKER_PREFIX = "\ue000DOCX_REVISION_"
 REVISION_MARKER_SUFFIX = "\ue001"
+FORMAT_MARKER_PREFIX = "\ue002DOCX_FORMAT_"
+FORMAT_MARKER_SUFFIX = "\ue003"
+INTERNAL_EXPORT_MARKERS = (
+    (FORMAT_MARKER_PREFIX, "format"),
+    (REVISION_MARKER_PREFIX, "revision"),
+)
 EXPLICIT_FORMAT_RUN_PROPERTIES = {
     "b",
     "bCs",
@@ -179,6 +201,14 @@ EXPLICIT_FORMAT_RUN_PROPERTIES = {
     "smallCaps",
     "caps",
 }
+WORD_RUN_PROPERTY_ORDER = (
+    "rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps",
+    "strike", "dstrike", "outline", "shadow", "emboss", "imprint", "noProof",
+    "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern",
+    "position", "sz", "szCs", "highlight", "u", "effect", "bdr", "shd",
+    "fitText", "vertAlign", "rtl", "cs", "em", "lang", "eastAsianLayout",
+    "specVanish", "oMath", "rPrChange",
+)
 
 
 @dataclass(frozen=True)
@@ -594,6 +624,11 @@ class TextToken:
     is_math: bool = False
     is_hyperlink: bool = False
     hyperlink_element: object | None = None
+    field_instruction_prefix: str | None = None
+    field_instruction_suffix: str = ""
+    field_instruction_extra_elements: list[ET.Element] = field(default_factory=list)
+    checkbox_marker: str | None = None
+    preserved_word_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -606,6 +641,9 @@ class CellParagraphTokens:
 @dataclass
 class ExportTrackedField:
     instruction_parts: list[str] = field(default_factory=list)
+    instruction_elements: list[ET.Element] = field(default_factory=list)
+    instruction_runs: list[ET.Element | None] = field(default_factory=list)
+    instruction_containers: list[ET.Element | None] = field(default_factory=list)
     collecting_instruction: bool = True
     hyperlink_key: object | None = None
 
@@ -628,7 +666,9 @@ def export_bilingual_docx_with_layout(
         document_parse_options=document_parse_options,
     )
     numbering_schema = _build_numbering_schema(package)
-    source_workspace = get_cached_docx_workspace(
+    # 导出必须使用当前解析器重新读取源文件，避免旧版本预览缓存与本次
+    # 实际写入的 XML 断句结构不一致。
+    source_workspace = parse_docx_workspace(
         raw_bytes,
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
@@ -656,15 +696,13 @@ def export_bilingual_docx_with_layout(
             order=order,
         )
 
-    _localize_numbering_definitions(
-        package,
-        target_language=target_language,
-        strategy=document_parse_options.get("docx_numbering_localization"),
-    )
+    # 双语版必须保持源文编号定义不变；目标副本会移除 numPr，并直接使用句段中的目标编号文本。
     if document_parse_options.get("clean_format"):
         _clean_story_formatting(stories)
     if not document_parse_options.get("preserve_hyperlinks", True):
         _strip_story_hyperlinks(stories)
+
+    _assert_no_internal_export_markers(stories)
 
     return _build_modified_docx(
         raw_bytes=raw_bytes,
@@ -693,7 +731,8 @@ def export_translated_docx(
         document_parse_options=document_parse_options,
     )
     numbering_schema = _build_numbering_schema(package)
-    source_workspace = get_cached_docx_workspace(
+    # 不复用预览缓存，确保句段定位与本次实际遍历的 DOCX 结构一致。
+    source_workspace = parse_docx_workspace(
         raw_bytes,
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
@@ -737,6 +776,8 @@ def export_translated_docx(
     if not document_parse_options.get("preserve_hyperlinks", True):
         _strip_story_hyperlinks(stories)
 
+    _apply_rtl_document_direction(stories, target_language)
+
     modified_part_names = (
         {story.part_name for story in stories}
         | _collect_related_chart_part_names(stories)
@@ -744,6 +785,8 @@ def export_translated_docx(
     )
     if revisions_by_sentence_id and _enable_word_revision_tracking(package):
         modified_part_names.add("word/settings.xml")
+
+    _assert_no_internal_export_markers(stories)
 
     return _build_modified_docx(
         raw_bytes=raw_bytes,
@@ -755,6 +798,35 @@ def export_translated_docx(
 def build_translated_docx_filename(filename: str) -> str:
     source_path = Path(filename or "document.docx")
     return f"{source_path.stem}_translated.docx"
+
+
+def apply_docx_rtl_direction(
+    raw_bytes: bytes,
+    target_language: str | None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> bytes:
+    """在所有其它 DOCX 后处理完成后，最终校正 RTL 目标文档方向。"""
+    if not is_right_to_left_language(target_language):
+        return raw_bytes
+
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(
+        document_parse_options,
+        document_parse_mode,
+    )
+    package = DocxPackage(raw_bytes)
+    stories = _build_story_parts(
+        package,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
+    _apply_rtl_document_direction(stories, target_language)
+    return _build_modified_docx(
+        raw_bytes=raw_bytes,
+        package=package,
+        part_names={story.part_name for story in stories},
+    )
 
 
 def build_bilingual_docx_filename(filename: str, order: str = BILINGUAL_LAYOUT_SOURCE_FIRST) -> str:
@@ -787,11 +859,7 @@ def _build_export_revision_lookup(
             continue
 
         revision_key = str(_get_segment_value(revision, "id", sentence_id) or sentence_id)
-        created_at_value = _get_segment_value(revision, "created_at")
-        if hasattr(created_at_value, "isoformat"):
-            created_at = created_at_value.isoformat()
-        else:
-            created_at = str(created_at_value) if created_at_value else None
+        created_at = _normalize_word_revision_date(_get_segment_value(revision, "created_at"))
 
         lookup[sentence_id] = ExportRevisionInfo(
             revision_key=revision_key,
@@ -801,6 +869,28 @@ def _build_export_revision_lookup(
             created_at=created_at,
         )
     return lookup
+
+
+def _normalize_word_revision_date(value: Any) -> str | None:
+    if value is None:
+        return None
+    parsed: datetime
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw_value = str(value).strip()
+        if not raw_value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        except ValueError:
+            logger.warning("DOCX revision date is not ISO-8601 and was omitted: %r", raw_value)
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _resolve_revision_author_name(author: Any) -> str:
@@ -819,16 +909,36 @@ def _enable_word_revision_tracking(package: DocxPackage) -> bool:
     settings_root = package.read_xml("word/settings.xml")
     if settings_root is None:
         return False
-    revision_view = settings_root.find("./w:revisionView", NS)
-    if revision_view is None:
-        revision_view = ET.Element(_qn("w", "revisionView"))
-        settings_root.append(revision_view)
+    revision_view = _upsert_ordered_word_property(
+        settings_root,
+        "revisionView",
+        before=(
+            "trackRevisions",
+            "doNotTrackMoves",
+            "doNotTrackFormatting",
+            "documentProtection",
+            "autoFormatOverride",
+            "styleLockTheme",
+            "styleLockQFSet",
+            "defaultTabStop",
+        ),
+    )
     revision_view.set(_qn("w", "markup"), "1")
     revision_view.set(_qn("w", "insDel"), "1")
 
-    track_revisions = settings_root.find("./w:trackRevisions", NS)
-    if track_revisions is None:
-        settings_root.append(ET.Element(_qn("w", "trackRevisions")))
+    _upsert_ordered_word_property(
+        settings_root,
+        "trackRevisions",
+        before=(
+            "doNotTrackMoves",
+            "doNotTrackFormatting",
+            "documentProtection",
+            "autoFormatOverride",
+            "styleLockTheme",
+            "styleLockQFSet",
+            "defaultTabStop",
+        ),
+    )
     return True
 
 
@@ -841,11 +951,16 @@ def _group_segments_by_block(
     grouped: dict[BlockKey, list[ExportSegment]] = defaultdict(list)
     math_map = math_placeholders_by_sentence_id or {}
     source_segment_list = list(source_segments or [])
+    segment_list = list(segments)
     source_segment_by_sentence_id = _build_source_segment_lookup_by_sentence_id(source_segment_list)
     source_segment_by_text_key = _build_unique_source_segment_lookup_by_text(source_segment_list)
+    source_segment_by_sequence_index = _build_source_segment_lookup_by_sequence_index(
+        segment_list,
+        source_segment_list,
+    )
     revision_map = revisions_by_sentence_id or {}
 
-    for segment in segments:
+    for segment in segment_list:
         block_type = str(_get_segment_value(segment, "block_type", "paragraph") or "paragraph")
         block_index = int(_get_segment_value(segment, "block_index", 0) or 0)
         row_index = _to_optional_int(_get_segment_value(segment, "row_index"))
@@ -853,11 +968,14 @@ def _group_segments_by_block(
         sentence_id = str(_get_segment_value(segment, "sentence_id", "") or "")
         target_html = _get_segment_value(segment, "target_html")
         target_layout_text = str(_get_segment_value(segment, "target_layout_text", "") or "")
+        sequence_index = _get_export_sequence_index(segment)
+        fallback_block_key = (block_type, block_index, row_index, cell_index)
         block_key = _resolve_export_segment_block_key(
             segment=segment,
-            fallback=(block_type, block_index, row_index, cell_index),
+            fallback=fallback_block_key,
             source_segment_by_sentence_id=source_segment_by_sentence_id,
             source_segment_by_text_key=source_segment_by_text_key,
+            source_segment_by_sequence_index=source_segment_by_sequence_index,
         )
         source_segment_by_id = source_segment_by_sentence_id.get(sentence_id)
         source_segment_by_text = _find_source_segment_by_export_text(
@@ -893,9 +1011,18 @@ def _group_segments_by_block(
             if is_target_layout_valid(target_text, target_layout_text):
                 resolved_target_html = tagged_fragment_to_html(target_layout_text, source_format_map)
         revision = revision_map.get(sentence_id)
-        if revision is not None and revision.after_text != target_text:
+        if revision is not None and normalize_text(revision.after_text) != normalize_text(target_text):
             # 只导出仍对应当前译文的待审修订，避免把过期快照写入 Word。
+            logger.info(
+                "DOCX revision skipped because current target no longer matches: sentence_id=%s",
+                sentence_id,
+            )
             revision = None
+        if revision is not None:
+            # 真实 Word 修订需要由 w:ins / w:del 承载。若继续使用从 source_html
+            # 派生的富文本替换路径，该句会被直接改写为普通文字，拒绝全部修订时
+            # 就无法恢复原文。修订 run 会继承参考 run 的版式，因此这里关闭 HTML 路径。
+            resolved_target_html = None
 
         grouped[block_key].append(
             ExportSegment(
@@ -909,7 +1036,7 @@ def _group_segments_by_block(
                 source_html=str(source_html) if source_html else None,
                 target_layout_text=target_layout_text or None,
                 math_placeholders=dict(math_map.get(sentence_id) or {}),
-                sequence_index=_get_export_sequence_index(segment),
+                sequence_index=sequence_index,
                 source_structure_changed=bool(source_segment_list) and not has_original_source_match,
                 revision=revision,
             )
@@ -918,6 +1045,13 @@ def _group_segments_by_block(
     # 原格式译文和双语 Word 共用这一排序入口。即使源块元数据无法重新定位，
     # 仍应优先使用持久化的 sequence_index，不能保留调用方或哈希 ID 带来的乱序。
     return _order_segment_groups_by_source(grouped, source_segment_list)
+
+
+def _has_complete_persisted_sequence(segments: Iterable[Any]) -> bool:
+    sequence_indexes = [_get_export_sequence_index(segment) for segment in segments]
+    return bool(sequence_indexes) and all(
+        sequence_index is not None for sequence_index in sequence_indexes
+    ) and len(sequence_indexes) == len(set(sequence_indexes))
 
 
 def _build_source_segment_lookup_by_sentence_id(
@@ -953,13 +1087,41 @@ def _build_unique_source_segment_lookup_by_text(
     }
 
 
+def _build_source_segment_lookup_by_sequence_index(
+    segments: list[Any],
+    source_segments: list[Mapping[str, Any]],
+) -> dict[int, Mapping[str, Any]]:
+    """在完整的一一对应导出中，让工作台全局顺序成为 Word 定位的权威来源。"""
+    if len(segments) != len(source_segments) or not _has_complete_persisted_sequence(segments):
+        return {}
+
+    sequence_indexes = sorted(_get_export_sequence_index(segment) for segment in segments)
+    if sequence_indexes != list(range(len(source_segments))):
+        return {}
+
+    return {
+        sequence_index: source_segment
+        for sequence_index, source_segment in enumerate(source_segments)
+    }
+
+
 def _resolve_export_segment_block_key(
     *,
     segment: Any,
     fallback: BlockKey,
     source_segment_by_sentence_id: Mapping[str, Mapping[str, Any]],
     source_segment_by_text_key: Mapping[str, Mapping[str, Any]],
+    source_segment_by_sequence_index: Mapping[int, Mapping[str, Any]],
 ) -> BlockKey:
+    sequence_index = _get_export_sequence_index(segment)
+    source_segment_by_sequence = (
+        source_segment_by_sequence_index.get(sequence_index)
+        if sequence_index is not None
+        else None
+    )
+    if source_segment_by_sequence is not None:
+        return _source_segment_block_key(source_segment_by_sequence)
+
     sentence_id = str(_get_segment_value(segment, "sentence_id", "") or "")
     source_segment_by_id = source_segment_by_sentence_id.get(sentence_id)
     source_segment_by_text = _find_source_segment_by_export_text(
@@ -1372,8 +1534,8 @@ def _export_bilingual_table(
 ) -> None:
     block_index = next(block_counter)
 
-    for row_index, row in enumerate(table.findall("./w:tr", NS)):
-        for cell_index, cell in enumerate(row.findall("./w:tc", NS)):
+    for row_index, row in enumerate(_iter_table_rows(table)):
+        for cell_index, cell in enumerate(_iter_table_cells(row)):
             _export_bilingual_table_cell(
                 cell=cell,
                 story=story,
@@ -1387,6 +1549,35 @@ def _export_bilingual_table(
             )
 
 
+def _table_cell_has_only_numeric_or_math_content(segments: Iterable[ExportSegment]) -> bool:
+    """判断表格单元格是否只包含无需重复展示的数字、标点或数学内容。"""
+    segment_list = list(segments)
+    if not segment_list:
+        return False
+
+    combined_source = "\n".join(segment.source_text for segment in segment_list)
+    visible_source = MATH_PLACEHOLDER_RE.sub("", combined_source)
+    has_numeric_or_symbol_content = any(segment.math_placeholders for segment in segment_list)
+
+    for character in visible_source:
+        if character.isspace():
+            continue
+        category = unicodedata.category(character)
+        if category == "Cf":
+            # 忽略零宽字符、方向控制符等不可见格式字符。
+            continue
+        if category.startswith("N") or category.startswith("P"):
+            has_numeric_or_symbol_content = True
+            continue
+        if category in {"Sm", "Sc"} or character in {"°", "℃", "℉"}:
+            has_numeric_or_symbol_content = True
+            continue
+        # 任意语言文字、拉丁变量、单位、缩写或其他可见内容都必须保留对照译文。
+        return False
+
+    return has_numeric_or_symbol_content
+
+
 def _export_table(
     table: ET.Element,
     story: StoryPart,
@@ -1396,8 +1587,8 @@ def _export_table(
 ) -> None:
     block_index = next(block_counter)
 
-    for row_index, row in enumerate(table.findall("./w:tr", NS)):
-        for cell_index, cell in enumerate(row.findall("./w:tc", NS)):
+    for row_index, row in enumerate(_iter_table_rows(table)):
+        for cell_index, cell in enumerate(_iter_table_cells(row)):
             _export_table_cell(
                 cell=cell,
                 story=story,
@@ -1640,6 +1831,11 @@ def _export_bilingual_table_cell(
         (_resolve_segment_block_type(story.kind, "table_cell"), block_index, row_index, cell_index),
         [],
     )
+    exportable_cell_segments = (
+        []
+        if _table_cell_has_only_numeric_or_math_content(cell_segments)
+        else cell_segments
+    )
     segment_cursor = 0
     paragraph_buffer: list[CellParagraphTokens] = []
 
@@ -1652,7 +1848,7 @@ def _export_bilingual_table_cell(
         buffer_sentence_count = sum(sentence_count for _, sentence_count in paragraph_groups)
         buffer_tokens = _cell_paragraph_group_tokens(paragraph_buffer)
         buffer_segments, buffer_consumed_count = _take_segments_matching_token_source(
-            cell_segments,
+            exportable_cell_segments,
             segment_cursor,
             buffer_tokens,
             buffer_sentence_count,
@@ -1681,13 +1877,14 @@ def _export_bilingual_table_cell(
             paragraph_buffer = []
             return
 
+        pending_target_groups: list[tuple[list[CellParagraphTokens], list[ET.Element]]] = []
         for paragraph_group, sentence_count in paragraph_groups:
             if sentence_count == 0:
                 continue
 
             target_tokens = _cell_paragraph_group_tokens(paragraph_group)
             group_segments, consumed_count = _take_segments_matching_token_source(
-                cell_segments,
+                exportable_cell_segments,
                 segment_cursor,
                 target_tokens,
                 sentence_count,
@@ -1709,12 +1906,36 @@ def _export_bilingual_table_cell(
                 segments=group_segments,
                 keep_source_when_empty=False,
             )
-            _insert_cloned_table_cell_paragraphs(
-                cell=cell,
-                paragraph_group=paragraph_group,
-                target_paragraphs=target_paragraphs,
-                order=order,
-            )
+            pending_target_groups.append((paragraph_group, target_paragraphs))
+
+        if pending_target_groups:
+            buffer_parents = [
+                item.parent if item.parent is not None else cell
+                for item in paragraph_buffer
+            ]
+            first_parent = buffer_parents[0]
+            if all(parent is first_parent for parent in buffer_parents):
+                # 同一表格单元格里的双语内容应按完整语言块排列：
+                # 先保留全部原文段落，再统一追加全部译文段落，避免译文穿插到原文中间。
+                _insert_cloned_blocks(
+                    parent=first_parent,
+                    anchors=[item.paragraph for item in paragraph_buffer],
+                    clones=[
+                        clone
+                        for _, target_paragraphs in pending_target_groups
+                        for clone in target_paragraphs
+                    ],
+                    order=order,
+                )
+            else:
+                # SDT / customXml 等跨父节点结构无法安全整块移动，继续按各自父节点就地插入。
+                for paragraph_group, target_paragraphs in pending_target_groups:
+                    _insert_cloned_table_cell_paragraphs(
+                        cell=cell,
+                        paragraph_group=paragraph_group,
+                        target_paragraphs=target_paragraphs,
+                        order=order,
+                    )
 
         paragraph_buffer = []
 
@@ -2092,12 +2313,40 @@ def _collect_inline_tokens(
         current_run_container = parent_element
 
     if node.tag == _qn("w", "fldChar"):
-        _update_export_field_state(node, active_field_stack)
-        return []
+        completed_field = _update_export_field_state(node, active_field_stack)
+        if completed_field is None:
+            return []
+        instruction = "".join(completed_field.instruction_parts)
+        checkbox = _parse_checkbox_macro_field(instruction)
+        if checkbox is None or not completed_field.instruction_elements:
+            return []
+        marker, label = checkbox
+        affixes = _split_checkbox_macro_instruction_affixes(instruction)
+        if affixes is None:
+            return []
+        prefix, suffix = affixes
+        return [
+            TextToken(
+                display_text=f"{marker} {label} ",
+                source_text=f"{marker} {label} ",
+                element=completed_field.instruction_elements[0],
+                run_element=completed_field.instruction_runs[0],
+                anchor_element=completed_field.instruction_runs[0],
+                container_element=completed_field.instruction_containers[0],
+                original_text=f"{marker} {label} ",
+                field_instruction_prefix=prefix,
+                field_instruction_suffix=suffix,
+                field_instruction_extra_elements=completed_field.instruction_elements[1:],
+                checkbox_marker=marker,
+            )
+        ]
 
     if node_name == "instrText":
         if active_field_stack and active_field_stack[-1].collecting_instruction:
             active_field_stack[-1].instruction_parts.append(node.text or "")
+            active_field_stack[-1].instruction_elements.append(node)
+            active_field_stack[-1].instruction_runs.append(current_run)
+            active_field_stack[-1].instruction_containers.append(current_run_container)
         return []
 
     field_hyperlink = _current_export_field_hyperlink(active_field_stack)
@@ -2144,7 +2393,20 @@ def _collect_inline_tokens(
         symbol_text = _decode_symbol(node)
         if not symbol_text:
             return []
-        return [TextToken(display_text=symbol_text, source_text=symbol_text)]
+        return [
+            TextToken(
+                display_text=symbol_text,
+                source_text=symbol_text,
+                run_element=current_run,
+                anchor_element=current_run if current_run is not None else node,
+                container_element=(
+                    current_run_container
+                    if current_run_container is not None
+                    else parent_element
+                ),
+                preserved_word_symbol=symbol_text,
+            )
+        ]
 
     if node.tag in {_qn("w", "footnoteReference"), _qn("w", "endnoteReference")}:
         note_id = node.get(_qn("w", "id"), "")
@@ -2195,24 +2457,36 @@ def _collect_inline_tokens(
 def _update_export_field_state(
     node: ET.Element,
     field_stack: list[ExportTrackedField],
-) -> None:
+) -> ExportTrackedField | None:
     field_type = node.get(_qn("w", "fldCharType"))
     if field_type == "begin":
         field_stack.append(ExportTrackedField())
-        return
+        return None
 
     if not field_stack:
-        return
+        return None
 
     current_field = field_stack[-1]
     if field_type == "separate":
         current_field.collecting_instruction = False
         if _resolve_internal_reference_field_target("".join(current_field.instruction_parts)):
             current_field.hyperlink_key = current_field
-        return
+        return None
 
     if field_type == "end":
-        field_stack.pop()
+        return field_stack.pop()
+    return None
+
+
+def _split_checkbox_macro_instruction_affixes(instruction: str) -> tuple[str, str] | None:
+    match = re.match(
+        r"^(\s*MACROBUTTON\s+SnrToggleCheckbox\s+)(.*?)(\s*)$",
+        instruction or "",
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    return match.group(1), match.group(3)
 
 
 def _current_export_field_hyperlink(field_stack: list[ExportTrackedField]) -> object | None:
@@ -2482,6 +2756,8 @@ def _replace_block_tokens(
     ]
     source_spans = [(span, source_text) for span, source_text in source_spans if source_text]
     if _should_replace_structurally_modified_block(source_spans, segments):
+        if any(segment.revision is not None for segment in segments):
+            logger.info("DOCX revision marks skipped for a structurally modified block")
         _replace_structurally_modified_block(
             tokens=tokens,
             source_spans=source_spans,
@@ -2495,7 +2771,8 @@ def _replace_block_tokens(
     use_explicit_sequence = _has_complete_explicit_sequence(segments)
     previous_replacement = ""
     previous_span: SentenceSpan | None = None
-    pending_revision_markers: list[tuple[str, ExportSegment, str]] = []
+    pending_revision_markers: list[tuple[str, ExportSegment, str, str]] = []
+    pending_format_markers: list[tuple[str, str]] = []
     for span in spans:
         sentence_source = _normalize_segment_source_text(_collect_span_text(tokens, span, use_source=True))
         if not sentence_source:
@@ -2522,6 +2799,15 @@ def _replace_block_tokens(
         ) or len(segments)
         segment = segments[match_index]
         replacement = _resolve_segment_replacement_text(segment)
+        if (
+            segment.revision is None
+            and normalize_text(segment.source_text) == normalize_text(replacement)
+        ):
+            # 保留未修改句段的原始 Word runs。即使文字归一化后相同，重新写回解析后的
+            # display_text 仍可能吞掉软换行、跨 run 字符，或把自动项目符号写成普通文本。
+            previous_replacement = sentence_source
+            previous_span = span
+            continue
         if previous_span is not None:
             boundary_text = display_text[previous_span.end:span.start]
             replacement = _normalize_adjacent_english_target_boundary(
@@ -2534,8 +2820,11 @@ def _replace_block_tokens(
                 segment.revision.revision_key,
                 len(pending_revision_markers),
             )
+            # 同时保留 DOCX 当前 span，展开标记时再判断母版究竟是目标译文原件
+            # 还是源语言原件：前者优先保留精确 run 文字，后者必须使用修订前译文。
+            original_span_text = display_text[span.start:span.end]
             _queue_sentence_replacement(tokens, span, marker)
-            pending_revision_markers.append((marker, segment, replacement))
+            pending_revision_markers.append((marker, segment, replacement, original_span_text))
             previous_replacement = replacement
             previous_span = span
             continue
@@ -2552,7 +2841,12 @@ def _replace_block_tokens(
 
         expected_math_placeholders = _extract_math_placeholders_from_tokens(tokens, span)
 
-        has_custom_target_html = segment.target_html is not None
+        # w:sym 是独立的 Word 结构，不能把同一个私用区字符再次写入 w:t。
+        # 这类句段优先走保留符号的纯文本路径；否则格式标记展开后会重复复选框。
+        has_custom_target_html = (
+            segment.target_html is not None
+            and not _span_contains_preserved_word_symbols(tokens, span)
+        )
 
         if expected_math_placeholders:
             _queue_math_sentence_replacement(
@@ -2562,7 +2856,16 @@ def _replace_block_tokens(
                 expected_math_placeholders=expected_math_placeholders,
             )
         elif has_custom_target_html:
-            _queue_formatted_sentence_replacement(tokens, span, segment.target_html)
+            format_marker = (
+                f"{FORMAT_MARKER_PREFIX}{len(pending_format_markers)}{FORMAT_MARKER_SUFFIX}"
+            )
+            if _queue_formatted_sentence_replacement(
+                tokens,
+                span,
+                segment.target_html,
+                inline_marker=format_marker,
+            ):
+                pending_format_markers.append((format_marker, segment.target_html))
         else:
             _queue_sentence_replacement(tokens, span, replacement)
 
@@ -2570,6 +2873,7 @@ def _replace_block_tokens(
         previous_span = span
 
     _apply_token_edits(tokens)
+    _expand_formatted_markers(tokens, pending_format_markers)
     _expand_word_revision_markers(tokens, pending_revision_markers)
 
 
@@ -2582,7 +2886,20 @@ def _can_queue_word_revision_marker(
         segment.revision is None
         or segment.source_structure_changed
         or segment.math_placeholders
+        or segment.target_html is not None
     ):
+        if segment.revision is not None:
+            logger.info(
+                "DOCX revision marks skipped for unsupported segment structure: sentence_id=%s",
+                segment.sentence_id,
+            )
+        return False
+
+    if _span_contains_preserved_word_symbols(tokens, span):
+        logger.info(
+            "DOCX revision marks skipped for preserved Word symbol: sentence_id=%s",
+            segment.sentence_id,
+        )
         return False
 
     writable_tokens = [
@@ -2592,7 +2909,16 @@ def _can_queue_word_revision_marker(
         and token.start < span.end
         and token.end > span.start
     ]
-    if not writable_tokens or any(token.is_math or token.is_hyperlink for token in writable_tokens):
+    if not writable_tokens or any(
+        token.is_math
+        or token.is_hyperlink
+        or token.field_instruction_prefix is not None
+        for token in writable_tokens
+    ):
+        logger.info(
+            "DOCX revision marks skipped for formula, hyperlink, or field code: sentence_id=%s",
+            segment.sentence_id,
+        )
         return False
 
     anchor = writable_tokens[0]
@@ -2607,6 +2933,18 @@ def _can_queue_word_revision_marker(
     )
 
 
+def _span_contains_preserved_word_symbols(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+) -> bool:
+    return any(
+        token.preserved_word_symbol is not None
+        and token.start < span.end
+        and token.end > span.start
+        for token in tokens
+    )
+
+
 def _build_revision_marker(revision_key: str, marker_index: int) -> str:
     digest = sha1(f"{revision_key}:{marker_index}".encode("utf-8")).hexdigest()[:16]
     return f"{REVISION_MARKER_PREFIX}{digest}{REVISION_MARKER_SUFFIX}"
@@ -2614,7 +2952,7 @@ def _build_revision_marker(revision_key: str, marker_index: int) -> str:
 
 def _expand_word_revision_markers(
     tokens: list[TextToken],
-    pending_markers: list[tuple[str, ExportSegment, str]],
+    pending_markers: list[tuple[str, ExportSegment, str, str]],
 ) -> None:
     paragraphs: list[ET.Element] = []
     seen_paragraph_ids: set[int] = set()
@@ -2629,9 +2967,25 @@ def _expand_word_revision_markers(
         seen_paragraph_ids.add(id(paragraph))
         paragraphs.append(paragraph)
 
-    for marker, segment, replacement in pending_markers:
+    for marker, segment, replacement, original_span_text in pending_markers:
         marker_context = _find_word_revision_marker_context(paragraphs, marker)
         if marker_context is None or segment.revision is None:
+            expanded_as_plain_text = False
+            for token in tokens:
+                text_element = token.element
+                current_text = text_element.text if text_element is not None else None
+                if not current_text or marker not in current_text:
+                    continue
+                text_element.text = current_text.replace(marker, replacement, 1)
+                if text_element.tag == _qn("w", "t"):
+                    _sync_word_text_space_attribute(text_element)
+                expanded_as_plain_text = True
+                break
+            logger.warning(
+                "DOCX revision marker could not be expanded and %s plain text: %s",
+                "fell back to" if expanded_as_plain_text else "was not found for",
+                marker,
+            )
             continue
 
         parent, run_element, text_element = marker_context
@@ -2650,6 +3004,10 @@ def _expand_word_revision_markers(
             segment,
             run_element,
             effective_after_text=replacement,
+            effective_before_text=_resolve_word_revision_baseline(
+                segment,
+                original_span_text,
+            ),
         )
         for node in revision_nodes:
             parent.insert(insert_index, node)
@@ -2659,6 +3017,31 @@ def _expand_word_revision_markers(
             for suffix_run in _build_inserted_word_runs(suffix, run_element):
                 parent.insert(insert_index, suffix_run)
                 insert_index += 1
+
+
+def _resolve_word_revision_baseline(
+    segment: ExportSegment,
+    original_span_text: str,
+) -> str:
+    """在目标母版原文与工作区译文基线之间选择正确的删除侧文字。"""
+
+    revision = segment.revision
+    if revision is None:
+        return original_span_text
+
+    revision_before_text = _resolve_revision_replacement_text(
+        segment,
+        revision.before_text,
+    )
+    if normalize_text(original_span_text) == normalize_text(revision_before_text):
+        # 双文档校对以目标 DOCX 为母版。二者内容一致时保留母版中的精确空格、
+        # 换行与跨 run 字符，使“拒绝全部修订”可以无损恢复目标原件。
+        return original_span_text
+
+    # 普通翻译导出的母版是源语言 DOCX，不能把源文当作译文修订基线。
+    # 此时删除侧必须来自人工修改前的译文，接受/拒绝修订才分别得到
+    # after_text / before_text，而不是“目标译文 / 源文”。
+    return revision_before_text
 
 
 def _find_word_revision_marker_context(
@@ -2697,12 +3080,16 @@ def _build_word_revision_nodes(
     segment: ExportSegment,
     reference_run: ET.Element | None,
     effective_after_text: str | None = None,
+    effective_before_text: str | None = None,
 ) -> list[ET.Element]:
     revision = segment.revision
     if revision is None:
         return _build_inserted_word_runs(_resolve_segment_replacement_text(segment), reference_run)
 
-    before_text = _resolve_revision_replacement_text(segment, revision.before_text)
+    before_text = _resolve_revision_replacement_text(
+        segment,
+        effective_before_text if effective_before_text is not None else revision.before_text,
+    )
     resolved_after_text = _resolve_revision_replacement_text(segment, revision.after_text)
     after_text = effective_after_text if effective_after_text is not None else resolved_after_text
     if (
@@ -2996,7 +3383,40 @@ def _collect_cell_group_tokens(
 def _clone_bilingual_paragraph(paragraph: ET.Element) -> ET.Element:
     clone = deepcopy(paragraph)
     _remove_paragraph_section_properties(clone)
+    _remove_paragraph_numbering_properties(clone)
+    _sanitize_bilingual_clone(clone)
     return clone
+
+
+def _sanitize_bilingual_clone(paragraph: ET.Element) -> None:
+    """移除复制后会造成 OOXML 标识冲突或重复对象的节点。"""
+    removable_names = {
+        "bookmarkStart", "bookmarkEnd",
+        "commentRangeStart", "commentRangeEnd", "commentReference",
+        "moveFromRangeStart", "moveFromRangeEnd", "moveToRangeStart", "moveToRangeEnd",
+        "customXmlInsRangeStart", "customXmlInsRangeEnd",
+        "customXmlDelRangeStart", "customXmlDelRangeEnd",
+        "customXmlMoveFromRangeStart", "customXmlMoveFromRangeEnd",
+        "customXmlMoveToRangeStart", "customXmlMoveToRangeEnd",
+        "permStart", "permEnd", "proofErr",
+        "footnoteReference", "endnoteReference",
+        "drawing", "pict", "object",
+    }
+
+    def clean(parent: ET.Element) -> None:
+        for attribute_name in list(parent.attrib):
+            if _local_name(attribute_name) in {"paraId", "textId"}:
+                parent.attrib.pop(attribute_name, None)
+        for child in list(parent):
+            if _local_name(child.tag) in removable_names:
+                parent.remove(child)
+                continue
+            clean(child)
+
+    clean(paragraph)
+    for sdt_properties in paragraph.iter(_qn("w", "sdtPr")):
+        for identifier in list(sdt_properties.findall("w:id", NS)):
+            sdt_properties.remove(identifier)
 
 
 def _remove_paragraph_section_properties(paragraph: ET.Element) -> None:
@@ -3005,6 +3425,14 @@ def _remove_paragraph_section_properties(paragraph: ET.Element) -> None:
         return
     for section_properties in list(paragraph_properties.findall("w:sectPr", NS)):
         paragraph_properties.remove(section_properties)
+
+
+def _remove_paragraph_numbering_properties(paragraph: ET.Element) -> None:
+    paragraph_properties = paragraph.find("w:pPr", NS)
+    if paragraph_properties is None:
+        return
+    for numbering_properties in list(paragraph_properties.findall("w:numPr", NS)):
+        paragraph_properties.remove(numbering_properties)
 
 
 def _insert_cloned_blocks(
@@ -3351,15 +3779,30 @@ def _queue_structural_word_text_range_edit(
 def _remove_structural_line_break_tokens(tokens: list[TextToken]) -> None:
     removed: set[tuple[int, int]] = set()
     for token in tokens:
-        parent = token.container_element
-        anchor = token.anchor_element
-        if parent is None or anchor is None:
+        run = token.run_element
+        line_break = token.element
+        if run is None or line_break is None:
             continue
-        key = (id(parent), id(anchor))
+
+        # 换行符可能和后续文本共用同一个 w:r。这里只能删除 w:br/w:cr
+        # 本身；如果删除作为锚点的整个 w:r，后续句段仍引用该 run 时会在
+        # 格式化译文插入阶段触发 “Element ... is not in list”。
+        line_break_parent = next(
+            (
+                candidate
+                for candidate in run.iter()
+                if any(child is line_break for child in list(candidate))
+            ),
+            None,
+        )
+        if line_break_parent is None:
+            continue
+
+        key = (id(line_break_parent), id(line_break))
         if key in removed:
             continue
         try:
-            parent.remove(anchor)
+            line_break_parent.remove(line_break)
         except ValueError:
             continue
         removed.add(key)
@@ -3486,12 +3929,13 @@ def _queue_formatted_sentence_replacement(
     tokens: list[TextToken],
     span: SentenceSpan,
     target_html: str,
-) -> None:
+    inline_marker: str | None = None,
+) -> bool:
     """使用带格式的 HTML 替换句子"""
     # 解析 HTML 获取格式化片段
     fragments = _parse_formatted_html(target_html)
     if not fragments:
-        return
+        return False
 
     # 找到可写入的 token
     writable_overlaps: list[tuple[TextToken, int, int]] = []
@@ -3507,10 +3951,22 @@ def _queue_formatted_sentence_replacement(
         )
 
     if not writable_overlaps:
-        return
+        return False
 
     # 清空所有重叠 token 的文本
     first_token, first_start, first_end = writable_overlaps[0]
+
+    # 多个句段可能共享同一个 w:t。若当前句段从 token 中间开始，直接把
+    # 格式化 run 插到原 run 前会把后面的译文移动到整段最前面。此时改用
+    # 字符偏移替换；超链接范围仍由普通替换逻辑保留，顺序和内容优先。
+    if first_start > 0 and inline_marker:
+        _queue_sentence_replacement(
+            tokens,
+            span,
+            inline_marker,
+        )
+        return True
+
     for token, local_start, local_end in writable_overlaps:
         token.edits.append((local_start, local_end, ""))
 
@@ -3526,6 +3982,130 @@ def _queue_formatted_sentence_replacement(
                 continue
             run = _build_formatted_word_run(fragment, first_token.run_element)
             parent.insert(insert_index + i, run)
+
+    return False
+
+
+def _expand_formatted_markers(
+    tokens: list[TextToken],
+    pending_markers: list[tuple[str, str]],
+) -> None:
+    if not pending_markers:
+        return
+
+    # token 记录的是替换前的 XML 节点。展开前一个标记时会创建新的 run，后续标记
+    # 可能随 after_text 移入新 run，因此每次都必须从当前 XML 子树重新定位。
+    marker_roots = _collect_live_marker_roots(tokens)
+
+    for marker_index, (marker, target_html) in enumerate(pending_markers):
+        fragments = _parse_formatted_html(target_html)
+        plain_text = "".join(fragment.text for fragment in fragments)
+        context = _find_live_marker_context(marker_roots, marker)
+        if context is None:
+            raise ValueError(
+                "DOCX 导出失败：富文本格式占位符无法定位，"
+                f"marker_index={marker_index}"
+            )
+
+        parent, run, element = context
+        text_value = element.text or ""
+        before_text, after_text = text_value.split(marker, 1)
+
+        if (
+            run is None
+            or parent is None
+            or _namespace_uri(run.tag) != NS["w"]
+            or run not in list(parent)
+        ):
+            element.text = text_value.replace(
+                marker,
+                _sanitize_xml_text(plain_text),
+                1,
+            )
+            if element.tag == _qn("w", "t"):
+                _sync_word_text_space_attribute(element)
+            logger.warning(
+                "DOCX formatted replacement fell back to plain text: marker_index=%d",
+                marker_index,
+            )
+            continue
+
+        element.text = before_text
+        _sync_word_text_space_attribute(element)
+        insert_index = list(parent).index(run) + 1
+        inserted_count = 0
+        for fragment in fragments:
+            if not fragment.text:
+                continue
+            parent.insert(
+                insert_index + inserted_count,
+                _build_formatted_word_run(fragment, run),
+            )
+            inserted_count += 1
+
+        if after_text:
+            parent.insert(
+                insert_index + inserted_count,
+                _build_inserted_word_run(after_text, run),
+            )
+
+
+def _collect_live_marker_roots(tokens: list[TextToken]) -> list[ET.Element]:
+    roots: list[ET.Element] = []
+    seen_root_ids: set[int] = set()
+    for token in tokens:
+        root = (
+            token.container_element
+            if token.container_element is not None
+            else token.element
+        )
+        if root is None or id(root) in seen_root_ids:
+            continue
+        seen_root_ids.add(id(root))
+        roots.append(root)
+    return roots
+
+
+def _find_live_marker_context(
+    roots: list[ET.Element],
+    marker: str,
+) -> tuple[ET.Element | None, ET.Element | None, ET.Element] | None:
+    for root in roots:
+        for parent in root.iter():
+            for run in list(parent):
+                if _local_name(run.tag) != "r":
+                    continue
+                for element in run.iter():
+                    if marker in (element.text or ""):
+                        return parent, run, element
+
+        # 极少数 OOXML 文本节点不位于 run 下，仍应保住正文并降级为纯文本。
+        for element in root.iter():
+            if marker in (element.text or ""):
+                return None, None, element
+    return None
+
+
+def _assert_no_internal_export_markers(stories: Iterable[StoryPart]) -> None:
+    checked_roots: set[tuple[str, int]] = set()
+    for story in stories:
+        roots = [(story.part_name, story.root)]
+        roots.extend(_iter_related_chart_parts(story.root, story))
+        for part_name, root in roots:
+            root_key = (part_name, id(root))
+            if root_key in checked_roots:
+                continue
+            checked_roots.add(root_key)
+            for element in root.iter():
+                for value in (element.text, element.tail):
+                    if not value:
+                        continue
+                    for marker_prefix, marker_kind in INTERNAL_EXPORT_MARKERS:
+                        if marker_prefix in value:
+                            raise ValueError(
+                                "DOCX 导出失败：检测到未清理的内部占位符，"
+                                f"part={part_name}, marker_kind={marker_kind}"
+                            )
 
 
 def _build_formatted_word_run(
@@ -3601,29 +4181,20 @@ def _clear_explicit_format_run_properties(run_properties: ET.Element) -> None:
 
 def _set_run_property(run_properties: ET.Element, prop_name: str) -> None:
     """设置 run 属性（如 bold, italic, strike）"""
-    prop = run_properties.find(f"w:{prop_name}", NS)
-    if prop is None:
-        prop = ET.Element(_qn("w", prop_name))
-        run_properties.append(prop)
+    prop = _upsert_ordered_run_property(run_properties, prop_name)
     # 确保属性启用（移除 val="false" 如果存在）
     prop.attrib.pop(_qn("w", "val"), None)
 
 
 def _set_run_underline(run_properties: ET.Element) -> None:
     """设置下划线"""
-    underline = run_properties.find("w:u", NS)
-    if underline is None:
-        underline = ET.Element(_qn("w", "u"))
-        run_properties.append(underline)
+    underline = _upsert_ordered_run_property(run_properties, "u")
     underline.set(_qn("w", "val"), "single")
 
 
 def _set_run_vertical_align(run_properties: ET.Element, align_type: str) -> None:
     """设置垂直对齐（上标/下标）"""
-    vert_align = run_properties.find("w:vertAlign", NS)
-    if vert_align is None:
-        vert_align = ET.Element(_qn("w", "vertAlign"))
-        run_properties.append(vert_align)
+    vert_align = _upsert_ordered_run_property(run_properties, "vertAlign")
     vert_align.set(_qn("w", "val"), align_type)
 
 
@@ -3673,6 +4244,10 @@ def _queue_sentence_replacement(
     span: SentenceSpan,
     replacement: str,
 ) -> None:
+    if _queue_checkbox_macro_replacement(tokens, span, replacement):
+        return
+    if _queue_sentence_replacement_preserving_word_symbols(tokens, span, replacement):
+        return
     if _queue_sentence_replacement_preserving_hyperlink_scope(tokens, span, replacement):
         return
 
@@ -3699,6 +4274,105 @@ def _queue_sentence_replacement(
         replacement,
         structural_line_break_tokens=structural_line_break_tokens,
     )
+
+
+def _queue_sentence_replacement_preserving_word_symbols(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    replacement: str,
+) -> bool:
+    overlapping_tokens = [
+        token
+        for token in tokens
+        if token.start < span.end and token.end > span.start
+    ]
+    symbol_tokens = [
+        token
+        for token in overlapping_tokens
+        if token.preserved_word_symbol is not None
+    ]
+    if not symbol_tokens:
+        return False
+
+    # 超链接有独立的作用域保持逻辑。若同一句同时包含超链接和 w:sym，
+    # 交给通用路径处理，避免为了复用符号而改变链接覆盖范围。
+    if any(token.is_hyperlink for token in overlapping_tokens):
+        return False
+
+    symbol_matches: list[tuple[int, int]] = []
+    replacement_cursor = 0
+    for token in symbol_tokens:
+        symbol_text = token.preserved_word_symbol or ""
+        match_start = replacement.find(symbol_text, replacement_cursor)
+        if match_start < 0:
+            return False
+        match_end = match_start + len(symbol_text)
+        symbol_matches.append((match_start, match_end))
+        replacement_cursor = match_end
+
+    source_cursor = span.start
+    replacement_cursor = 0
+    previous_symbol: TextToken | None = None
+    for token, (match_start, match_end) in zip(symbol_tokens, symbol_matches, strict=True):
+        _queue_text_region_replacement(
+            tokens=tokens,
+            region_start=source_cursor,
+            region_end=token.start,
+            replacement_text=replacement[replacement_cursor:match_start],
+            before_token=previous_symbol,
+            after_token=token,
+        )
+        source_cursor = token.end
+        replacement_cursor = match_end
+        previous_symbol = token
+
+    _queue_text_region_replacement(
+        tokens=tokens,
+        region_start=source_cursor,
+        region_end=span.end,
+        replacement_text=replacement[replacement_cursor:],
+        before_token=previous_symbol,
+        after_token=_find_first_token_starting_at_or_after(tokens, span.end),
+    )
+    return True
+
+
+def _queue_checkbox_macro_replacement(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    replacement: str,
+) -> bool:
+    overlapping_tokens = [
+        token
+        for token in tokens
+        if token.start < span.end
+        and token.end > span.start
+        and normalize_text(
+            token.display_text[
+                max(span.start, token.start) - token.start:
+                min(span.end, token.end) - token.start
+            ]
+        )
+    ]
+    if not overlapping_tokens or any(token.checkbox_marker is None for token in overlapping_tokens):
+        return False
+
+    checkbox_matches = list(re.finditer(r"[√□]", replacement))
+    if len(checkbox_matches) != len(overlapping_tokens):
+        return False
+
+    replacement_parts: list[str] = []
+    for index, match in enumerate(checkbox_matches):
+        end = checkbox_matches[index + 1].start() if index + 1 < len(checkbox_matches) else len(replacement)
+        part = replacement[match.start():end].strip()
+        if not part:
+            return False
+        replacement_parts.append(f"{part} ")
+
+    for token, replacement_part in zip(overlapping_tokens, replacement_parts, strict=True):
+        token.edits.append((0, len(token.display_text), replacement_part))
+        token.apply_export_font = False
+    return True
 
 
 @dataclass(frozen=True)
@@ -3846,12 +4520,28 @@ def _apply_token_edits(tokens: list[TextToken]) -> None:
             text_value = f"{text_value[:start]}{replacement}{text_value[end:]}"
 
         text_value = _sanitize_xml_text(text_value)
-        token.element.text = text_value
-        if _needs_space_preserve(text_value):
+        if token.field_instruction_prefix is not None:
+            serialized_text = (
+                f"{token.field_instruction_prefix}"
+                f"{text_value.strip()}"
+                f"{token.field_instruction_suffix}"
+            )
+            for extra_element in token.field_instruction_extra_elements:
+                extra_element.text = ""
+                extra_element.attrib.pop(XML_SPACE_ATTR, None)
+        else:
+            serialized_text = text_value
+
+        token.element.text = serialized_text
+        if _needs_space_preserve(serialized_text):
             token.element.set(XML_SPACE_ATTR, "preserve")
         else:
             token.element.attrib.pop(XML_SPACE_ATTR, None)
-        if token.apply_export_font and token.run_element is not None:
+        if (
+            token.apply_export_font
+            and token.field_instruction_prefix is None
+            and token.run_element is not None
+        ):
             _apply_export_font(token.run_element)
 
 
@@ -3878,10 +4568,7 @@ def _apply_word_run_font(run_element: ET.Element) -> None:
         run_properties = ET.Element(_qn("w", "rPr"))
         run_element.insert(0, run_properties)
 
-    fonts = run_properties.find("w:rFonts", NS)
-    if fonts is None:
-        fonts = ET.Element(_qn("w", "rFonts"))
-        run_properties.insert(0, fonts)
+    fonts = _upsert_ordered_run_property(run_properties, "rFonts")
 
     for attr_name in ("ascii", "hAnsi", "cs", "eastAsia"):
         fonts.set(_qn("w", attr_name), EXPORT_FONT_FAMILY)
@@ -3901,6 +4588,142 @@ def _apply_drawingml_run_font(run_element: ET.Element) -> None:
             font_element = ET.Element(_qn("a", child_name))
             run_properties.append(font_element)
         font_element.set("typeface", EXPORT_FONT_FAMILY)
+
+
+def _apply_rtl_document_direction(
+    stories: Iterable[StoryPart],
+    target_language: str | None,
+) -> None:
+    """为 RTL 目标语言写入 Word/DrawingML 的段落方向和复杂文字属性。"""
+    if not is_right_to_left_language(target_language):
+        return
+
+    language = (target_language or "").strip()
+    for story in stories:
+        for paragraph in story.root.iter(_qn("w", "p")):
+            _apply_word_paragraph_rtl(paragraph, language)
+        for paragraph in story.root.iter(_qn("a", "p")):
+            _apply_drawingml_paragraph_rtl(paragraph, language)
+
+
+def _apply_word_paragraph_rtl(paragraph: ET.Element, language: str) -> None:
+    paragraph_properties = paragraph.find("w:pPr", NS)
+    if paragraph_properties is None:
+        paragraph_properties = ET.Element(_qn("w", "pPr"))
+        paragraph.insert(0, paragraph_properties)
+
+    # WordprocessingML 的 pPr/rPr 子元素有固定顺序。若简单 append 到 rPr 后面，
+    # Word 可能忽略后面的 bidi/jc，表现为方向正确但仍需手动点击“右对齐”。
+    bidi = _upsert_ordered_word_property(
+        paragraph_properties,
+        "bidi",
+        before=(
+            "adjustRightInd",
+            "snapToGrid",
+            "spacing",
+            "ind",
+            "contextualSpacing",
+            "mirrorIndents",
+            "suppressOverlap",
+            "jc",
+            "textDirection",
+            "textAlignment",
+            "textboxTightWrap",
+            "outlineLvl",
+            "divId",
+            "cnfStyle",
+            "rPr",
+            "sectPr",
+            "pPrChange",
+        ),
+    )
+    bidi.set(_qn("w", "val"), "1")
+
+    alignment = _upsert_ordered_word_property(
+        paragraph_properties,
+        "jc",
+        before=(
+            "textDirection",
+            "textAlignment",
+            "textboxTightWrap",
+            "outlineLvl",
+            "divId",
+            "cnfStyle",
+            "rPr",
+            "sectPr",
+            "pPrChange",
+        ),
+    )
+    alignment.set(_qn("w", "val"), "right")
+
+    for run in paragraph.iter(_qn("w", "r")):
+        run_properties = run.find("w:rPr", NS)
+        if run_properties is None:
+            run_properties = ET.Element(_qn("w", "rPr"))
+            run.insert(0, run_properties)
+
+        rtl = _upsert_ordered_word_property(
+            run_properties,
+            "rtl",
+            before=("cs", "em", "lang", "eastAsianLayout", "specVanish", "oMath", "rPrChange"),
+        )
+        rtl.set(_qn("w", "val"), "1")
+
+        lang = _upsert_ordered_word_property(
+            run_properties,
+            "lang",
+            before=("eastAsianLayout", "specVanish", "oMath", "rPrChange"),
+        )
+        lang.set(_qn("w", "bidi"), language)
+
+
+def _upsert_ordered_word_property(
+    parent: ET.Element,
+    property_name: str,
+    *,
+    before: Iterable[str],
+) -> ET.Element:
+    """新增或移动 Word 属性，并去除重复项，保证其处于合法的架构顺序。"""
+    property_tag = _qn("w", property_name)
+    matches = [child for child in list(parent) if child.tag == property_tag]
+    element = matches[0] if matches else ET.Element(property_tag)
+    for match in matches:
+        parent.remove(match)
+
+    following_tags = {_qn("w", name) for name in before}
+    insert_at = len(parent)
+    for index, child in enumerate(parent):
+        if child.tag in following_tags:
+            insert_at = index
+            break
+    parent.insert(insert_at, element)
+    return element
+
+
+def _upsert_ordered_run_property(parent: ET.Element, property_name: str) -> ET.Element:
+    try:
+        property_index = WORD_RUN_PROPERTY_ORDER.index(property_name)
+    except ValueError:
+        property_index = len(WORD_RUN_PROPERTY_ORDER) - 1
+    return _upsert_ordered_word_property(
+        parent,
+        property_name,
+        before=WORD_RUN_PROPERTY_ORDER[property_index + 1:],
+    )
+
+
+def _apply_drawingml_paragraph_rtl(paragraph: ET.Element, language: str) -> None:
+    paragraph_properties = paragraph.find("a:pPr", NS)
+    if paragraph_properties is None:
+        paragraph_properties = ET.Element(_qn("a", "pPr"))
+        paragraph.insert(0, paragraph_properties)
+    paragraph_properties.set("rtl", "1")
+    paragraph_properties.set("algn", "r")
+
+    for property_name in ("rPr", "defRPr", "endParaRPr"):
+        for run_properties in paragraph.iter(_qn("a", property_name)):
+            run_properties.set("rtl", "1")
+            run_properties.set("lang", language)
 
 
 def _namespace_uri(tag: str) -> str:

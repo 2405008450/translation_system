@@ -36,6 +36,7 @@ import { useAuthStore } from '../stores/auth'
 
 interface ProjectItem {
   id: string
+  workflow_template_id: string
   name: string
   filename: string
   status: string
@@ -93,6 +94,7 @@ interface EditableWorkflowStep {
 
 type ProjectDeadlineScope = '' | 'overdue' | 'due_soon' | 'no_deadline'
 type ProjectFileCountScope = '' | 'has_files' | 'no_files'
+type ProjectSegmentSort = '' | 'asc' | 'desc'
 
 interface ProjectFilters {
   status: string
@@ -102,6 +104,7 @@ interface ProjectFilters {
   creator: string
   deadline_scope: ProjectDeadlineScope
   file_count_scope: ProjectFileCountScope
+  segment_sort: ProjectSegmentSort
   created_from: string
   created_to: string
   deadline_from: string
@@ -167,6 +170,10 @@ const duplicateTemplates = ref<ProjectItem[]>([])
 const duplicateTemplateProjectId = ref('')
 const duplicateTemplateDetail = ref<ProjectDetailResponse | null>(null)
 const workflowTemplates = ref<WorkflowTemplate[]>([])
+const orderedWorkflowTemplates = computed(() => [
+  ...workflowTemplates.value.filter((template) => template.id !== 'proofread'),
+  ...workflowTemplates.value.filter((template) => template.id === 'proofread'),
+])
 const loadingWorkflowTemplates = ref(false)
 const showFilterDialog = ref(false)
 const loadingFilterOptions = ref(false)
@@ -202,6 +209,7 @@ function defaultProjectFilters(): ProjectFilters {
     creator: '',
     deadline_scope: '',
     file_count_scope: '',
+    segment_sort: '',
     created_from: '',
     created_to: '',
     deadline_from: '',
@@ -230,6 +238,11 @@ const fileCountScopeOptions: SelectOption[] = [
   { value: '', label: '全部文件数量' },
   { value: 'has_files', label: '已有文件' },
   { value: 'no_files', label: '暂无文件' },
+]
+const segmentSortOptions: SelectOption[] = [
+  { value: '', label: '默认排序' },
+  { value: 'desc', label: '总句段数：从多到少' },
+  { value: 'asc', label: '总句段数：从少到多' },
 ]
 const activeProjectFilterCount = computed(() => getActiveProjectFilterCount(projectFilters))
 const hasActiveProjectFilters = computed(() => activeProjectFilterCount.value > 0)
@@ -292,6 +305,9 @@ const projectFilterTags = computed(() => {
   if (projectFilters.file_count_scope) {
     tags.push(getOptionLabel(fileCountScopeOptions, projectFilters.file_count_scope))
   }
+  if (projectFilters.segment_sort) {
+    tags.push(getOptionLabel(segmentSortOptions, projectFilters.segment_sort))
+  }
   const createdRange = formatDateRangeLabel(projectFilters.created_from, projectFilters.created_to)
   if (createdRange) {
     tags.push(`创建时间：${createdRange}`)
@@ -306,10 +322,12 @@ const canManageProjects = computed(() => authStore.isBusinessManager)
 const canCreateProjects = computed(() => authStore.isBusinessManager)
 const canAssignProjects = computed(() => authStore.isBusinessManager)
 const isCreateLanguagePairPartiallySelected = computed(() => (
-  Boolean(form.source_language) !== Boolean(form.target_language)
+  form.workflow_template_id !== 'proofread'
+  && Boolean(form.source_language) !== Boolean(form.target_language)
 ))
 const isCreateLanguagePairDuplicated = computed(() => (
-  Boolean(form.source_language)
+  form.workflow_template_id !== 'proofread'
+  && Boolean(form.source_language)
   && Boolean(form.target_language)
   && form.source_language === form.target_language
 ))
@@ -411,6 +429,7 @@ function getActiveProjectFilterCount(filters: ProjectFilters) {
     filters.creator,
     filters.deadline_scope,
     filters.file_count_scope,
+    filters.segment_sort,
   ].filter(Boolean).length
   const rangeCount = [
     filters.created_from || filters.created_to,
@@ -428,6 +447,7 @@ function copyProjectFilters(source: ProjectFilters, target: ProjectFilters) {
     creator: source.creator,
     deadline_scope: source.deadline_scope,
     file_count_scope: source.file_count_scope,
+    segment_sort: source.segment_sort,
     created_from: source.created_from,
     created_to: source.created_to,
     deadline_from: source.deadline_from,
@@ -552,20 +572,25 @@ function getProjectSortValue(project: ProjectItem, key: string) {
   if (key === 'open_issue_count') {
     return Number(project.open_issue_count || 0)
   }
+  if (key === 'total_segments') {
+    return Number(project.total_segments || 0)
+  }
   return String((project as unknown as Record<string, unknown>)[key] ?? '')
 }
 
 function sortProjectRows(items: ProjectItem[]) {
-  if (!sortKey.value) {
+  const activeSortKey = projectFilters.segment_sort ? 'total_segments' : sortKey.value
+  const activeSortOrder = projectFilters.segment_sort || sortOrder.value
+  if (!activeSortKey) {
     return items
   }
   return [...items].sort((left, right) => {
-    const leftValue = getProjectSortValue(left, sortKey.value)
-    const rightValue = getProjectSortValue(right, sortKey.value)
+    const leftValue = getProjectSortValue(left, activeSortKey)
+    const rightValue = getProjectSortValue(right, activeSortKey)
     const result = typeof leftValue === 'number' && typeof rightValue === 'number'
       ? leftValue - rightValue
       : String(leftValue).localeCompare(String(rightValue), 'zh-CN')
-    return sortOrder.value === 'asc' ? result : -result
+    return activeSortOrder === 'asc' ? result : -result
   })
 }
 
@@ -575,6 +600,9 @@ function normalizeWorkflowStepKey(value: string, index: number) {
 }
 
 function cloneWorkflowSteps(template: WorkflowTemplate): EditableWorkflowStep[] {
+  if (template.id === 'proofread') {
+    return [{ step_key: 'proofread', name: '校对', step_type: 'proofread' }]
+  }
   return template.steps.map((step, index) => ({
     step_key: index === 0 ? 'translate' : normalizeWorkflowStepKey(step.step_key || '', index),
     name: index === 0 ? '翻译' : step.name,
@@ -600,6 +628,10 @@ async function loadWorkflowTemplates() {
 function handleWorkflowTemplateChange() {
   const template = workflowTemplates.value.find((item) => item.id === form.workflow_template_id)
   form.workflow_steps = template ? cloneWorkflowSteps(template) : []
+  if (template?.id === 'proofread') {
+    form.source_language = ''
+    form.target_language = ''
+  }
 }
 
 function addWorkflowStep() {
@@ -749,11 +781,13 @@ async function createProject() {
     formError.value = t('projectList.errors.sameLanguage')
     return
   }
-  const workflowSteps = form.workflow_steps.map((step, index) => ({
-    step_key: index === 0 ? 'translate' : normalizeWorkflowStepKey(step.step_key, index),
-    name: index === 0 ? '翻译' : step.name.trim(),
-    step_type: index === 0 ? 'translation' : (step.step_type || 'custom'),
-  }))
+  const workflowSteps = form.workflow_template_id === 'proofread'
+    ? [{ step_key: 'proofread', name: '校对', step_type: 'proofread' }]
+    : form.workflow_steps.map((step, index) => ({
+        step_key: index === 0 ? 'translate' : normalizeWorkflowStepKey(step.step_key, index),
+        name: index === 0 ? '翻译' : step.name.trim(),
+        step_type: index === 0 ? 'translation' : (step.step_type || 'custom'),
+      }))
 
   creating.value = true
   formError.value = ''
@@ -1297,6 +1331,15 @@ onBeforeUnmount(() => {
                     </option>
                   </select>
                 </label>
+
+                <label class="project-filter-dialog__field">
+                  <span>总句段数排序</span>
+                  <select v-model="filterDraft.segment_sort" class="field__control">
+                    <option v-for="option in segmentSortOptions" :key="option.value" :value="option.value">
+                      {{ option.label }}
+                    </option>
+                  </select>
+                </label>
               </div>
 
               <section class="project-filter-dialog__section">
@@ -1525,7 +1568,7 @@ onBeforeUnmount(() => {
           </select>
         </label>
 
-        <div class="field field--full project-language-binding">
+        <div v-if="form.workflow_template_id !== 'proofread'" class="field field--full project-language-binding">
           <span class="field__label">{{ t('projectList.form.languagePairBinding') }}</span>
           <p class="project-language-binding__hint">
             {{ t('projectList.form.languagePairBindingHint') }}
@@ -1581,8 +1624,8 @@ onBeforeUnmount(() => {
             @change="handleWorkflowTemplateChange"
           >
             <option value="" disabled>{{ loadingWorkflowTemplates ? '模板加载中...' : '请选择工作流模板' }}</option>
-            <option v-for="template in workflowTemplates" :key="template.id" :value="template.id">
-              {{ template.name }}
+            <option v-for="template in orderedWorkflowTemplates" :key="template.id" :value="template.id">
+              {{ template.name }}{{ template.id === 'proofread' ? '（最新）' : '' }}
             </option>
           </select>
         </label>
@@ -1610,7 +1653,7 @@ onBeforeUnmount(() => {
               删除
             </button>
           </div>
-          <button class="button button--ghost workflow-editor__add" type="button" @click="addWorkflowStep">
+          <button v-if="form.workflow_template_id !== 'proofread'" class="button button--ghost workflow-editor__add" type="button" @click="addWorkflowStep">
             <Plus :size="14" />
             添加阶段
           </button>

@@ -80,9 +80,62 @@ class SegmentExtractor:
                     "MULTILEADER", "ACAD_TABLE", "MERGED_TEXT"
                 )
                 
+                preserve_as_single_segment = bool(
+                    node.metadata.get("preserve_as_single_segment", False)
+                )
+
                 if is_cad_entity:
-                    # CAD 实体：整体作为一个句段，不自动分割
-                    # 用户可以在工作台手动分割或合并
+                    # DWG/DXF 的 CAD 文本采用 Lin 分支的分句方案，并通过分组元数据
+                    # 在导出时重新组合，从而支持长文本翻译后的布局优化。
+                    raw_sentences = [
+                        sentence
+                        for sentence in self._split_cad_sentences(text)
+                        if sentence[0]
+                    ]
+                    if len(raw_sentences) > 1:
+                        parent_source = self._normalize_text(text)
+                        group_id = ":".join((
+                            path,
+                            str(node.metadata.get("scope", "")),
+                            str(node.metadata.get("handle", "")),
+                            str(node.metadata.get("sentence_id", "")),
+                        ))
+                        joiner = "\n" if "\n" in text else " "
+                        for sentence_index, (
+                            sentence_text,
+                            display_text,
+                            _start,
+                            _end,
+                        ) in enumerate(raw_sentences):
+                            if not sentence_text:
+                                continue
+                            metadata = dict(node.metadata)
+                            metadata.update({
+                                "cad_sentence_split": True,
+                                "cad_sentence_group_id": group_id,
+                                "cad_sentence_index": sentence_index,
+                                "cad_sentence_count": len(raw_sentences),
+                                "cad_sentence_joiner": joiner,
+                                "cad_parent_source_text": parent_source,
+                                "cad_parent_display_text": text,
+                            })
+                            segments.append(self._create_segment(
+                                source_text=sentence_text,
+                                display_text=display_text,
+                                block_path=path,
+                                metadata=metadata,
+                            ))
+                    else:
+                        for sentence_text, display_text, _start, _end in raw_sentences:
+                            if sentence_text:
+                                segments.append(self._create_segment(
+                                    source_text=sentence_text,
+                                    display_text=display_text,
+                                    block_path=path,
+                                    metadata=dict(node.metadata),
+                                ))
+                elif preserve_as_single_segment:
+                    # SVG 等需要精确回写的结构化文本槽位沿用 main 的整段方案。
                     segment = self._create_segment(
                         source_text=self._normalize_text(text),
                         display_text=text,
@@ -92,7 +145,12 @@ class SegmentExtractor:
                     segments.append(segment)
                 else:
                     # 其他格式：按句子分割
-                    raw_sentences = self._split_sentences(text)
+                    raw_sentences = self._split_sentences(
+                        text,
+                        preserve_dotted_names=bool(
+                            (node.metadata or {}).get("preserve_dotted_names", False)
+                        ),
+                    )
                     layout_fragments = self._compute_layout_fragments(node, text, raw_sentences)
                     html_fragments = self._compute_source_html_fragments(node, text, raw_sentences)
                     format_map = (node.metadata or {}).get("source_layout_formats") or {}
@@ -133,6 +191,39 @@ class SegmentExtractor:
                 segments.extend(child_segments)
         
         return segments
+
+    def _split_cad_sentences(
+        self,
+        text: str,
+    ) -> List[Tuple[str, str, int, int]]:
+        """拆分 CAD 文本，并额外识别换行后的多级编号条目。"""
+        split_pattern = re.compile(
+            r"\r?\n+(?=\s*\d+(?:\.\d+)+(?:\.?\s|$))"
+        )
+        sentences: List[Tuple[str, str, int, int]] = []
+        part_start = 0
+
+        for match in split_pattern.finditer(text):
+            part = text[part_start:match.start()]
+            for source, display, start, end in self._split_sentences(part):
+                sentences.append((
+                    source,
+                    display,
+                    part_start + start,
+                    part_start + end,
+                ))
+            part_start = match.end()
+
+        part = text[part_start:]
+        for source, display, start, end in self._split_sentences(part):
+            sentences.append((
+                source,
+                display,
+                part_start + start,
+                part_start + end,
+            ))
+
+        return sentences
 
     def _compute_layout_fragments(
         self,
@@ -191,7 +282,12 @@ class SegmentExtractor:
             return None
         return [tagged_fragment_to_html(fragment, format_map) for fragment in fragments]
 
-    def _split_sentences(self, text: str) -> List[Tuple[str, str, int, int]]:
+    def _split_sentences(
+        self,
+        text: str,
+        *,
+        preserve_dotted_names: bool = False,
+    ) -> List[Tuple[str, str, int, int]]:
         """将文本分割为句子
         
         Args:
@@ -204,6 +300,20 @@ class SegmentExtractor:
         """
         if not text:
             return []
+
+        if preserve_dotted_names:
+            from app.services.sentence_splitter import split_sentence_spans
+
+            spans = split_sentence_spans(text, preserve_dotted_names=True)
+            return [
+                (
+                    self._normalize_text(text[span.start:span.end]),
+                    text[span.start:span.end].strip(),
+                    span.start,
+                    span.end,
+                )
+                for span in spans
+            ]
         
         sentences: List[Tuple[str, str, int, int]] = []
         start = 0
