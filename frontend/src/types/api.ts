@@ -674,6 +674,8 @@ export interface NumberCheckReportItem {
   applied_at: string | null
   status: 'open' | 'ignored' | 'modified'
   ignored: boolean
+  preview_text: string
+  preview_spans: { start: number; end: number }[]
   can_apply: boolean
   block_index: number
   row_index: number | null

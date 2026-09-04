@@ -170,6 +170,14 @@ EXPLICIT_FORMAT_RUN_PROPERTIES = {
     "strike",
     "dstrike",
     "vertAlign",
+    "color",
+    "highlight",
+    "shd",
+    "sz",
+    "szCs",
+    "rFonts",
+    "smallCaps",
+    "caps",
 }
 
 
@@ -183,6 +191,12 @@ class FormattedTextFragment:
     strike: bool = False
     subscript: bool = False
     superscript: bool = False
+    font_color: str | None = None
+    background_color: str | None = None
+    font_size_pt: float | None = None
+    font_family: str | None = None
+    small_caps: bool = False
+    all_caps: bool = False
 
     @property
     def formats(self) -> tuple[bool, bool, bool, bool, bool, bool]:
@@ -195,6 +209,31 @@ class FormattedTextFragment:
             self.superscript,
         )
 
+    @property
+    def style_key(self) -> tuple[Any, ...]:
+        return (
+            *self.formats,
+            self.font_color,
+            self.background_color,
+            self.font_size_pt,
+            self.font_family,
+            self.small_caps,
+            self.all_caps,
+        )
+
+    @property
+    def has_style(self) -> bool:
+        return bool(self.formats) or any(
+            (
+                self.font_color,
+                self.background_color,
+                self.font_size_pt,
+                self.font_family,
+                self.small_caps,
+                self.all_caps,
+            )
+        )
+
 
 def _has_format_tags(html: str | None) -> bool:
     """检查 HTML 是否包含格式标签"""
@@ -204,18 +243,19 @@ def _has_format_tags(html: str | None) -> bool:
 
 
 def _parse_formatted_html(html: str) -> list[FormattedTextFragment]:
-    """解析编辑器或源文档 HTML，返回仅包含受支持基础格式的文本片段。"""
+    """解析 HTML，保留字体、颜色、底纹和基础字符格式。"""
     fragments: list[FormattedTextFragment] = []
 
     class FormatHTMLParser(HTMLParser):
         def __init__(self):
             super().__init__()
-            self.format_stack: list[set[str]] = []
+            self.format_stack: list[tuple[set[str], dict[str, Any]]] = []
             self.current_formats: set[str] = set()
+            self.current_style: dict[str, Any] = {}
 
         def handle_starttag(self, tag: str, attrs):
             tag_lower = tag.lower()
-            self.format_stack.append(self.current_formats.copy())
+            self.format_stack.append((self.current_formats.copy(), self.current_style.copy()))
             next_formats = self.current_formats.copy()
             if tag_lower in ('b', 'strong'):
                 next_formats.add('bold')
@@ -233,12 +273,14 @@ def _parse_formatted_html(html: str) -> list[FormattedTextFragment]:
             style = dict(attrs).get("style") or ""
             next_formats.update(_formats_from_inline_css(style))
             self.current_formats = next_formats
+            self.current_style.update(_inline_style_properties(style))
 
         def handle_endtag(self, tag: str):
             if self.format_stack:
-                self.current_formats = self.format_stack.pop()
+                self.current_formats, self.current_style = self.format_stack.pop()
             else:
                 self.current_formats = set()
+                self.current_style = {}
 
         def handle_data(self, data: str):
             if data:
@@ -250,8 +292,14 @@ def _parse_formatted_html(html: str) -> list[FormattedTextFragment]:
                     strike='strike' in self.current_formats,
                     subscript='subscript' in self.current_formats,
                     superscript='superscript' in self.current_formats,
+                    font_color=self.current_style.get("font_color"),
+                    background_color=self.current_style.get("background_color"),
+                    font_size_pt=self.current_style.get("font_size_pt"),
+                    font_family=self.current_style.get("font_family"),
+                    small_caps=bool(self.current_style.get("small_caps")),
+                    all_caps=bool(self.current_style.get("all_caps")),
                 )
-                if fragments and fragments[-1].formats == fragment.formats:
+                if fragments and fragments[-1].style_key == fragment.style_key:
                     previous = fragments[-1]
                     fragments[-1] = FormattedTextFragment(
                         text=previous.text + fragment.text,
@@ -261,6 +309,12 @@ def _parse_formatted_html(html: str) -> list[FormattedTextFragment]:
                         strike=fragment.strike,
                         subscript=fragment.subscript,
                         superscript=fragment.superscript,
+                        font_color=fragment.font_color,
+                        background_color=fragment.background_color,
+                        font_size_pt=fragment.font_size_pt,
+                        font_family=fragment.font_family,
+                        small_caps=fragment.small_caps,
+                        all_caps=fragment.all_caps,
                     )
                 else:
                     fragments.append(fragment)
@@ -268,6 +322,55 @@ def _parse_formatted_html(html: str) -> list[FormattedTextFragment]:
     parser = FormatHTMLParser()
     parser.feed(html)
     return fragments
+
+
+def _normalize_css_color(value: str) -> str | None:
+    normalized = value.strip().lower()
+    if normalized.startswith("#"):
+        normalized = normalized[1:]
+    if re.fullmatch(r"[0-9a-f]{3}", normalized):
+        normalized = "".join(character * 2 for character in normalized)
+    if re.fullmatch(r"[0-9a-f]{6}", normalized):
+        return normalized.upper()
+    return None
+
+
+def _inline_style_properties(style: str) -> dict[str, Any]:
+    declarations: dict[str, str] = {}
+    for declaration in style.split(";"):
+        if ":" not in declaration:
+            continue
+        name, value = declaration.split(":", 1)
+        declarations[name.strip().lower()] = value.strip()
+
+    properties: dict[str, Any] = {}
+    for css_name, property_name in (
+        ("color", "font_color"),
+        ("background-color", "background_color"),
+    ):
+        color = _normalize_css_color(declarations.get(css_name, ""))
+        if color:
+            properties[property_name] = color
+
+    size_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)pt", declarations.get("font-size", "").strip(), re.IGNORECASE)
+    if size_match:
+        properties["font_size_pt"] = float(size_match.group(1))
+
+    family = declarations.get("font-family", "").strip()
+    if family:
+        family = family.split(",", 1)[0].strip().strip("'\"")
+        if family:
+            properties["font_family"] = family
+
+    if "small-caps" in declarations.get("font-variant", "").lower():
+        properties["small_caps"] = True
+    if declarations.get("text-transform", "").strip().lower() == "uppercase":
+        properties["all_caps"] = True
+    return properties
+
+
+def _background_color_from_inline_css(style: str) -> str | None:
+    return _inline_style_properties(style).get("background_color")
 
 
 def _formats_from_inline_css(style: str) -> set[str]:
@@ -329,7 +432,7 @@ def _derive_target_html_from_source(source_html: str | None, target_text: str) -
         return None
 
     source_fragments = _parse_formatted_html(source_html)
-    if not source_fragments or not any(any(fragment.formats) for fragment in source_fragments):
+    if not source_fragments or not any(fragment.has_style for fragment in source_fragments):
         return None
 
     source_text = "".join(fragment.text for fragment in source_fragments)
@@ -350,7 +453,7 @@ def _derive_target_html_from_source(source_html: str | None, target_text: str) -
     candidates = sorted(
         (
             fragment for fragment in source_fragments
-            if any(fragment.formats) and len(re.sub(r"\W", "", fragment.text, flags=re.UNICODE)) >= 2
+            if fragment.has_style and len(re.sub(r"\W", "", fragment.text, flags=re.UNICODE)) >= 2
         ),
         key=lambda fragment: len(fragment.text),
         reverse=True,
@@ -390,7 +493,26 @@ def _find_unique_whitespace_flexible_match(text: str, candidate: str) -> list[tu
 
 
 def _formatted_fragment_to_html(fragment: FormattedTextFragment) -> str:
-    return _wrap_html_with_formats(escape_html(fragment.text), _format_names_from_flags(fragment.formats))
+    content = _wrap_html_with_formats(
+        escape_html(fragment.text),
+        _format_names_from_flags(fragment.formats),
+    )
+    styles: list[str] = []
+    if fragment.font_color:
+        styles.append(f"color: #{fragment.font_color}")
+    if fragment.background_color:
+        styles.append(f"background-color: #{fragment.background_color}")
+    if fragment.font_size_pt is not None:
+        styles.append(f"font-size: {fragment.font_size_pt:g}pt")
+    if fragment.font_family:
+        styles.append(f"font-family: '{escape_html(fragment.font_family, quote=True)}'")
+    if fragment.small_caps:
+        styles.append("font-variant: small-caps")
+    if fragment.all_caps:
+        styles.append("text-transform: uppercase")
+    if styles:
+        content = f'<span style="{escape_html("; ".join(styles), quote=True)}">{content}</span>'
+    return content
 
 
 def _render_text_with_format_sets(text: str, format_sets: list[set[str]]) -> str:
@@ -3442,6 +3564,18 @@ def _build_formatted_word_run(
         _set_run_vertical_align(run_properties, "subscript")
     if fragment.superscript:
         _set_run_vertical_align(run_properties, "superscript")
+    if fragment.font_color:
+        _set_run_color(run_properties, fragment.font_color)
+    if fragment.background_color:
+        _set_run_shading(run_properties, fragment.background_color)
+    if fragment.font_size_pt is not None:
+        _set_run_font_size(run_properties, fragment.font_size_pt)
+    if fragment.font_family:
+        _set_run_font_family(run_properties, fragment.font_family)
+    if fragment.small_caps:
+        _set_run_property(run_properties, "smallCaps")
+    if fragment.all_caps:
+        _set_run_property(run_properties, "caps")
 
     # 创建文本元素
     fragment_text = _sanitize_xml_text(fragment.text)
@@ -3451,8 +3585,10 @@ def _build_formatted_word_run(
         text_element.set(XML_SPACE_ATTR, "preserve")
     run_element.append(text_element)
 
-    # 应用导出字体
+    # 应用导出字体；若源 run 指定字体，最后恢复该字体，避免全局导出字体覆盖它。
     _apply_export_font(run_element)
+    if fragment.font_family:
+        _set_run_font_family(run_element.find("w:rPr", NS), fragment.font_family)
 
     return run_element
 
@@ -3489,6 +3625,47 @@ def _set_run_vertical_align(run_properties: ET.Element, align_type: str) -> None
         vert_align = ET.Element(_qn("w", "vertAlign"))
         run_properties.append(vert_align)
     vert_align.set(_qn("w", "val"), align_type)
+
+
+def _set_run_color(run_properties: ET.Element, color: str) -> None:
+    color_element = run_properties.find("w:color", NS)
+    if color_element is None:
+        color_element = ET.Element(_qn("w", "color"))
+        run_properties.append(color_element)
+    color_element.set(_qn("w", "val"), color.lstrip("#").upper())
+
+
+def _set_run_font_size(run_properties: ET.Element, size_pt: float) -> None:
+    value = str(max(1, round(size_pt * 2)))
+    for element_name in ("sz", "szCs"):
+        size_element = run_properties.find(f"w:{element_name}", NS)
+        if size_element is None:
+            size_element = ET.Element(_qn("w", element_name))
+            run_properties.append(size_element)
+        size_element.set(_qn("w", "val"), value)
+
+
+def _set_run_font_family(run_properties: ET.Element | None, family: str) -> None:
+    if run_properties is None or not family:
+        return
+    fonts = run_properties.find("w:rFonts", NS)
+    if fonts is None:
+        fonts = ET.Element(_qn("w", "rFonts"))
+        run_properties.insert(0, fonts)
+    for attr_name in ("ascii", "hAnsi", "cs", "eastAsia"):
+        fonts.set(_qn("w", attr_name), family)
+    for theme_attr in ("asciiTheme", "hAnsiTheme", "csTheme", "eastAsiaTheme"):
+        fonts.attrib.pop(_qn("w", theme_attr), None)
+
+
+def _set_run_shading(run_properties: ET.Element, color: str) -> None:
+    shading = run_properties.find("w:shd", NS)
+    if shading is None:
+        shading = ET.Element(_qn("w", "shd"))
+        run_properties.append(shading)
+    shading.set(_qn("w", "val"), "clear")
+    shading.set(_qn("w", "color"), "auto")
+    shading.set(_qn("w", "fill"), color.lstrip("#").upper())
 
 
 def _queue_sentence_replacement(

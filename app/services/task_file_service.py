@@ -1206,12 +1206,23 @@ def build_export_segments_from_source(
 
 
 def _normalize_existing_segment(segment: Any) -> dict[str, Any]:
+    import json as _json
+
+    metadata_value = _get_segment_value(segment, "segment_metadata", "{}")
+    try:
+        metadata = _json.loads(metadata_value) if metadata_value else {}
+    except (TypeError, _json.JSONDecodeError):
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
     return {
         "segment_id": _get_segment_value(segment, "segment_id", _get_segment_value(segment, "sentence_id", "")),
         "sentence_id": _get_segment_value(segment, "sentence_id", _get_segment_value(segment, "segment_id", "")),
         "source_text": _get_segment_value(segment, "source_text", ""),
         "display_text": _get_segment_value(segment, "display_text", ""),
         "target_text": _get_segment_value(segment, "target_text", ""),
+        "target_layout_text": str(metadata.get("target_layout_text") or ""),
         "status": _get_segment_value(segment, "status", "none"),
         "matched_source_text": _get_segment_value(segment, "matched_source_text", ""),
         "block_type": _get_segment_value(segment, "block_type", "paragraph"),
@@ -1220,6 +1231,8 @@ def _normalize_existing_segment(segment: Any) -> dict[str, Any]:
         "cell_index": _get_segment_value(segment, "cell_index"),
         "sequence_index": _get_segment_value(segment, "sequence_index", -1),
     }
+
+
 
 
 def _build_translated_render_segments(segments: list[Any]) -> list[dict[str, Any]]:

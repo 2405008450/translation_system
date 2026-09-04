@@ -4901,32 +4901,27 @@ interface NumberCheckPreviewPart {
 }
 
 function numberCheckPreviewParts(item: NumberCheckReportItem): NumberCheckPreviewPart[] {
-  const target = item.target_text || ''
-  const anchor = item.replace_anchor || ''
-  const suggested = item.suggested_value || ''
+  // 预览文本与高亮区间由后端统一计算（与实际写回同一套锚点定位逻辑），
+  // 前端只负责按区间切片渲染，不再自行猜测锚点位置。
+  const text = item.preview_text || item.target_text || ''
+  const spans = item.preview_spans || []
+  if (spans.length === 0) {
+    return [{ text: text || '未填写', mark: false }]
+  }
 
-  if (item.applied) {
-    if (suggested && target.includes(suggested)) {
-      const idx = target.indexOf(suggested)
-      return [
-        { text: target.slice(0, idx), mark: false },
-        { text: suggested, mark: true },
-        { text: target.slice(idx + suggested.length), mark: false },
-      ].filter((part) => part.text.length > 0)
+  const parts: NumberCheckPreviewPart[] = []
+  let cursor = 0
+  for (const span of spans) {
+    if (span.start > cursor) {
+      parts.push({ text: text.slice(cursor, span.start), mark: false })
     }
-    return [{ text: target || '未填写', mark: false }]
+    parts.push({ text: text.slice(span.start, span.end), mark: true })
+    cursor = span.end
   }
-
-  if (anchor && suggested && target.includes(anchor)) {
-    const idx = target.indexOf(anchor)
-    return [
-      { text: target.slice(0, idx), mark: false },
-      { text: suggested, mark: true },
-      { text: target.slice(idx + anchor.length), mark: false },
-    ].filter((part) => part.text.length > 0)
+  if (cursor < text.length) {
+    parts.push({ text: text.slice(cursor), mark: false })
   }
-
-  return [{ text: target || '未填写', mark: false }]
+  return parts.filter((part) => part.text.length > 0)
 }
 
 function onNumberCheckScroll(event: Event) {
@@ -4995,20 +4990,24 @@ function numberCheckHasCorrection(item: NumberCheckReportItem) {
   if (item.applied) {
     return true
   }
-  return Boolean(
-    item.replace_anchor
-    && item.suggested_value
-    && (item.target_text || '').includes(item.replace_anchor),
-  )
+  return (item.preview_spans || []).length > 0
 }
 
-function numberCheckAiReason(item: NumberCheckReportItem): string {
-  const first = item.ai_errors?.[0]
-  if (!first) {
-    return ''
+function numberCheckAiReasons(item: NumberCheckReportItem): string[] {
+  const errors = item.ai_errors || []
+  const reasons: string[] = []
+  for (const error of errors) {
+    const record = error as Record<string, unknown>
+    const isSourceConsistent = String(record['is_source_consistent'] ?? '').trim().toLowerCase() === 'true'
+    if (isSourceConsistent) {
+      continue
+    }
+    const reason = record['修改理由']
+    if (typeof reason === 'string' && reason.trim()) {
+      reasons.push(reason.trim())
+    }
   }
-  const reason = (first as Record<string, unknown>)['修改理由']
-  return typeof reason === 'string' ? reason : ''
+  return reasons
 }
 
 interface NumberCheckStatusTag {
@@ -5455,14 +5454,12 @@ const styleTagCheckFiles = computed(() => {
   if (!report || !isMergeWorkbench.value) {
     return []
   }
-  const fileIds = report.file_ids ?? []
-  const detailFiles = segmentStore.mergeViewDetail?.files ?? []
-  return fileIds.map((fileId) => {
-    const file = detailFiles.find((candidate) => candidate.id === fileId)
-    const items = report.items.filter((item) => item.file_record_id === fileId)
+  const detailFiles = styleTagCheckMergeFiles.value
+  return detailFiles.map((file) => {
+    const items = report.items.filter((item) => item.file_record_id === file.id)
     return {
-      id: fileId,
-      name: file?.filename || items[0]?.file_name || fileId,
+      id: file.id,
+      name: file.filename,
       count: items.length,
     }
   })
@@ -5528,7 +5525,7 @@ const styleTagCheckMetaText = computed(() => {
   ].filter(Boolean).join(' · ')
 })
 
-const styleTagCheckSupportedExtensions = new Set(['.docx', '.pptx'])
+const styleTagCheckSupportedExtensions = new Set(['.docx', '.pptx', '.xlsx'])
 const styleTagCheckMergeViewId = computed(() => segmentStore.mergeViewId || props.mergeViewId || '')
 const styleTagCheckMergeFiles = computed(() => (
   segmentStore.mergeViewDetail?.files.filter((file) => {
@@ -10772,9 +10769,13 @@ onBeforeRouteLeave(async () => {
                               <span v-else class="number-check__no-fix">—</span>
                             </div>
                             <div
-                              v-if="numberCheckShowAiReason && numberCheckHasCorrection(item) && numberCheckAiReason(item)"
+                              v-if="numberCheckShowAiReason && numberCheckHasCorrection(item) && numberCheckAiReasons(item).length > 0"
                               class="number-check__ai-reason"
-                            >AI 修改理由：{{ numberCheckAiReason(item) }}</div>
+                            >
+                              <div v-for="(reason, reasonIndex) in numberCheckAiReasons(item)" :key="reasonIndex">
+                                AI 修改理由{{ numberCheckAiReasons(item).length > 1 ? `（${reasonIndex + 1}）` : '' }}：{{ reason }}
+                              </div>
+                            </div>
                           </td>
                           <td class="number-check__cell">
                             <div class="number-check__status">

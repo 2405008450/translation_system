@@ -51,6 +51,7 @@ from app.services.adapters.pptx_inline_tags import (
 from app.services.file_record_service import (
     backfill_file_record_pptx_layout,
     backfill_file_record_source_html,
+    backfill_file_record_xlsx_layout,
     list_segments_for_file_record,
     set_segment_target_layout_text,
 )
@@ -84,7 +85,7 @@ _ERROR_TEXT_MISMATCH = "text_mismatch"
 _ERROR_STRUCTURE = "invalid_structure"
 
 _MARKER_RE = re.compile(r"⟦\s*/?\s*\d+\s*⟧")
-STYLE_TAG_CHECK_SUPPORTED_EXTENSIONS = {".docx", ".pptx"}
+STYLE_TAG_CHECK_SUPPORTED_EXTENSIONS = {".docx", ".pptx", ".xlsx"}
 
 
 def _filter_style_tag_check_files(files: list[FileRecord], scope: str) -> list[FileRecord]:
@@ -96,7 +97,7 @@ def _filter_style_tag_check_files(files: list[FileRecord], scope: str) -> list[F
         if Path(file_record.filename or "").suffix.lower() in STYLE_TAG_CHECK_SUPPORTED_EXTENSIONS
     ]
     if not supported:
-        raise HTTPException(status_code=400, detail="当前合并视图没有支持样式专检的 DOCX 或 PPTX 文件。")
+        raise HTTPException(status_code=400, detail="当前合并视图没有支持样式专检的 DOCX、PPTX 或 XLSX 文件。")
     return supported
 
 
@@ -171,6 +172,8 @@ def _collect_style_tag_candidates(
             backfill_file_record_source_html(db, file_record)
         elif extension == ".pptx":
             backfill_file_record_pptx_layout(db, file_record)
+        elif extension == ".xlsx":
+            backfill_file_record_xlsx_layout(db, file_record)
         segments = list_segments_for_file_record(db, file_record.id)
         total_segments += len(segments)
         for segment in segments:
@@ -193,32 +196,45 @@ def _collect_style_tag_candidates(
 # ─────────────────────────────────────────
 
 def _describe_format_map(format_map: dict[str, Any]) -> str:
-    """把 format_map 的 CSS token 转成人类可读的样式描述，供 AI 理解每个标签代表什么样式。"""
+    """把 format_map 的 CSS token 转成人类可读的完整样式描述，供 AI 理解每个标签。"""
     descriptions: list[str] = []
     for tag_id, tokens in format_map.items():
         if tag_id == "base" or not isinstance(tokens, (list, tuple)) or not tokens:
             continue
         open_tag = str(tokens[0] or "")
-        style_match = re.search(r'style="([^"]*)"', open_tag)
+        style_match = re.search(r'style=["\']([^"\']*)["\']', open_tag)
         css = style_match.group(1) if style_match else ""
+        compact_css = re.sub(r"\s+", "", css).lower()
         labels: list[str] = []
-        if "font-weight:bold" in css:
+        if re.search(r"font-weight:(?:bold|bolder|[6-9]\d\d)", compact_css):
             labels.append("加粗")
-        if "font-style:italic" in css:
+        if "font-style:italic" in compact_css or "font-style:oblique" in compact_css:
             labels.append("斜体")
-        if "underline" in css:
+        if "underline" in compact_css:
             labels.append("下划线")
-        if "line-through" in css:
+        if "line-through" in compact_css:
             labels.append("删除线")
-        color_match = re.search(r"color:(#[0-9a-fA-F]{3,6})", css)
+        color_match = re.search(r"(?:^|;)color:(#[0-9a-f]{3,8})", compact_css)
         if color_match:
-            labels.append(f"颜色{color_match.group(1)}")
-        size_match = re.search(r"font-size:([0-9.]+pt)", css)
+            labels.append(f"字体颜色{color_match.group(1)}")
+        background_match = re.search(r"(?:^|;)background-color:(#[0-9a-f]{3,8})", compact_css)
+        if background_match:
+            labels.append(f"背景/底纹{background_match.group(1)}")
+        size_match = re.search(r"(?:^|;)font-size:([0-9.]+(?:pt|em|px))", compact_css)
         if size_match:
             labels.append(f"字号{size_match.group(1)}")
-        family_match = re.search(r"font-family:'([^']*)'", css)
+        family_match = re.search(r"(?:^|;)font-family\s*:\s*['\"]?([^;'\"]+)", css, re.IGNORECASE)
         if family_match:
-            labels.append(f"字体{family_match.group(1)}")
+            family_name = family_match.group(1).strip(" '")
+            labels.append(f"字体{family_name}")
+        if "vertical-align:super" in compact_css:
+            labels.append("上标")
+        if "vertical-align:sub" in compact_css:
+            labels.append("下标")
+        if "font-variant:small-caps" in compact_css:
+            labels.append("小型大写")
+        if "text-transform:uppercase" in compact_css:
+            labels.append("全部大写")
         descriptions.append(f"⟦{tag_id}⟧={('+'.join(labels) or '特殊样式')}")
     return "；".join(descriptions)
 

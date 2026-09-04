@@ -908,6 +908,67 @@ def backfill_file_record_pptx_layout(db: Session, file_record: FileRecord) -> in
     return updated_count
 
 
+def backfill_file_record_xlsx_layout(db: Session, file_record: FileRecord) -> int:
+    """为既有 XLSX 文件回填原文样式与版式标签，不改动译文。"""
+    source_filename = get_file_record_source_filename(file_record)
+    if Path(source_filename).suffix.lower() != ".xlsx":
+        return 0
+
+    missing_filter = or_(
+        Segment.source_html.is_(None),
+        Segment.segment_metadata.is_(None),
+        ~Segment.segment_metadata.like('%"source_layout_formats"%'),
+    )
+    has_missing = (
+        db.query(Segment.id)
+        .filter(Segment.file_record_id == file_record.id, missing_filter)
+        .first()
+        is not None
+    )
+    if not has_missing:
+        return 0
+
+    raw_bytes = load_file_record_source(file_record)
+    if raw_bytes is None:
+        return 0
+
+    from app.services.adapters import ensure_default_adapters_registered
+
+    document_parse_options = normalize_document_parse_options(
+        getattr(file_record, "document_parse_options", None)
+    )
+    registry = ensure_default_adapters_registered()
+    adapter = registry.get_adapter(source_filename)
+    parse_result = adapter.parse_with_options(
+        raw_bytes, filename=source_filename, options=document_parse_options
+    )
+    parsed_by_sentence_id = {str(seg.segment_id): seg for seg in parse_result.segments}
+
+    updated_count = 0
+    segments = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record.id, missing_filter)
+        .all()
+    )
+    for segment in segments:
+        parsed_segment = parsed_by_sentence_id.get(str(segment.sentence_id))
+        if parsed_segment is None or parsed_segment.source_text != segment.source_text:
+            segment.source_html = ""
+            updated_count += 1
+            continue
+        segment.source_html = parsed_segment.source_html or ""
+        _merge_segment_layout_metadata(
+            segment,
+            parsed_segment.source_layout_text or "",
+            getattr(parsed_segment, "source_format_map", {}) or {},
+        )
+        updated_count += 1
+
+    if updated_count:
+        db.flush()
+    return updated_count
+
+
 def get_file_record_document_statistics(file_record: FileRecord) -> dict:
     return normalize_document_statistics(getattr(file_record, "document_statistics", None))
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from io import BytesIO
+import json
 from pathlib import PurePosixPath
 import posixpath
 import re
@@ -11,6 +12,7 @@ from zipfile import ZipFile
 from xml.etree import ElementTree as ET
 
 from app.services.adapters.models import BlockNode, DocumentAST
+from app.services.adapters.pptx_inline_tags import strip_format_tags
 from app.services.adapters.xlsx_adapter import MAIN_NS, NS, XlsxAdapter
 from app.services.document_workspace import normalize_document_parse_options
 
@@ -27,6 +29,8 @@ class Replacement:
     metadata: dict[str, Any]
     source_text: str
     parts: list[str] = field(default_factory=list)
+    layout_parts: list[str] = field(default_factory=list)
+    layout_format_maps: list[dict[str, list[str]]] = field(default_factory=list)
     has_target: bool = False
     bilingual: bool = False
 
@@ -77,10 +81,8 @@ class XlsxExporter:
         translated_segments: Iterable[Any],
         bilingual: bool = False,
     ) -> dict[tuple[Any, ...], Replacement]:
-        targets = {
-            str(_get_segment_value(segment, "sentence_id", _get_segment_value(segment, "segment_id", ""))): str(
-                _get_segment_value(segment, "target_text", "") or ""
-            )
+        translated_by_id = {
+            str(_get_segment_value(segment, "sentence_id", _get_segment_value(segment, "segment_id", ""))): segment
             for segment in translated_segments
         }
         replacements: dict[tuple[Any, ...], Replacement] = {}
@@ -101,12 +103,28 @@ class XlsxExporter:
                     bilingual=bilingual,
                 ),
             )
-            target_text = targets.get(parsed_segment.segment_id, "")
+            translated_segment = translated_by_id.get(parsed_segment.segment_id)
+            target_text = str(_get_segment_value(translated_segment, "target_text", "") or "")
             if target_text.strip():
                 replacement.parts.append(target_text.strip())
                 replacement.has_target = True
             else:
                 replacement.parts.append(parsed_segment.display_text)
+
+            layout_text = str(_get_segment_value(translated_segment, "target_layout_text", "") or "")
+            if layout_text and target_text:
+                metadata = _get_segment_value(translated_segment, "metadata", {}) or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        metadata = {}
+                format_map = metadata.get("source_layout_formats", {}) if isinstance(metadata, Mapping) else {}
+                replacement.layout_parts.append(layout_text if strip_format_tags(layout_text) == target_text else target_text)
+                replacement.layout_format_maps.append(format_map if isinstance(format_map, dict) else {})
+            else:
+                replacement.layout_parts.append(target_text or parsed_segment.display_text)
+                replacement.layout_format_maps.append({})
 
         return {
             key: replacement
@@ -152,7 +170,15 @@ class XlsxExporter:
                         replacement = entries.get(cell_ref)
                         if replacement is None:
                             continue
-                        _set_cell_inline_string(cell, replacement.text)
+                        if replacement.layout_parts and any("⟦" in part for part in replacement.layout_parts):
+                            _set_cell_rich_text(
+                                cell,
+                                replacement.layout_parts,
+                                replacement.layout_format_maps,
+                                replacement.source_text,
+                            )
+                        else:
+                            _set_cell_inline_string(cell, replacement.text)
                     modified[sheet_part] = _serialize_xml(root, original_xml)
 
             workbook_updates = self._update_workbook_xml(archive, replacements)
@@ -276,6 +302,99 @@ def _set_cell_inline_string(cell: ET.Element, text: str) -> None:
     text_element.text = text
     if text[:1].isspace() or text[-1:].isspace():
         text_element.set(XML_SPACE_ATTR, "preserve")
+
+
+def _set_cell_rich_text(
+    cell: ET.Element,
+    parts: list[str],
+    format_maps: list[dict[str, list[str]]],
+    source_text: str,
+) -> None:
+    """把带 ⟦n⟧ 标签的译文写回 XLSX inline rich text。"""
+    separator = "\n" if "\n" in source_text else " "
+    for child in list(cell):
+        cell.remove(child)
+    cell.set("t", "inlineStr")
+    inline = ET.SubElement(cell, f"{{{MAIN_NS}}}is")
+    marker_re = re.compile(r"⟦\s*(/?)\s*(\d+)\s*⟧")
+
+    def emit(text: str, format_tokens: list[str] | tuple[str, str] | None) -> None:
+        if not text:
+            return
+        run = ET.SubElement(inline, f"{{{MAIN_NS}}}r")
+        _append_xlsx_run_properties(run, format_tokens)
+        text_element = ET.SubElement(run, f"{{{MAIN_NS}}}t")
+        text_element.text = _sanitize_xml_text(text)
+        if text[:1].isspace() or text[-1:].isspace():
+            text_element.set(XML_SPACE_ATTR, "preserve")
+
+    for index, part in enumerate(parts):
+        format_map = format_maps[index] if index < len(format_maps) else {}
+        if index:
+            emit(separator, format_map.get("base"))
+        cursor = 0
+        current_id: str | None = None
+        for match in marker_re.finditer(part):
+            emit(part[cursor:match.start()], format_map.get(current_id or "base"))
+            cursor = match.end()
+            current_id = None if match.group(1) else match.group(2)
+        emit(part[cursor:], format_map.get(current_id or "base"))
+
+
+def _append_xlsx_run_properties(
+    run: ET.Element,
+    format_tokens: list[str] | tuple[str, str] | None,
+) -> None:
+    if not format_tokens:
+        return
+    open_tag = str(format_tokens[0] if format_tokens else "")
+    style_match = re.search(r'style="([^"]*)"', open_tag)
+    if not style_match:
+        return
+    styles = {
+        key.strip().lower(): value.strip()
+        for key, value in (
+            declaration.split(":", 1)
+            for declaration in style_match.group(1).split(";")
+            if ":" in declaration
+        )
+    }
+    properties: list[tuple[str, dict[str, str]]] = []
+    if styles.get("font-weight") == "bold":
+        properties.append(("b", {}))
+    if styles.get("font-style") == "italic":
+        properties.append(("i", {}))
+    decoration = styles.get("text-decoration", "")
+    if "underline" in decoration:
+        underline_attributes = {"val": "single"}
+        if styles.get("text-decoration-style") == "double":
+            underline_attributes["val"] = "double"
+        properties.append(("u", underline_attributes))
+    if "line-through" in decoration:
+        properties.append(("strike", {}))
+    vertical_align = styles.get("vertical-align", "")
+    if vertical_align in {"super", "sub"}:
+        properties.append(("vertAlign", {"val": "superscript" if vertical_align == "super" else "subscript"}))
+    color = styles.get("color", "")
+    if color.startswith("#") and len(color) in (4, 7):
+        rgb = color[1:]
+        if len(rgb) == 3:
+            rgb = "".join(char * 2 for char in rgb)
+        properties.append(("color", {"rgb": f"FF{rgb.upper()}"}))
+    size = styles.get("font-size", "")
+    size_match = re.fullmatch(r"([0-9.]+)pt", size)
+    if size_match:
+        # Excel SpreadsheetML 的字号值直接使用实际磅数，不是 Word 的半磅单位。
+        properties.append(("sz", {"val": size_match.group(1)}))
+    family = styles.get("font-family", "").strip("'")
+    if family:
+        properties.append(("rFont", {"val": family}))
+    if not properties:
+        return
+    run_properties = ET.Element(f"{{{MAIN_NS}}}rPr")
+    for tag, attributes in properties:
+        ET.SubElement(run_properties, f"{{{MAIN_NS}}}{tag}", attributes)
+    run.insert(0, run_properties)
 
 
 def _replace_text_elements(elements: list[ET.Element], text: str) -> None:

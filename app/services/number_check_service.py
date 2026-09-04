@@ -62,8 +62,8 @@ _STATUS_API_ERROR = "api_error"
 _STATUS_MISSING = "missing"
 
 _ERROR_SCHEMA = """{
-  "替换锚点": "译文中需要被替换的精确字符片段",
-  "译文修改建议值": "修正后的译文片段，必须与替换锚点在语境中完全对等，确保直接替换锚点后译文在语法、空格和单位上完全正确。例如锚点为'1 million'，建议值应为'10 million'，严禁只给数字'10'。",
+  "替换锚点": "译文中可唯一定位、需要替换的完整原文片段。短数值或重复数值不得单独作为锚点；必须带上前后词、空格或标点，使该片段在本条译文中只出现一次。例如应返回'and 5%, respectively'，而不是'5%'。",
+  "译文修改建议值": "替换锚点的完整对应替换片段，只修改错误数值并原样保留锚点中的上下文。例如锚点为'and 5%, respectively'时，应返回'and 53%, respectively'，不得只返回'53%'。",
   "is_source_consistent": "true或false — 译文数值是否忠实还原了原文数值",
   "修改理由": "简述违反的具体规则（如数量级错误）"
 }"""
@@ -154,9 +154,15 @@ def _build_ai_prompt(combined: str, count: int) -> str:
 - errors：译文数值与原文不符（错译、漏译、多译，严禁四舍五入、严禁序号与单位漏译），【需要修改译文】。一条译文中可能有多个 error，请全部列出。
 - source_issues：译文忠实还原了原文，但原文数值本身存在逻辑问题，【不需要修改译文】。
 
+替换字段必须遵守：
+1. 替换锚点必须是本条译文中的原样子串，并且在本条译文中只出现一次。
+2. 短数值或重复数值不得单独作为替换锚点。必须带上足够的前后词、空格或标点形成唯一上下文，例如返回“and 5%, respectively”，不得只返回“5%”。
+3. 译文修改建议值必须是替换锚点的完整对应替换片段，只修改错误数值并保留同样的上下文。例如返回“and 53%, respectively”，不得只返回“53%”。
+4. 最小拆分原则：一句话内多个数值错误须拆分为多个 JSON 对象，"译文数值"/"替换锚点"精确到具体错误片段。
+
 特别注意中文数量单位换算：万=10^4（如 80万吨=800,000吨）、亿=10^8。比对前先写出原文实际数值再与译文对比。
 
-输出 JSON 数组，长度必须与输入条数({count})相同，每项对应同序号条目：
+输出 JSON 数组，长度必须与输入条数({count})相同，每项对应同序号条目,若句子存在多个错误则返回多个错误对象：
 [
   {{"seq": 0, "is_correct": true, "errors": [], "source_issues": []}},
   {{"seq": 1, "is_correct": false, "errors": [{_ERROR_SCHEMA}], "source_issues": [{_SOURCE_ISSUE_SCHEMA}]}}
@@ -165,6 +171,7 @@ def _build_ai_prompt(combined: str, count: int) -> str:
 待检查内容：
 {combined}
 """
+
 
 
 async def _call_ai(
@@ -739,27 +746,184 @@ def _get_item_segment(db: Session, item: NumberCheckReportItem) -> Segment:
         raise HTTPException(status_code=404, detail="对应句段不存在，无法操作。")
     return segment
 
+_NUMERIC_DIGITS = frozenset("0123456789０１２３４５６７８９")
+_NUMERIC_SIGNS = frozenset("+-−")
+_DECIMAL_SEPARATORS = frozenset(".,，．")
+_PERCENT_SIGNS = frozenset("%％‰‱")
+
+
+def _safe_anchor_positions(text: str, anchor: str) -> list[int]:
+    """返回不位于更长数值内部的锚点位置。"""
+    if not anchor:
+        return []
+
+    digits = "0123456789０１２３４５６７８９"
+    decimal_separators = ".,，．"
+    positions: list[int] = []
+    offset = 0
+    while (index := text.find(anchor, offset)) >= 0:
+        end = index + len(anchor)
+        extends_left = (
+            anchor[0] in digits
+            and index > 0
+            and (
+                text[index - 1] in digits + "+-−"
+                or (
+                    text[index - 1] in decimal_separators
+                    and index > 1
+                    and text[index - 2] in digits
+                )
+            )
+        )
+        extends_right = (
+            anchor[-1] in digits
+            and end < len(text)
+            and (
+                text[end] in digits + "%％‰‱+-−"
+                or (
+                    text[end] in decimal_separators
+                    and end + 1 < len(text)
+                    and text[end + 1] in digits
+                )
+            )
+        )
+        if not extends_left and not extends_right:
+            positions.append(index)
+        offset = index + len(anchor)
+    return positions
+
+
+
+def _replace_unique_safe_anchor(text: str, anchor: str, suggested: str) -> str | None:
+    """仅在锚点能安全且唯一定位时替换，否则返回 None。"""
+    positions = _safe_anchor_positions(text, anchor)
+    if len(positions) != 1:
+        return None
+    index = positions[0]
+    return text[:index] + suggested + text[index + len(anchor):]
+
+
+def _is_source_consistent_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() == "true"
+
+
+def _extract_applicable_errors(item: NumberCheckReportItem) -> list[tuple[str, str]]:
+    """从 ai_errors 中提取全部可自动替换的 (锚点, 建议值) 候选。
+
+    一条译文可能同时命中多个数值错误，AI 已按最小拆分原则把它们拆成独立
+    error 对象；这里把它们全部取出，而不是只取第一个。
+    is_source_consistent=true 表示原文本身有问题、不需要改译文，跳过。
+    长锚点优先排在前面替换，避免短锚点在长锚点内被提前命中。
+    """
+    errors = _load_json_list(item.ai_errors)
+    candidates: list[tuple[str, str]] = []
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        if _is_source_consistent_flag(error.get("is_source_consistent")):
+            continue
+        anchor = str(error.get("替换锚点") or "").strip()
+        suggested = str(error.get("译文修改建议值") or "").strip()
+        if not anchor or not suggested or anchor == suggested:
+            continue
+        candidates.append((anchor, suggested))
+    candidates.sort(key=lambda pair: len(pair[0]), reverse=True)
+    return candidates
+
+
+def _apply_all_safe_errors_to_text(
+    current_target: str,
+    candidates: list[tuple[str, str]],
+) -> tuple[str, int, list[str], list[tuple[int, int]]]:
+    """依次应用所有安全且唯一的锚点替换，跳过无法唯一定位的项。
+
+    同时追踪每次替换后建议值在最终文本中的位置区间，供前端高亮使用
+    （替换顺序不同、长度不同都会让后续锚点的位置发生偏移，这里统一处理，
+    避免前端另用一套逻辑重新猜测位置）。
+
+    返回 (替换后的文本, 成功替换数, 被跳过的锚点列表, 高亮区间列表)。
+    """
+    text = current_target
+    applied_count = 0
+    skipped_anchors: list[str] = []
+    spans: list[tuple[int, int]] = []
+    for anchor, suggested in candidates:
+        positions = _safe_anchor_positions(text, anchor)
+        if len(positions) != 1:
+            skipped_anchors.append(anchor)
+            continue
+        start = positions[0]
+        old_end = start + len(anchor)
+        delta = len(suggested) - len(anchor)
+        spans = [
+            (s + delta, e + delta) if s >= old_end else (s, e)
+            for s, e in spans
+        ]
+        spans.append((start, start + len(suggested)))
+        text = text[:start] + suggested + text[old_end:]
+        applied_count += 1
+    spans.sort()
+    return text, applied_count, skipped_anchors, spans
+
+
+def _compute_preview_text_and_spans(
+    item: NumberCheckReportItem,
+) -> tuple[str, list[tuple[int, int]]]:
+    """计算修正后译文预览及高亮区间，与实际写回使用同一套定位逻辑。
+
+    - 未应用时：基于当前 target_text 试算全部安全候选的替换结果，仅用于预览，
+      不落库、不修改 target_text。
+    - 已应用时：基于 original_target_text 重新试算，若结果与已保存的
+      target_text 一致，则复用算出的高亮区间；若不一致（如译文被再次手动
+      编辑），则不做高亮，只显示当前译文。
+    """
+    candidates = _extract_applicable_errors(item)
+    current_text = item.target_text or ""
+    if not candidates:
+        return current_text, []
+
+    if item.applied:
+        base_text = item.original_target_text or ""
+        if not base_text:
+            return current_text, []
+        result_text, applied_count, _skipped, spans = _apply_all_safe_errors_to_text(
+            base_text, candidates
+        )
+        if applied_count == 0 or result_text != current_text:
+            return current_text, []
+        return result_text, spans
+
+    result_text, applied_count, _skipped, spans = _apply_all_safe_errors_to_text(
+        current_text, candidates
+    )
+    if applied_count == 0:
+        return current_text, []
+    return result_text, spans
+
 
 def apply_number_check_item(
     db: Session,
     item: NumberCheckReportItem,
     current_user: User,
 ) -> NumberCheckReportItem:
-    """按锚点替换将 AI 建议应用到译文。"""
-    anchor = (item.replace_anchor or "").strip()
-    suggested = item.suggested_value or ""
-    if not anchor:
-        raise HTTPException(status_code=400, detail="缺少替换锚点，无法自动替换，请手动修改。")
+    """把该句段命中的所有安全且唯一锚点错误一次性应用到译文。
+
+    一条译文可能有多个数值错误；无法唯一定位的锚点会被跳过并记录在
+    ai_error_status 中，不会猜测位置强行替换。
+    """
+    candidates = _extract_applicable_errors(item)
+    if not candidates:
+        raise HTTPException(status_code=400, detail="缺少可自动替换的锚点，请手动修改。")
 
     segment = _get_item_segment(db, item)
     current_target = segment.target_text or ""
-    if anchor not in current_target:
-        raise HTTPException(
-            status_code=400,
-            detail="替换锚点不在当前译文中，译文可能已变更，请手动处理。",
-        )
-
-    new_target = current_target.replace(anchor, suggested, 1)
+    new_target, applied_count, skipped_anchors, _spans = _apply_all_safe_errors_to_text(
+        current_target, candidates
+    )
+    if applied_count == 0:
+        raise HTTPException(status_code=400, detail="替换锚点均无法唯一定位，请手动处理。")
     if new_target == current_target:
         raise HTTPException(status_code=400, detail="按建议替换后译文没有变化。")
 
@@ -769,6 +933,9 @@ def apply_number_check_item(
     item.applied = True
     item.applied_at = datetime.utcnow()
     item.status = ITEM_STATUS_MODIFIED
+    item.ai_error_status = (
+        f"{len(skipped_anchors)} 处锚点无法唯一定位，需手动处理" if skipped_anchors else ""
+    )
 
     update_segment_by_sentence_id(
         db=db,
@@ -780,6 +947,7 @@ def apply_number_check_item(
     )
     db.refresh(item)
     return item
+
 
 
 def restore_number_check_item(
@@ -834,10 +1002,11 @@ def _apply_single_number_check_item(
     item: NumberCheckReportItem,
     current_user: User,
 ) -> bool:
-    """尝试按锚点替换应用单个项，失败返回 False（不抛异常，供批量使用）。"""
-    anchor = (item.replace_anchor or "").strip()
-    suggested = item.suggested_value or ""
-    if not anchor or item.applied or item.status == ITEM_STATUS_IGNORED:
+    """应用该句段所有安全且唯一的锚点错误；一个都替换不了则返回 False，供批量使用。"""
+    if item.applied or item.status == ITEM_STATUS_IGNORED:
+        return False
+    candidates = _extract_applicable_errors(item)
+    if not candidates:
         return False
     segment = (
         db.query(Segment)
@@ -850,10 +1019,10 @@ def _apply_single_number_check_item(
     if not segment:
         return False
     current_target = segment.target_text or ""
-    if anchor not in current_target:
-        return False
-    new_target = current_target.replace(anchor, suggested, 1)
-    if new_target == current_target:
+    new_target, applied_count, skipped_anchors, _spans = _apply_all_safe_errors_to_text(
+        current_target, candidates
+    )
+    if applied_count == 0 or new_target == current_target:
         return False
 
     item.original_target_text = current_target
@@ -861,6 +1030,9 @@ def _apply_single_number_check_item(
     item.applied = True
     item.applied_at = datetime.utcnow()
     item.status = ITEM_STATUS_MODIFIED
+    item.ai_error_status = (
+        f"{len(skipped_anchors)} 处锚点无法唯一定位，需手动处理" if skipped_anchors else ""
+    )
     update_segment_by_sentence_id(
         db=db,
         file_record_id=item.file_record_id,
@@ -870,6 +1042,7 @@ def _apply_single_number_check_item(
         current_user=current_user,
     )
     return True
+
 
 
 def apply_number_check_items_bulk(
@@ -949,6 +1122,7 @@ def _load_json_list(raw_value: str | None) -> list[Any]:
 
 
 def serialize_number_check_item(item: NumberCheckReportItem) -> dict[str, Any]:
+    preview_text, preview_spans = _compute_preview_text_and_spans(item)
     return {
         "id": str(item.id),
         "report_id": str(item.report_id),
@@ -977,7 +1151,15 @@ def serialize_number_check_item(item: NumberCheckReportItem) -> dict[str, Any]:
         "applied_at": item.applied_at.isoformat() if item.applied_at else None,
         "status": item.status,
         "ignored": item.status == ITEM_STATUS_IGNORED,
-        "can_apply": bool(item.replace_anchor) and not item.applied,
+        "preview_text": preview_text,
+        "preview_spans": [{"start": start, "end": end} for start, end in preview_spans],
+        "can_apply": (
+            not item.applied
+            and any(
+                len(_safe_anchor_positions(item.target_text or "", anchor)) == 1
+                for anchor, _ in _extract_applicable_errors(item)
+            )
+        ),
         "block_index": item.block_index,
         "row_index": item.row_index,
         "cell_index": item.cell_index,
