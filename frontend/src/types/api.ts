@@ -291,6 +291,25 @@ export interface DocumentParseOptions {
   docx_numbering_localization?: DocxNumberingLocalization
 }
 
+export type DocumentStatisticsScope = 'standard' | 'extended'
+
+export interface DocumentTextStatisticsMetrics {
+  words: number | null
+  non_asian_words: number | null
+  asian_characters: number | null
+  characters: number | null
+  characters_with_spaces: number | null
+  paragraphs: number | null
+  lines: number | null
+}
+
+export interface DocumentAdditionalContentStatistics {
+  textbox: DocumentTextStatisticsMetrics
+  footnote: DocumentTextStatisticsMetrics
+  endnote: DocumentTextStatisticsMetrics
+  total: DocumentTextStatisticsMetrics
+}
+
 export interface DocumentStatistics {
   source: string
   engine: string | null
@@ -300,6 +319,9 @@ export interface DocumentStatistics {
   statistics_profile: string | null
   content_scope: string | null
   statistics_warnings: string[]
+  statistics_scope: DocumentStatisticsScope
+  standard_text_metrics: DocumentTextStatisticsMetrics | null
+  additional_content: DocumentAdditionalContentStatistics | null
   match_analysis: DocumentMatchAnalysis | null
   pages: number | null
   words: number | null
@@ -370,6 +392,9 @@ export interface DocumentStatisticsTotals {
   linked_image_count: number | null
   chart_count: number | null
   smartart_count: number | null
+  statistics_scope: DocumentStatisticsScope
+  standard_text_metrics: DocumentTextStatisticsMetrics | null
+  additional_content: DocumentAdditionalContentStatistics | null
   match_analysis: DocumentMatchAnalysis | null
 }
 
@@ -394,6 +419,7 @@ export interface DocumentStatisticsReport {
   file_ids: string[]
   total_files: number
   available_files: number
+  statistics_scope: DocumentStatisticsScope
   totals: DocumentStatisticsTotals
   status: string
   created_at: string | null

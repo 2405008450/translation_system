@@ -62,6 +62,22 @@ STATISTIC_NUMBER_KEYS = (
     "chart_count",
     "smartart_count",
 )
+TEXT_STATISTIC_NUMBER_KEYS = (
+    "words",
+    "non_asian_words",
+    "asian_characters",
+    "characters",
+    "characters_with_spaces",
+    "paragraphs",
+    "lines",
+)
+DOCUMENT_STATISTICS_SCOPE_STANDARD = "standard"
+DOCUMENT_STATISTICS_SCOPE_EXTENDED = "extended"
+DOCUMENT_STATISTICS_SCOPES = {
+    DOCUMENT_STATISTICS_SCOPE_STANDARD,
+    DOCUMENT_STATISTICS_SCOPE_EXTENDED,
+}
+ADDITIONAL_CONTENT_KEYS = ("textbox", "footnote", "endnote")
 NON_ASIAN_WORD_PATTERN = re.compile(
     r"[A-Za-z0-9]+(?:[.,:/_-][A-Za-z0-9]+)*%?|[^\W_\d\s]+(?:[-'][^\W_\d\s]+)*",
     re.UNICODE,
@@ -71,15 +87,25 @@ _LICENSE_LOCK = Lock()
 _LICENSE_STATUS: str | None = None
 
 
-def compute_docx_statistics(raw_bytes: bytes) -> dict[str, Any]:
+def compute_docx_statistics(
+    raw_bytes: bytes,
+    *,
+    statistics_scope: str = DOCUMENT_STATISTICS_SCOPE_STANDARD,
+) -> dict[str, Any]:
     """Compute DOCX statistics with the default OpenXML word-like profile."""
-    return compute_word_document_statistics(raw_bytes, "source.docx")
+    return compute_word_document_statistics(
+        raw_bytes,
+        "source.docx",
+        statistics_scope=statistics_scope,
+    )
 
 
 def compute_document_statistics(
     raw_bytes: bytes,
     filename: str,
     options: dict[str, Any] | None = None,
+    *,
+    statistics_scope: str = DOCUMENT_STATISTICS_SCOPE_STANDARD,
 ) -> dict[str, Any]:
     """根据文件类型计算文档统计，同时保持既有 Word 统计口径不变。"""
     suffix = Path(filename or "").suffix.lower()
@@ -88,23 +114,46 @@ def compute_document_statistics(
     if suffix == ".idml":
         return compute_idml_document_statistics(raw_bytes)
     if suffix in {".doc", ".docx"}:
-        return compute_word_document_statistics(raw_bytes, filename)
+        return compute_word_document_statistics(
+            raw_bytes,
+            filename,
+            statistics_scope=statistics_scope,
+        )
     return compute_adapter_document_statistics(raw_bytes, filename)
 
 
-def compute_word_document_statistics(raw_bytes: bytes, filename: str) -> dict[str, Any]:
+def compute_word_document_statistics(
+    raw_bytes: bytes,
+    filename: str,
+    *,
+    statistics_scope: str = DOCUMENT_STATISTICS_SCOPE_STANDARD,
+) -> dict[str, Any]:
     """Compute Word statistics without starting LibreOffice for DOCX files."""
+    statistics_scope = normalize_document_statistics_scope(statistics_scope)
     suffix = Path(filename or "").suffix.lower()
     if suffix == ".docx":
-        return _compute_docx_statistics_without_libreoffice(raw_bytes)
+        return _compute_docx_statistics_without_libreoffice(
+            raw_bytes,
+            statistics_scope=statistics_scope,
+        )
 
     if suffix == ".doc":
         converted_docx = _convert_doc_to_docx(raw_bytes, filename)
         if converted_docx is not None:
-            return _compute_docx_statistics_without_libreoffice(converted_docx)
+            return _compute_docx_statistics_without_libreoffice(
+                converted_docx,
+                statistics_scope=statistics_scope,
+            )
 
         libreoffice_statistics = _compute_with_libreoffice(raw_bytes, filename)
         if libreoffice_statistics is not None:
+            libreoffice_statistics["statistics_scope"] = statistics_scope
+            if statistics_scope == DOCUMENT_STATISTICS_SCOPE_EXTENDED:
+                libreoffice_statistics["standard_text_metrics"] = None
+                libreoffice_statistics["additional_content"] = None
+                libreoffice_statistics.setdefault("statistics_warnings", []).append(
+                    "extended_content_breakdown_unavailable"
+                )
             return libreoffice_statistics
 
     return _build_statistics_payload(
@@ -114,6 +163,7 @@ def compute_word_document_statistics(raw_bytes: bytes, filename: str) -> dict[st
         license_status=None,
         statistics_profile="unavailable",
         content_scope="unavailable",
+        statistics_scope=statistics_scope,
     )
 
 
@@ -429,17 +479,25 @@ def _compute_with_libreoffice(raw_bytes: bytes, filename: str) -> dict[str, Any]
     return statistics
 
 
-def _compute_docx_statistics_without_libreoffice(raw_bytes: bytes) -> dict[str, Any]:
-    openxml_statistics = _compute_with_openxml(raw_bytes)
+def _compute_docx_statistics_without_libreoffice(
+    raw_bytes: bytes,
+    *,
+    statistics_scope: str = DOCUMENT_STATISTICS_SCOPE_STANDARD,
+) -> dict[str, Any]:
+    statistics_scope = normalize_document_statistics_scope(statistics_scope)
+    openxml_statistics = _compute_with_openxml(raw_bytes, statistics_scope=statistics_scope)
     if openxml_statistics is not None:
         return openxml_statistics
 
-    aspose_statistics = _compute_with_aspose(raw_bytes)
+    aspose_statistics = _compute_with_aspose(raw_bytes, statistics_scope=statistics_scope)
     if aspose_statistics is not None:
         return aspose_statistics
 
     cached_statistics = _read_cached_docprops_statistics(raw_bytes)
     if cached_statistics is not None:
+        cached_statistics["statistics_scope"] = statistics_scope
+        if statistics_scope == DOCUMENT_STATISTICS_SCOPE_EXTENDED:
+            cached_statistics["statistics_warnings"].append("extended_content_breakdown_unavailable")
         return cached_statistics
 
     return _build_statistics_payload(
@@ -449,6 +507,7 @@ def _compute_docx_statistics_without_libreoffice(raw_bytes: bytes) -> dict[str, 
         license_status=None,
         statistics_profile="unavailable",
         content_scope="unavailable",
+        statistics_scope=statistics_scope,
     )
 
 
@@ -474,7 +533,11 @@ def serialize_document_statistics(value: Any) -> str:
     return json.dumps(statistics, ensure_ascii=False, sort_keys=True)
 
 
-def _compute_with_aspose(raw_bytes: bytes) -> dict[str, Any] | None:
+def _compute_with_aspose(
+    raw_bytes: bytes,
+    *,
+    statistics_scope: str = DOCUMENT_STATISTICS_SCOPE_STANDARD,
+) -> dict[str, Any] | None:
     try:
         import aspose.words as aw
     except Exception:
@@ -486,17 +549,23 @@ def _compute_with_aspose(raw_bytes: bytes) -> dict[str, Any] | None:
             docx_path = Path(temp_dir) / "source.docx"
             docx_path.write_bytes(raw_bytes)
             document = aw.Document(str(docx_path))
-            document.include_textboxes_footnotes_endnotes_in_stat = False
+            include_extended = statistics_scope == DOCUMENT_STATISTICS_SCOPE_EXTENDED
+            document.include_textboxes_footnotes_endnotes_in_stat = include_extended
             document.update_word_count(True)
             properties = document.built_in_document_properties
 
             payload = _build_statistics_payload(
                 source="aspose",
                 engine="aspose-words",
-                include_textboxes_footnotes_endnotes=False,
+                include_textboxes_footnotes_endnotes=include_extended,
                 license_status=license_status,
-                statistics_profile="aspose_word",
-                content_scope="aspose_document",
+                statistics_profile="aspose_word_extended" if include_extended else "aspose_word",
+                content_scope=(
+                    "aspose_document_textboxes_footnotes_endnotes"
+                    if include_extended
+                    else "aspose_document"
+                ),
+                statistics_scope=statistics_scope,
             )
             payload.update(
                 {
@@ -513,17 +582,35 @@ def _compute_with_aspose(raw_bytes: bytes) -> dict[str, Any] | None:
                     "lines": _to_optional_int(getattr(properties, "lines", None)),
                 }
             )
+            if include_extended:
+                payload["statistics_warnings"].append("extended_content_breakdown_unavailable")
             return payload
     except Exception:
         return None
 
 
-def _compute_with_openxml(raw_bytes: bytes) -> dict[str, Any] | None:
+def _compute_with_openxml(
+    raw_bytes: bytes,
+    *,
+    statistics_scope: str = DOCUMENT_STATISTICS_SCOPE_STANDARD,
+) -> dict[str, Any] | None:
+    statistics_scope = normalize_document_statistics_scope(statistics_scope)
+    include_extended = statistics_scope == DOCUMENT_STATISTICS_SCOPE_EXTENDED
+    optional_part_errors: list[str] = []
     try:
         with ZipFile(BytesIO(raw_bytes)) as archive:
             document_xml = archive.read("word/document.xml")
             cached_statistics = _read_cached_docprops_statistics_from_archive(archive)
             relationships = _read_part_relationships(archive, "word/document.xml")
+            footnotes_root = None
+            endnotes_root = None
+            if include_extended:
+                footnotes_root, footnotes_error = _read_optional_xml_part(archive, "word/footnotes.xml")
+                endnotes_root, endnotes_error = _read_optional_xml_part(archive, "word/endnotes.xml")
+                if footnotes_error:
+                    optional_part_errors.append("footnotes")
+                if endnotes_error:
+                    optional_part_errors.append("endnotes")
     except (BadZipFile, KeyError):
         return None
 
@@ -533,30 +620,80 @@ def _compute_with_openxml(raw_bytes: bytes) -> dict[str, Any] | None:
         return None
 
     paragraphs = [text for text in _iter_word_like_paragraph_texts(root) if text.strip()]
+    standard_line_count = _trusted_cached_line_count(cached_statistics, paragraph_count=len(paragraphs))
+    standard_text_metrics = _build_text_statistics_metrics(paragraphs, line_count=standard_line_count)
+    additional_content = None
+    counted_paragraphs = paragraphs
+    counted_text_metrics = standard_text_metrics
+
+    if include_extended:
+        textbox_paragraphs = [text for text in _iter_textbox_paragraph_texts(root) if text.strip()]
+        footnote_paragraphs = (
+            [text for text in _iter_note_paragraph_texts(footnotes_root, "footnote") if text.strip()]
+            if footnotes_root is not None
+            else []
+        )
+        endnote_paragraphs = (
+            [text for text in _iter_note_paragraph_texts(endnotes_root, "endnote") if text.strip()]
+            if endnotes_root is not None
+            else []
+        )
+        category_texts = {
+            "textbox": textbox_paragraphs,
+            "footnote": footnote_paragraphs,
+            "endnote": endnote_paragraphs,
+        }
+        category_metrics = {
+            key: _build_text_statistics_metrics(
+                texts,
+                line_count=sum(_count_nonempty_text_lines(text) for text in texts),
+            )
+            for key, texts in category_texts.items()
+        }
+        additional_content = {
+            **category_metrics,
+            "total": _sum_text_statistics_metrics(category_metrics.values()),
+        }
+        counted_paragraphs = paragraphs + textbox_paragraphs + footnote_paragraphs + endnote_paragraphs
+        counted_text_metrics = _build_text_statistics_metrics(
+            counted_paragraphs,
+            line_count=sum(_count_nonempty_text_lines(text) for text in counted_paragraphs),
+        )
+
     object_statistics = _compute_openxml_object_statistics(root, relationships)
     payload = _build_statistics_payload(
         source="openxml_word_like",
         engine="openxml-word-like",
-        include_textboxes_footnotes_endnotes=False,
+        include_textboxes_footnotes_endnotes=include_extended,
         license_status=None,
-        statistics_profile="word_web_approx",
-        content_scope="main_document_body",
+        statistics_profile="word_web_approx_extended" if include_extended else "word_web_approx",
+        content_scope=(
+            "main_document_body_textboxes_footnotes_endnotes"
+            if include_extended
+            else "main_document_body"
+        ),
+        statistics_scope=statistics_scope,
     )
     payload.update(
         {
             "pages": _to_optional_int((cached_statistics or {}).get("pages")),
-            "words": _count_word_words(paragraphs),
-            "non_asian_words": _count_non_asian_words(paragraphs),
-            "asian_characters": _count_asian_characters(paragraphs),
-            "characters": _count_characters(paragraphs, include_spaces=False),
-            "characters_with_spaces": _count_characters(paragraphs, include_spaces=True),
-            "paragraphs": len(paragraphs),
-            "lines": _trusted_cached_line_count(cached_statistics, paragraph_count=len(paragraphs)),
+            **counted_text_metrics,
             **object_statistics,
         }
     )
+    if include_extended:
+        payload["standard_text_metrics"] = standard_text_metrics
+        payload["additional_content"] = additional_content
+        payload["statistics_warnings"].append("extended_lines_estimated_from_explicit_breaks")
+        payload["statistics_warnings"].extend(
+            f"extended_{part}_xml_unavailable" for part in optional_part_errors
+        )
     if payload["pages"] is not None or payload["lines"] is not None:
         payload["statistics_warnings"].append("pages_lines_from_cached_docprops")
+        if include_extended:
+            payload["statistics_warnings"].remove("pages_lines_from_cached_docprops")
+            if payload["pages"] is not None:
+                payload["statistics_warnings"].append("pages_from_cached_docprops")
     return payload
 
 
@@ -652,6 +789,20 @@ def _read_part_relationships(
     return relationships
 
 
+def _read_optional_xml_part(
+    archive: ZipFile,
+    part_name: str,
+) -> tuple[ET.Element | None, bool]:
+    try:
+        xml_bytes = archive.read(part_name)
+    except KeyError:
+        return None, False
+    try:
+        return ET.fromstring(xml_bytes), False
+    except ET.ParseError:
+        return None, True
+
+
 def _iter_word_like_paragraph_texts(root: ET.Element) -> Iterable[str]:
     body = root.find(f".//{_w_tag('body')}")
     container = body if body is not None else root
@@ -671,6 +822,36 @@ def _iter_word_like_paragraph_texts(root: ET.Element) -> Iterable[str]:
             yield from walk(child)
 
     yield from walk(container)
+
+
+def _iter_textbox_paragraph_texts(root: ET.Element) -> Iterable[str]:
+    body = root.find(f".//{_w_tag('body')}")
+    container = body if body is not None else root
+
+    def walk(node: ET.Element, *, inside_textbox: bool = False) -> Iterable[str]:
+        if _local_name(node.tag) == "AlternateContent":
+            preferred_branch = _select_preferred_alternate_content_branch(node)
+            if preferred_branch is not None:
+                yield from walk(preferred_branch, inside_textbox=inside_textbox)
+            return
+        next_inside_textbox = inside_textbox or node.tag == _w_tag("txbxContent")
+        if next_inside_textbox and node.tag == _w_tag("p"):
+            yield _extract_word_like_paragraph_text(node)
+            return
+        for child in node:
+            yield from walk(child, inside_textbox=next_inside_textbox)
+
+    yield from walk(container)
+
+
+def _iter_note_paragraph_texts(root: ET.Element, note_kind: str) -> Iterable[str]:
+    note_tag = _w_tag(note_kind)
+    note_type_attr = _w_tag("type")
+    for note in root.findall(f".//{note_tag}"):
+        if note.get(note_type_attr):
+            continue
+        yield from _iter_word_like_paragraph_texts(note)
+        yield from _iter_textbox_paragraph_texts(note)
 
 
 def _extract_word_like_paragraph_text(paragraph: ET.Element) -> str:
@@ -1060,6 +1241,35 @@ def _count_text_blocks(text: str) -> int:
     return len(blocks) if blocks else _count_nonempty_text_lines(content)
 
 
+def _build_text_statistics_metrics(
+    paragraphs: Iterable[str],
+    *,
+    line_count: int | None = None,
+) -> dict[str, int | None]:
+    text_parts = list(paragraphs)
+    return {
+        "words": _count_word_words(text_parts),
+        "non_asian_words": _count_non_asian_words(text_parts),
+        "asian_characters": _count_asian_characters(text_parts),
+        "characters": _count_characters(text_parts, include_spaces=False),
+        "characters_with_spaces": _count_characters(text_parts, include_spaces=True),
+        "paragraphs": len(text_parts),
+        "lines": line_count,
+    }
+
+
+def _sum_text_statistics_metrics(
+    metrics_list: Iterable[dict[str, int | None]],
+) -> dict[str, int | None]:
+    rows = list(metrics_list)
+    totals: dict[str, int | None] = {}
+    for key in TEXT_STATISTIC_NUMBER_KEYS:
+        values = [row.get(key) for row in rows]
+        numeric_values = [value for value in values if isinstance(value, int)]
+        totals[key] = sum(numeric_values) if numeric_values else (0 if rows else None)
+    return totals
+
+
 def _count_word_words(paragraphs: Iterable[str]) -> int:
     text_parts = list(paragraphs)
     return _count_asian_characters(text_parts) + _count_non_asian_words(text_parts)
@@ -1154,6 +1364,7 @@ def _build_statistics_payload(
     statistics_profile: str | None = None,
     content_scope: str | None = None,
     statistics_warnings: Iterable[str] | None = None,
+    statistics_scope: str = DOCUMENT_STATISTICS_SCOPE_STANDARD,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "source": source,
@@ -1164,6 +1375,9 @@ def _build_statistics_payload(
         "statistics_profile": statistics_profile or _default_statistics_profile(source),
         "content_scope": content_scope or _default_content_scope(source),
         "statistics_warnings": list(statistics_warnings or []),
+        "statistics_scope": normalize_document_statistics_scope(statistics_scope),
+        "standard_text_metrics": None,
+        "additional_content": None,
         "match_analysis": None,
     }
     for key in STATISTIC_NUMBER_KEYS:
@@ -1200,11 +1414,39 @@ def _coerce_statistics_payload(value: dict[str, Any]) -> dict[str, Any]:
             else str(value.get("content_scope"))
         ),
         statistics_warnings=_to_string_list(value.get("statistics_warnings")),
+        statistics_scope=normalize_document_statistics_scope(value.get("statistics_scope")),
     )
     for key in STATISTIC_NUMBER_KEYS:
         payload[key] = _to_optional_int(value.get(key))
     payload["match_analysis"] = normalize_document_match_analysis(value.get("match_analysis"))
+    payload["standard_text_metrics"] = _normalize_text_statistics_metrics(
+        value.get("standard_text_metrics")
+    )
+    payload["additional_content"] = _normalize_additional_content(value.get("additional_content"))
     return payload
+
+
+def normalize_document_statistics_scope(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in DOCUMENT_STATISTICS_SCOPES:
+        return normalized
+    return DOCUMENT_STATISTICS_SCOPE_STANDARD
+
+
+def _normalize_text_statistics_metrics(value: Any) -> dict[str, int | None] | None:
+    if not isinstance(value, dict):
+        return None
+    return {key: _to_optional_int(value.get(key)) for key in TEXT_STATISTIC_NUMBER_KEYS}
+
+
+def _normalize_additional_content(value: Any) -> dict[str, dict[str, int | None]] | None:
+    if not isinstance(value, dict):
+        return None
+    normalized: dict[str, dict[str, int | None]] = {}
+    for key in (*ADDITIONAL_CONTENT_KEYS, "total"):
+        metrics = _normalize_text_statistics_metrics(value.get(key))
+        normalized[key] = metrics or {metric_key: 0 for metric_key in TEXT_STATISTIC_NUMBER_KEYS}
+    return normalized
 
 
 def _default_statistics_profile(source: str) -> str:

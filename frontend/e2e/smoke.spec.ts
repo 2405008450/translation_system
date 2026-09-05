@@ -1,4 +1,5 @@
 import path from 'node:path'
+import { Buffer } from 'node:buffer'
 import type { Locator, Page } from '@playwright/test'
 
 import { expect, test } from './test-fixtures'
@@ -6,7 +7,9 @@ import { expect, test } from './test-fixtures'
 const ADMIN_USERNAME = process.env.E2E_ADMIN_USERNAME || 'e2e_admin'
 const ADMIN_PASSWORD = process.env.E2E_ADMIN_PASSWORD || 'E2ePass123!'
 const FIXTURE_FILE = path.resolve(process.cwd(), 'e2e', 'fixtures', 'smoke-source.txt')
-
+const EXTENDED_STATISTICS_DOCX_BASE64 = [
+  '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',
+].join('')
 async function initializeAdmin(page: Page) {
   await page.goto('/login')
   await expect(page.getByTestId('auth-form')).toBeVisible()
@@ -283,6 +286,45 @@ test.describe.serial('核心 E2E 冒烟流程', () => {
     await expect(fileTable.getByText('smoke-source.txt')).toHaveCount(2)
     await expect(fileTable).toContainText('英语（美国）')
     await expect(fileTable).toContainText('日语')
+  })
+
+  test('文档统计可以生成并回看含附加内容报告', async ({ page }) => {
+    await login(page)
+    await page.getByTestId('project-create-button').click()
+    await page.getByTestId('project-create-name').fill(`E2E Extended Statistics ${Date.now()}`)
+    await page.getByTestId('project-create-workflow-template').selectOption('translate')
+    await Promise.all([
+      page.waitForURL(/\/projects\/[0-9a-f-]+/i),
+      page.getByTestId('project-create-submit').click(),
+    ])
+
+    await page.getByTestId('project-upload-open').click()
+    await page.getByTestId('project-upload-file-input').setInputFiles({
+      name: 'extended-statistics.docx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      buffer: Buffer.from(EXTENDED_STATISTICS_DOCX_BASE64, 'base64'),
+    })
+    await page.getByTestId('project-upload-source-language').selectOption('zh-CN')
+    await page.getByTestId('project-upload-target-trigger').click()
+    await page.getByTestId('project-upload-target-en-US').check()
+    await page.getByTestId('project-upload-submit').click()
+    await expect(page.getByTestId('project-upload-page')).toBeHidden({ timeout: 45_000 })
+
+    await page.getByTestId('project-tab-stats').click()
+    const statisticsTable = page.getByTestId('project-statistics-file-table')
+    await statisticsTable.getByRole('checkbox', { name: '选择第 1 行' }).check()
+
+    const statisticsRequest = page.waitForRequest((request) => (
+      request.method() === 'POST'
+      && /\/api\/projects\/[0-9a-f-]+\/document-statistics$/i.test(request.url())
+    ))
+    await page.getByTestId('project-statistics-generate-extended').click()
+    const request = await statisticsRequest
+    expect(request.postDataJSON()).toMatchObject({ statistics_scope: 'extended' })
+
+    await expect(page.getByText('附加内容分类统计')).toBeVisible()
+    await expect(page.getByText('正文文本框').first()).toBeVisible()
+    await expect(page.locator('.pd-statistics-report-picker__select')).toContainText('含附加内容')
   })
 
   test('项目详情工具栏删除只删除选中文件', async ({ page }) => {

@@ -127,9 +127,14 @@ from app.services.comment_service import (
     update_segment_comment,
 )
 from app.services.document_statistics import (
+    ADDITIONAL_CONTENT_KEYS,
+    DOCUMENT_STATISTICS_SCOPE_EXTENDED,
+    DOCUMENT_STATISTICS_SCOPE_STANDARD,
     STATISTIC_NUMBER_KEYS,
+    TEXT_STATISTIC_NUMBER_KEYS,
     compute_document_statistics,
     normalize_document_statistics,
+    normalize_document_statistics_scope,
     serialize_document_statistics,
 )
 from app.services.document_alignment.service import merge_alignment_pair_range
@@ -3034,6 +3039,7 @@ class ProjectUpdatePayload(BaseModel):
 
 class ProjectDocumentStatisticsPayload(BaseModel):
     file_ids: list[UUID] = Field(default_factory=list)
+    statistics_scope: Literal["standard", "extended"] = DOCUMENT_STATISTICS_SCOPE_STANDARD
 
 
 class ProjectFileZipExportPayload(BaseModel):
@@ -3046,13 +3052,18 @@ class FileRecordExportPayload(BaseModel):
     include_revision_marks: bool = False
 
 
-def _build_unavailable_document_statistics() -> dict[str, Any]:
+def _build_unavailable_document_statistics(
+    statistics_scope: str = DOCUMENT_STATISTICS_SCOPE_STANDARD,
+) -> dict[str, Any]:
     statistics = {
         "source": "unavailable",
         "engine": None,
         "engine_version": None,
         "license_status": None,
         "include_textboxes_footnotes_endnotes": None,
+        "statistics_scope": normalize_document_statistics_scope(statistics_scope),
+        "standard_text_metrics": None,
+        "additional_content": None,
         "match_analysis": None,
     }
     for key in STATISTIC_NUMBER_KEYS:
@@ -3060,8 +3071,13 @@ def _build_unavailable_document_statistics() -> dict[str, Any]:
     return statistics
 
 
-def _create_empty_document_statistics_totals() -> dict[str, Any]:
+def _create_empty_document_statistics_totals(
+    statistics_scope: str = DOCUMENT_STATISTICS_SCOPE_STANDARD,
+) -> dict[str, Any]:
     totals: dict[str, Any] = {key: None for key in STATISTIC_NUMBER_KEYS}
+    totals["statistics_scope"] = normalize_document_statistics_scope(statistics_scope)
+    totals["standard_text_metrics"] = None
+    totals["additional_content"] = None
     totals["match_analysis"] = None
     return totals
 
@@ -3072,9 +3088,16 @@ def _has_any_document_statistic(statistics: dict[str, Any] | None) -> bool:
     return any(isinstance(statistics.get(key), int) for key in STATISTIC_NUMBER_KEYS)
 
 
-def _sum_document_statistics(statistics_list: list[dict[str, Any]]) -> dict[str, Any]:
-    totals = _create_empty_document_statistics_totals()
+def _sum_document_statistics(
+    statistics_list: list[dict[str, Any]],
+    *,
+    statistics_scope: str = DOCUMENT_STATISTICS_SCOPE_STANDARD,
+) -> dict[str, Any]:
+    statistics_scope = normalize_document_statistics_scope(statistics_scope)
+    totals = _create_empty_document_statistics_totals(statistics_scope)
     match_analyses: list[Any] = []
+    standard_metric_rows: list[dict[str, Any]] = []
+    additional_rows: list[dict[str, Any]] = []
     for raw_statistics in statistics_list:
         statistics = normalize_document_statistics(raw_statistics)
         match_analyses.append(statistics.get("match_analysis"))
@@ -3083,7 +3106,26 @@ def _sum_document_statistics(statistics_list: list[dict[str, Any]]) -> dict[str,
             if not isinstance(value, int):
                 continue
             totals[key] = (totals[key] or 0) + value
+        if statistics_scope == DOCUMENT_STATISTICS_SCOPE_EXTENDED:
+            standard_metrics = statistics.get("standard_text_metrics")
+            if not isinstance(standard_metrics, dict):
+                standard_metrics = {
+                    key: statistics.get(key)
+                    for key in TEXT_STATISTIC_NUMBER_KEYS
+                }
+            standard_metric_rows.append(standard_metrics)
+            additional_content = statistics.get("additional_content")
+            if isinstance(additional_content, dict):
+                additional_rows.append(additional_content)
     totals["match_analysis"] = merge_document_match_analyses(match_analyses)
+    if statistics_scope == DOCUMENT_STATISTICS_SCOPE_EXTENDED:
+        totals["standard_text_metrics"] = _sum_document_text_metrics(standard_metric_rows)
+        totals["additional_content"] = {
+            key: _sum_document_text_metrics(
+                [row[key] for row in additional_rows if isinstance(row.get(key), dict)]
+            )
+            for key in (*ADDITIONAL_CONTENT_KEYS, "total")
+        }
     return totals
 
 
@@ -3092,7 +3134,12 @@ def _load_document_statistics_totals(raw_value: str | None) -> dict[str, Any]:
         value = json.loads(raw_value or "{}")
     except (TypeError, ValueError):
         value = {}
-    totals = _create_empty_document_statistics_totals()
+    statistics_scope = (
+        normalize_document_statistics_scope(value.get("statistics_scope"))
+        if isinstance(value, dict)
+        else DOCUMENT_STATISTICS_SCOPE_STANDARD
+    )
+    totals = _create_empty_document_statistics_totals(statistics_scope)
     if isinstance(value, dict):
         for key in STATISTIC_NUMBER_KEYS:
             raw_number = value.get(key)
@@ -3101,6 +3148,32 @@ def _load_document_statistics_totals(raw_value: str | None) -> dict[str, Any]:
             elif isinstance(raw_number, str) and raw_number.strip().isdigit():
                 totals[key] = int(raw_number)
         totals["match_analysis"] = normalize_document_match_analysis(value.get("match_analysis"))
+        if statistics_scope == DOCUMENT_STATISTICS_SCOPE_EXTENDED:
+            totals["standard_text_metrics"] = _normalize_document_text_metrics(
+                value.get("standard_text_metrics")
+            )
+            raw_additional_content = value.get("additional_content")
+            if isinstance(raw_additional_content, dict):
+                totals["additional_content"] = {
+                    key: _normalize_document_text_metrics(raw_additional_content.get(key))
+                    for key in (*ADDITIONAL_CONTENT_KEYS, "total")
+                }
+    return totals
+
+
+def _normalize_document_text_metrics(value: Any) -> dict[str, int | None]:
+    source = value if isinstance(value, dict) else {}
+    return {
+        key: int(source[key]) if isinstance(source.get(key), int) else None
+        for key in TEXT_STATISTIC_NUMBER_KEYS
+    }
+
+
+def _sum_document_text_metrics(rows: list[dict[str, Any]]) -> dict[str, int | None]:
+    totals: dict[str, int | None] = {}
+    for key in TEXT_STATISTIC_NUMBER_KEYS:
+        values = [row.get(key) for row in rows if isinstance(row.get(key), int)]
+        totals[key] = sum(values) if values else None
     return totals
 
 
@@ -3126,6 +3199,7 @@ def _serialize_document_statistics_report(
     items: list[DocumentStatisticsReportItem] | None = None,
 ) -> dict[str, Any]:
     report_items = list(items if items is not None else report.items)
+    totals = _load_document_statistics_totals(report.totals)
     return {
         "id": str(report.id),
         "project_id": str(report.project_id),
@@ -3134,7 +3208,8 @@ def _serialize_document_statistics_report(
         "file_ids": [str(value) for value in _load_json_list(report.file_ids)],
         "total_files": report.total_files,
         "available_files": report.available_files,
-        "totals": _load_document_statistics_totals(report.totals),
+        "statistics_scope": totals["statistics_scope"],
+        "totals": totals,
         "status": report.status,
         "created_at": report.created_at.isoformat() if report.created_at else None,
         "items": [_serialize_document_statistics_report_item(item) for item in report_items],
@@ -10376,7 +10451,8 @@ def compute_project_document_statistics(
     if len(files) != len(file_ids):
         raise HTTPException(status_code=404, detail="部分文件不存在或不属于当前项目。")
 
-    unavailable_statistics = _build_unavailable_document_statistics()
+    statistics_scope = normalize_document_statistics_scope(payload.statistics_scope)
+    unavailable_statistics = _build_unavailable_document_statistics(statistics_scope)
     report_statistics: list[dict[str, Any]] = []
     report = DocumentStatisticsReport(
         project_id=project.id,
@@ -10384,7 +10460,11 @@ def compute_project_document_statistics(
         file_ids=json.dumps([str(file_record.id) for file_record in files]),
         total_files=len(files),
         available_files=0,
-        totals=json.dumps(_create_empty_document_statistics_totals(), ensure_ascii=False, sort_keys=True),
+        totals=json.dumps(
+            _create_empty_document_statistics_totals(statistics_scope),
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
         status="completed",
     )
     db.add(report)
@@ -10403,6 +10483,7 @@ def compute_project_document_statistics(
                 source_bytes,
                 source_filename,
                 options=_get_file_record_document_parse_options(file_record),
+                statistics_scope=statistics_scope,
             )
         else:
             statistics = unavailable_statistics
@@ -10416,7 +10497,8 @@ def compute_project_document_statistics(
             normalized_statistics.get("words") if isinstance(normalized_statistics.get("words"), int) else None,
         ) or match_analysis
         serialized_statistics = serialize_document_statistics(normalized_statistics)
-        file_record.document_statistics = serialized_statistics
+        if statistics_scope == DOCUMENT_STATISTICS_SCOPE_STANDARD:
+            file_record.document_statistics = serialized_statistics
         report_statistics.append(normalized_statistics)
         db.add(DocumentStatisticsReportItem(
             report_id=report.id,
@@ -10430,7 +10512,11 @@ def compute_project_document_statistics(
         ))
 
     report.available_files = sum(1 for statistics in report_statistics if _has_any_document_statistic(statistics))
-    report.totals = json.dumps(_sum_document_statistics(report_statistics), ensure_ascii=False, sort_keys=True)
+    report.totals = json.dumps(
+        _sum_document_statistics(report_statistics, statistics_scope=statistics_scope),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
     db.commit()
     db.refresh(report)
