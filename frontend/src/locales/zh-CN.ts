@@ -581,6 +581,9 @@ export default {
       description: '选择一个或多个 DOC、DOCX 或 PPTX 文件，生成页数、字数和字符数统计表。',
       generate: '统计',
       generating: '统计中...',
+      generateExtended: '含文本框、脚注和尾注统计',
+      generatingExtended: '附加内容统计中...',
+      extendedNoWordFiles: '所选文件中没有可执行附加内容统计的 DOC 或 DOCX 文件',
       clear: '清空选择',
       selectFileFirst: '请先勾选要统计的文件',
       selectedCount: '已选 {count} 个文件',
@@ -591,7 +594,11 @@ export default {
       loadingReports: '加载中',
       reportCreatedAt: '报告时间',
       reportCreator: '统计人',
-      reportOption: '{createdAt} · {files} 个文件 · {words} 字',
+      reportOption: '{createdAt} · {scope} · {files} 个文件 · {words} 字',
+      scopes: {
+        standard: '默认口径',
+        extended: '含附加内容',
+      },
       total: '合计',
       columns: {
         file: '文件',
@@ -641,6 +648,28 @@ export default {
       summary: {
         files: '统计文件',
         available: '可用统计',
+        standardWords: '默认字数',
+        additionalWords: '附加字数',
+        combinedWords: '含附加总字数',
+      },
+      additionalContent: {
+        title: '附加内容分类统计',
+        description: '仅统计正文文本框、脚注和尾注；页眉、页脚、批注和图表文字不计入附加内容。',
+        fileTitle: '分文件附加内容统计',
+        fileMeta: '默认 {standard} 字 · 含附加 {combined} 字',
+        columns: {
+          category: '内容类型',
+          words: '字数',
+          characters: '字符数',
+          charactersWithSpaces: '字符数(含空格)',
+          paragraphs: '段落数',
+        },
+        rows: {
+          textbox: '正文文本框',
+          footnote: '脚注',
+          endnote: '尾注',
+          total: '附加合计',
+        },
       },
       sources: {
         completed: '已统计',

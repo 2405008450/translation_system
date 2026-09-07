@@ -103,10 +103,12 @@ import type {
   DocumentParseOptions,
   DocumentMatchAnalysis,
   DocumentStatistics,
+  DocumentStatisticsScope,
   DocumentStatisticsReport,
   DocumentStatisticsReportItem,
   DocumentStatisticsReportsResponse,
   DocumentStatisticsTotals,
+  DocumentTextStatisticsMetrics,
   AssignmentEvent,
   AssignmentEventsResponse,
   IssueMarker,
@@ -406,6 +408,22 @@ interface DocumentFileMatchAnalysisBlock {
   rows: DocumentMatchAnalysisDisplayRow[]
 }
 
+type DocumentAdditionalContentKey = 'textbox' | 'footnote' | 'endnote' | 'total'
+
+interface DocumentAdditionalContentDisplayRow extends DocumentTextStatisticsMetrics {
+  key: DocumentAdditionalContentKey
+  label: string
+  is_total?: boolean
+}
+
+interface DocumentFileAdditionalContentBlock {
+  id: string
+  file_name: string
+  standard_words: number | null
+  combined_words: number | null
+  rows: DocumentAdditionalContentDisplayRow[]
+}
+
 interface LanguageDetectResponse {
   language: string | null
   label: string | null
@@ -451,6 +469,7 @@ const creatingEnglishVariantCopy = ref(false)
 const uploading = ref(false)
 const statisticsLoading = ref(false)
 const statisticsReportsLoading = ref(false)
+const statisticsRunningScope = ref<DocumentStatisticsScope | null>(null)
 const uploadPercent = ref(0)
 const project = ref<ProjectDetail | null>(null)
 const pageError = ref('')
@@ -1289,6 +1308,10 @@ const canGenerateStatistics = computed(() => (
   && statisticsSelectedFileIds.value.size > 0
   && !statisticsLoading.value
 ))
+const canGenerateExtendedStatistics = computed(() => (
+  canGenerateStatistics.value
+  && statisticsSelectedFiles.value.some((row) => isWordProjectFile(row))
+))
 const statisticsAvailableCount = computed(() => (
   activeStatisticsReport.value?.available_files
   ?? statisticsResultRows.value.filter((row) => hasAnyDocumentStatistic(row.statistics)).length
@@ -1315,6 +1338,31 @@ const statisticsTotals = computed<DocumentStatisticsTotals>(() => {
   totals.match_analysis = mergeDocumentMatchAnalyses(matchAnalyses)
   return totals
 })
+const activeStatisticsScope = computed<DocumentStatisticsScope>(() => (
+  activeStatisticsReport.value?.statistics_scope === 'extended' ? 'extended' : 'standard'
+))
+const isExtendedStatisticsReport = computed(() => activeStatisticsScope.value === 'extended')
+const statisticsStandardTextMetrics = computed(() => (
+  normalizeTextStatisticsMetrics(statisticsTotals.value.standard_text_metrics)
+))
+const statisticsAdditionalContent = computed(() => statisticsTotals.value.additional_content)
+const statisticsAdditionalContentRows = computed<DocumentAdditionalContentDisplayRow[]>(() => (
+  buildAdditionalContentRows(statisticsAdditionalContent.value)
+))
+const statisticsFileAdditionalContentBlocks = computed<DocumentFileAdditionalContentBlock[]>(() => (
+  statisticsResultRows.value.map((row) => {
+    const combinedWords = getStatisticNumber(row.statistics, 'words')
+    const standardWords = row.statistics.standard_text_metrics?.words
+      ?? (row.statistics.include_textboxes_footnotes_endnotes === true ? null : combinedWords)
+    return {
+      id: row.file_record_id || row.id,
+      file_name: row.file_name,
+      standard_words: standardWords,
+      combined_words: combinedWords,
+      rows: buildAdditionalContentRows(row.statistics.additional_content),
+    }
+  })
+))
 const statisticsMatchAnalysis = computed(() => (
   reconcileDocumentMatchAnalysisForDisplay(statisticsTotals.value.match_analysis, statisticsTotals.value.words)
 ))
@@ -2099,6 +2147,9 @@ function createEmptyStatisticsTotals(): DocumentStatisticsTotals {
     linked_image_count: null,
     chart_count: null,
     smartart_count: null,
+    statistics_scope: 'standard',
+    standard_text_metrics: null,
+    additional_content: null,
     match_analysis: null,
   }
 }
@@ -2113,7 +2164,44 @@ function normalizeStatisticsTotals(totals: DocumentStatisticsTotals | null | und
     normalized[key] = typeof value === 'number' && Number.isFinite(value) ? value : null
   }
   normalized.match_analysis = normalizeDocumentMatchAnalysis(totals.match_analysis)
+  normalized.statistics_scope = totals.statistics_scope === 'extended' ? 'extended' : 'standard'
+  normalized.standard_text_metrics = normalizeTextStatisticsMetrics(totals.standard_text_metrics)
+  normalized.additional_content = totals.additional_content
+    ? {
+        textbox: normalizeTextStatisticsMetrics(totals.additional_content.textbox) ?? createEmptyTextStatisticsMetrics(),
+        footnote: normalizeTextStatisticsMetrics(totals.additional_content.footnote) ?? createEmptyTextStatisticsMetrics(),
+        endnote: normalizeTextStatisticsMetrics(totals.additional_content.endnote) ?? createEmptyTextStatisticsMetrics(),
+        total: normalizeTextStatisticsMetrics(totals.additional_content.total) ?? createEmptyTextStatisticsMetrics(),
+      }
+    : null
   return normalized
+}
+
+function createEmptyTextStatisticsMetrics(): DocumentTextStatisticsMetrics {
+  return {
+    words: 0,
+    non_asian_words: 0,
+    asian_characters: 0,
+    characters: 0,
+    characters_with_spaces: 0,
+    paragraphs: 0,
+    lines: 0,
+  }
+}
+
+function normalizeTextStatisticsMetrics(
+  metrics: DocumentTextStatisticsMetrics | null | undefined,
+): DocumentTextStatisticsMetrics | null {
+  if (!metrics) return null
+  return {
+    words: normalizeStatisticNumber(metrics.words),
+    non_asian_words: normalizeStatisticNumber(metrics.non_asian_words),
+    asian_characters: normalizeStatisticNumber(metrics.asian_characters),
+    characters: normalizeStatisticNumber(metrics.characters),
+    characters_with_spaces: normalizeStatisticNumber(metrics.characters_with_spaces),
+    paragraphs: normalizeStatisticNumber(metrics.paragraphs),
+    lines: normalizeStatisticNumber(metrics.lines),
+  }
 }
 
 function normalizeDocumentMatchAnalysis(value: DocumentMatchAnalysis | null | undefined): DocumentMatchAnalysis | null {
@@ -2315,6 +2403,26 @@ function hasAnyDocumentStatistic(statistics: DocumentStatistics | null | undefin
   return DOCUMENT_STATISTIC_NUMBER_KEYS.some((key) => getStatisticNumber(statistics, key) != null)
 }
 
+function buildAdditionalContentRows(
+  content: DocumentStatistics['additional_content'] | null | undefined,
+): DocumentAdditionalContentDisplayRow[] {
+  const rowDefinitions: Array<{ key: DocumentAdditionalContentKey; label: string; isTotal?: boolean }> = [
+    { key: 'textbox', label: t('projectDetail.stats.additionalContent.rows.textbox') },
+    { key: 'footnote', label: t('projectDetail.stats.additionalContent.rows.footnote') },
+    { key: 'endnote', label: t('projectDetail.stats.additionalContent.rows.endnote') },
+    { key: 'total', label: t('projectDetail.stats.additionalContent.rows.total'), isTotal: true },
+  ]
+  return rowDefinitions.map(({ key, label, isTotal }) => {
+    const metrics = normalizeTextStatisticsMetrics(content?.[key]) ?? createEmptyTextStatisticsMetrics()
+    return {
+      key,
+      label,
+      ...metrics,
+      is_total: isTotal,
+    }
+  })
+}
+
 function formatStatisticNumber(value: number | null | undefined) {
   if (value == null || Number.isNaN(value)) {
     return getPlaceholder()
@@ -2416,6 +2524,7 @@ function formatStatisticsReportOption(report: DocumentStatisticsReport) {
     createdAt,
     files: report.total_files,
     words,
+    scope: t(`projectDetail.stats.scopes.${report.statistics_scope === 'extended' ? 'extended' : 'standard'}`),
   })
 }
 
@@ -3289,18 +3398,24 @@ function updateStatisticsSelectedFileIds(ids: Set<string>) {
   statisticsSelectedFileIds.value = new Set(ids)
 }
 
-async function generateDocumentStatisticsTable() {
-  if (!project.value || !canGenerateStatistics.value) {
+async function generateDocumentStatisticsTable(
+  statisticsScope: DocumentStatisticsScope = 'standard',
+) {
+  const canGenerate = statisticsScope === 'extended'
+    ? canGenerateExtendedStatistics.value
+    : canGenerateStatistics.value
+  if (!project.value || !canGenerate) {
     return
   }
   statisticsLoading.value = true
+  statisticsRunningScope.value = statisticsScope
   pageError.value = ''
   const fileIds = Array.from(statisticsSelectedFileIds.value)
 
   try {
     const { data } = await http.post<ProjectDocumentStatisticsResponse>(
       `/projects/${project.value.id}/document-statistics`,
-      { file_ids: fileIds },
+      { file_ids: fileIds, statistics_scope: statisticsScope },
     )
     const updatedFiles = new Map(data.files.map((file) => [file.id, file]))
     project.value = {
@@ -3316,6 +3431,7 @@ async function generateDocumentStatisticsTable() {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.statistics'))
   } finally {
     statisticsLoading.value = false
+    statisticsRunningScope.value = null
   }
 }
 
@@ -6196,6 +6312,7 @@ onBeforeUnmount(() => {
         v-for="tab in tabs"
         :key="tab.key"
         class="pd-tabs__item"
+        :data-testid="`project-tab-${tab.key}`"
         :class="{ 'is-active': activeTab === tab.key }"
         type="button"
         :disabled="tab.disabled"
@@ -8304,11 +8421,29 @@ onBeforeUnmount(() => {
               type="button"
               :disabled="!canGenerateStatistics"
               :title="statisticsSelectedFileIds.size === 0 ? t('projectDetail.stats.selectFileFirst') : undefined"
-              @click="generateDocumentStatisticsTable"
+              @click="generateDocumentStatisticsTable('standard')"
             >
-              <Loader2 v-if="statisticsLoading" class="lucide-spin" :size="14" />
+              <Loader2 v-if="statisticsRunningScope === 'standard'" class="lucide-spin" :size="14" />
               <Check v-else :size="14" />
-              {{ statisticsLoading ? t('projectDetail.stats.generating') : t('projectDetail.stats.generate') }}
+              {{ statisticsRunningScope === 'standard' ? t('projectDetail.stats.generating') : t('projectDetail.stats.generate') }}
+            </button>
+            <button
+              class="button"
+              data-testid="project-statistics-generate-extended"
+              type="button"
+              :disabled="!canGenerateExtendedStatistics"
+              :title="statisticsSelectedFileIds.size === 0
+                ? t('projectDetail.stats.selectFileFirst')
+                : (!statisticsSelectedFiles.some((row) => isWordProjectFile(row))
+                    ? t('projectDetail.stats.extendedNoWordFiles')
+                    : undefined)"
+              @click="generateDocumentStatisticsTable('extended')"
+            >
+              <Loader2 v-if="statisticsRunningScope === 'extended'" class="lucide-spin" :size="14" />
+              <FileText v-else :size="14" />
+              {{ statisticsRunningScope === 'extended'
+                ? t('projectDetail.stats.generatingExtended')
+                : t('projectDetail.stats.generateExtended') }}
             </button>
             <button
               class="button"
@@ -8410,8 +8545,16 @@ onBeforeUnmount(() => {
               <strong>{{ formatStatisticNumber(statisticsAvailableCount) }}</strong>
             </div>
             <div class="pd-statistics-summary__item">
-              <span>{{ t('projectDetail.stats.columns.words') }}</span>
+              <span>{{ isExtendedStatisticsReport ? t('projectDetail.stats.summary.combinedWords') : t('projectDetail.stats.columns.words') }}</span>
               <strong>{{ formatStatisticNumber(statisticsTotals.words) }}</strong>
+            </div>
+            <div v-if="isExtendedStatisticsReport" class="pd-statistics-summary__item">
+              <span>{{ t('projectDetail.stats.summary.standardWords') }}</span>
+              <strong>{{ formatStatisticNumber(statisticsStandardTextMetrics?.words) }}</strong>
+            </div>
+            <div v-if="isExtendedStatisticsReport" class="pd-statistics-summary__item">
+              <span>{{ t('projectDetail.stats.summary.additionalWords') }}</span>
+              <strong>{{ formatStatisticNumber(statisticsAdditionalContent?.total.words) }}</strong>
             </div>
             <div class="pd-statistics-summary__item">
               <span>{{ t('projectDetail.stats.columns.charactersWithSpaces') }}</span>
@@ -8420,6 +8563,86 @@ onBeforeUnmount(() => {
             <div class="pd-statistics-summary__item">
               <span>图片数</span>
               <strong>{{ formatStatisticNumber(statisticsTotals.image_count) }}</strong>
+            </div>
+          </div>
+
+          <div v-if="isExtendedStatisticsReport" class="pd-statistics-match-analysis">
+            <div class="pd-statistics-subhead">
+              <div class="section-title section-title--tight">{{ t('projectDetail.stats.additionalContent.title') }}</div>
+              <span>{{ t('projectDetail.stats.additionalContent.description') }}</span>
+            </div>
+            <div class="pd-statistics-grid-wrap pd-statistics-grid-wrap--match">
+              <table class="pd-statistics-grid pd-statistics-match-grid">
+                <thead>
+                  <tr>
+                    <th>{{ t('projectDetail.stats.additionalContent.columns.category') }}</th>
+                    <th>{{ t('projectDetail.stats.additionalContent.columns.words') }}</th>
+                    <th>{{ t('projectDetail.stats.additionalContent.columns.characters') }}</th>
+                    <th>{{ t('projectDetail.stats.additionalContent.columns.charactersWithSpaces') }}</th>
+                    <th>{{ t('projectDetail.stats.additionalContent.columns.paragraphs') }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="row in statisticsAdditionalContentRows"
+                    :key="`additional-total-${row.key}`"
+                    :class="{ 'is-total': row.is_total }"
+                  >
+                    <td>{{ row.label }}</td>
+                    <td>{{ formatStatisticNumber(row.words) }}</td>
+                    <td>{{ formatStatisticNumber(row.characters) }}</td>
+                    <td>{{ formatStatisticNumber(row.characters_with_spaces) }}</td>
+                    <td>{{ formatStatisticNumber(row.paragraphs) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div v-if="isExtendedStatisticsReport && statisticsFileAdditionalContentBlocks.length > 0" class="pd-statistics-match-analysis">
+            <div class="pd-statistics-subhead">
+              <div class="section-title section-title--tight">{{ t('projectDetail.stats.additionalContent.fileTitle') }}</div>
+            </div>
+            <div class="pd-statistics-file-match-list">
+              <section
+                v-for="block in statisticsFileAdditionalContentBlocks"
+                :key="`additional-${block.id}`"
+                class="pd-statistics-file-match-block"
+              >
+                <div class="pd-statistics-file-match-head">
+                  <strong :title="block.file_name">{{ block.file_name }}</strong>
+                  <span>{{ t('projectDetail.stats.additionalContent.fileMeta', {
+                    standard: formatStatisticNumber(block.standard_words),
+                    combined: formatStatisticNumber(block.combined_words),
+                  }) }}</span>
+                </div>
+                <div class="pd-statistics-grid-wrap pd-statistics-grid-wrap--match">
+                  <table class="pd-statistics-grid pd-statistics-match-grid">
+                    <thead>
+                      <tr>
+                        <th>{{ t('projectDetail.stats.additionalContent.columns.category') }}</th>
+                        <th>{{ t('projectDetail.stats.additionalContent.columns.words') }}</th>
+                        <th>{{ t('projectDetail.stats.additionalContent.columns.characters') }}</th>
+                        <th>{{ t('projectDetail.stats.additionalContent.columns.charactersWithSpaces') }}</th>
+                        <th>{{ t('projectDetail.stats.additionalContent.columns.paragraphs') }}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr
+                        v-for="row in block.rows"
+                        :key="`${block.id}-${row.key}`"
+                        :class="{ 'is-total': row.is_total }"
+                      >
+                        <td>{{ row.label }}</td>
+                        <td>{{ formatStatisticNumber(row.words) }}</td>
+                        <td>{{ formatStatisticNumber(row.characters) }}</td>
+                        <td>{{ formatStatisticNumber(row.characters_with_spaces) }}</td>
+                        <td>{{ formatStatisticNumber(row.paragraphs) }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
             </div>
           </div>
 
