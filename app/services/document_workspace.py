@@ -98,6 +98,8 @@ DEFAULT_DOCUMENT_PARSE_OPTIONS = {
     "custom_parse_config": False,
     "translate_idml_comments": False,
     "translate_idml_hidden_layers": False,
+    "psd_translate_hidden_layers": False,
+    "psd_translate_locked_layers": False,
     "pptx_translate_comments": True,
     "pptx_translate_notes": True,
     "pptx_translate_document_properties": False,

@@ -52,6 +52,7 @@ _DEFAULT_ADAPTER_SPECS = (
     _AdapterSpec("app.services.adapters.docx_adapter", "DocxAdapter"),
     _AdapterSpec("app.services.adapters.xlsx_adapter", "XlsxAdapter"),
     _AdapterSpec("app.services.adapters.pdf_adapter", "PdfAdapter"),
+    _AdapterSpec("app.services.adapters.psd_adapter", "PsdAdapter"),
     _AdapterSpec("app.services.adapters.pptx_adapter", "PptxAdapter"),
     _AdapterSpec("app.services.adapters.dita_adapter", "DitaAdapter"),
     _AdapterSpec("app.services.adapters.svg_adapter", "SvgAdapter"),

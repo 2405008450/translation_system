@@ -42,6 +42,8 @@ const optionDefaults: DocumentParseOptions = {
   custom_parse_config: false,
   translate_idml_comments: false,
   translate_idml_hidden_layers: false,
+  psd_translate_hidden_layers: false,
+  psd_translate_locked_layers: false,
   pptx_translate_comments: true,
   pptx_translate_notes: true,
   pptx_translate_document_properties: false,
@@ -63,7 +65,7 @@ const wordTranslationOptionKeys: ParseOptionKey[] = [
   'include_comments',
 ]
 
-const formatOrder = ['.docx', '.doc', '.pptx', '.xlsx', '.md', '.dat', '.dxf', '.idml', '.xml', '.yaml', '.yml']
+const formatOrder = ['.docx', '.doc', '.pptx', '.xlsx', '.md', '.dat', '.dxf', '.idml', '.psd', '.xml', '.yaml', '.yml']
 
 const selectedExtensions = computed(() => {
   const extensions = new Set<string>()

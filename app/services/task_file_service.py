@@ -64,6 +64,7 @@ TASK_ADAPTER_EXTENSIONS = {
     ".ditamap",
     ".xml",
     ".svg",
+    ".psd",
     ".sdlxliff",
     ".txml",
     ".dxf",
@@ -375,6 +376,31 @@ _UPLOAD_CAPABILITY_SPECS = (
         "features": ("提取 text / tspan 文本", "保留图形结构", "支持原格式导出"),
     },
     {
+        "extensions": (".psd",),
+        "label": "Photoshop PSD",
+        "category": "design",
+        "features": (
+            "提取 RGB 8 位 PSD 的水平可编辑文本图层",
+            "保留图层结构并按图层路径原位写回",
+            "支持原格式 PSD 导出",
+            "译文文本层预览将在兼容编辑器首次打开时重绘",
+            "混合字符样式写回时沿用文本层基础样式",
+        ),
+        "settings_select_all": False,
+        "settings": (
+            {
+                "id": "psd_translate_hidden_layers",
+                "label": "翻译隐藏文本图层",
+                "default": False,
+            },
+            {
+                "id": "psd_translate_locked_layers",
+                "label": "翻译锁定文本图层",
+                "default": False,
+            },
+        ),
+    },
+    {
         "extensions": (".sdlxliff",),
         "label": "SDLXLIFF",
         "category": "bilingual",
@@ -661,7 +687,11 @@ def build_task_workspace(
 
     registry = ensure_default_adapters_registered()
     adapter = registry.get_adapter(filename)
-    parse_result = adapter.parse_with_options(raw_bytes, filename=filename, options=document_parse_options)
+    parse_options = {
+        **document_parse_options,
+        "source_language": source_language or "",
+    }
+    parse_result = adapter.parse_with_options(raw_bytes, filename=filename, options=parse_options)
     if not parse_result.segments:
         raise ValueError("文件中没有可翻译的内容。")
 
@@ -942,6 +972,7 @@ def build_export_segments_from_source(
     # segment_metadata 中，禁止在导出阶段再次请求 LLM。
     extension = (filename or "").lower().rsplit(".", 1)[-1] if filename else ""
     is_cad_file = extension in ("dwg", "dxf")
+    is_psd_file = extension == "psd"
     parse_options = dict(document_parse_options)
     if is_cad_file:
         parse_options["enable_llm_layout"] = False
@@ -1060,6 +1091,17 @@ def build_export_segments_from_source(
             translated_segments_by_source.setdefault(source_key, []).append(segment)
     ordered_translated_segments = list(segments)
     used_translated_segment_ids: set[int] = set()
+    psd_layer_id_to_db_segments: dict[int, list[Any]] = {}
+    psd_layer_path_to_db_segments: dict[str, list[Any]] = {}
+    if is_psd_file:
+        for segment in segments:
+            db_metadata = _load_segment_metadata(segment)
+            layer_id = db_metadata.get("layer_id")
+            layer_path = str(db_metadata.get("layer_path") or "")
+            if isinstance(layer_id, int):
+                psd_layer_id_to_db_segments.setdefault(layer_id, []).append(segment)
+            if layer_path:
+                psd_layer_path_to_db_segments.setdefault(layer_path, []).append(segment)
 
     _logger.debug(
         "build_export_segments_from_source: 解析得到 %d 个句段，数据库有 %d 个翻译句段",
@@ -1068,13 +1110,29 @@ def build_export_segments_from_source(
 
     export_segments: list[dict[str, Any]] = []
     for index, parsed_segment in enumerate(parse_result.segments):
-        # 首先尝试按 segment_id 匹配
-        translated_segment = translated_segments.get(parsed_segment.segment_id)
+        # PSD 先按持久化 layer_id/layer_path 匹配，避免 OCR 候选顺序或文本变化
+        # 让相邻图层错误消费另一条数据库译文。
+        segment_metadata = getattr(parsed_segment, 'metadata', {}) or {}
+        translated_segment = None
+        if is_psd_file:
+            layer_id = segment_metadata.get("layer_id")
+            layer_path = str(segment_metadata.get("layer_path") or "")
+            if isinstance(layer_id, int):
+                translated_segment = _take_unused_candidate(
+                    psd_layer_id_to_db_segments.get(layer_id, [])
+                )
+            if translated_segment is None and layer_path:
+                translated_segment = _take_unused_candidate(
+                    psd_layer_path_to_db_segments.get(layer_path, [])
+                )
+
+        # 其他格式及缺少稳定身份的旧 PSD 数据再按 segment_id 匹配。
+        if translated_segment is None:
+            translated_segment = translated_segments.get(parsed_segment.segment_id)
         if translated_segment is not None and id(translated_segment) in used_translated_segment_ids:
             translated_segment = None
 
         # 获取解析时的 metadata（CAD 文件需要 handle 用于兜底匹配）
-        segment_metadata = getattr(parsed_segment, 'metadata', {}) or {}
         handle = segment_metadata.get('handle', '')
 
         parsed_source = _normalize_export_source_text(parsed_segment.source_text)
@@ -1302,6 +1360,49 @@ def build_export_segments_from_source(
                 **context,
             }
         )
+
+    # PSD 图片文字以持久化的 layer_path/layer_id 为稳定身份。导出重解析即使
+    # 暂时未产生同一 OCR 句段，也必须把数据库译文交给 bridge，不能静默丢失。
+    if is_psd_file:
+        appended_psd_image_segments = 0
+        for segment in segments:
+            if id(segment) in used_translated_segment_ids:
+                continue
+            db_metadata = _load_segment_metadata(segment)
+            if str(db_metadata.get("entity_type") or "").upper() != "PSD_IMAGE_TEXT":
+                continue
+            if not str(db_metadata.get("layer_path") or "").strip():
+                continue
+            sentence_id = str(
+                _get_segment_value(
+                    segment,
+                    "sentence_id",
+                    _get_segment_value(segment, "segment_id", ""),
+                )
+            )
+            export_segments.append(
+                {
+                    "segment_id": sentence_id,
+                    "sentence_id": sentence_id,
+                    "source_text": _get_segment_value(segment, "source_text", ""),
+                    "display_text": _get_segment_value(segment, "display_text", ""),
+                    "target_text": _get_segment_value(segment, "target_text", ""),
+                    "status": _get_segment_value(segment, "status", "none"),
+                    "matched_source_text": _get_segment_value(segment, "matched_source_text", ""),
+                    "metadata": db_metadata,
+                    "block_type": _get_segment_value(segment, "block_type", "paragraph"),
+                    "block_index": _get_segment_value(segment, "block_index", len(export_segments)),
+                    "row_index": _get_segment_value(segment, "row_index"),
+                    "cell_index": _get_segment_value(segment, "cell_index"),
+                }
+            )
+            used_translated_segment_ids.add(id(segment))
+            appended_psd_image_segments += 1
+        if appended_psd_image_segments:
+            _logger.info(
+                "build_export_segments_from_source: 追加重解析未覆盖的 PSD 图片文字句段 %d 个",
+                appended_psd_image_segments,
+            )
 
     # 导出重解析的句子边界可能与导入时不同。把尚未匹配的稳定数据库
     # 句段一并交给 MultiFormatExporter：MTEXT 段落按 handle + 段落序号

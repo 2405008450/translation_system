@@ -12,6 +12,10 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
+WORKDIR /build/psd_runtime
+COPY psd_runtime/package*.json ./
+RUN npm ci --omit=dev --ignore-scripts
+
 
 FROM python:3.11-slim-bookworm AS runtime
 
@@ -23,7 +27,18 @@ ENV TZ=Asia/Shanghai \
     PIP_NO_CACHE_DIR=1 \
     LIBREOFFICE_SOFFICE_PATH=/usr/bin/libreoffice \
     LIBREOFFICE_PYTHON_PATH=/usr/bin/python3 \
-    WEB_CONCURRENCY=4 \
+    PSD_NODE_PATH=/usr/local/bin/node \
+    PSD_BRIDGE_PATH=/app/psd_runtime/bridge.cjs \
+    PSD_PROCESS_TIMEOUT_SECONDS=120 \
+    PSD_NODE_MAX_OLD_SPACE_MB=512 \
+    PSD_IMAGEMAGICK_PATH=/usr/bin/convert \
+    PSD_IMAGEMAGICK_TIMEOUT_SECONDS=90 \
+    PSD_OCR_DEVICE=cpu \
+    PADDLE_PDX_CACHE_HOME=/opt/paddlex \
+    PADDLE_PDX_MODEL_SOURCE=BOS \
+    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
+    PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=False \
+    WEB_CONCURRENCY=2 \
     FORWARDED_ALLOW_IPS=*
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -34,10 +49,14 @@ RUN apt-get update \
         curl \
         fontconfig \
         fonts-noto-cjk \
+        libgl1 \
+        libglib2.0-0 \
+        libstdc++6 \
         libreoffice \
         libreoffice-calc \
         libreoffice-impress \
         libreoffice-writer \
+        imagemagick \
         p7zip-full \
         postgresql-client \
         python3-uno \
@@ -54,10 +73,17 @@ COPY requirements.txt ./
 RUN python -m pip install --upgrade pip \
     && python -m pip install -r requirements.txt
 
+# 在镜像构建阶段下载并初始化 PP-OCRv6；运行容器无需联网获取模型。
+RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, enable_mkldnn=False, device='cpu')"
+
 COPY app ./app
 COPY scripts ./scripts
 COPY prompt_templates ./prompt_templates
 COPY gunicorn.conf.py ./gunicorn.conf.py
+COPY psd_runtime/*.cjs ./psd_runtime/
+COPY psd_runtime/package*.json ./psd_runtime/
+COPY --from=frontend-builder /usr/local/bin/node /usr/local/bin/node
+COPY --from=frontend-builder /build/psd_runtime/node_modules ./psd_runtime/node_modules
 COPY --from=frontend-builder /build/frontend/dist ./frontend/dist
 
 RUN mkdir -p /app/data/file_records /app/data/export_tasks /app/data/import_tasks /app/logs

@@ -275,6 +275,10 @@ class MultiFormatExporter:
             from app.services.adapters.svg_exporter import SvgExporter
 
             content = SvgExporter().export(original_bytes, text_map)
+        elif extension == ".psd":
+            from app.services.adapters.psd_exporter import PsdExporter
+
+            content = PsdExporter().export(original_bytes, segments)
         elif extension == ".pptx":
             from app.services.adapters.pptx_exporter import PptxExporter
 
@@ -936,6 +940,7 @@ class MultiFormatExporter:
             ".mif": "application/octet-stream",
             ".po": "text/x-gettext-translation; charset=utf-8",
             ".pot": "text/x-gettext-translation; charset=utf-8",
+            ".psd": "image/vnd.adobe.photoshop",
             ".properties": "text/plain; charset=utf-8",
             ".sdlxliff": "application/octet-stream",
             ".srt": "text/plain; charset=utf-8",

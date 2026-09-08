@@ -234,6 +234,8 @@ export interface DocumentParseOptions {
   custom_parse_config: boolean
   translate_idml_comments: boolean
   translate_idml_hidden_layers: boolean
+  psd_translate_hidden_layers: boolean
+  psd_translate_locked_layers: boolean
   pptx_translate_comments: boolean
   pptx_translate_notes: boolean
   pptx_translate_document_properties: boolean
@@ -1627,6 +1629,45 @@ export interface ReferenceSentencePair {
   source: string
   target: string
   similarity: number
+}
+
+export interface ReferenceExactMatch {
+  segment_id: string
+  source: string
+  target: string
+  source_file: string | null
+  similarity: number
+}
+
+export interface ReferenceFuzzyMatch {
+  segment_id: string
+  source: string
+  matched_source: string
+  target: string
+  source_file: string | null
+  similarity: number
+}
+
+export interface ReferenceTermMatchItem {
+  source: string
+  target: string
+  source_file?: string | null
+  category?: string | null
+}
+
+export interface ReferenceTermMatch {
+  segment_id: string
+  source_file: string | null
+  terms: ReferenceTermMatchItem[]
+}
+
+export interface ReferenceMatchResult {
+  exact_matches: ReferenceExactMatch[]
+  fuzzy_matches: ReferenceFuzzyMatch[]
+  term_matches: ReferenceTermMatch[]
+  exact_count: number
+  fuzzy_count: number
+  term_count: number
 }
 
 export interface ReferenceAnalyzeResponse {
