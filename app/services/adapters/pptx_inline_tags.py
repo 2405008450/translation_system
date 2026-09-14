@@ -134,12 +134,7 @@ def slice_tagged_paragraph(
 
 
 def _rpr_style_css(rpr: ET.Element) -> str:
-    """把 run 属性 ``<a:rPr>`` 汇总为一条内联 CSS（粗/斜/下划线/删除线/颜色/字号/字体族）。
-
-    统一用内联样式而非 ``<b>/<u>`` 标签：前端渲染译文时用它包裹样式 span，序列化会
-    忽略 style span（只保留文本与 ⟦n⟧ 标记），因此不会污染 target_html。工作台的原文
-    列同样能识别（getStyleFormatTags 会把 font-weight 等映射回基础格式）。
-    """
+    """把 PPTX run 属性转换为可读的完整行内样式描述。"""
     styles: list[str] = []
 
     if rpr.get("b") == "1":
@@ -151,6 +146,16 @@ def _rpr_style_css(rpr: ET.Element) -> str:
     underline = rpr.get("u")
     if underline and underline != "none":
         decorations.append("underline")
+        underline_styles = {
+            "dbl": "double",
+            "heavy": "solid",
+            "wavy": "wavy",
+            "wavyDbl": "wavy",
+            "dotted": "dotted",
+            "dash": "dashed",
+        }
+        if underline in underline_styles:
+            styles.append(f"text-decoration-style:{underline_styles[underline]}")
     strike = rpr.get("strike")
     if strike and strike != "noStrike":
         decorations.append("line-through")
@@ -162,16 +167,40 @@ def _rpr_style_css(rpr: ET.Element) -> str:
     if color:
         styles.append(f"color:#{color}")
 
+    highlight_element = rpr.find(f"{_A}highlight/{_A}srgbClr")
+    highlight = highlight_element.get("val") if highlight_element is not None else None
+    if highlight:
+        styles.append(f"background-color:#{highlight}")
+
     size = rpr.get("sz")
     if size and size.isdigit():
         # PPTX 字号单位是 1/100 磅
-        points = int(size) / 100
-        styles.append(f"font-size:{points:g}pt")
+        styles.append(f"font-size:{int(size) / 100:g}pt")
 
-    latin = rpr.find(f"{_A}latin")
-    typeface = latin.get("typeface") if latin is not None else None
-    if typeface:
-        styles.append(f"font-family:'{typeface}'")
+    for font_element_name in ("latin", "ea", "cs"):
+        font_element = rpr.find(f"{_A}{font_element_name}")
+        typeface = font_element.get("typeface") if font_element is not None else None
+        if typeface:
+            safe_typeface = typeface.replace("'", r"\'")
+            styles.append(f"font-family:'{safe_typeface}'")
+            break
+
+    baseline = rpr.get("baseline")
+    if baseline:
+        try:
+            baseline_value = int(baseline)
+        except ValueError:
+            baseline_value = 0
+        if baseline_value > 0:
+            styles.append("vertical-align:super")
+        elif baseline_value < 0:
+            styles.append("vertical-align:sub")
+
+    cap = rpr.get("cap")
+    if cap == "small":
+        styles.append("font-variant:small-caps")
+    elif cap == "all":
+        styles.append("text-transform:uppercase")
 
     return ";".join(styles)
 
@@ -282,7 +311,7 @@ def build_tagged_paragraph(paragraph: ET.Element) -> TaggedParagraph | None:
         t_element = run.find(f"{_A}t")
         rpr = run.find(f"{_A}rPr")
         text = t_element.text if (t_element is not None and t_element.text) else ""
-        key = ET.tostring(rpr, encoding="unicode") if rpr is not None else ""
+        key = _visual_rpr_key(rpr)
         segments.append((text, rpr, key))
 
     # 选“文本量最大”的样式作为基准，标签数量最少

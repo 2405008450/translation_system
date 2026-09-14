@@ -25,6 +25,7 @@ import json
 import logging
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -35,6 +36,7 @@ from app.config import get_settings
 from app.models import (
     FileRecord,
     Project,
+    ProjectMergeView,
     Segment,
     StyleTagCheckReport,
     StyleTagCheckReportItem,
@@ -47,8 +49,16 @@ from app.services.adapters.pptx_inline_tags import (
     validate_tagged_text_structure,
 )
 from app.services.file_record_service import (
+    backfill_file_record_pptx_layout,
+    backfill_file_record_source_html,
+    backfill_file_record_xlsx_layout,
     list_segments_for_file_record,
     set_segment_target_layout_text,
+)
+from app.services.merge_view_service import (
+    compute_merge_display_offsets,
+    load_view_file_records,
+    parse_file_ids,
 )
 from app.services.llm_service import (
     LLMConfigurationError,
@@ -75,6 +85,20 @@ _ERROR_TEXT_MISMATCH = "text_mismatch"
 _ERROR_STRUCTURE = "invalid_structure"
 
 _MARKER_RE = re.compile(r"⟦\s*/?\s*\d+\s*⟧")
+STYLE_TAG_CHECK_SUPPORTED_EXTENSIONS = {".docx", ".pptx", ".xlsx"}
+
+
+def _filter_style_tag_check_files(files: list[FileRecord], scope: str) -> list[FileRecord]:
+    if scope != "merge_view":
+        return files
+    supported = [
+        file_record
+        for file_record in files
+        if Path(file_record.filename or "").suffix.lower() in STYLE_TAG_CHECK_SUPPORTED_EXTENSIONS
+    ]
+    if not supported:
+        raise HTTPException(status_code=400, detail="当前合并视图没有支持样式专检的 DOCX、PPTX 或 XLSX 文件。")
+    return supported
 
 
 def _resolve_llm_options(provider: str, model: str | None) -> tuple[str, str | None]:
@@ -143,6 +167,13 @@ def _collect_style_tag_candidates(
     total_segments = 0
     drafts: list[dict[str, Any]] = []
     for file_record in files:
+        extension = Path(file_record.filename or "").suffix.lower()
+        if extension == ".docx":
+            backfill_file_record_source_html(db, file_record)
+        elif extension == ".pptx":
+            backfill_file_record_pptx_layout(db, file_record)
+        elif extension == ".xlsx":
+            backfill_file_record_xlsx_layout(db, file_record)
         segments = list_segments_for_file_record(db, file_record.id)
         total_segments += len(segments)
         for segment in segments:
@@ -165,32 +196,45 @@ def _collect_style_tag_candidates(
 # ─────────────────────────────────────────
 
 def _describe_format_map(format_map: dict[str, Any]) -> str:
-    """把 format_map 的 CSS token 转成人类可读的样式描述，供 AI 理解每个标签代表什么样式。"""
+    """把 format_map 的 CSS token 转成人类可读的完整样式描述，供 AI 理解每个标签。"""
     descriptions: list[str] = []
     for tag_id, tokens in format_map.items():
         if tag_id == "base" or not isinstance(tokens, (list, tuple)) or not tokens:
             continue
         open_tag = str(tokens[0] or "")
-        style_match = re.search(r'style="([^"]*)"', open_tag)
+        style_match = re.search(r'style=["\']([^"\']*)["\']', open_tag)
         css = style_match.group(1) if style_match else ""
+        compact_css = re.sub(r"\s+", "", css).lower()
         labels: list[str] = []
-        if "font-weight:bold" in css:
+        if re.search(r"font-weight:(?:bold|bolder|[6-9]\d\d)", compact_css):
             labels.append("加粗")
-        if "font-style:italic" in css:
+        if "font-style:italic" in compact_css or "font-style:oblique" in compact_css:
             labels.append("斜体")
-        if "underline" in css:
+        if "underline" in compact_css:
             labels.append("下划线")
-        if "line-through" in css:
+        if "line-through" in compact_css:
             labels.append("删除线")
-        color_match = re.search(r"color:(#[0-9a-fA-F]{3,6})", css)
+        color_match = re.search(r"(?:^|;)color:(#[0-9a-f]{3,8})", compact_css)
         if color_match:
-            labels.append(f"颜色{color_match.group(1)}")
-        size_match = re.search(r"font-size:([0-9.]+pt)", css)
+            labels.append(f"字体颜色{color_match.group(1)}")
+        background_match = re.search(r"(?:^|;)background-color:(#[0-9a-f]{3,8})", compact_css)
+        if background_match:
+            labels.append(f"背景/底纹{background_match.group(1)}")
+        size_match = re.search(r"(?:^|;)font-size:([0-9.]+(?:pt|em|px))", compact_css)
         if size_match:
             labels.append(f"字号{size_match.group(1)}")
-        family_match = re.search(r"font-family:'([^']*)'", css)
+        family_match = re.search(r"(?:^|;)font-family\s*:\s*['\"]?([^;'\"]+)", css, re.IGNORECASE)
         if family_match:
-            labels.append(f"字体{family_match.group(1)}")
+            family_name = family_match.group(1).strip(" '")
+            labels.append(f"字体{family_name}")
+        if "vertical-align:super" in compact_css:
+            labels.append("上标")
+        if "vertical-align:sub" in compact_css:
+            labels.append("下标")
+        if "font-variant:small-caps" in compact_css:
+            labels.append("小型大写")
+        if "text-transform:uppercase" in compact_css:
+            labels.append("全部大写")
         descriptions.append(f"⟦{tag_id}⟧={('+'.join(labels) or '特殊样式')}")
     return "；".join(descriptions)
 
@@ -406,6 +450,7 @@ def _persist_style_tag_check_report(
     files: list[FileRecord],
     current_user: User | None,
     scope: str,
+    merge_view_id: UUID | None = None,
     total_segments: int,
     drafts: list[dict[str, Any]],
 ) -> StyleTagCheckReport:
@@ -413,6 +458,7 @@ def _persist_style_tag_check_report(
     report = StyleTagCheckReport(
         project_id=project.id if project else None,
         file_record_id=files[0].id if scope == "file" and len(files) == 1 else None,
+        merge_view_id=merge_view_id,
         created_by_id=getattr(current_user, "id", None),
         scope=scope,
         file_ids=json.dumps([str(file_id) for file_id in file_ids]),
@@ -477,10 +523,12 @@ def create_style_tag_check_report(
     files: list[FileRecord],
     current_user: User | None,
     scope: str,
+    merge_view_id: UUID | None = None,
 ) -> StyleTagCheckReport:
     """扫描候选并落库（不含 AI 标注）。"""
     if not files:
         raise HTTPException(status_code=400, detail="请选择要检查的文件。")
+    files = _filter_style_tag_check_files(files, scope)
     total_segments, drafts = _collect_style_tag_candidates(db, files)
     return _persist_style_tag_check_report(
         db,
@@ -488,6 +536,7 @@ def create_style_tag_check_report(
         files=files,
         current_user=current_user,
         scope=scope,
+        merge_view_id=merge_view_id,
         total_segments=total_segments,
         drafts=drafts,
     )
@@ -763,6 +812,7 @@ def serialize_style_tag_check_item(item: StyleTagCheckReportItem) -> dict[str, A
         "file_record_id": str(item.file_record_id),
         "segment_id": str(item.segment_id) if item.segment_id else None,
         "sentence_id": item.sentence_id,
+        "display_index": int(getattr(item, "_display_index", -1)),
         "file_name": item.file_name,
         "source_text": item.source_text,
         "source_layout_text": item.source_layout_text,
@@ -813,6 +863,7 @@ def serialize_style_tag_check_report(
         "id": str(report.id),
         "project_id": str(report.project_id) if report.project_id else None,
         "file_record_id": str(report.file_record_id) if report.file_record_id else None,
+        "merge_view_id": str(report.merge_view_id) if report.merge_view_id else None,
         "scope": report.scope,
         "file_ids": _load_ids(report.file_ids),
         "total_files": report.total_files,
@@ -828,8 +879,33 @@ def serialize_style_tag_check_report(
 
 
 def load_style_tag_check_items(db: Session, report_id: UUID) -> list[StyleTagCheckReportItem]:
-    return (
-        db.query(StyleTagCheckReportItem)
+    rows = (
+        db.query(StyleTagCheckReportItem, Segment.display_index)
+        .outerjoin(
+            Segment,
+            (Segment.file_record_id == StyleTagCheckReportItem.file_record_id)
+            & (Segment.sentence_id == StyleTagCheckReportItem.sentence_id),
+        )
         .filter(StyleTagCheckReportItem.report_id == report_id)
         .all()
     )
+    report = db.query(StyleTagCheckReport).filter(StyleTagCheckReport.id == report_id).first()
+    offsets = {}
+    if report and report.scope == "merge_view":
+        file_ids = parse_file_ids(report.file_ids)
+        if report.merge_view_id:
+            view = db.query(ProjectMergeView).filter(
+                ProjectMergeView.id == report.merge_view_id,
+            ).first()
+            if view:
+                file_ids = [file_record.id for file_record in load_view_file_records(db, view)]
+        offsets = compute_merge_display_offsets(db, file_ids)
+
+    items: list[StyleTagCheckReportItem] = []
+    for item, current_display_index in rows:
+        display_index = int(current_display_index) if current_display_index is not None else -1
+        if display_index >= 0:
+            display_index += offsets.get(item.file_record_id, 0)
+        setattr(item, "_display_index", display_index)
+        items.append(item)
+    return items

@@ -9,6 +9,7 @@ from zipfile import BadZipFile, ZipFile
 from xml.etree import ElementTree as ET
 
 from openpyxl import load_workbook
+from openpyxl.cell.rich_text import CellRichText
 from openpyxl.utils import get_column_letter
 
 from app.services.adapters.base import FormatAdapter
@@ -102,7 +103,12 @@ class XlsxAdapter(FormatAdapter):
 
     def _parse_cell_nodes(self, raw_bytes: bytes, options: dict[str, Any]) -> list[BlockNode]:
         try:
-            workbook = load_workbook(BytesIO(raw_bytes), read_only=False, data_only=False)
+            workbook = load_workbook(
+                BytesIO(raw_bytes),
+                read_only=False,
+                data_only=False,
+                rich_text=True,
+            )
         except Exception as exc:
             raise ParseError(filename="<unknown>", reason=f"无法解析 XLSX 文件: {exc}") from exc
 
@@ -129,6 +135,7 @@ class XlsxAdapter(FormatAdapter):
                         text = self._cell_text(cell, options)
                         if not text:
                             continue
+                        layout_text, format_map = self._cell_layout(cell, text)
 
                         nodes.append(
                             BlockNode(
@@ -142,6 +149,10 @@ class XlsxAdapter(FormatAdapter):
                                     "row": cell.row - 1,
                                     "col": cell.column - 1,
                                     "cell_ref": cell.coordinate,
+                                    "source_layout_text": layout_text,
+                                    "source_layout_tagged": layout_text,
+                                    "source_layout_html_tagged": layout_text,
+                                    "source_layout_formats": format_map,
                                 },
                             )
                         )
@@ -149,6 +160,8 @@ class XlsxAdapter(FormatAdapter):
             workbook.close()
 
         return nodes
+
+
 
     def _is_hidden_cell(self, worksheet: Any, row_index: int, column_index: int) -> bool:
         row_dimension = worksheet.row_dimensions.get(row_index)
@@ -162,6 +175,12 @@ class XlsxAdapter(FormatAdapter):
         value = cell.value
         if value is None:
             return ""
+        if isinstance(value, CellRichText):
+            text = "".join(
+                str(getattr(part, "text", part) or "")
+                for part in value
+            ).strip()
+            return text
         if cell.data_type == "f":
             return str(value).strip() if options["xlsx_translate_formula_cells"] else ""
         if isinstance(value, bool):
@@ -177,6 +196,114 @@ class XlsxAdapter(FormatAdapter):
         if self._is_numeric(text) and not options["xlsx_translate_numeric_cells"]:
             return ""
         return text
+
+    def _cell_layout(self, cell: Any, text: str) -> tuple[str, dict[str, list[str]]]:
+        """提取 Excel 单元格富文本字体样式并编码为通用行内标签。"""
+        value = cell.value
+        base_css = self._xlsx_font_css(getattr(cell, "font", None))
+        fill_color = self._cell_fill_color(cell)
+        if fill_color:
+            base_css = ";".join(filter(None, [base_css, f"background-color:#{fill_color.lower()}"]))
+        base_tokens = [f'<span style="{base_css}">', "</span>"] if base_css else ["", ""]
+
+        if not isinstance(value, CellRichText):
+            return text, {"base": base_tokens}
+
+        pieces: list[tuple[str, str]] = []
+        for part in value:
+            part_text = str(getattr(part, "text", part) or "")
+            if not part_text:
+                continue
+            inline_css = self._xlsx_font_css(getattr(part, "font", None))
+            css = ";".join(filter(None, [inline_css, f"background-color:#{fill_color.lower()}" if fill_color else ""]))
+            pieces.append((part_text, css or base_css))
+        if not pieces:
+            return text, {"base": base_tokens}
+
+        full_text = "".join(piece_text for piece_text, _css in pieces)
+        start = full_text.find(text)
+        if start < 0:
+            return text, {"base": base_tokens}
+        end = start + len(text)
+        trimmed: list[tuple[str, str]] = []
+        cursor = 0
+        for piece_text, css in pieces:
+            piece_start = cursor
+            piece_end = cursor + len(piece_text)
+            overlap_start = max(start, piece_start)
+            overlap_end = min(end, piece_end)
+            if overlap_end > overlap_start:
+                trimmed.append((piece_text[overlap_start - piece_start:overlap_end - piece_start], css))
+            cursor = piece_end
+
+        weights: dict[str, int] = {}
+        for piece_text, css in trimmed:
+            if piece_text.strip():
+                weights[css] = weights.get(css, 0) + len(piece_text)
+        base_css = max(weights, key=weights.get) if weights else (trimmed[0][1] if trimmed else base_css)
+        format_map: dict[str, list[str]] = {
+            "base": [f'<span style="{base_css}">', "</span>"] if base_css else ["", ""]
+        }
+
+        spans: list[tuple[str, str]] = []
+        for piece_text, css in trimmed:
+            effective_css = base_css if not piece_text.strip() else css
+            if spans and spans[-1][0] == effective_css:
+                spans[-1] = (effective_css, spans[-1][1] + piece_text)
+            else:
+                spans.append((effective_css, piece_text))
+
+        parts: list[str] = []
+        next_id = 1
+        for css, piece_text in spans:
+            if css == base_css or not piece_text.strip():
+                parts.append(piece_text)
+                continue
+            tag_id = str(next_id)
+            next_id += 1
+            format_map[tag_id] = [f'<span style="{css}">', "</span>"]
+            parts.append(f"⟦{tag_id}⟧{piece_text}⟦/{tag_id}⟧")
+        return "".join(parts), format_map
+
+    def _xlsx_font_css(self, font: Any) -> str:
+        if font is None:
+            return ""
+        styles: list[str] = []
+        if getattr(font, "b", False):
+            styles.append("font-weight:bold")
+        if getattr(font, "i", False):
+            styles.append("font-style:italic")
+        underline = getattr(font, "u", None)
+        if underline and underline != "none":
+            styles.append("text-decoration:underline")
+            underline_styles = {
+                "double": "double",
+                "doubleAccounting": "double",
+                "singleAccounting": "solid",
+            }
+            if underline in underline_styles:
+                styles.append(f"text-decoration-style:{underline_styles[underline]}")
+        if getattr(font, "strike", False):
+            styles.append("text-decoration:line-through")
+        vert_align = getattr(font, "vertAlign", None)
+        if vert_align in {"superscript", "subscript"}:
+            styles.append(f"vertical-align:{'super' if vert_align == 'superscript' else 'sub'}")
+        color = getattr(font, "color", None)
+        if color is not None and getattr(color, "type", None) == "rgb":
+            rgb = str(getattr(color, "rgb", "") or "")
+            if len(rgb) >= 6:
+                styles.append(f"color:#{rgb[-6:]}")
+        size = getattr(font, "sz", None)
+        if size:
+            styles.append(f"font-size:{float(size):g}pt")
+        name = getattr(font, "name", None)
+        if not isinstance(name, str) or not name:
+            candidate_name = getattr(font, "rFont", None)
+            name = candidate_name if isinstance(candidate_name, str) else None
+        if name:
+            safe_name = name.replace("\\", "\\\\").replace("'", "\\'")
+            styles.append(f"font-family:'{safe_name}'")
+        return ";".join(styles)
 
     def _cell_fill_color(self, cell: Any) -> str | None:
         fill = getattr(cell, "fill", None)

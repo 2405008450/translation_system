@@ -736,6 +736,7 @@ export interface NumberCheckReportItem {
   file_record_id: string
   segment_id: string | null
   sentence_id: string
+  display_index: number
   file_name: string
   source_text: string
   target_text: string
@@ -756,6 +757,8 @@ export interface NumberCheckReportItem {
   applied_at: string | null
   status: 'open' | 'ignored' | 'modified'
   ignored: boolean
+  preview_text: string
+  preview_spans: { start: number; end: number }[]
   can_apply: boolean
   block_index: number
   row_index: number | null
@@ -790,6 +793,7 @@ export interface StyleTagCheckReportItem {
   file_record_id: string
   segment_id: string | null
   sentence_id: string
+  display_index: number
   file_name: string
   source_text: string
   source_layout_text: string
@@ -813,6 +817,7 @@ export interface StyleTagCheckReport {
   id: string
   project_id: string | null
   file_record_id: string | null
+  merge_view_id: string | null
   scope: string
   file_ids: string[]
   total_files: number
@@ -896,6 +901,8 @@ export interface TranslationReviewCategoryStat {
 export interface TranslationReviewProgress {
   phase?: string
   overall_percent: number
+  checked_segments?: number
+  total_segments?: number
   current_category?: string
   current_file_name?: string
   categories?: TranslationReviewCategoryStat[]

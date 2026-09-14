@@ -1782,6 +1782,61 @@ def _render_paragraph_from_fragments(
     )
 
 
+def _build_docx_layout_tagged_text(
+    fragments: list[InlineFragment],
+    span: SentenceSpan,
+) -> tuple[str, dict[str, list[str]]]:
+    """把 DOCX 句段的 run 样式编码成专检使用的内联标签。"""
+    pieces: list[tuple[str, str]] = []
+    cursor = 0
+    for fragment in fragments:
+        next_cursor = cursor + len(fragment.display_text)
+        overlap_start = max(span.start, cursor)
+        overlap_end = min(span.end, next_cursor)
+        if overlap_end > overlap_start:
+            local_start = overlap_start - cursor
+            local_end = overlap_end - cursor
+            pieces.append((fragment.source_text[local_start:local_end], fragment.css))
+        cursor = next_cursor
+
+    if not pieces:
+        return "", {}
+
+    weights: dict[str, int] = {}
+    for text, css in pieces:
+        if text.strip():
+            weights[css] = weights.get(css, 0) + len(text)
+    base_css = max(weights, key=weights.get) if weights else pieces[0][1]
+    format_map: dict[str, list[str]] = {
+        "base": (
+            [f'<span style="{base_css}">', "</span>"]
+            if base_css
+            else ["", ""]
+        )
+    }
+
+    spans: list[tuple[str, str]] = []
+    for text, css in pieces:
+        effective_css = base_css if not text.strip() else css
+        if spans and spans[-1][0] == effective_css:
+            spans[-1] = (effective_css, spans[-1][1] + text)
+        else:
+            spans.append((effective_css, text))
+
+    parts: list[str] = []
+    next_id = 1
+    for css, text in spans:
+        if css == base_css or not text.strip():
+            parts.append(text)
+            continue
+        tag_id = str(next_id)
+        next_id += 1
+        format_map[tag_id] = [f'<span style="{css}">', "</span>"]
+        parts.append(f"⟦{tag_id}⟧{text}⟦/{tag_id}⟧")
+
+    return _normalize_segment_source_layout_text("".join(parts).strip()), format_map
+
+
 def _render_paragraph_fragment_group(
     fragments: list[InlineFragment],
     sentence_counter,
@@ -1811,7 +1866,7 @@ def _render_paragraph_fragment_group(
         sentence_display = _collect_span_text(fragments, span, use_source=False)
         raw_sentence_source = _collect_span_text(fragments, span, use_source=True)
         sentence_source = _normalize_segment_source_text(raw_sentence_source)
-        sentence_layout_source = _normalize_segment_source_layout_text(raw_sentence_source)
+        sentence_layout_source, source_format_map = _build_docx_layout_tagged_text(fragments, span)
         math_placeholders = _collect_span_math_placeholders(fragments, span)
         source_html = _collect_span_html(
             fragments,
@@ -1830,6 +1885,7 @@ def _render_paragraph_fragment_group(
                     "source_text": sentence_source,
                     "display_text": sentence_display,
                     "source_layout_text": sentence_layout_source,
+                    "source_format_map": source_format_map,
                     "source_html": source_html,
                     "numbering_text": segment_numbering_text,
                     "status": "none",
@@ -1841,6 +1897,10 @@ def _render_paragraph_fragment_group(
                     "row_index": row_index,
                     "cell_index": cell_index,
                     "math_placeholders": math_placeholders,
+                    "segment_metadata": {
+                        "source_layout_text": sentence_layout_source,
+                        "source_layout_formats": source_format_map,
+                    },
                 }
             )
             numbering_available = False

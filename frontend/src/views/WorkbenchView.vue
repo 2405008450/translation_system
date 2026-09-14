@@ -125,7 +125,9 @@ import {
   applyAllStyleTagCheckItems,
   applyStyleTagCheckItem,
   createFileStyleTagCheckReport,
+  createMergeViewStyleTagCheckReport,
   fetchFileStyleTagCheckReport,
+  fetchMergeViewStyleTagCheckReport,
   recheckStyleTagCheckReport,
   rejectStyleTagCheckItem,
   rerunStyleTagCheckItem,
@@ -1145,6 +1147,7 @@ const generatingNumberCheck = ref(false)
 const recheckingNumberCheck = ref(false)
 const numberCheckAiEnabled = ref(true)
 const numberCheckFilter = ref<NumberCheckFilter>('all')
+const numberCheckFileId = ref('all')
 const numberCheckVisibleLimit = ref(100)
 const numberCheckAiScope = ref<'program_only' | 'all'>('program_only')
 const numberCheckModel = ref<string>('')
@@ -1161,6 +1164,7 @@ const loadingStyleTagCheck = ref(false)
 const generatingStyleTagCheck = ref(false)
 const recheckingStyleTagCheck = ref(false)
 const styleTagCheckFilter = ref<StyleTagCheckFilter>('all')
+const styleTagCheckFileId = ref('all')
 const styleTagCheckVisibleLimit = ref(100)
 const styleTagCheckModel = ref<string>('')
 const showStyleTagCheckSettings = ref(false)
@@ -2196,6 +2200,12 @@ function formatTermQASegmentNumber(sentenceId: string) {
     return sentenceId
   }
   return String(Number.parseInt(match[0], 10))
+}
+
+function formatCheckSegmentNumber(displayIndex: number | null | undefined, sentenceId: string) {
+  return typeof displayIndex === 'number' && Number.isFinite(displayIndex) && displayIndex >= 0
+    ? String(displayIndex + 1)
+    : formatTermQASegmentNumber(sentenceId)
 }
 
 const qualityQARules = [
@@ -5546,8 +5556,28 @@ async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
 
 const NUMBER_CHECK_RENDER_STEP = 100
 
+const numberCheckFiles = computed(() => {
+  const report = numberCheckReport.value
+  if (!report || !isMergeWorkbench.value) {
+    return []
+  }
+  const fileIds = report.file_ids ?? []
+  const detailFiles = segmentStore.mergeViewDetail?.files ?? []
+  return fileIds.map((fileId) => {
+    const file = detailFiles.find((candidate) => candidate.id === fileId)
+    const items = report.items.filter((item) => item.file_record_id === fileId)
+    return {
+      id: fileId,
+      name: file?.filename || items[0]?.file_name || fileId,
+      count: items.length,
+    }
+  })
+})
+
 const numberCheckFilteredItems = computed(() => {
-  const items = numberCheckReport.value?.items ?? []
+  const items = (numberCheckReport.value?.items ?? []).filter((item) => (
+    numberCheckFileId.value === 'all' || item.file_record_id === numberCheckFileId.value
+  ))
   switch (numberCheckFilter.value) {
     case 'program':
       return items.filter((item) => item.status !== 'ignored')
@@ -5584,32 +5614,27 @@ interface NumberCheckPreviewPart {
 }
 
 function numberCheckPreviewParts(item: NumberCheckReportItem): NumberCheckPreviewPart[] {
-  const target = item.target_text || ''
-  const anchor = item.replace_anchor || ''
-  const suggested = item.suggested_value || ''
+  // 预览文本与高亮区间由后端统一计算（与实际写回同一套锚点定位逻辑），
+  // 前端只负责按区间切片渲染，不再自行猜测锚点位置。
+  const text = item.preview_text || item.target_text || ''
+  const spans = item.preview_spans || []
+  if (spans.length === 0) {
+    return [{ text: text || '未填写', mark: false }]
+  }
 
-  if (item.applied) {
-    if (suggested && target.includes(suggested)) {
-      const idx = target.indexOf(suggested)
-      return [
-        { text: target.slice(0, idx), mark: false },
-        { text: suggested, mark: true },
-        { text: target.slice(idx + suggested.length), mark: false },
-      ].filter((part) => part.text.length > 0)
+  const parts: NumberCheckPreviewPart[] = []
+  let cursor = 0
+  for (const span of spans) {
+    if (span.start > cursor) {
+      parts.push({ text: text.slice(cursor, span.start), mark: false })
     }
-    return [{ text: target || '未填写', mark: false }]
+    parts.push({ text: text.slice(span.start, span.end), mark: true })
+    cursor = span.end
   }
-
-  if (anchor && suggested && target.includes(anchor)) {
-    const idx = target.indexOf(anchor)
-    return [
-      { text: target.slice(0, idx), mark: false },
-      { text: suggested, mark: true },
-      { text: target.slice(idx + anchor.length), mark: false },
-    ].filter((part) => part.text.length > 0)
+  if (cursor < text.length) {
+    parts.push({ text: text.slice(cursor), mark: false })
   }
-
-  return [{ text: target || '未填写', mark: false }]
+  return parts.filter((part) => part.text.length > 0)
 }
 
 function onNumberCheckScroll(event: Event) {
@@ -5678,20 +5703,24 @@ function numberCheckHasCorrection(item: NumberCheckReportItem) {
   if (item.applied) {
     return true
   }
-  return Boolean(
-    item.replace_anchor
-    && item.suggested_value
-    && (item.target_text || '').includes(item.replace_anchor),
-  )
+  return (item.preview_spans || []).length > 0
 }
 
-function numberCheckAiReason(item: NumberCheckReportItem): string {
-  const first = item.ai_errors?.[0]
-  if (!first) {
-    return ''
+function numberCheckAiReasons(item: NumberCheckReportItem): string[] {
+  const errors = item.ai_errors || []
+  const reasons: string[] = []
+  for (const error of errors) {
+    const record = error as Record<string, unknown>
+    const isSourceConsistent = String(record['is_source_consistent'] ?? '').trim().toLowerCase() === 'true'
+    if (isSourceConsistent) {
+      continue
+    }
+    const reason = record['修改理由']
+    if (typeof reason === 'string' && reason.trim()) {
+      reasons.push(reason.trim())
+    }
   }
-  const reason = (first as Record<string, unknown>)['修改理由']
-  return typeof reason === 'string' ? reason : ''
+  return reasons
 }
 
 interface NumberCheckStatusTag {
@@ -5746,6 +5775,7 @@ function setCurrentNumberCheckReport(
   numberCheckReport.value = report
   if (!options.keepPage) {
     numberCheckVisibleLimit.value = NUMBER_CHECK_RENDER_STEP
+    numberCheckFileId.value = 'all'
   }
   if (!options.keepSelection) {
     selectedNumberCheckItemIds.value = new Set()
@@ -6132,8 +6162,26 @@ async function focusNumberCheckReportItem(item: NumberCheckReportItem) {
 
 const NUMBER_CHECK_RENDER_STEP_STYLE = 100
 
+const styleTagCheckFiles = computed(() => {
+  const report = styleTagCheckReport.value
+  if (!report || !isMergeWorkbench.value) {
+    return []
+  }
+  const detailFiles = styleTagCheckMergeFiles.value
+  return detailFiles.map((file) => {
+    const items = report.items.filter((item) => item.file_record_id === file.id)
+    return {
+      id: file.id,
+      name: file.filename,
+      count: items.length,
+    }
+  })
+})
+
 const styleTagCheckFilteredItems = computed(() => {
-  const items = styleTagCheckReport.value?.items ?? []
+  const items = (styleTagCheckReport.value?.items ?? []).filter((item) => (
+    styleTagCheckFileId.value === 'all' || item.file_record_id === styleTagCheckFileId.value
+  ))
   if (styleTagCheckFilter.value === 'all') {
     return items
   }
@@ -6190,19 +6238,33 @@ const styleTagCheckMetaText = computed(() => {
   ].filter(Boolean).join(' · ')
 })
 
+const styleTagCheckSupportedExtensions = new Set(['.docx', '.pptx', '.xlsx'])
+const styleTagCheckMergeViewId = computed(() => segmentStore.mergeViewId || props.mergeViewId || '')
+const styleTagCheckMergeFiles = computed(() => (
+  segmentStore.mergeViewDetail?.files.filter((file) => {
+    const filename = file.filename.toLowerCase()
+    return [...styleTagCheckSupportedExtensions].some((extension) => filename.endsWith(extension))
+  }) ?? []
+))
+const styleTagCheckUnsupportedMergeFiles = computed(() => (
+  segmentStore.mergeViewDetail?.files.filter((file) => !styleTagCheckMergeFiles.value.some((supported) => supported.id === file.id)) ?? []
+))
+const styleTagCheckMergeFileNames = computed(() => styleTagCheckMergeFiles.value.map((file) => file.filename).join('、'))
+const styleTagCheckUnsupportedMergeFileNames = computed(() => styleTagCheckUnsupportedMergeFiles.value.map((file) => file.filename).join('、'))
+
 const canRunStyleTagCheck = computed(() => {
   if (generatingStyleTagCheck.value) {
     return false
   }
   if (isMergeWorkbench.value) {
-    return false
+    return Boolean(styleTagCheckMergeViewId.value && styleTagCheckMergeFiles.value.length > 0)
   }
   return Boolean(segmentStore.fileRecord)
 })
 
 const styleTagCheckButtonTitle = computed(() => {
-  if (isMergeWorkbench.value) {
-    return '样式标记专检暂不支持合并工作台'
+  if (isMergeWorkbench.value && styleTagCheckMergeFiles.value.length === 0) {
+    return '当前合并视图没有 DOCX 或 PPTX 文件，无法进行样式专检'
   }
   return styleTagCheckReport.value
     ? `样式标记专检：${styleTagCheckReport.value.candidate_count} 处候选`
@@ -6411,6 +6473,7 @@ function setCurrentStyleTagCheckReport(
   styleTagCheckReport.value = report
   if (!options.keepPage) {
     styleTagCheckVisibleLimit.value = NUMBER_CHECK_RENDER_STEP_STYLE
+    styleTagCheckFileId.value = 'all'
   }
   if (!options.keepSelection) {
     selectedStyleTagCheckItemIds.value = new Set()
@@ -6446,12 +6509,18 @@ function toggleAllStyleTagCheckItems(selected: boolean) {
 }
 
 async function loadStyleTagCheckReport() {
-  if (!segmentStore.fileRecord) {
+  const mergeViewId = styleTagCheckMergeViewId.value
+  if (isMergeWorkbench.value && !mergeViewId) {
+    return
+  }
+  if (!isMergeWorkbench.value && !segmentStore.fileRecord) {
     return
   }
   loadingStyleTagCheck.value = true
   try {
-    const report = await fetchFileStyleTagCheckReport(segmentStore.fileRecord.id)
+    const report = isMergeWorkbench.value
+      ? await fetchMergeViewStyleTagCheckReport(mergeViewId)
+      : await fetchFileStyleTagCheckReport(segmentStore.fileRecord!.id)
     setCurrentStyleTagCheckReport(report)
   } catch (error) {
     // 尚无报告时忽略错误
@@ -6489,7 +6558,11 @@ function resolveStyleTagCheckGenerateOptions() {
 }
 
 async function generateStyleTagCheckReport() {
-  if (generatingStyleTagCheck.value || !canRunStyleTagCheck.value || !segmentStore.fileRecord) {
+  if (generatingStyleTagCheck.value || !canRunStyleTagCheck.value) {
+    return
+  }
+  const mergeViewId = styleTagCheckMergeViewId.value
+  if (!isMergeWorkbench.value && !segmentStore.fileRecord) {
     return
   }
   generatingStyleTagCheck.value = true
@@ -6497,11 +6570,13 @@ async function generateStyleTagCheckReport() {
   await scrollBottomPanelIntoView()
   try {
     const options = resolveStyleTagCheckGenerateOptions()
-    const report = await createFileStyleTagCheckReport(segmentStore.fileRecord.id, options)
+    const report = isMergeWorkbench.value
+      ? await createMergeViewStyleTagCheckReport(mergeViewId, options)
+      : await createFileStyleTagCheckReport(segmentStore.fileRecord!.id, options)
     setCurrentStyleTagCheckReport(report)
     toast.show({
       title: '样式标记专检完成',
-      message: `共 ${report.candidate_count} 处多样式候选句段`,
+      message: `已检查 ${report.total_segments} 个句段，发现 ${report.candidate_count} 处样式候选`,
     })
   } catch (error) {
     toast.error({
@@ -6651,15 +6726,19 @@ async function focusStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
   if (locatingStyleTagCheckItemId.value) {
     return
   }
+  const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+  const isMergeMode = Boolean(isMergeWorkbench.value && mergeViewId)
   const fileRecord = segmentStore.fileRecord
-  if (!fileRecord) {
+  if (!isMergeMode && !fileRecord) {
     return
   }
 
   locatingStyleTagCheckItemId.value = item.id
   try {
     const currentPageIndex = editorSegments.value.findIndex((segment) => (
-      segment.sentence_id === item.sentence_id
+      isMergeMode
+        ? segment.file_record_id === item.file_record_id && segment.sentence_id === item.sentence_id
+        : segment.sentence_id === item.sentence_id
     ))
     if (currentPageIndex >= 0) {
       await focusEditorSegmentAtIndex(currentPageIndex)
@@ -6671,14 +6750,26 @@ async function focusStyleTagCheckReportItem(item: StyleTagCheckReportItem) {
       return
     }
 
-    const data = (await http.get<SegmentPositionResponse>(
-      `/file-records/${fileRecord.id}/segments/${encodeURIComponent(item.sentence_id)}/position`,
-      { params: { page_size: segmentStore.pageSize } },
-    )).data
+    let data: SegmentPositionResponse
+    if (isMergeMode) {
+      data = await fetchMergeViewSegmentPosition(mergeViewId, item.file_record_id, item.sentence_id, {
+        pageSize: segmentStore.pageSize,
+      })
+    } else {
+      if (!fileRecord) {
+        return
+      }
+      data = (await http.get<SegmentPositionResponse>(
+        `/file-records/${fileRecord.id}/segments/${encodeURIComponent(item.sentence_id)}/position`,
+        { params: { page_size: segmentStore.pageSize } },
+      )).data
+    }
     await clearSegmentFiltersForTermQANavigation()
     await refreshSegmentPage(data.page, data.page_size)
     const targetIndex = editorSegments.value.findIndex((segment) => (
-      segment.sentence_id === item.sentence_id
+      isMergeMode
+        ? segment.file_record_id === item.file_record_id && segment.sentence_id === item.sentence_id
+        : segment.sentence_id === item.sentence_id
     ))
     if (targetIndex === -1) {
       toast.warn('已切换到目标页，但未找到对应句段。')
@@ -8564,6 +8655,61 @@ function openFocusWorkbench() {
 
 async function loadAllSegments() {
   toast.info('大文档模式已启用分页加载，请使用分页控件切换句段。')
+}
+
+async function focusTranslationReviewSentence(sentenceId: string, fileRecordId?: string) {
+  const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+  const isMergeMode = Boolean(isMergeWorkbench.value && mergeViewId)
+  const fileRecord = segmentStore.fileRecord
+  if (!isMergeMode && !fileRecord) {
+    return
+  }
+  if (isMergeMode && !fileRecordId) {
+    toast.warn('无法确定问题所属文件。')
+    return
+  }
+
+  const targetKey = isMergeMode
+    ? segmentStore.segmentKeyOf({ sentence_id: sentenceId, file_record_id: fileRecordId } as Segment)
+    : sentenceId
+  const currentPageIndex = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === targetKey)
+  if (currentPageIndex >= 0) {
+    await focusEditorSegmentAtIndex(currentPageIndex, { caretAtEnd: true })
+    return
+  }
+
+  try {
+    const synced = await syncPendingWorkbenchEdits()
+    if (!synced) {
+      return
+    }
+
+    let data: SegmentPositionResponse
+    if (isMergeMode) {
+      data = await fetchMergeViewSegmentPosition(mergeViewId, fileRecordId!, sentenceId, {
+        pageSize: segmentStore.pageSize,
+      })
+    } else {
+      data = (await http.get<SegmentPositionResponse>(
+        `/file-records/${fileRecord!.id}/segments/${encodeURIComponent(sentenceId)}/position`,
+        { params: { page_size: segmentStore.pageSize } },
+      )).data
+    }
+
+    await clearSegmentFiltersForTermQANavigation()
+    await refreshSegmentPage(data.page, data.page_size)
+    const targetIndex = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === targetKey)
+    if (targetIndex === -1) {
+      toast.warn('已切换到目标页，但未找到对应句段。')
+      return
+    }
+    await focusEditorSegmentAtIndex(targetIndex, { caretAtEnd: true })
+  } catch (error) {
+    toast.error({
+      title: '跳转翻译校对句段失败',
+      message: getErrorMessage(error, '无法定位报告中的句段。'),
+    })
+  }
 }
 
 async function handlePreviewFocus(sentenceId: string) {
@@ -11461,7 +11607,7 @@ onBeforeRouteLeave(async () => {
                   {{ aiCapabilityBadgeCount }}
                 </span>
               </button>
-              <Teleport to="body">
+              <Teleport :to="isWorkbenchFullscreen && workbenchPageRef ? workbenchPageRef : 'body'">
                 <div
                   v-if="showAiCapabilityMenu"
                   ref="aiCapabilityMenuRef"
@@ -11491,7 +11637,6 @@ onBeforeRouteLeave(async () => {
                     </span>
                   </button>
                   <button
-                    v-if="!isMergeWorkbench"
                     type="button"
                     role="menuitem"
                     class="segment-editor-bottom-tool-dropdown__item"
@@ -11590,7 +11735,7 @@ onBeforeRouteLeave(async () => {
               />
 
               <button
-                v-if="activeBottomTool === 'history' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check' || activeBottomTool === 'style-tag-check'"
+                v-if="activeBottomTool === 'history' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check' || activeBottomTool === 'style-tag-check' || activeBottomTool === 'translation-review'"
                 class="workbench-bottom-drawer__close"
                 type="button"
                 title="关闭"
@@ -11985,6 +12130,17 @@ onBeforeRouteLeave(async () => {
                       <option value="modified">已修改</option>
                       <option value="ignored">已忽略</option>
                     </select>
+                    <select
+                      v-if="numberCheckReport && isMergeWorkbench && numberCheckFiles.length > 1"
+                      v-model="numberCheckFileId"
+                      class="term-qa-dialog__filter-select"
+                      title="按文件筛选"
+                    >
+                      <option value="all">全部文件</option>
+                      <option v-for="file in numberCheckFiles" :key="file.id" :value="file.id">
+                        {{ file.name }}{{ file.count > 0 ? ` (${file.count})` : '' }}
+                      </option>
+                    </select>
                     <label class="term-qa-dialog__toggle" title="生成时默认对程序筛选结果进行 AI 复核">
                       <input type="checkbox" v-model="numberCheckAiEnabled">
                       AI 复核
@@ -12098,7 +12254,7 @@ onBeforeRouteLeave(async () => {
                                 class="lucide-spin"
                                 :size="13"
                               />
-                              {{ formatTermQASegmentNumber(item.sentence_id) }}
+                              {{ formatCheckSegmentNumber(item.display_index, item.sentence_id) }}
                             </span>
                           </td>
                           <td
@@ -12123,9 +12279,13 @@ onBeforeRouteLeave(async () => {
                               <span v-else class="number-check__no-fix">—</span>
                             </div>
                             <div
-                              v-if="numberCheckShowAiReason && numberCheckHasCorrection(item) && numberCheckAiReason(item)"
+                              v-if="numberCheckShowAiReason && numberCheckHasCorrection(item) && numberCheckAiReasons(item).length > 0"
                               class="number-check__ai-reason"
-                            >AI 修改理由：{{ numberCheckAiReason(item) }}</div>
+                            >
+                              <div v-for="(reason, reasonIndex) in numberCheckAiReasons(item)" :key="reasonIndex">
+                                AI 修改理由{{ numberCheckAiReasons(item).length > 1 ? `（${reasonIndex + 1}）` : '' }}：{{ reason }}
+                              </div>
+                            </div>
                           </td>
                           <td class="number-check__cell">
                             <div class="number-check__status">
@@ -12202,6 +12362,14 @@ onBeforeRouteLeave(async () => {
                   <div class="workbench-bottom-drawer__header-lead">
                     <div class="section-title section-title--tight">样式标记专检</div>
                     <p class="panel-subtitle">根据原文样式为多样式句段的译文补全样式，不改动译文本身。</p>
+                    <template v-if="isMergeWorkbench">
+                      <p v-if="styleTagCheckMergeFileNames" class="panel-subtitle">
+                        支持检查：{{ styleTagCheckMergeFileNames }}
+                      </p>
+                      <p v-if="styleTagCheckUnsupportedMergeFileNames" class="panel-subtitle">
+                        不支持样式专检：{{ styleTagCheckUnsupportedMergeFileNames }}
+                      </p>
+                    </template>
                   </div>
 
                   <div v-if="styleTagCheckReport" class="term-qa-dialog__summary">
@@ -12229,17 +12397,15 @@ onBeforeRouteLeave(async () => {
                       </button>
                     </div>
                     <select
-                      v-if="styleTagCheckReport"
+                      v-if="styleTagCheckReport && isMergeWorkbench && styleTagCheckFiles.length > 1"
+                      v-model="styleTagCheckFileId"
                       class="term-qa-dialog__filter-select"
-                      :value="styleTagCheckFilter"
-                      title="筛选报告项"
-                      @change="setStyleTagCheckFilter(($event.target as HTMLSelectElement).value as StyleTagCheckFilter)"
+                      title="按文件筛选"
                     >
-                      <option value="all">全部</option>
-                      <option value="open">待审校</option>
-                      <option value="applied">已应用</option>
-                      <option value="rejected">已拒绝</option>
-                      <option value="failed">AI失败</option>
+                      <option value="all">全部文件</option>
+                      <option v-for="file in styleTagCheckFiles" :key="file.id" :value="file.id">
+                        {{ file.name }}{{ file.count > 0 ? ` (${file.count})` : '' }}
+                      </option>
                     </select>
                     <button
                       v-if="styleTagCheckReport"
@@ -12299,6 +12465,7 @@ onBeforeRouteLeave(async () => {
                             >
                           </th>
                           <th class="term-qa-dialog__col-segment">序号</th>
+                          <th v-if="isMergeWorkbench" class="term-qa-dialog__col-file">文件</th>
                           <th class="number-check__col-reason">原文（含样式）</th>
                           <th class="number-check__col-target">AI 标注建议</th>
                           <th class="number-check__col-status">状态</th>
@@ -12336,9 +12503,14 @@ onBeforeRouteLeave(async () => {
                                 class="lucide-spin"
                                 :size="13"
                               />
-                              {{ formatTermQASegmentNumber(item.sentence_id) }}
+                              {{ formatCheckSegmentNumber(item.display_index, item.sentence_id) }}
                             </span>
                           </td>
+                          <td
+                            v-if="isMergeWorkbench"
+                            class="number-check__cell"
+                            :title="item.file_name"
+                          >{{ item.file_name }}</td>
                           <td class="number-check__cell">
                             <div class="number-check__reason" v-html="styleTagCheckSourcePreviewHtml(item)"></div>
                           </td>
@@ -12432,17 +12604,10 @@ onBeforeRouteLeave(async () => {
                 :file-record-id="isMergeWorkbench ? null : (segmentStore.fileRecord?.id ?? null)"
                 :merge-view-id="isMergeWorkbench ? (segmentStore.mergeViewId ?? props.mergeViewId ?? null) : null"
                 :is-merge-workbench="isMergeWorkbench"
-                :active-file-record-id="activeWorkbenchFileId"
+                :merge-view-files="isMergeWorkbench ? (segmentStore.mergeViewDetail?.files ?? []) : []"
                 :project-id="activeWorkbenchProjectId"
                 :on-focus-sentence="(sid: string, fid?: string) => {
-                  if (fid && isMergeWorkbench) {
-                    const key = segmentStore.segments.find(s => s.sentence_id === sid && s.file_record_id === fid)
-                      ? segmentStore.segmentKeyOf(segmentStore.segments.find(s => s.sentence_id === sid && s.file_record_id === fid) as any)
-                      : sid
-                    void handlePreviewFocus(key)
-                  } else {
-                    void handlePreviewFocus(sid)
-                  }
+                  void focusTranslationReviewSentence(sid, fid)
                 }"
                 :on-active-count-change="(n: number | null) => { translationReviewActiveCount = n }"
                 class="workbench-bottom-drawer__qa"
@@ -17436,6 +17601,32 @@ onBeforeRouteLeave(async () => {
   min-height: 0;
   overflow: auto;
   border-radius: 4px;
+}
+
+.workbench-bottom-drawer--translation-review :deep(.term-qa-dialog__table-wrap) {
+  min-height: 0;
+  height: max(80px, calc(var(--workbench-visible-bottom-panel-height) - 88px));
+  max-height: max(80px, calc(var(--workbench-visible-bottom-panel-height) - 88px));
+  overflow-x: auto;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #8fa9b5 #eef3f5;
+}
+
+.workbench-bottom-drawer--translation-review :deep(.term-qa-dialog__table-wrap::-webkit-scrollbar) {
+  width: 10px;
+  height: 10px;
+}
+
+.workbench-bottom-drawer--translation-review :deep(.term-qa-dialog__table-wrap::-webkit-scrollbar-track) {
+  background: #eef3f5;
+}
+
+.workbench-bottom-drawer--translation-review :deep(.term-qa-dialog__table-wrap::-webkit-scrollbar-thumb) {
+  border: 2px solid #eef3f5;
+  border-radius: 999px;
+  background: #8fa9b5;
 }
 
 .workbench-bottom-drawer__qa .term-qa-dialog__table {

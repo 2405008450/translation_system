@@ -766,9 +766,16 @@ def backfill_file_record_source_html(db: Session, file_record: FileRecord) -> in
         return 0
 
     missing_filter = or_(Segment.source_html.is_(None), Segment.source_html == "")
+    missing_layout_filter = or_(
+        Segment.segment_metadata.is_(None),
+        ~Segment.segment_metadata.like('%"source_layout_formats"%'),
+    )
     has_missing_source_html = (
         db.query(Segment.id)
-        .filter(Segment.file_record_id == file_record.id, missing_filter)
+        .filter(
+            Segment.file_record_id == file_record.id,
+            or_(missing_filter, missing_layout_filter),
+        )
         .first()
         is not None
     )
@@ -787,7 +794,7 @@ def backfill_file_record_source_html(db: Session, file_record: FileRecord) -> in
     parsed_segments = {
         str(seg.get("sentence_id")): seg
         for seg in workspace.get("segments", [])
-        if seg.get("sentence_id") and seg.get("source_html")
+        if seg.get("sentence_id")
     }
     if not parsed_segments:
         return 0
@@ -795,7 +802,10 @@ def backfill_file_record_source_html(db: Session, file_record: FileRecord) -> in
     updated_count = 0
     segments = (
         db.query(Segment)
-        .filter(Segment.file_record_id == file_record.id, missing_filter)
+        .filter(
+            Segment.file_record_id == file_record.id,
+            or_(missing_filter, missing_layout_filter),
+        )
         .all()
     )
     for segment in segments:
@@ -804,7 +814,12 @@ def backfill_file_record_source_html(db: Session, file_record: FileRecord) -> in
             continue
         if parsed_segment.get("source_text") != segment.source_text:
             continue
-        segment.source_html = parsed_segment.get("source_html")
+        segment.source_html = parsed_segment.get("source_html") or ""
+        _merge_segment_layout_metadata(
+            segment,
+            parsed_segment.get("source_layout_text") or "",
+            parsed_segment.get("source_format_map") or {},
+        )
         updated_count += 1
 
     if updated_count:
@@ -827,7 +842,7 @@ def _merge_segment_layout_metadata(segment: Segment, layout_text: str, format_ma
     if format_map:
         metadata["source_layout_formats"] = format_map
     else:
-        metadata.pop("source_layout_formats", None)
+        metadata["source_layout_formats"] = {}
     segment.segment_metadata = json.dumps(metadata, ensure_ascii=False)
 
 
@@ -873,7 +888,11 @@ def backfill_file_record_pptx_layout(db: Session, file_record: FileRecord) -> in
     if Path(source_filename).suffix.lower() != ".pptx":
         return 0
 
-    missing_filter = Segment.source_html.is_(None)
+    missing_filter = or_(
+        Segment.source_html.is_(None),
+        Segment.segment_metadata.is_(None),
+        ~Segment.segment_metadata.like('%"source_layout_formats"%'),
+    )
     has_missing = (
         db.query(Segment.id)
         .filter(Segment.file_record_id == file_record.id, missing_filter)
@@ -909,6 +928,67 @@ def backfill_file_record_pptx_layout(db: Session, file_record: FileRecord) -> in
         parsed_segment = parsed_by_sentence_id.get(str(segment.sentence_id))
         if parsed_segment is None or parsed_segment.source_text != segment.source_text:
             # 对不上就只落“已处理”标记，避免下次打开再全量解析。
+            segment.source_html = ""
+            updated_count += 1
+            continue
+        segment.source_html = parsed_segment.source_html or ""
+        _merge_segment_layout_metadata(
+            segment,
+            parsed_segment.source_layout_text or "",
+            getattr(parsed_segment, "source_format_map", {}) or {},
+        )
+        updated_count += 1
+
+    if updated_count:
+        db.flush()
+    return updated_count
+
+
+def backfill_file_record_xlsx_layout(db: Session, file_record: FileRecord) -> int:
+    """为既有 XLSX 文件回填原文样式与版式标签，不改动译文。"""
+    source_filename = get_file_record_source_filename(file_record)
+    if Path(source_filename).suffix.lower() != ".xlsx":
+        return 0
+
+    missing_filter = or_(
+        Segment.source_html.is_(None),
+        Segment.segment_metadata.is_(None),
+        ~Segment.segment_metadata.like('%"source_layout_formats"%'),
+    )
+    has_missing = (
+        db.query(Segment.id)
+        .filter(Segment.file_record_id == file_record.id, missing_filter)
+        .first()
+        is not None
+    )
+    if not has_missing:
+        return 0
+
+    raw_bytes = load_file_record_source(file_record)
+    if raw_bytes is None:
+        return 0
+
+    from app.services.adapters import ensure_default_adapters_registered
+
+    document_parse_options = normalize_document_parse_options(
+        getattr(file_record, "document_parse_options", None)
+    )
+    registry = ensure_default_adapters_registered()
+    adapter = registry.get_adapter(source_filename)
+    parse_result = adapter.parse_with_options(
+        raw_bytes, filename=source_filename, options=document_parse_options
+    )
+    parsed_by_sentence_id = {str(seg.segment_id): seg for seg in parse_result.segments}
+
+    updated_count = 0
+    segments = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record.id, missing_filter)
+        .all()
+    )
+    for segment in segments:
+        parsed_segment = parsed_by_sentence_id.get(str(segment.sentence_id))
+        if parsed_segment is None or parsed_segment.source_text != segment.source_text:
             segment.source_html = ""
             updated_count += 1
             continue
