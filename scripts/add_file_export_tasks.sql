@@ -26,7 +26,9 @@ ALTER TABLE IF EXISTS file_export_tasks
 ALTER TABLE IF EXISTS file_export_tasks
     ADD COLUMN IF NOT EXISTS media_type VARCHAR(120);
 ALTER TABLE IF EXISTS file_export_tasks
-    ADD COLUMN IF NOT EXISTS size_bytes INTEGER;
+    ADD COLUMN IF NOT EXISTS size_bytes BIGINT;
+ALTER TABLE IF EXISTS file_export_tasks
+    ALTER COLUMN size_bytes TYPE BIGINT USING size_bytes::BIGINT;
 ALTER TABLE IF EXISTS file_export_tasks
     ADD COLUMN IF NOT EXISTS error TEXT;
 ALTER TABLE IF EXISTS file_export_tasks

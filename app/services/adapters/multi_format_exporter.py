@@ -58,6 +58,30 @@ class MultiFormatExporter:
             if original_bytes is None:
                 raise ValueError("Source export requires the original source file.")
             return original_bytes, self._get_mime_type(extension), filename
+        if export_type in {"translated_pdf", "translated_svg"}:
+            if extension != ".ai":
+                raise ValueError(f"{export_type} export is only supported for .ai files.")
+            if original_bytes is None:
+                raise ValueError("AI export requires the original source file.")
+
+            from app.services.adapters.ai_exporter import (
+                PDF_MEDIA_TYPE,
+                SVG_MEDIA_TYPE,
+                AiExporter,
+            )
+
+            ai_exporter = AiExporter()
+            if export_type == "translated_pdf":
+                return (
+                    ai_exporter.export_pdf(original_bytes, normalized_segments),
+                    PDF_MEDIA_TYPE,
+                    self._build_translated_filename(filename, extension_override=".pdf"),
+                )
+            return (
+                ai_exporter.export_svg(original_bytes, normalized_segments),
+                SVG_MEDIA_TYPE,
+                self._build_translated_filename(filename, extension_override=".svg"),
+            )
         if export_type == "original":
             return self._export_original(
                 extension,
@@ -94,6 +118,46 @@ class MultiFormatExporter:
             return self._export_xliff(normalized_segments, filename, version)
 
         raise ValueError(f"Unsupported export type: {export_type}")
+
+    def export_to_path(
+        self,
+        export_type: str,
+        segments: list[Any],
+        filename: str,
+        original_path: str | Path,
+        output_path: str | Path,
+    ) -> tuple[Path, str, str, list[str]]:
+        """将大型格式直接导出到磁盘；当前原生支持 PDF-compatible AI。
+
+        第四个返回值是面向使用者的导出提示（如部分画板已转为位图），可能为空列表。
+        """
+
+        extension = Path(filename).suffix.lower()
+        if extension != ".ai" or export_type not in {"translated_pdf", "translated_svg"}:
+            raise ValueError("Path-based export is currently only supported for AI PDF/SVG outputs.")
+
+        from app.services.adapters.ai_exporter import PDF_MEDIA_TYPE, SVG_MEDIA_TYPE, AiExporter
+
+        normalized_segments = self._normalize_segments(segments)
+        exporter = AiExporter()
+        if export_type == "translated_pdf":
+            result_path = exporter.export_pdf_to_path(original_path, output_path, normalized_segments)
+            return (
+                result_path,
+                PDF_MEDIA_TYPE,
+                self._build_translated_filename(filename, extension_override=".pdf"),
+                [],
+            )
+        result_path, report = exporter.export_svg_to_path(
+            original_path, output_path, normalized_segments
+        )
+        notice = report.build_notice()
+        return (
+            result_path,
+            SVG_MEDIA_TYPE,
+            self._build_translated_filename(filename, extension_override=".svg"),
+            [notice] if notice else [],
+        )
 
     def _normalize_segments(self, segments: list[Any]) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
@@ -1221,3 +1285,22 @@ def export_file(
 ) -> tuple[bytes, str, str]:
     exporter = MultiFormatExporter(source_lang, target_lang)
     return exporter.export(export_type, segments, filename, original_bytes)
+
+
+def export_file_to_path(
+    export_type: str,
+    segments: list[Any],
+    filename: str,
+    original_path: str | Path,
+    output_path: str | Path,
+    source_lang: str = "zh-CN",
+    target_lang: str = "en-US",
+) -> tuple[Path, str, str, list[str]]:
+    exporter = MultiFormatExporter(source_lang, target_lang)
+    return exporter.export_to_path(
+        export_type,
+        segments,
+        filename,
+        original_path,
+        output_path,
+    )

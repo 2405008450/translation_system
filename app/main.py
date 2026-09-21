@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 
 import anyio.to_thread
@@ -89,8 +90,129 @@ def _spa_entry_response(index_path: Path) -> FileResponse:
 def _spa_file_response(path: Path) -> FileResponse:
     return FileResponse(path, headers=SPA_ENTRY_CACHE_HEADERS)
 
+RESOURCE_IMPORT_REQUEST_PATHS = frozenset(
+    {
+        "/api/glossary-bases/import/preview",
+        "/api/glossary-bases/import-xlsx",
+        "/api/term-bases/import/preview",
+        "/api/term-bases/import-xlsx",
+        "/api/term-bases/import",
+        "/api/translation-memory/import/preview",
+        "/api/translation-memory/import-xlsx",
+        "/api/translation-memory/import",
+        "/api/tm/import/preview",
+        "/api/tm/import-xlsx",
+        "/api/tm/import",
+        "/api/termbase/import-xlsx",
+        "/api/termbase/import",
+    }
+)
+
+
+class RequestBodyTooLarge(Exception):
+    """请求体实际读取字节数超过当前端点预算。"""
+
+
+class RequestBodyLimitMiddleware:
+    """在 multipart 解析期间按实际接收字节计数，兼容 chunked 请求。"""
+
+    def __init__(self, asgi_app):
+        self.asgi_app = asgi_app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.asgi_app(scope, receive, send)
+            return
+
+        path = str(scope.get("path") or "/").rstrip("/") or "/"
+        if path in RESOURCE_IMPORT_REQUEST_PATHS:
+            max_request_mb = (
+                max(int(settings.resource_import_max_size_mb), 1)
+                + max(int(settings.resource_import_request_overhead_mb), 0)
+            )
+        else:
+            max_request_mb = max(int(settings.upload_max_request_size_mb), 1)
+        max_request_bytes = max_request_mb * 1024 * 1024
+
+        content_length: bytes | None = None
+        for key, value in scope.get("headers", []):
+            if key.lower() == b"content-length":
+                content_length = value
+                break
+        if content_length is not None:
+            try:
+                declared_size = int(content_length.decode("ascii"))
+            except (UnicodeDecodeError, ValueError):
+                declared_size = -1
+            if declared_size > max_request_bytes:
+                await self._send_rejection(scope, receive, send, max_request_mb)
+                return
+            large_upload_threshold = max(int(settings.ai_inline_max_size_mb), 1) * 1024 * 1024
+            if path not in RESOURCE_IMPORT_REQUEST_PATHS and declared_size > large_upload_threshold:
+                import_root = Path(settings.import_task_dir)
+                import_root.mkdir(parents=True, exist_ok=True)
+                reserve_bytes = max(int(settings.ai_min_free_disk_mb), 1) * 1024 * 1024
+                # multipart spool、任务暂存和永久源文件在导入完成前可能同时存在。
+                required_bytes = declared_size * 3 + reserve_bytes
+                if shutil.disk_usage(import_root).free < required_bytes:
+                    await self._send_disk_rejection(scope, receive, send, required_bytes)
+                    return
+
+        received_bytes = 0
+        limit_exceeded = False
+
+        async def limited_receive():
+            nonlocal limit_exceeded, received_bytes
+            message = await receive()
+            if message.get("type") == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > max_request_bytes:
+                    limit_exceeded = True
+                    raise RequestBodyTooLarge
+            return message
+
+        response_started = False
+
+        async def tracked_send(message):
+            nonlocal response_started
+            # FastAPI 可能把 receive 的异常转换为 400；超限后屏蔽该响应，统一改发 413。
+            if limit_exceeded:
+                return
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.asgi_app(scope, limited_receive, tracked_send)
+        except Exception:
+            if not limit_exceeded:
+                raise
+
+        if limit_exceeded and not response_started:
+            await self._send_rejection(scope, receive, send, max_request_mb)
+
+    @staticmethod
+    async def _send_disk_rejection(scope, receive, send, required_bytes: int) -> None:
+        required_gib = round(required_bytes / (1024 ** 3), 2)
+        response = JSONResponse(
+            status_code=507,
+            content={"detail": f"上传磁盘空间不足，至少需要 {required_gib} GiB 可用空间。"},
+        )
+        await response(scope, receive, send)
+
+    @staticmethod
+    async def _send_rejection(scope, receive, send, max_request_mb: int) -> None:
+        response = JSONResponse(
+            status_code=413,
+            content={"detail": f"请求体超过服务器上限（{max_request_mb} MB）。"},
+        )
+        await response(scope, receive, send)
+
+
 app = FastAPI(title=settings.app_name)
 
+# 后添加的 CORS 位于请求体限制器外层，确保 413 响应也带正确的跨域响应头。
+app.add_middleware(RequestBodyLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allow_origins,

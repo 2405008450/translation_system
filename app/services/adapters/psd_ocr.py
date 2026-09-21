@@ -19,6 +19,62 @@ class PsdOcrError(RuntimeError):
     """PSD PaddleOCR 初始化或识别失败。"""
 
 
+def recognize_image_text_lines(
+    image_path: Path,
+    *,
+    scale: float = 1.0,
+    min_confidence: float = _DEFAULT_MIN_CONFIDENCE,
+) -> list[dict[str, Any]]:
+    """识别单张图片中的逐行文字，并返回换算到原始坐标系的边界框。"""
+    if not _ocr_enabled():
+        return []
+
+    resolved_scale = _positive_float(scale, default=1.0)
+    threshold = min(max(_finite_float(min_confidence), 0.0), 1.0)
+    ocr = _get_ocr_instance()
+    try:
+        with _OCR_PREDICT_LOCK:
+            predictions = list(ocr.predict(str(image_path)))
+    except Exception as exc:  # Paddle 内部错误类型在版本间不稳定
+        raise PsdOcrError(f"PaddleOCR 图片识别失败：{exc}") from exc
+
+    lines: list[dict[str, Any]] = []
+    for prediction in predictions:
+        payload = getattr(prediction, "json", prediction)
+        if callable(payload):
+            payload = payload()
+        if not isinstance(payload, dict):
+            continue
+        result = payload.get("res", payload)
+        if not isinstance(result, dict):
+            continue
+        texts = result.get("rec_texts") or []
+        scores = result.get("rec_scores") or []
+        boxes = result.get("rec_boxes") or []
+        polygons = result.get("rec_polys") or []
+        for index, raw_text in enumerate(texts):
+            text = _normalize_text(raw_text)
+            score = _finite_float(scores[index] if index < len(scores) else 0.0)
+            if not text or score < threshold or not _contains_meaningful_text(text):
+                continue
+            raw_box = boxes[index] if index < len(boxes) else None
+            raw_polygon = polygons[index] if index < len(polygons) else None
+            bounds = _read_bounds(raw_box, raw_polygon)
+            if bounds is None:
+                continue
+            left, top, right, bottom = (value / resolved_scale for value in bounds)
+            if right <= left or bottom <= top:
+                continue
+            lines.append(
+                {
+                    "text": text,
+                    "confidence": score,
+                    "bbox": [left, top, right, bottom],
+                }
+            )
+    return lines
+
+
 def recognize_psd_candidates(
     candidate_directory: Path,
     candidates: list[dict[str, Any]],

@@ -140,6 +140,7 @@ import type {
 import { buildDocumentPreviewHtml } from '../utils/documentPreview'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import {
+  extractExportNotice,
   getExportOptionExtensionLabel,
   groupExportOptions,
   type FileExportOption,
@@ -6765,7 +6766,11 @@ async function exportTranslatedFile() {
   try {
     await segmentStore.downloadTranslatedFile()
   } catch (error) {
-    pageError.value = getErrorMessage(error, '导出失败。')
+    const message = getErrorMessage(error, '导出失败。')
+    pageError.value = message
+    // 导出错误可能包含较长的处置建议（如 AI 转 SVG 超限），
+    // 使用常驻 toast 弹窗，避免被顶部单行红字截断。
+    toast.error({ title: '导出失败', message, duration: 0 })
   }
 }
 
@@ -6929,12 +6934,19 @@ async function exportWithTypeForFile(exportType: string, fileRecordId?: string |
     const resolvedFilename = resolveDownloadFilename(response.headers['content-disposition'], `export.${exportType}`)
     downloadBlob(response.data, resolvedFilename)
     toast.success('导出完成，文件已开始下载。')
-  } catch (error) {
-    if (axios.isAxiosError(error)) {
-      pageError.value = String(error.response?.data?.detail || '导出失败。')
-      return
+    // 导出成功但结果被降级（如部分画板转为位图）时，用常驻提示告知使用者。
+    const notice = extractExportNotice(completedTask.message)
+    if (notice) {
+      toast.warn({ title: '导出结果为混合内容', message: notice, duration: 0 })
     }
-    pageError.value = error instanceof Error ? error.message : '导出失败。'
+  } catch (error) {
+    const message = axios.isAxiosError(error)
+      ? String(error.response?.data?.detail || '导出失败。')
+      : (error instanceof Error ? error.message : '导出失败。')
+    pageError.value = message
+    // 导出错误可能包含较长的处置建议（如 AI 转 SVG 超限），
+    // 使用常驻 toast 弹窗，避免被顶部单行红字截断。
+    toast.error({ title: '导出失败', message, duration: 0 })
   } finally {
     clearExportPollTimer()
     exporting.value = false

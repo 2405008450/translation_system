@@ -179,7 +179,9 @@ Copy-Item .env.example .env
 | `TM_VECTOR_*`                                 | pgvector 语义检索开关、维度、候选数和权重                                                                   |
 | `DEEPSEEK_*` / `OPENROUTER_*`                 | LLM Provider 配置，AI 修正至少需要一个 API Key                                                         |
 | `LLM_TIMEOUT_SECONDS` / `LLM_STALL_TIMEOUT_SECONDS` / `LLM_MAX_CONCURRENCY` | LLM 单次请求超时、无进展中止阈值与并发控制                                                                 |
-| `ARQ_IMPORT_MAX_JOBS` / `ARQ_MAINTENANCE_MAX_JOBS` / `ARQ_AUTO_TM_MAX_JOBS` / `ARQ_SEGMENT_SYNC_MAX_JOBS` / `ARQ_PRETRANSLATION_MAX_JOBS` / `PRETRANSLATION_RUN_FILE_CONCURRENCY` | 上传与资源导入、普通维护、auto-TM、项目重复句段同步、预翻译 run 队列和单个预翻译批次内文件并发控制 |
+| `ARQ_IMPORT_MAX_JOBS` / `ARQ_MAINTENANCE_MAX_JOBS` / `ARQ_AUTO_TM_MAX_JOBS` / `ARQ_SEGMENT_SYNC_MAX_JOBS` / `ARQ_PRETRANSLATION_MAX_JOBS` / `ARQ_AI_MAX_JOBS` / `PRETRANSLATION_RUN_FILE_CONCURRENCY` | 上传与资源导入、普通维护、auto-TM、项目重复句段同步、预翻译 run、大型 AI 处理队列以及单个预翻译批次内文件并发控制 |
+| `AI_MAX_FILE_SIZE_MB` / `AI_INLINE_MAX_SIZE_MB` / `AI_MIN_FREE_DISK_MB` / `AI_WORKER_JOB_TIMEOUT_SECONDS` / `AI_WORKER_MEMORY_LIMIT_MB` | Adobe Illustrator (`.ai`) 上传大小、内联/异步分派阈值以及大型 AI 专用 worker 的超时和内存上限 |
+| `AI_OCR_ENABLED` / `AI_OCR_SCALE` / `AI_OCR_MIN_CONFIDENCE` / `AI_OCR_MAX_PIXELS` | 对 Illustrator 转曲文字启用本地 PaddleOCR 的开关、渲染分辨率、置信度阈值和单画板像素上限 |
 | `LANGUAGETOOL_BASE_URL` / `LANGUAGETOOL_TIMEOUT_SECONDS` / `LANGUAGETOOL_MAX_TEXT_LENGTH` / `SPELLING_GRAMMAR_QA_AUTO_SCHEDULE` | 拼写/语法 QA 使用的自托管 LanguageTool HTTP Server 配置；默认手动生成，不影响译文保存。 |
 
 
@@ -221,6 +223,14 @@ python -m pip install -r requirements.txt
 - API 文档：`http://127.0.0.1:19013/docs`
 
 - `--host 0.0.0.0` 用于允许局域网访问；Windows 防火墙需要放行端口。
+
+需要处理超过 `AI_INLINE_MAX_SIZE_MB`（默认 100 MB）的 Adobe Illustrator (`.ai`) 文件时，先启动 Redis，然后在**另一个终端**运行大型 AI 专用 worker：
+
+```powershell
+.\.venv\Scripts\arq.exe app.routers.api.AiWorkerSettings
+```
+
+未启动该 worker 时，超阈值的 AI 上传会返回“ai-worker 不可用”。小型 AI 仍由 uvicorn 内联解析，不需要额外进程。
 
 ### 5. 启动前端
 

@@ -64,6 +64,7 @@ TASK_ADAPTER_EXTENSIONS = {
     ".ditamap",
     ".xml",
     ".svg",
+    ".ai",
     ".psd",
     ".sdlxliff",
     ".txml",
@@ -370,6 +371,17 @@ _UPLOAD_CAPABILITY_SPECS = (
         ),
     },
     {
+        "extensions": (".ai",),
+        "label": "Adobe Illustrator AI",
+        "category": "design",
+        "features": (
+            "支持启用了 PDF 兼容保存的 AI 文件",
+            "按画板提取未转曲的可编辑文字",
+            "译文可导出为 PDF 或 SVG",
+            "不生成原生可编辑 AI 文件",
+        ),
+    },
+    {
         "extensions": (".svg",),
         "label": "SVG",
         "category": "design",
@@ -555,8 +567,8 @@ def get_max_upload_size_bytes(filename: str) -> int:
         return FORMAT_SIZE_LIMITS.get(extension, DEFAULT_MAX_FILE_SIZE)
 
 
-def validate_upload_batch(
-    files: list[tuple[str, bytes]],
+def _validate_upload_sizes(
+    files: list[tuple[str, int]],
     *,
     max_files: int | None = None,
 ) -> None:
@@ -571,9 +583,8 @@ def validate_upload_batch(
         )
 
     total = 0
-    for filename, raw_bytes in files:
+    for filename, size in files:
         max_size = get_max_upload_size_bytes(filename)
-        size = len(raw_bytes)
         if size > max_size:
             max_mb = round(max_size / (1024 * 1024), 2)
             raise UploadLimitError(
@@ -589,14 +600,27 @@ def validate_upload_batch(
         )
 
 
-def validate_expanded_upload_batch(file_payloads: list[dict[str, Any]]) -> None:
-    from app.services.import_task_storage import read_import_file_bytes
+def validate_upload_batch(
+    files: list[tuple[str, bytes]],
+    *,
+    max_files: int | None = None,
+) -> None:
+    _validate_upload_sizes(
+        [(filename, len(raw_bytes)) for filename, raw_bytes in files],
+        max_files=max_files,
+    )
 
-    files = [
-        (payload.get("filename") or "source.txt", read_import_file_bytes(payload))
-        for payload in file_payloads
-    ]
-    validate_upload_batch(files, max_files=get_settings().upload_max_expanded_files)
+
+def validate_expanded_upload_batch(file_payloads: list[dict[str, Any]]) -> None:
+    from app.services.import_task_storage import get_import_file_size
+
+    _validate_upload_sizes(
+        [
+            (payload.get("filename") or "source.txt", get_import_file_size(payload))
+            for payload in file_payloads
+        ],
+        max_files=get_settings().upload_max_expanded_files,
+    )
 
 
 def get_upload_capabilities() -> dict[str, Any]:
@@ -644,7 +668,7 @@ def _get_upload_max_size_mb(extension: str) -> float:
 
 def build_task_workspace(
     db: Session,
-    raw_bytes: bytes,
+    raw_bytes: bytes | None,
     filename: str,
     similarity_threshold: float,
     collection_ids: list[UUID] | None = None,
@@ -652,10 +676,13 @@ def build_task_workspace(
     target_language: str | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: dict[str, object] | str | None = None,
+    source_path: str | Path | None = None,
 ) -> dict[str, Any]:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
     if is_word_task(filename):
+        if raw_bytes is None:
+            raise ValueError("Word 源文件缺失，无法解析。")
         parse_bytes = raw_bytes
         parse_filename = filename
         original_filename = filename
@@ -691,7 +718,16 @@ def build_task_workspace(
         **document_parse_options,
         "source_language": source_language or "",
     }
-    parse_result = adapter.parse_with_options(raw_bytes, filename=filename, options=parse_options)
+    if source_path is not None:
+        parse_result = adapter.parse_path_with_options(
+            source_path,
+            filename=filename,
+            options=parse_options,
+        )
+    else:
+        if raw_bytes is None:
+            raise ValueError("源文件内容缺失，无法解析。")
+        parse_result = adapter.parse_with_options(raw_bytes, filename=filename, options=parse_options)
     if not parse_result.segments:
         raise ValueError("文件中没有可翻译的内容。")
 

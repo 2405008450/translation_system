@@ -6,6 +6,7 @@ API 路由模块 - 文件上传、解析和导出接口
 import asyncio
 import json
 import logging
+import multiprocessing
 import re
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
@@ -18,7 +19,7 @@ from urllib.parse import quote, unquote, urlparse
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, case, func, literal, or_
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -140,6 +141,8 @@ from app.services.issue_marker_service import (
 from app.services.import_task_storage import (
     cleanup_expired_import_staging,
     cleanup_import_task_staging,
+    get_import_file_path,
+    get_seekable_stream_size,
     read_import_file_bytes,
     stage_import_file_payload,
     stage_import_file_payloads,
@@ -162,11 +165,14 @@ from app.services.file_record_service import (
     batch_update_segments,
     calculate_file_record_progress,
     create_file_record_with_segments,
+    create_file_record_with_segments_from_path,
     delete_file_record,
     duplicate_file_record,
     get_file_record as get_file_record_model,
     get_file_record_document_statistics,
     get_file_record_source_filename,
+    get_file_record_source_path,
+    get_file_record_source_size,
     get_file_record_with_segments,
     get_segment_ordering_for_file_record,
     get_tm_target_text_map,
@@ -301,8 +307,11 @@ from app.services.qa_safe_process import (
 )
 from app.services.file_export_queue import (
     build_file_export_download_response,
+    dispatch_file_export_task,
+    fail_file_export_task,
     get_file_export_task,
     queue_file_export,
+    run_file_export_task,
     serialize_file_export_task,
     wait_for_file_export_task,
 )
@@ -359,6 +368,7 @@ from app.services.resource_export_queue import (
     queue_resource_export,
 )
 from app.services.slate_parser import parse_docx_for_slate
+from app.services.adapters import get_export_options_for_file
 from app.services.task_file_service import (
     BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS,
     DOCUMENT_PARSE_MODE_FULL,
@@ -427,6 +437,7 @@ ARQ_MAINTENANCE_QUEUE_NAME = "arq:maintenance"
 ARQ_AUTO_TM_QUEUE_NAME = "arq:auto-tm"
 ARQ_SEGMENT_SYNC_QUEUE_NAME = "arq:segment-sync"
 ARQ_PRETRANSLATION_QUEUE_NAME = "arq:pretranslation"
+ARQ_AI_QUEUE_NAME = "arq:ai"
 ARQ_AUTO_TM_BACKGROUND_JOB_ID = "auto-tm-background"
 ARQ_AUTO_TM_REMATCH_BACKGROUND_JOB_ID = "auto-tm-rematch-background"
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -552,7 +563,13 @@ async def _close_arq_pool(redis_pool) -> None:
             await wait_result
 
 
-async def _enqueue_arq_import_task(task_id: str, payload: dict[str, Any]) -> bool:
+async def _enqueue_arq_import_task(
+    task_id: str,
+    payload: dict[str, Any],
+    *,
+    queue_name: str = ARQ_IMPORT_QUEUE_NAME,
+    function_name: str = "process_import_task_job",
+) -> bool:
     settings = get_settings()
     if settings.import_queue_backend.lower() != "arq":
         return False
@@ -567,10 +584,10 @@ async def _enqueue_arq_import_task(task_id: str, payload: dict[str, Any]) -> boo
     try:
         redis_pool = await arq_create_pool(redis_settings)
         await redis_pool.enqueue_job(
-            "process_import_task_job",
+            function_name,
             task_id,
             payload,
-            _queue_name=ARQ_IMPORT_QUEUE_NAME,
+            _queue_name=queue_name,
         )
         return True
     except Exception:
@@ -693,6 +710,26 @@ async def _dispatch_project_segment_sync(
     )
 
 
+def _get_staged_ai_files(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    single = payload.get("file")
+    if isinstance(single, dict):
+        candidates.append(single)
+    multiple = payload.get("files")
+    if isinstance(multiple, list):
+        candidates.extend(item for item in multiple if isinstance(item, dict))
+    return [
+        item
+        for item in candidates
+        if Path(str(item.get("filename") or "")).suffix.lower() == ".ai"
+    ]
+
+
+def _is_large_ai_payload(payload: dict[str, Any]) -> bool:
+    threshold = max(int(get_settings().ai_inline_max_size_mb), 1) * 1024 * 1024
+    return any(int(item.get("size") or 0) > threshold for item in _get_staged_ai_files(payload))
+
+
 async def _queue_import_task(
     background_tasks: BackgroundTasks,
     payload: dict[str, Any],
@@ -705,14 +742,15 @@ async def _queue_import_task(
     task_id = str(uuid4())
     try:
         if staging_upload_files is not None:
-            payload = {
-                **payload,
-                "files": await asyncio.to_thread(
-                    stage_import_file_streams,
-                    task_id,
-                    staging_upload_files,
-                ),
-            }
+            staged_uploads = await asyncio.to_thread(
+                stage_import_file_streams,
+                task_id,
+                staging_upload_files,
+            )
+            if payload.get("kind") == "file_record" and len(staged_uploads) == 1:
+                payload = {**payload, "file": staged_uploads[0]}
+            else:
+                payload = {**payload, "files": staged_uploads}
         elif staging_files is not None:
             payload = {
                 **payload,
@@ -726,8 +764,31 @@ async def _queue_import_task(
             }
         payload["staging_task_id"] = task_id
 
+        ai_files = _get_staged_ai_files(payload)
+        is_ai_task = bool(ai_files)
         _set_import_task_status(task_id, "queued", progress=0, message="任务已进入导入队列。")
-        if not await _enqueue_arq_import_task(task_id, payload):
+        if is_ai_task:
+            enqueued = await _enqueue_arq_import_task(
+                task_id,
+                payload,
+                queue_name=ARQ_AI_QUEUE_NAME,
+                function_name="process_ai_import_task_job",
+            )
+            if not enqueued and _is_large_ai_payload(payload):
+                _set_import_task_status(
+                    task_id,
+                    "failed",
+                    progress=100,
+                    message="大型 AI 导入失败。",
+                    error="大型 AI 必须由专用 ARQ AI worker 处理，请检查 Redis、IMPORT_QUEUE_BACKEND 和 ai-worker。",
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="大型 AI 专用处理队列不可用，请联系管理员检查 ai-worker。",
+                )
+            if not enqueued:
+                background_tasks.add_task(_run_import_task, task_id, payload)
+        elif not await _enqueue_arq_import_task(task_id, payload):
             background_tasks.add_task(_run_import_task, task_id, payload)
 
         return JSONResponse(
@@ -913,8 +974,10 @@ def _get_file_record_document_parse_options(file_record: FileRecord) -> dict[str
 
 def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
     file_payload = payload["file"]
-    raw_bytes = read_import_file_bytes(file_payload)
     filename = file_payload["filename"] or "untitled.txt"
+    is_path_based_ai = Path(filename).suffix.lower() == ".ai"
+    source_path = get_import_file_path(file_payload) if is_path_based_ai else None
+    raw_bytes = None if is_path_based_ai else read_import_file_bytes(file_payload)
     selected_collection_ids = _uuid_list(payload.get("collection_ids"))
     term_base_id = UUID(payload["term_base_id"]) if payload.get("term_base_id") else None
     document_parse_mode = payload.get("document_parse_mode") or DOCUMENT_PARSE_MODE_FULL
@@ -946,6 +1009,7 @@ def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[st
     workspace_data = build_task_workspace(
         db=db,
         raw_bytes=raw_bytes,
+        source_path=source_path,
         filename=filename,
         similarity_threshold=threshold,
         collection_ids=selected_collection_ids,
@@ -954,15 +1018,21 @@ def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[st
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
     )
-    file_record = create_file_record_with_segments(
+    create_record = (
+        create_file_record_with_segments_from_path
+        if source_path is not None
+        else create_file_record_with_segments
+    )
+    source_argument = {"source_path": source_path} if source_path is not None else {"raw_bytes": raw_bytes}
+    file_record = create_record(
         db=db,
-        raw_bytes=raw_bytes,
         filename=filename,
         similarity_threshold=threshold,
         workspace_data=workspace_data,
         collection_ids=selected_collection_ids,
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
+        **source_argument,
     )
     if selected_collection_ids:
         file_record.collection_id = selected_collection_ids[0]
@@ -994,8 +1064,11 @@ def _expand_archive_payloads(file_payloads: list[dict[str, Any]]) -> list[dict[s
     for file_payload in file_payloads:
         filename = file_payload.get("filename") or ""
         ext = Path(filename).suffix.lower()
-        raw_bytes = read_import_file_bytes(file_payload)
+        if ext not in {".zip", ".rar"}:
+            expanded.append(file_payload)
+            continue
 
+        raw_bytes = read_import_file_bytes(file_payload)
         if ext == ".zip":
             extracted = _extract_zip_files(raw_bytes, filename)
             if extracted:
@@ -1045,6 +1118,14 @@ def _extract_zip_files(raw_bytes: bytes, archive_name: str) -> list[dict[str, An
         if not supports_task_file(basename):
             continue
 
+        # AI 只能作为独立文件进入 path-based arq:ai；禁止在普通 worker 中解压为 bytes。
+        if Path(basename).suffix.lower() == ".ai":
+            zf.close()
+            raise UploadLimitError(
+                f"压缩包 {archive_name} 内包含 AI 文件 {basename}；请单独上传 AI 文件。",
+                status_code=400,
+            )
+
         try:
             file_bytes = zf.read(info.filename)
             if file_bytes:
@@ -1084,6 +1165,13 @@ def _extract_rar_files(raw_bytes: bytes, archive_name: str) -> list[dict[str, An
 
             if not supports_task_file(basename):
                 continue
+
+            # AI 只能作为独立文件进入 path-based arq:ai；禁止在普通 worker 中解压为 bytes。
+            if Path(basename).suffix.lower() == ".ai":
+                raise UploadLimitError(
+                    f"压缩包 {archive_name} 内包含 AI 文件 {basename}；请单独上传 AI 文件。",
+                    status_code=400,
+                )
 
             try:
                 file_bytes = rf.read(info.filename)
@@ -1178,7 +1266,9 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
     for index, file_payload in enumerate(expanded_payloads, start=1):
         raise_if_import_task_canceled(task_id)
         filename = file_payload["filename"] or "source.txt"
-        raw_bytes = read_import_file_bytes(file_payload)
+        is_path_based_ai = Path(filename).suffix.lower() == ".ai"
+        source_path = get_import_file_path(file_payload) if is_path_based_ai else None
+        raw_bytes = None if is_path_based_ai else read_import_file_bytes(file_payload)
         _set_import_task_status(
             task_id,
             "running",
@@ -1188,6 +1278,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         workspace_data = build_task_workspace(
             db=db,
             raw_bytes=raw_bytes,
+            source_path=source_path,
             filename=filename,
             similarity_threshold=threshold,
             collection_ids=selected_collection_ids,
@@ -1196,15 +1287,21 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         )
-        file_record = create_file_record_with_segments(
+        create_record = (
+            create_file_record_with_segments_from_path
+            if source_path is not None
+            else create_file_record_with_segments
+        )
+        source_argument = {"source_path": source_path} if source_path is not None else {"raw_bytes": raw_bytes}
+        file_record = create_record(
             db=db,
-            raw_bytes=raw_bytes,
             filename=filename,
             similarity_threshold=threshold,
             workspace_data=workspace_data,
             collection_ids=selected_collection_ids,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
+            **source_argument,
         )
         file_record.project_id = project.id
         file_record.creator_id = project.creator_id
@@ -1315,6 +1412,131 @@ def _run_import_task(task_id: str, payload: dict[str, Any]) -> None:
 
 async def process_import_task_job(ctx, task_id: str, payload: dict[str, Any]) -> None:
     await asyncio.to_thread(_run_import_task, task_id, payload)
+
+
+def _apply_ai_process_memory_limit() -> None:
+    """Linux 子进程地址空间上限；Docker mem_limit 仍是最终 RSS 硬边界。"""
+    try:
+        import resource
+    except ImportError:
+        # Windows 不提供 resource；本地依靠单任务子进程隔离，生产环境由容器限制兜底。
+        return
+
+    try:
+        limit_bytes = max(int(get_settings().ai_worker_memory_limit_mb), 512) * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+    except (OSError, ValueError):
+        logger.warning("unable to apply AI subprocess memory limit", exc_info=True)
+
+
+def _run_ai_import_process(task_id: str, payload: dict[str, Any]) -> None:
+    _apply_ai_process_memory_limit()
+    _run_import_task(task_id, payload)
+
+
+def _run_ai_export_process(
+    task_id: str,
+    style_settings: dict[str, Any] | None = None,
+) -> None:
+    _apply_ai_process_memory_limit()
+    run_file_export_task(UUID(task_id), style_settings=style_settings)
+
+
+def _wait_for_ai_process(target, args: tuple[Any, ...]) -> tuple[str, int | None]:
+    process = None
+    try:
+        process = multiprocessing.get_context("spawn").Process(target=target, args=args)
+        process.start()
+        timeout = max(int(get_settings().ai_worker_job_timeout_seconds), 60)
+        process.join(timeout)
+        if process.is_alive():
+            process.terminate()
+            process.join(10)
+            if process.is_alive():
+                process.kill()
+                process.join(5)
+            return "timeout", process.exitcode
+        if process.exitcode != 0:
+            return "crashed", process.exitcode
+        return "completed", process.exitcode
+    except Exception:
+        logger.exception("AI isolated process infrastructure failed")
+        if process is not None and process.pid is not None:
+            try:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(10)
+                if process.is_alive():
+                    process.kill()
+                    process.join(5)
+            except Exception:
+                logger.warning("failed to terminate AI process after infrastructure error", exc_info=True)
+        return "error", getattr(process, "exitcode", None)
+
+
+def _fail_ai_import_task(task_id: str, payload: dict[str, Any], error: str) -> None:
+    _set_import_task_status(
+        task_id,
+        "failed",
+        progress=100,
+        message="AI 导入失败。",
+        error=error,
+    )
+    cleanup_import_task_staging(str(payload.get("staging_task_id") or task_id))
+
+
+async def process_ai_import_task_job(ctx, task_id: str, payload: dict[str, Any]) -> None:
+    try:
+        status, exit_code = await asyncio.to_thread(
+            _wait_for_ai_process,
+            _run_ai_import_process,
+            (task_id, payload),
+        )
+    except Exception as exc:
+        logger.exception("AI import process supervision failed task_id=%s", task_id)
+        status, exit_code = "error", None
+        infrastructure_error = str(exc)
+    else:
+        infrastructure_error = ""
+    if status == "completed":
+        return
+    if status == "timeout":
+        error = f"AI 解析超过 {get_settings().ai_worker_job_timeout_seconds} 秒，已终止隔离进程。"
+    elif status == "error":
+        suffix = f"：{infrastructure_error}" if infrastructure_error else "。"
+        error = f"AI 解析隔离进程启动或监控失败{suffix}"
+    else:
+        error = f"AI 解析隔离进程异常退出（exit_code={exit_code}），可能触发了内存限制。"
+    await asyncio.to_thread(_fail_ai_import_task, task_id, payload, error)
+
+
+async def file_export_task_job(
+    ctx,
+    task_id: str,
+    style_settings: dict[str, Any] | None = None,
+) -> None:
+    try:
+        status, exit_code = await asyncio.to_thread(
+            _wait_for_ai_process,
+            _run_ai_export_process,
+            (task_id, style_settings),
+        )
+    except Exception as exc:
+        logger.exception("AI export process supervision failed task_id=%s", task_id)
+        status, exit_code = "error", None
+        infrastructure_error = str(exc)
+    else:
+        infrastructure_error = ""
+    if status == "completed":
+        return
+    if status == "timeout":
+        error = f"AI 导出超过 {get_settings().ai_worker_job_timeout_seconds} 秒，已终止隔离进程。"
+    elif status == "error":
+        suffix = f"：{infrastructure_error}" if infrastructure_error else "。"
+        error = f"AI 导出隔离进程启动或监控失败{suffix}"
+    else:
+        error = f"AI 导出隔离进程异常退出（exit_code={exit_code}），可能触发了内存限制。"
+    await asyncio.to_thread(fail_file_export_task, UUID(task_id), error)
 
 
 async def tm_resource_import_job(ctx, task_id: str, payload: dict[str, Any]) -> None:
@@ -1454,6 +1676,18 @@ class ImportWorkerSettings:
         tm_resource_import_job,
         term_resource_import_job,
         glossary_resource_import_job,
+    ]
+    redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
+
+
+class AiWorkerSettings:
+    queue_name = ARQ_AI_QUEUE_NAME
+    keep_result = 0
+    max_jobs = _resolve_arq_worker_max_jobs(get_settings().arq_ai_max_jobs, 1)
+    job_timeout = max(int(get_settings().ai_worker_job_timeout_seconds), 60) + 60
+    functions = [
+        process_ai_import_task_job,
+        file_export_task_job,
     ]
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
@@ -3712,6 +3946,22 @@ def _require_file_record_read_access(file_record: FileRecord, current_user: User
         raise HTTPException(status_code=404, detail="任务不存在或未分配给当前用户。")
 
 
+def _file_record_has_available_exports(filename: str, *, has_source_file: bool) -> bool:
+    """工作台顶部导出按钮的启用条件：只要存在至少一种可用导出格式即可。
+
+    与 ``can_export_task_file`` 严格限定"原格式导出可用"不同，此函数覆盖
+    翻译后 PDF/SVG、双语 Word/Excel/TXT、TMX、XLIFF 等所有派生格式，避免
+    ``.ai`` 等无原格式回写能力的文件被整体禁用导出。
+    """
+    try:
+        options = get_export_options_for_file(filename)
+    except Exception:
+        return False
+    if not has_source_file:
+        options = [option for option in options if option.get("id") != "source"]
+    return bool(options)
+
+
 def _require_file_record_work_access(file_record: FileRecord, current_user: User) -> None:
     if not _can_write_file_record(file_record, current_user):
         raise HTTPException(status_code=403, detail="当前账号没有处理该任务的权限。")
@@ -5013,6 +5263,15 @@ def _raise_upload_file_too_large(filename: str, max_bytes: int) -> None:
 def _read_upload_file_bytes_with_limit(file: UploadFile) -> bytes:
     filename = file.filename or "uploaded"
     max_bytes = get_max_upload_size_bytes(filename)
+    known_size = get_seekable_stream_size(file.file)
+    if known_size is not None and known_size > max_bytes:
+        _raise_upload_file_too_large(filename, max_bytes)
+    if known_size is not None:
+        try:
+            file.file.seek(0)
+        except (AttributeError, OSError):
+            pass
+        return file.file.read(known_size)
     chunks: list[bytes] = []
     total_size = 0
     try:
@@ -5033,6 +5292,16 @@ def _read_upload_file_bytes_with_limit(file: UploadFile) -> bytes:
 async def _read_upload_bytes_with_limit(file: UploadFile) -> bytes:
     filename = file.filename or "uploaded"
     max_bytes = get_max_upload_size_bytes(filename)
+    known_size = get_seekable_stream_size(file.file)
+    if known_size is not None and known_size > max_bytes:
+        _raise_upload_file_too_large(filename, max_bytes)
+    if known_size is not None:
+        await file.seek(0)
+        return await file.read(known_size)
+    try:
+        await file.seek(0)
+    except (AttributeError, OSError):
+        pass
     chunks: list[bytes] = []
     total_size = 0
     while True:
@@ -5411,6 +5680,11 @@ async def upload_for_workspace(
     db: Session = Depends(get_db),
 ):
     _validate_task_upload(file)
+    if Path(file.filename or "").suffix.lower() == ".ai":
+        raise HTTPException(
+            status_code=409,
+            detail="AI 文件必须通过文件记录或项目上传接口进入专用异步处理队列。",
+        )
 
     raw_bytes = await _read_upload_bytes_with_limit(file)
     if not raw_bytes:
@@ -5441,6 +5715,11 @@ def parse_document(
 
     定义为同步 def，由 FastAPI 调度到线程池执行，避免 CPU 密集的解析阻塞事件循环。
     """
+    if Path(file.filename or "").suffix.lower() == ".ai":
+        raise HTTPException(
+            status_code=409,
+            detail="AI 文件必须通过文件记录或项目上传接口进入专用异步处理队列。",
+        )
     ext = _validate_file_upload(file)
 
     raw_bytes = _read_upload_file_bytes_with_limit(file)
@@ -6024,7 +6303,7 @@ def _build_project_file_payload(
     workflow_steps: list[ProjectWorkflowStep] | None = None,
     workflow_progress: list[dict[str, Any]] | None = None,
 ) -> dict:
-    source_bytes = load_file_record_source(file_record)
+    source_size = get_file_record_source_size(file_record)
     operation_state = (
         serialize_file_operation_state(file_record)
         if hasattr(file_record, "active_operation")
@@ -6081,8 +6360,8 @@ def _build_project_file_payload(
         "access_level": file_record.access_level,
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
-        "has_source_document": source_bytes is not None,
-        "file_size_bytes": len(source_bytes) if source_bytes is not None else None,
+        "has_source_document": source_size is not None,
+        "file_size_bytes": source_size,
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
         "collection_ids": [str(collection_id) for collection_id in collection_ids],
         "tm_match_threshold": _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
@@ -8894,9 +9173,11 @@ def compute_project_document_statistics(
     )
     match_analysis_by_file_id = _load_document_match_analysis_for_files(db, files)
     for file_record in files:
-        source_bytes = load_file_record_source(file_record)
         source_filename = get_file_record_source_filename(file_record)
-        if source_bytes and Path(source_filename).suffix.lower() in {".doc", ".docx"}:
+        source_path = get_file_record_source_path(file_record)
+        source_size = source_path.stat().st_size if source_path is not None else None
+        if source_path is not None and Path(source_filename).suffix.lower() in {".doc", ".docx"}:
+            source_bytes = source_path.read_bytes()
             statistics = compute_word_document_statistics(source_bytes, source_filename)
         else:
             statistics = unavailable_statistics
@@ -8919,7 +9200,7 @@ def compute_project_document_statistics(
             file_name=file_record.filename,
             source_language=file_record.source_language,
             target_language=file_record.target_language,
-            file_size_bytes=len(source_bytes) if source_bytes is not None else None,
+            file_size_bytes=source_size,
             statistics=serialized_statistics,
         ))
 
@@ -10640,7 +10921,7 @@ def get_file_record(
         .all()
     )
     display_index_map = _get_segment_display_index_map(db, file_record_id, segments)
-    source_bytes = load_file_record_source(file_record)
+    source_path = get_file_record_source_path(file_record)
     source_filename = get_file_record_source_filename(file_record)
 
     # 获取绑定的库信息
@@ -10753,8 +11034,11 @@ def get_file_record(
         "skip": safe_skip,
         "limit": safe_limit,
         "source_extension": get_task_file_extension(source_filename),
-        "has_source_document": source_bytes is not None,
-        "can_export": can_export_task_file(source_filename, has_source_file=source_bytes is not None),
+        "has_source_document": source_path is not None,
+        "can_export": _file_record_has_available_exports(
+            source_filename,
+            has_source_file=source_path is not None,
+        ),
         "can_manage": _can_manage_workflow(current_user),
         "can_write": _can_write_file_record(file_record, current_user, db),
         "workflow_steps": [_serialize_workflow_step(step) for step in workflow_steps],
@@ -11825,7 +12109,66 @@ def _require_file_export_task_read_access(
     _require_file_record_read_access(task.file_record, current_user)
 
 
-def _queue_file_record_export_for_current_user(
+def _prepare_file_record_export_for_current_user(
+    *,
+    file_record_id: UUID,
+    export_type: str,
+    current_user_id: UUID,
+    style_settings: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """在线程内使用独立 Session 完成同步校验、建任务及文件系统检查。"""
+    with SessionLocal() as export_db:
+        current_user = export_db.query(User).filter(User.id == current_user_id).first()
+        if current_user is None:
+            raise HTTPException(status_code=401, detail="User not found.")
+        file_record = get_file_record_model(export_db, file_record_id)
+        if not file_record:
+            raise HTTPException(status_code=404, detail="File record not found.")
+
+        _require_file_record_read_access(file_record, current_user)
+        source_path = get_file_record_source_path(file_record)
+        from app.services.adapters import get_export_options_for_file
+
+        export_option_ids = {option.get("id") for option in get_export_options_for_file(file_record.filename)}
+        if export_type not in export_option_ids:
+            raise HTTPException(status_code=400, detail="Current file format does not support this export type.")
+
+        if export_type == "source" and source_path is None:
+            raise HTTPException(status_code=400, detail="The source file is unavailable.")
+
+        if export_type == "original" and not can_export_task_file(
+            get_file_record_source_filename(file_record),
+            has_source_file=source_path is not None,
+        ):
+            raise HTTPException(status_code=400, detail="Current file format does not support original export yet.")
+
+        source_filename = get_file_record_source_filename(file_record)
+        is_ai = get_task_file_extension(source_filename) == ".ai"
+        is_large_ai = bool(
+            is_ai
+            and source_path is not None
+            and source_path.stat().st_size > max(int(get_settings().ai_inline_max_size_mb), 1) * 1024 * 1024
+        )
+        arq_enabled = get_settings().import_queue_backend.lower() == "arq"
+        if is_large_ai and not arq_enabled:
+            raise HTTPException(
+                status_code=503,
+                detail="大型 AI 必须由专用 ARQ AI worker 导出，请先启用 Redis 和 ai-worker。",
+            )
+
+        defer_execution = is_ai and arq_enabled
+        queued_task = queue_file_export(
+            export_db,
+            file_record_id=file_record_id,
+            export_type=export_type,
+            current_user=current_user,
+            style_settings=style_settings,
+            defer_execution=defer_execution,
+        )
+        return queued_task, defer_execution
+
+
+async def _queue_file_record_export_for_current_user(
     *,
     file_record_id: UUID,
     export_type: str,
@@ -11833,34 +12176,29 @@ def _queue_file_record_export_for_current_user(
     current_user: User,
     style_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    file_record = get_file_record_model(db, file_record_id)
-    if not file_record:
-        raise HTTPException(status_code=404, detail="File record not found.")
-
-    _require_file_record_read_access(file_record, current_user)
-    raw_bytes = load_file_record_source(file_record)
-    from app.services.adapters import get_export_options_for_file
-
-    export_option_ids = {option.get("id") for option in get_export_options_for_file(file_record.filename)}
-    if export_type not in export_option_ids:
-        raise HTTPException(status_code=400, detail="Current file format does not support this export type.")
-
-    if export_type == "source" and raw_bytes is None:
-        raise HTTPException(status_code=400, detail="The source file is unavailable.")
-
-    if export_type == "original" and not can_export_task_file(
-        get_file_record_source_filename(file_record),
-        has_source_file=raw_bytes is not None,
-    ):
-        raise HTTPException(status_code=400, detail="Current file format does not support original export yet.")
-
-    return queue_file_export(
-        db,
-        file_record_id=file_record_id,
-        export_type=export_type,
-        current_user=current_user,
-        style_settings=style_settings,
+    # 保留 db 参数以维持路由调用契约；同步工作使用线程内独立 Session，避免阻塞事件循环。
+    _ = db
+    queued_task, defer_execution = await asyncio.to_thread(
+        partial(
+            _prepare_file_record_export_for_current_user,
+            file_record_id=file_record_id,
+            export_type=export_type,
+            current_user_id=current_user.id,
+            style_settings=style_settings,
+        )
     )
+    if defer_execution:
+        task_id = UUID(queued_task["task_id"])
+        if not await _enqueue_arq_job(
+            "file_export_task_job",
+            str(task_id),
+            style_settings,
+            queue_name=ARQ_AI_QUEUE_NAME,
+        ):
+            error = "AI 专用导出队列不可用，请检查 Redis、IMPORT_QUEUE_BACKEND 和 ai-worker。"
+            await asyncio.to_thread(fail_file_export_task, task_id, error)
+            raise HTTPException(status_code=503, detail=error)
+    return queued_task
 
 
 def _load_project_file_zip_export_files(
@@ -11890,10 +12228,10 @@ def _load_project_file_zip_export_files(
             raise HTTPException(status_code=404, detail="部分文件不存在或不属于当前项目。")
         if not _can_read_file_record(file_record, current_user, db):
             raise HTTPException(status_code=404, detail="部分文件不存在或未分配给当前用户。")
-        raw_bytes = load_file_record_source(file_record)
+        source_path = get_file_record_source_path(file_record)
         if not can_export_task_file(
             get_file_record_source_filename(file_record),
-            has_source_file=raw_bytes is not None,
+            has_source_file=source_path is not None,
         ):
             raise HTTPException(
                 status_code=400,
@@ -12737,23 +13075,21 @@ def get_merge_view_segments(
 
 @router.post("/file-records/{file_record_id}/exports")
 @router.post("/documents/{file_record_id}/exports", include_in_schema=False)
-def create_file_record_export_task(
+async def create_file_record_export_task(
     file_record_id: UUID,
     type: str = Query(default="original"),
     payload: FileRecordExportPayload | None = Body(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return JSONResponse(
-        status_code=202,
-        content=_queue_file_record_export_for_current_user(
-            file_record_id=file_record_id,
-            export_type=type,
-            db=db,
-            current_user=current_user,
-            style_settings=payload.style_settings if payload else None,
-        ),
+    queued_task = await _queue_file_record_export_for_current_user(
+        file_record_id=file_record_id,
+        export_type=type,
+        db=db,
+        current_user=current_user,
+        style_settings=payload.style_settings if payload else None,
     )
+    return JSONResponse(status_code=202, content=queued_task)
 
 
 @router.get("/file-records/export-tasks/{task_id}")
@@ -12784,18 +13120,18 @@ def download_file_record_export_task(
 @router.get("/documents/{file_record_id}/export", include_in_schema=False)
 @router.get("/file-records/{file_record_id}/export-docx")
 @router.get("/documents/{file_record_id}/export-docx", include_in_schema=False)
-def export_file_record_docx(
+async def export_file_record_docx(
     file_record_id: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    queued_task = _queue_file_record_export_for_current_user(
+    queued_task = await _queue_file_record_export_for_current_user(
         file_record_id=file_record_id,
         export_type="original",
         db=db,
         current_user=current_user,
     )
-    task = wait_for_file_export_task(UUID(queued_task["task_id"]))
+    task = await asyncio.to_thread(wait_for_file_export_task, UUID(queued_task["task_id"]))
     return build_file_export_download_response(task)
 
 
@@ -12814,9 +13150,9 @@ def get_file_record_export_options(
         raise HTTPException(status_code=404, detail="文档不存在。")
 
     _require_file_record_read_access(file_record, current_user)
-    raw_bytes = load_file_record_source(file_record)
+    source_path = get_file_record_source_path(file_record)
     options = get_export_options_for_file(file_record.filename)
-    if raw_bytes is None:
+    if source_path is None:
         options = [option for option in options if option.get("id") != "source"]
 
     return {
@@ -12828,19 +13164,19 @@ def get_file_record_export_options(
 
 @router.get("/file-records/{file_record_id}/export/{export_type}")
 @router.get("/documents/{file_record_id}/export/{export_type}", include_in_schema=False)
-def export_file_record_with_type_queued(
+async def export_file_record_with_type_queued(
     file_record_id: UUID,
     export_type: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    queued_task = _queue_file_record_export_for_current_user(
+    queued_task = await _queue_file_record_export_for_current_user(
         file_record_id=file_record_id,
         export_type=export_type,
         db=db,
         current_user=current_user,
     )
-    task = wait_for_file_export_task(UUID(queued_task["task_id"]))
+    task = await asyncio.to_thread(wait_for_file_export_task, UUID(queued_task["task_id"]))
     return build_file_export_download_response(task)
 
 
@@ -12867,18 +13203,22 @@ def export_file_record_with_type(
         raise HTTPException(status_code=404, detail="文档不存在。")
 
     _require_file_record_read_access(file_record, current_user)
-    raw_bytes = load_file_record_source(file_record)
+    source_path = get_file_record_source_path(file_record)
 
     if export_type == "source":
-        if raw_bytes is None:
+        if source_path is None:
             raise HTTPException(status_code=400, detail="The source file is unavailable.")
         source_filename = get_file_record_source_filename(file_record)
-        return _build_binary_download_response(
-            filename=source_filename,
-            content=raw_bytes,
+        return FileResponse(
+            source_path,
             media_type="application/octet-stream",
+            filename=source_filename,
         )
 
+    source_filename = get_file_record_source_filename(file_record)
+    if get_task_file_extension(source_filename) == ".ai":
+        raise HTTPException(status_code=409, detail="AI 文件请使用异步导出任务接口。")
+    raw_bytes = source_path.read_bytes() if source_path is not None else None
     segments = list_segments_for_file_record(db, file_record_id)
 
     # 原格式导出需要按原文件重新写回，避免走通用导出器丢失格式。

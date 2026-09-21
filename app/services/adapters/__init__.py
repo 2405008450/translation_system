@@ -32,6 +32,7 @@ from app.services.adapters.models import (
 from app.services.adapters.multi_format_exporter import (
     MultiFormatExporter,
     export_file,
+    export_file_to_path,
     get_export_options_for_file,
 )
 from app.services.adapters.registry import AdapterRegistry, get_registry, register_adapter
@@ -52,6 +53,7 @@ _DEFAULT_ADAPTER_SPECS = (
     _AdapterSpec("app.services.adapters.docx_adapter", "DocxAdapter"),
     _AdapterSpec("app.services.adapters.xlsx_adapter", "XlsxAdapter"),
     _AdapterSpec("app.services.adapters.pdf_adapter", "PdfAdapter"),
+    _AdapterSpec("app.services.adapters.ai_adapter", "AiAdapter"),
     _AdapterSpec("app.services.adapters.psd_adapter", "PsdAdapter"),
     _AdapterSpec("app.services.adapters.pptx_adapter", "PptxAdapter"),
     _AdapterSpec("app.services.adapters.dita_adapter", "DitaAdapter"),

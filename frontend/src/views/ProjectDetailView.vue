@@ -66,6 +66,7 @@ import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constan
 import { useAuthStore } from '../stores/auth'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import {
+  extractExportNotice,
   getExportOptionExtensionLabel,
   groupExportOptions,
   type FileExportOption,
@@ -4828,7 +4829,8 @@ async function toggleProjectExportMenu() {
   showProjectExportMenu.value = true
 }
 
-async function downloadProjectFileExport(row: ProjectRow, exportType: string) {
+/** 返回后端携带的导出提示（如部分画板已转为位图），无提示时为空串。 */
+async function downloadProjectFileExport(row: ProjectRow, exportType: string): Promise<string> {
   const rowId = String(row.id)
   const filename = String(row.filename || 'export')
   const { data: task } = await http.post<FileExportTask>(
@@ -4845,6 +4847,18 @@ async function downloadProjectFileExport(row: ProjectRow, exportType: string) {
     getProjectFileExportFallbackName(filename, exportType),
   )
   downloadBlob(response.data, downloadName)
+  return extractExportNotice(completedTask.message)
+}
+
+function notifyExportNotices(notices: string[]) {
+  if (notices.length === 0) {
+    return
+  }
+  toast.warn({
+    title: '导出结果为混合内容',
+    message: notices.join('\n'),
+    duration: 0,
+  })
 }
 
 function getProjectFileZipExportFallbackName() {
@@ -4882,13 +4896,18 @@ async function exportProjectFile(row: ProjectRow, exportType = 'original') {
   exportFileMessage.value = '导出任务提交中。'
 
   try {
-    await downloadProjectFileExport(row, exportType)
+    const notice = await downloadProjectFileExport(row, exportType)
     toast.success(getProjectFileExportSuccessMessage(exportType, 1))
+    notifyExportNotices(notice ? [notice] : [])
   } catch (error) {
-    pageError.value = getErrorMessage(
-      error,
-      exportType === 'source' ? t('projectDetail.errors.exportSource') : t('projectDetail.errors.export'),
-    )
+    const fallback = exportType === 'source'
+      ? t('projectDetail.errors.exportSource')
+      : t('projectDetail.errors.export')
+    const message = getErrorMessage(error, fallback)
+    pageError.value = message
+    // 导出后端会返回带处置建议的长文案，使用常驻 toast 弹窗展示，
+    // 避免被顶部单行红字截断，用户必须手动关闭。
+    toast.error({ title: '导出失败', message, duration: 0 })
   } finally {
     clearExportPollTimer()
     exportingFileId.value = ''
@@ -4916,7 +4935,9 @@ async function exportSelectedProjectFilesAsZip() {
     await downloadProjectFileZipExport(rows)
     toast.success(`已开始下载包含 ${rows.length} 个目标文件的压缩包。`)
   } catch (error) {
-    pageError.value = getErrorMessage(error, t('projectDetail.errors.exportZip'))
+    const message = getErrorMessage(error, t('projectDetail.errors.exportZip'))
+    pageError.value = message
+    toast.error({ title: '导出失败', message, duration: 0 })
   } finally {
     clearExportPollTimer()
     exportingFileId.value = ''
@@ -4937,20 +4958,27 @@ async function exportSelectedProjectFiles(exportType: string) {
   const rows = [...selectedProjectFiles.value]
 
   try {
+    const notices: string[] = []
     for (let index = 0; index < rows.length; index += 1) {
       const current = rows[index]
       exportingFileId.value = String(current.id)
       exportingFileType.value = exportType
       exportFileProgress.value = 0
       exportFileMessage.value = `导出 ${index + 1}/${rows.length} 提交中。`
-      await downloadProjectFileExport(current, exportType)
+      const notice = await downloadProjectFileExport(current, exportType)
+      if (notice) {
+        notices.push(rows.length > 1 ? `${current.filename}：${notice}` : notice)
+      }
     }
     toast.success(getProjectFileExportSuccessMessage(exportType, rows.length))
+    notifyExportNotices(notices)
   } catch (error) {
-    pageError.value = getErrorMessage(
-      error,
-      exportType === 'source' ? t('projectDetail.errors.exportSource') : t('projectDetail.errors.export'),
-    )
+    const fallback = exportType === 'source'
+      ? t('projectDetail.errors.exportSource')
+      : t('projectDetail.errors.export')
+    const message = getErrorMessage(error, fallback)
+    pageError.value = message
+    toast.error({ title: '导出失败', message, duration: 0 })
   } finally {
     clearExportPollTimer()
     exportingFileId.value = ''
