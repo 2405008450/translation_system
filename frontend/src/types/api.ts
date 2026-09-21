@@ -518,6 +518,8 @@ export interface ProjectSyncOrigin {
 }
 
 export interface Segment {
+  review_sync_enabled?: boolean
+  review_sync_group_id?: string | null
   id: string
   sentence_id: string
   display_index?: number | null
@@ -1726,6 +1728,10 @@ export interface SegmentUpdatePayload {
 }
 
 export interface SegmentRevisionEntry {
+  review_sync_group_id?: string
+  review_sync_count?: number
+  review_sync_source_segment_id?: string
+  review_sync_result?: { updated_count: number; skipped_count: number; reasons: Record<string, number> }
   id: string
   file_record_id: string
   segment_id: string

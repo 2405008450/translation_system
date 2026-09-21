@@ -59,6 +59,9 @@ class Project(Base):
     auto_tm_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("true")
     )
+    review_sync_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     # 项目级翻译校对规则（从上传文件提取的纯文本）
     translation_rules: Mapped[str] = mapped_column(
         Text, nullable=False, default="", server_default=text("''")
@@ -109,6 +112,49 @@ class Project(Base):
         cascade="all, delete-orphan",
         order_by="ProjectMergeView.created_at",
     )
+
+
+class ReviewSyncGroup(Base):
+    """一轮人工修订及其服务器保存基线。"""
+    __tablename__ = "review_sync_groups"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    source_segment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("segments.id", ondelete="CASCADE"), index=True)
+    author_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    source_hash: Mapped[str] = mapped_column(String(128))
+    source_language: Mapped[str] = mapped_column(String(20), default="")
+    target_language: Mapped[str] = mapped_column(String(20), default="")
+    before_text: Mapped[str] = mapped_column(Text)
+    after_text: Mapped[str] = mapped_column(Text)
+    source_version: Mapped[int] = mapped_column(Integer)
+    generation: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    created_at: Mapped[DateTime] = mapped_column(DateTime, server_default=func.now())
+
+
+class ReviewSyncMember(Base):
+    __tablename__ = "review_sync_members"
+    __table_args__ = (UniqueConstraint("group_id", "segment_id"),)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    group_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("review_sync_groups.id", ondelete="CASCADE"), index=True)
+    segment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("segments.id", ondelete="CASCADE"), index=True)
+    revision_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("segment_revisions.id", ondelete="SET NULL"), nullable=True, index=True)
+    before_text: Mapped[str] = mapped_column(Text)
+    after_text: Mapped[str] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class ReviewSyncTask(Base):
+    __tablename__ = "review_sync_tasks"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    group_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("review_sync_groups.id", ondelete="CASCADE"), unique=True)
+    generation: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[DateTime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 class ProjectMergeView(Base):

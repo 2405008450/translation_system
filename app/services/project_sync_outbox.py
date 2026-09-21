@@ -78,6 +78,8 @@ def select_segments_for_project_sync(
     confirmed_only = _project_sync_confirmed_only()
     selected: list[Segment] = []
     for segment in segments:
+        if getattr(segment, "_review_sync_managed", False):
+            continue
         if segment is None or segment.project_sync_disabled:
             continue
         if not normalize_text(segment.target_text):
@@ -388,6 +390,8 @@ def _prune_completed_outbox_rows(db: Session) -> None:
 
 def run_project_sync_outbox_once() -> None:
     """后台 worker 入口：循环消费直到清空或达到批次上限。"""
+    from app.services.review_sync import run_review_sync_once
+    run_review_sync_once()
     with SessionLocal() as db:
         try:
             for _ in range(PROJECT_SYNC_OUTBOX_MAX_BATCHES_PER_RUN):

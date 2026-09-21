@@ -36,6 +36,9 @@ LEGACY_REQUIRED_EXISTING_TABLES = (
     "translation_memory_entries",
 )
 REQUIRED_SCHEMA = {
+    "review_sync_groups": {"id", "source_version", "generation"},
+    "review_sync_members": {"id", "revision_id", "version"},
+    "review_sync_tasks": {"id", "generation", "result"},
     "projects": {
         "workflow_template_id",
     },
@@ -151,6 +154,7 @@ REQUIRED_SCHEMA = {
         "translation_guidelines",
         "quality_qa_settings",
         "auto_tm_enabled",
+        "review_sync_enabled",
         "translation_rules",
         "translation_rules_filename",
         "created_at",
@@ -4139,4 +4143,6 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
         ]
     )
+    from app.services.review_sync_schema import schema_statements
+    statements.extend(schema_statements())
     return statements

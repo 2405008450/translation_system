@@ -809,6 +809,11 @@ def _apply_candidate_to_targets(
 
 
 def _build_candidate(segment: Segment) -> _SyncCandidate | None:
+    from sqlalchemy.orm import object_session
+    from app.services.review_sync import active_member
+    db = object_session(segment)
+    if db is not None and active_member(db, segment.id):
+        return None
     if not normalize_text(segment.target_text):
         return None
     if segment.project_sync_disabled:

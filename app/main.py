@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 from pathlib import Path
 
 import anyio.to_thread
@@ -113,6 +114,7 @@ app.include_router(document_alignment_router, prefix="/api")
 
 @app.on_event("startup")
 async def _configure_runtime() -> None:
+    app.state.review_sync_worker = asyncio.create_task(_review_sync_recovery_loop())
     storage_state = initialize_import_task_storage()
     logger.info("upload storage initialized: %s", storage_state)
     with SessionLocal() as db:
@@ -132,6 +134,24 @@ async def _configure_runtime() -> None:
         settings.database_pgbouncer_transaction_mode,
         settings.database_application_name,
     )
+
+
+async def _review_sync_recovery_loop() -> None:
+    from app.services.review_sync import run_review_sync_once
+    while True:
+        try:
+            await asyncio.to_thread(run_review_sync_once)
+        except Exception:
+            logger.exception("review sync recovery failed")
+        await asyncio.sleep(15)
+
+
+@app.on_event("shutdown")
+async def _stop_review_sync_worker() -> None:
+    task = getattr(app.state, "review_sync_worker", None)
+    if task:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @app.get("/api/health", include_in_schema=False)

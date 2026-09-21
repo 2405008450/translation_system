@@ -353,6 +353,7 @@ from app.services.merge_view_service import (
     serialize_merge_view_detail,
     serialize_merge_view_summary,
 )
+from app.services.review_sync import segment_sync_info
 from app.services.project_segment_sync import (
     PretranslationLLMConvergenceSummary,
     ProjectSyncDisableSummary,
@@ -1613,12 +1614,16 @@ class SegmentProjectSyncUpdate(BaseModel):
 class SegmentProjectSyncTrigger(BaseModel):
     expected_version: int = Field(ge=1)
     trigger: Literal["blur"] = "blur"
+    mode: Literal["translation", "review"] = "translation"
+    group_id: UUID | None = None
 
 
 class SegmentProjectSyncTriggerResponse(BaseModel):
     enabled: bool
     queued_count: int
     source_version: int
+    task_id: UUID | None = None
+    task_generation: int | None = None
 
 
 class ProjectSyncDisableResponse(BaseModel):
@@ -3029,6 +3034,7 @@ class ProjectCreatePayload(BaseModel):
 
 
 class ProjectUpdatePayload(BaseModel):
+    review_sync_enabled: bool | None = None
     name: str | None = None
     source_language: str | None = None
     target_language: str | None = None
@@ -6945,6 +6951,7 @@ def _build_project_summary_payload(
         "pretranslation_progress": pretranslation_progress,
         "source_language": project.source_language,
         "target_language": project.target_language,
+        "review_sync_enabled": bool(getattr(project, "review_sync_enabled", False)),
         "workflow_template_id": getattr(project, "workflow_template_id", "custom") or "custom",
         "creator": creator_name,
         "deadline": project.deadline.isoformat() if project.deadline else None,
@@ -10629,6 +10636,10 @@ def update_project(
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在。")
 
+    if payload.review_sync_enabled is not None:
+        from app.services.review_sync import lock_project
+        lock_project(db, project.id)
+        project.review_sync_enabled = payload.review_sync_enabled
     if payload.name is not None:
         name = payload.name.strip()
         if not name:
@@ -10654,6 +10665,7 @@ def update_project(
         "id": str(project.id),
         "name": project.name,
         "filename": project.name,
+        "review_sync_enabled": bool(project.review_sync_enabled),
         "source_language": project.source_language,
         "target_language": project.target_language,
         "deadline": project.deadline.isoformat() if project.deadline else None,
@@ -11426,6 +11438,7 @@ def _serialize_workbench_segment(
         "status": seg.status,
         "project_sync_disabled": bool(getattr(seg, "project_sync_disabled", False)),
         "project_sync_origin": _serialize_project_sync_origin(seg),
+        **segment_sync_info(seg),
         "version": int(seg.version or 1),
         "score": seg.score,
         "matched_source_text": seg.matched_source_text,
@@ -15114,6 +15127,8 @@ def update_segment(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """更新单个片段的译文"""
+    from app.services.review_sync import lock_file_project
+    lock_file_project(db, file_record_id)
     file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     current_segment = (
         db.query(Segment)
@@ -15431,6 +15446,20 @@ def trigger_segment_project_sync(
             },
         )
 
+    if payload.mode == "review":
+        from app.services.review_sync import enqueue
+        if payload.group_id is None:
+            raise HTTPException(422, "缺少修订同步组。")
+        task = enqueue(db, segment, payload.group_id, payload.expected_version, current_user)
+        db.commit()
+        _schedule_project_segment_sync_processing(background_tasks, 1)
+        return SegmentProjectSyncTriggerResponse(enabled=True, queued_count=1,
+                                                  source_version=current_version, task_id=task.id,
+                                                  task_generation=task.generation)
+    # 修订组只能通过专用通道传播，不能被旧客户端的失焦请求带入普通翻译同步。
+    from app.services.review_sync import active_member
+    if active_member(db, segment.id):
+        return SegmentProjectSyncTriggerResponse(enabled=False, queued_count=0, source_version=current_version)
     enabled = project_sync_blur_enabled_for_project(file_record.project_id)
     queued_count = 0
     if enabled:
@@ -15449,6 +15478,17 @@ def trigger_segment_project_sync(
         queued_count=queued_count,
         source_version=current_version,
     )
+
+
+@router.get("/review-sync/tasks/{task_id}")
+def get_review_sync_task(task_id: UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    from app.models import ReviewSyncTask, ReviewSyncGroup
+    task = db.get(ReviewSyncTask, task_id)
+    group = db.get(ReviewSyncGroup, task.group_id) if task else None
+    if not group or group.author_id != current_user.id:
+        raise HTTPException(404, "同步任务不存在。")
+    return {"id": str(task.id), "generation": task.generation, "status": task.status,
+            "result": task.result, "error": task.error}
 
 
 @router.post("/file-records/{file_record_id}/segments/project-sync/disable")
@@ -16029,6 +16069,8 @@ def batch_update(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """批量更新片段译文"""
+    from app.services.review_sync import lock_file_project
+    lock_file_project(db, file_record_id)
     file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     update_items = [u.model_dump() for u in batch.updates]
     requested_sentence_ids = [
@@ -16606,6 +16648,9 @@ def resolve_revision(
 ):
     existing_revision = get_revision_or_404(db, revision_id)
     _require_file_record_write_access(db, existing_revision.file_record_id, current_user)
+    segment = db.get(Segment, existing_revision.segment_id)
+    if segment:
+        _require_segment_work_access(db, segment.file_record, segment, current_user)
     if payload.status == "accepted":
         revision = accept_revision(
             db,
@@ -16634,7 +16679,7 @@ def resolve_all_revisions_as_accepted(
         file_record_id=file_record_id,
         current_user=current_user,
     )
-    return {"updated_count": updated_count}
+    return {"updated_count": updated_count, "review_sync_result": db.info.pop("review_sync_result", None)}
 
 
 @router.post("/file-records/{file_record_id}/revisions/batch-reject")
@@ -16650,7 +16695,7 @@ def resolve_all_revisions_as_rejected(
         file_record_id=file_record_id,
         current_user=current_user,
     )
-    return {"updated_count": updated_count}
+    return {"updated_count": updated_count, "review_sync_result": db.info.pop("review_sync_result", None)}
 
 
 @router.get("/file-records/{file_record_id}/comments")

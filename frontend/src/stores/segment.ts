@@ -431,6 +431,11 @@ export const useSegmentStore = defineStore('segment', () => {
   let syncPromise: Promise<boolean> | null = null
   const blurSyncGenerationByKey = new Map<string, number>()
   const lastBlurSyncedVersionByKey = new Map<string, number>()
+  const reviewSyncFailures = ref<Record<string, string>>({})
+  const reviewSyncTasks = new Map<string, { key: string; version: number; groupId: string; generation: number }>()
+  let reviewSyncTimer: number | null = null
+  let reviewSyncPolling = false
+  let reviewSyncEpoch = 0
   let changePollTimer: number | null = null
   let changePollBurstTimers: number[] = []
   let segmentEventAbortController: AbortController | null = null
@@ -477,13 +482,13 @@ export const useSegmentStore = defineStore('segment', () => {
     for (const entries of Object.values(revisionHistory.value)) {
       for (const entry of entries) {
         if (isCurrentVisiblePendingManualRevision(entry)) {
-          sentenceIds.add(entry.sentence_id)
+          sentenceIds.add(revisionKey(entry))
         }
       }
     }
     for (const entry of Object.values(localRevisionDrafts.value)) {
       if (isPendingManualRevision(entry)) {
-        sentenceIds.add(entry.sentence_id)
+        sentenceIds.add(revisionKey(entry))
       }
     }
     return sentenceIds.size
@@ -533,12 +538,115 @@ export const useSegmentStore = defineStore('segment', () => {
     return b.id.localeCompare(a.id)
   }
 
+  function revisionKey(entry: SegmentRevisionEntry) {
+    return mergeViewId.value ? buildSegmentKey(entry.file_record_id, entry.sentence_id) : entry.sentence_id
+  }
+
+  async function loadVisibleRevisions() {
+    const epoch = reviewSyncEpoch
+    const groups = new Map<string, string[]>()
+    for (const segment of segments.value) {
+      const fileId = fileRecordIdForSegment(segment) || fileRecord.value?.id
+      if (fileId) groups.set(fileId, [...(groups.get(fileId) || []), segment.sentence_id])
+    }
+    const entries = await Promise.all([...groups].map(async ([fileId, ids]) => {
+      const { data } = await http.get<SegmentRevisionEntry[]>(`/file-records/${fileId}/revisions`, {
+        params: { 'sentence_ids[]': ids },
+      })
+      return data
+    }))
+    const all = entries.flat()
+    if (epoch !== reviewSyncEpoch) return []
+    setRevisionEntries(all)
+    for (const segment of segments.value) {
+      const key = segmentKeyOf(segment)
+      if (!dirtyEntries.value[key]) {
+        setLocalRevisionBaseline(key, getPendingRevision(key)?.before_text ?? segment.target_text ?? '')
+      }
+    }
+    return all
+  }
+
+  async function refreshReviewState() {
+    const epoch = reviewSyncEpoch
+    if (mergeViewId.value) {
+      const page = await fetchMergeViewSegmentPage(mergeViewId.value, resolveCurrentMergeQuery())
+      if (epoch !== reviewSyncEpoch) return
+      for (const segment of page.segments) {
+        if (!dirtyEntries.value[segmentKeyOf(segment)]) applyServerSegment(segment)
+      }
+      await refreshMergeViewDetail()
+    } else if (fileRecord.value) {
+      const { data } = await fetchSegmentPage(fileRecord.value.id, getCurrentPageQuery())
+      if (epoch !== reviewSyncEpoch) return
+      for (const segment of data.segments) {
+        if (!dirtyEntries.value[segmentKeyOf(segment)]) applyServerSegment(segment)
+      }
+      if (data.status_stats) setSegmentStatusStats(data.status_stats)
+    }
+    await loadVisibleRevisions()
+  }
+
+  function showReviewSyncResult(result: { updated_count: number; skipped_count: number; reasons?: Record<string, number> }) {
+    const labels: Record<string, string> = {
+      different_translation: '旧译文不同', independent_revision: '存在独立修订',
+      independently_modified: '已独立修改', no_write_access: '无编辑权限', sync_disabled: '同步已关闭',
+      no_write_access_or_disabled: '无权限或已关闭同步', source_changed_or_disabled: '源片段已变化或同步已关闭',
+    }
+    const reasons = Object.entries(result.reasons || {}).map(([key, count]) => `${labels[key] || key} ${count} 个`).join('；')
+    pushToast({ tone: result.skipped_count ? 'warn' : 'success', title: '关联修订处理完成',
+      message: `已处理 ${result.updated_count} 个片段，跳过 ${result.skipped_count} 个${reasons ? `（${reasons}）` : ''}。` })
+  }
+
+  function startReviewSyncPolling() {
+    if (reviewSyncTimer !== null) return
+    reviewSyncTimer = window.setInterval(async () => {
+      if (reviewSyncPolling) return
+      reviewSyncPolling = true
+      const epoch = reviewSyncEpoch
+      try {
+        let changed = false
+        for (const [id, item] of reviewSyncTasks) {
+          const { data } = await http.get(`/review-sync/tasks/${id}`)
+          if (epoch !== reviewSyncEpoch) return
+          if (reviewSyncTasks.get(id) !== item) continue
+          if (data.generation != null && data.generation !== item.generation) {
+            reviewSyncTasks.delete(id)
+            continue
+          }
+          if (data.status === 'pending') continue
+          reviewSyncTasks.delete(id)
+          if (data.status === 'completed') {
+            showReviewSyncResult(data.result)
+            changed = true
+          } else {
+            lastBlurSyncedVersionByKey.delete(item.key)
+            reviewSyncFailures.value = { ...reviewSyncFailures.value, [item.key]: data.error || '同步已取消，请保存最新内容后重试。' }
+          }
+        }
+        if (changed || mergeViewId.value) await refreshReviewState()
+      } catch {
+        // 网络恢复后继续查询持久化任务，不清除尚未确认完成的任务。
+      } finally {
+        reviewSyncPolling = false
+      }
+    }, 3000)
+  }
+
+  async function retryReviewSync() {
+    for (const key of Object.keys(reviewSyncFailures.value)) {
+      lastBlurSyncedVersionByKey.delete(key)
+      await syncBlurredSegment(key)
+    }
+  }
+
   function setRevisionEntries(entries: SegmentRevisionEntry[]) {
     const nextHistory: Record<string, SegmentRevisionEntry[]> = {}
     for (const entry of entries) {
-      const sentenceEntries = nextHistory[entry.sentence_id] || []
+      const key = revisionKey(entry)
+      const sentenceEntries = nextHistory[key] || []
       sentenceEntries.push(entry)
-      nextHistory[entry.sentence_id] = sentenceEntries
+      nextHistory[key] = sentenceEntries
     }
 
     for (const sentenceId of Object.keys(nextHistory)) {
@@ -550,8 +658,9 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function upsertRevisionEntry(entry: SegmentRevisionEntry) {
+    const key = revisionKey(entry)
     const nextHistory = { ...revisionHistory.value }
-    const sentenceEntries = [...(nextHistory[entry.sentence_id] || [])]
+    const sentenceEntries = [...(nextHistory[key] || [])]
     const index = sentenceEntries.findIndex((item) => item.id === entry.id)
 
     if (index === -1) {
@@ -560,7 +669,7 @@ export const useSegmentStore = defineStore('segment', () => {
       sentenceEntries[index] = entry
     }
 
-    nextHistory[entry.sentence_id] = sentenceEntries.sort(compareRevisionEntries)
+    nextHistory[key] = sentenceEntries.sort(compareRevisionEntries)
     revisionHistory.value = nextHistory
   }
 
@@ -630,7 +739,7 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function upsertLocalRevisionDraft(segment: Segment, targetText: string) {
-    const sentenceId = segment.sentence_id
+    const sentenceId = segmentKeyOf(segment)
     if (!hasLocalRevisionBaseline(sentenceId)) {
       setLocalRevisionBaseline(sentenceId, segment.target_text || '')
     }
@@ -645,9 +754,9 @@ export const useSegmentStore = defineStore('segment', () => {
 
     nextDrafts[sentenceId] = {
       id: `local-${sentenceId}`,
-      file_record_id: fileRecord.value?.id || '',
+      file_record_id: fileRecordIdForSegment(segment) || fileRecord.value?.id || '',
       segment_id: segment.id,
-      sentence_id: sentenceId,
+      sentence_id: segment.sentence_id,
       source: 'manual',
       status: 'pending',
       before_text: baselineText,
@@ -676,8 +785,9 @@ export const useSegmentStore = defineStore('segment', () => {
     const nextBaselines = { ...localRevisionBaselines.value }
     let changed = false
     for (const segment of segments.value) {
-      if (!Object.prototype.hasOwnProperty.call(nextBaselines, segment.sentence_id)) {
-        nextBaselines[segment.sentence_id] = segment.target_text || ''
+      const key = segmentKeyOf(segment)
+      if (!Object.prototype.hasOwnProperty.call(nextBaselines, key)) {
+        nextBaselines[key] = segment.target_text || ''
         changed = true
       }
     }
@@ -1156,6 +1266,7 @@ export const useSegmentStore = defineStore('segment', () => {
         hasMore = Boolean(data.has_more)
       }
 
+      await loadVisibleRevisions()
       const latestDirtyEntries = { ...dirtyEntries.value }
       for (const [sentenceId, version] of dirtyBaseVersionBumps) {
         bumpDirtyBaseVersion(latestDirtyEntries, sentenceId, version)
@@ -1196,6 +1307,7 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   async function loadRevisions(fileRecordId: string, query: SegmentPageQuery = {}) {
+    if (mergeViewId.value) return loadVisibleRevisions()
     if (!segments.value.length) {
       setRevisionEntries([])
       return []
@@ -1245,6 +1357,11 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function resetState() {
+    reviewSyncEpoch += 1
+    if (reviewSyncTimer !== null) window.clearInterval(reviewSyncTimer)
+    reviewSyncTimer = null
+    reviewSyncTasks.clear()
+    reviewSyncFailures.value = {}
     if (syncTimer !== null) {
       window.clearTimeout(syncTimer)
       syncTimer = null
@@ -1367,6 +1484,8 @@ export const useSegmentStore = defineStore('segment', () => {
       mergeViewGroups.value = page.groups
       changeCursor = page.change_cursor || page.server_time || new Date().toISOString()
       resetSegments(page.segments)
+      await loadVisibleRevisions()
+      startReviewSyncPolling()
       // 自动激活首个句段
       if (segments.value[0]) {
         setActiveSentence(segmentKeyOf(segments.value[0]))
@@ -1407,6 +1526,7 @@ export const useSegmentStore = defineStore('segment', () => {
       mergeViewGroups.value = page.groups
       changeCursor = page.change_cursor || page.server_time || changeCursor
       resetSegments(page.segments)
+      await loadVisibleRevisions()
       if (segments.value[0] && !activeSentenceId.value) {
         setActiveSentence(segmentKeyOf(segments.value[0]))
       }
@@ -2109,6 +2229,8 @@ export const useSegmentStore = defineStore('segment', () => {
     if (segment.project_sync_disabled) {
       return
     }
+    const reviewMode = Boolean(segment.review_sync_enabled && revisionTrackingEnabled.value)
+    if (reviewMode && !segment.review_sync_group_id) return
     const fileId = fileRecordIdForSegment(segment) ?? fileRecord.value?.id
     const sourceVersion = Number(segment.version || 1)
     if (!fileId || lastBlurSyncedVersionByKey.get(segmentKey) === sourceVersion) {
@@ -2116,18 +2238,33 @@ export const useSegmentStore = defineStore('segment', () => {
     }
 
     try {
-      await http.post<{
+      const { data } = await http.post<{
         enabled: boolean
         queued_count: number
         source_version: number
+        task_id?: string
+        task_generation?: number
       }>(`/file-records/${fileId}/segments/${segment.sentence_id}/project-sync`, {
         expected_version: sourceVersion,
         trigger: 'blur',
+        mode: reviewMode ? 'review' : 'translation',
+        group_id: reviewMode ? segment.review_sync_group_id : undefined,
       })
+      if (data.task_id) {
+        reviewSyncTasks.set(data.task_id, { key: segmentKey, version: sourceVersion,
+          groupId: segment.review_sync_group_id!, generation: data.task_generation ?? 0 })
+        const failures = { ...reviewSyncFailures.value }
+        delete failures[segmentKey]
+        reviewSyncFailures.value = failures
+        startReviewSyncPolling()
+      }
       if (blurSyncGenerationByKey.get(segmentKey) === generation) {
         lastBlurSyncedVersionByKey.set(segmentKey, sourceVersion)
       }
     } catch (error: any) {
+      if (reviewMode) {
+        reviewSyncFailures.value = { ...reviewSyncFailures.value, [segmentKey]: '修订同步未完成，当前编辑已保留。' }
+      }
       // 409 表示保存后该句段已被再次更新；下一次失焦会携带新版本重试。
       if (Number(error?.response?.status) !== 409) {
         console.warn('Failed to enqueue blurred segment sync:', error)
@@ -2337,7 +2474,7 @@ export const useSegmentStore = defineStore('segment', () => {
         }
         applyServerSegment(segment, false)
       }
-      // 合并模式下按文件加载修订意义不大（多文件），跳过 loadRevisions
+      void loadVisibleRevisions()
       const updatedSentenceIds = new Set((result.data.segments || []).map((segment) => segment.sentence_id))
       const sensitiveConflicts = (result.data.conflicts || []).filter((conflict) => {
         const key = buildSegmentKey(result.fileId, conflict.sentence_id)
@@ -2472,7 +2609,8 @@ export const useSegmentStore = defineStore('segment', () => {
       throw new Error('修订尚未保存，无法继续处理。')
     }
 
-    const persistedRevision = getPendingRevision(localDraft.sentence_id)
+    await loadVisibleRevisions()
+    const persistedRevision = getPendingRevision(revisionKey(localDraft))
     if (!persistedRevision) {
       throw new Error('修订保存后未返回可处理记录，请刷新页面后重试。')
     }
@@ -2480,28 +2618,40 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   async function acceptRevision(id: string) {
+    if (!await syncToBackend()) throw new Error('请先解决保存冲突。')
     const revisionId = await resolvePersistedRevisionId(id)
     const { data } = await http.patch<SegmentRevisionEntry>(`/revisions/${revisionId}`, {
       status: 'accepted',
     })
     upsertRevisionEntry(data)
-    // 接受修订：将 after_text 应用到 segment
-    applyLLMUpdate(data.sentence_id, data.after_text, data.source)
+    clearResolvedReviewTasks(data)
+    await refreshReviewState()
+    if (data.review_sync_result) showReviewSyncResult(data.review_sync_result)
     return data
   }
 
   async function rejectRevision(id: string) {
+    if (!await syncToBackend()) throw new Error('请先解决保存冲突。')
     const revisionId = await resolvePersistedRevisionId(id)
     const { data } = await http.patch<SegmentRevisionEntry>(`/revisions/${revisionId}`, {
       status: 'rejected',
     })
     upsertRevisionEntry(data)
-    // 拒绝修订：恢复 before_text 到 segment
-    applyLLMUpdate(data.sentence_id, data.before_text, data.source)
+    clearResolvedReviewTasks(data)
+    await refreshReviewState()
+    if (data.review_sync_result) showReviewSyncResult(data.review_sync_result)
     return data
   }
 
+  function clearResolvedReviewTasks(entry: SegmentRevisionEntry) {
+    if (!entry.review_sync_group_id) return
+    for (const [id, item] of reviewSyncTasks) {
+      if (item.groupId === entry.review_sync_group_id) reviewSyncTasks.delete(id)
+    }
+  }
+
   async function batchAcceptRevisions() {
+    if (mergeViewId.value) return resolveMergeRevisions('accepted')
     if (!fileRecord.value) {
       return 0
     }
@@ -2515,22 +2665,30 @@ export const useSegmentStore = defineStore('segment', () => {
       await loadRevisions(fileRecord.value.id)
       const revisions = listVisiblePendingRevisions()
       let updatedCount = 0
+      const seen = new Set<string>()
       for (const revision of revisions) {
-        await acceptRevision(revision.id)
-        updatedCount += 1
+        const key = revision.review_sync_group_id || revision.id
+        if (seen.has(key)) continue
+        seen.add(key)
+        const data = await acceptRevision(revision.id)
+        updatedCount += data.review_sync_result?.updated_count ?? 1
       }
       await refreshCurrentSegmentPage()
       return updatedCount
     }
 
-    const { data } = await http.post<{ updated_count: number }>(
+    const { data } = await http.post<{ updated_count: number; review_sync_result?: SegmentRevisionEntry['review_sync_result'] }>(
       `/file-records/${fileRecord.value.id}/revisions/batch-accept`,
     )
+    if (data.review_sync_result) showReviewSyncResult(data.review_sync_result)
+    reviewSyncTasks.clear()
+    reviewSyncFailures.value = {}
     await refreshCurrentSegmentPage()
     return data.updated_count
   }
 
   async function batchRejectRevisions() {
+    if (mergeViewId.value) return resolveMergeRevisions('rejected')
     if (!fileRecord.value) {
       return 0
     }
@@ -2544,19 +2702,57 @@ export const useSegmentStore = defineStore('segment', () => {
       await loadRevisions(fileRecord.value.id)
       const revisions = listVisiblePendingRevisions()
       let updatedCount = 0
+      const seen = new Set<string>()
       for (const revision of revisions) {
-        await rejectRevision(revision.id)
-        updatedCount += 1
+        const key = revision.review_sync_group_id || revision.id
+        if (seen.has(key)) continue
+        seen.add(key)
+        const data = await rejectRevision(revision.id)
+        updatedCount += data.review_sync_result?.updated_count ?? 1
       }
       await refreshCurrentSegmentPage()
       return updatedCount
     }
 
-    const { data } = await http.post<{ updated_count: number }>(
+    const { data } = await http.post<{ updated_count: number; review_sync_result?: SegmentRevisionEntry['review_sync_result'] }>(
       `/file-records/${fileRecord.value.id}/revisions/batch-reject`,
     )
+    if (data.review_sync_result) showReviewSyncResult(data.review_sync_result)
+    reviewSyncTasks.clear()
+    reviewSyncFailures.value = {}
     await refreshCurrentSegmentPage()
     return data.updated_count
+  }
+
+  async function resolveMergeRevisions(status: 'accepted' | 'rejected') {
+    if (!await syncToBackend()) return 0
+    if (revisionSettings.value.show_others_revisions) {
+      let count = 0
+      for (const file of mergeViewDetail.value?.files || []) {
+        if (file.can_write === false) continue
+        const action = status === 'accepted' ? 'batch-accept' : 'batch-reject'
+        const { data } = await http.post<{ updated_count: number; review_sync_result?: SegmentRevisionEntry['review_sync_result'] }>(
+          `/file-records/${file.id}/revisions/${action}`,
+        )
+        count += data.updated_count
+        if (data.review_sync_result?.skipped_count) showReviewSyncResult(data.review_sync_result)
+      }
+      reviewSyncTasks.clear()
+      reviewSyncFailures.value = {}
+      await refreshReviewState()
+      return count
+    }
+    await loadVisibleRevisions()
+    const seen = new Set<string>()
+    let count = 0
+    for (const revision of listVisiblePendingRevisions()) {
+      const key = revision.review_sync_group_id || revision.id
+      if (seen.has(key)) continue
+      seen.add(key)
+      const data = status === 'accepted' ? await acceptRevision(revision.id) : await rejectRevision(revision.id)
+      count += data.review_sync_result?.updated_count ?? 1
+    }
+    return count
   }
 
   async function updateAllSegmentConfirmations(
@@ -3083,6 +3279,8 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   return {
+    reviewSyncFailures,
+    retryReviewSync,
     fileRecord,
     translateFilename,
     segments,

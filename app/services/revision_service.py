@@ -38,7 +38,10 @@ def require_revisions_table() -> None:
 
 
 def serialize_segment_revision(revision: SegmentRevision) -> dict:
+    from app.services.review_sync import revision_sync_info
     return {
+        **revision_sync_info(revision),
+        **getattr(revision, "_review_sync_resolution", {}),
         "id": str(revision.id),
         "file_record_id": str(revision.file_record_id),
         "segment_id": str(revision.segment_id),
@@ -240,6 +243,15 @@ def _resolve_revision(
 ) -> SegmentRevision:
     normalized_status = _normalize_resolved_status(next_status)
     revision = get_revision_or_404(db, revision_id)
+    from app.services.review_sync import resolve_group
+    summary = resolve_group(db, revision, normalized_status, current_user)
+    if summary is not None:
+        db.commit()
+        from app.services.segment_events import publish_segment_changes
+        publish_segment_changes([UUID(value) for value in summary["affected_file_ids"]])
+        revision = get_revision_or_404(db, revision_id)
+        revision._review_sync_resolution = {"review_sync_result": summary}
+        return revision
     if revision.status != "pending":
         raise HTTPException(status_code=409, detail="Revision has already been resolved.")
 
@@ -302,11 +314,41 @@ def _batch_resolve_revisions(
 
     resolved_at = datetime.now()
     resolved_count = 0
+    from app.services.review_sync import resolve_group
+    linked_files = set()
+    linked_summary = {"updated_count": 0, "skipped_count": 0, "reasons": {}}
+    from app.models import ReviewSyncMember
+    from app.services.review_sync import can_write
+    group_by_revision = {member.revision_id: member.group_id for member in db.query(ReviewSyncMember)
+                         .filter(ReviewSyncMember.revision_id.in_([r.id for r in pending_revisions]),
+                                 ReviewSyncMember.active.is_(True)).all()}
+    seen_groups = set()
     grouped_revisions: dict[UUID, list[SegmentRevision]] = {}
     for revision in pending_revisions:
         grouped_revisions.setdefault(revision.segment_id, []).append(revision)
 
     for segment_revisions in grouped_revisions.values():
+        group_id = group_by_revision.get(segment_revisions[0].id)
+        if group_id in seen_groups:
+            continue
+        if group_id:
+            seen_groups.add(group_id)
+        if all(entry.status != "pending" for entry in segment_revisions):
+            continue
+        summary = resolve_group(db, segment_revisions[0], normalized_status, current_user)
+        if summary is not None:
+            resolved_count += summary["updated_count"]
+            linked_summary["updated_count"] += summary["updated_count"]
+            linked_summary["skipped_count"] += summary["skipped_count"]
+            for reason, count in summary["reasons"].items():
+                linked_summary["reasons"][reason] = linked_summary["reasons"].get(reason, 0) + count
+            linked_files.update(summary["affected_file_ids"])
+            continue
+        segment = db.get(Segment, segment_revisions[0].segment_id)
+        if segment is None or not can_write(db, segment, current_user):
+            linked_summary["skipped_count"] += 1
+            linked_summary["reasons"]["no_write_access"] = linked_summary["reasons"].get("no_write_access", 0) + 1
+            continue
         anchor_revision, duplicate_revisions = _merge_pending_revisions(segment_revisions)
         for duplicate_revision in duplicate_revisions:
             db.delete(duplicate_revision)
@@ -329,6 +371,9 @@ def _batch_resolve_revisions(
         resolved_count += 1
 
     db.commit()
+    from app.services.segment_events import publish_segment_changes
+    publish_segment_changes([UUID(value) for value in linked_files])
+    db.info["review_sync_result"] = linked_summary
     return resolved_count
 
 

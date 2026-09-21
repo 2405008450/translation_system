@@ -3182,6 +3182,8 @@ watch(
         >
           {{ targetAutomaticNumberingText }}
         </span>
+        <small v-if="pendingRevision?.review_sync_group_id" data-testid="review-sync-linked"
+          title="接受或拒绝时将一并处理未独立修改的关联片段">关联 {{ pendingRevision.review_sync_count || 1 }} 个片段</small>
         <div
           ref="editorRef"
           class="segment-row__editor"

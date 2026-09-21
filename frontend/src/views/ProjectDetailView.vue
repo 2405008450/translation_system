@@ -167,6 +167,7 @@ type DocumentStatisticNumberKey =
   | 'smartart_count'
 
 interface ProjectDetail {
+  review_sync_enabled?: boolean
   id: string
   workflow_template_id: string
   name: string
@@ -3856,6 +3857,25 @@ async function setProjectSyncForProject(enabled: boolean): Promise<boolean> {
   }
 }
 
+const reviewSyncSaving = ref(false)
+async function handleReviewSyncToggle(event: Event) {
+  const input = event.target as HTMLInputElement
+  if (!project.value) return
+  reviewSyncSaving.value = true
+  try {
+    const { data } = await http.patch<Partial<ProjectDetail>>(`/projects/${project.value.id}`, {
+      review_sync_enabled: input.checked,
+    })
+    project.value = { ...project.value, ...data }
+    toast.success(data.review_sync_enabled ? '修订同步已开启' : '修订同步已关闭')
+  } catch {
+    input.checked = Boolean(project.value.review_sync_enabled)
+    toast.error('修订同步设置保存失败，请重试')
+  } finally {
+    reviewSyncSaving.value = false
+  }
+}
+
 async function handleProjectSyncToggle(event: Event) {
   const input = event.target as HTMLInputElement | null
   if (!input) {
@@ -7242,6 +7262,14 @@ onBeforeUnmount(() => {
               <div class="pd-settings-section-body automation-settings">
                 <section class="automation-settings__group">
                   <h3>自动应用</h3>
+                  <label class="automation-settings__check is-connected">
+                    <input type="checkbox" data-testid="project-review-sync"
+                      :checked="project.review_sync_enabled"
+                      :disabled="reviewSyncSaving || !project.can_manage"
+                      @change="handleReviewSyncToggle" />
+                    <span>修订同步</span>
+                  </label>
+                  <p class="panel-subtitle">修订模式下离开片段后，同步到同项目、同语言对中原文及旧译文相同的可编辑片段（含其他文件），并保留关联修订。接受或拒绝时一并处理未独立修改的关联片段。</p>
                   <label
                     class="automation-settings__check is-connected"
                     :class="{ 'is-busy': projectSyncToggleLoading }"

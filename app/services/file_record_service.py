@@ -1317,6 +1317,10 @@ def update_segment_target(
     track_revision: bool = True,
     confirm: bool = False,
 ) -> Segment | None:
+    from app.services.review_sync import lock_file_project, record_edit
+    file_id = db.query(Segment.file_record_id).filter(Segment.id == segment_id).scalar()
+    if file_id:
+        lock_file_project(db, file_id)
     segment = db.query(Segment).filter(Segment.id == segment_id).first()
     if not segment:
         return None
@@ -1354,6 +1358,7 @@ def update_segment_target(
             source=source,
             author=current_user,
         )
+    record_edit(db, segment, before_text, current_user, track_revision, source)
     record_translation_metric_event(
         db,
         segment=segment,
@@ -1383,6 +1388,8 @@ def update_segment_by_sentence_id(
     confirm: bool = False,
     defer_commit: bool = False,
 ) -> Segment | None:
+    from app.services.review_sync import lock_file_project, record_edit
+    lock_file_project(db, file_record_id)
     segment = (
         db.query(Segment)
         .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
@@ -1423,6 +1430,7 @@ def update_segment_by_sentence_id(
             source=source,
             author=current_user,
         )
+    record_edit(db, segment, before_text, current_user, track_revision, source)
     record_translation_metric_event(
         db,
         segment=segment,
@@ -1499,6 +1507,8 @@ def batch_update_segments(
     return_result: bool = False,
     defer_commit: bool = False,
 ) -> int | SegmentBatchUpdateResult:
+    from app.services.review_sync import lock_file_project, record_edit
+    lock_file_project(db, file_record_id)
     updates_by_sentence_id: dict[str, dict] = {}
     for item in updates:
         sentence_id = item.get("sentence_id")
@@ -1588,6 +1598,7 @@ def batch_update_segments(
                 source=source,
                 author=current_user,
             )
+        record_edit(db, segment, before_text, current_user, track_revision, source)
         record_translation_metric_event(
             db,
             segment=segment,

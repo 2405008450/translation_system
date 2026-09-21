@@ -8056,9 +8056,9 @@ async function handleAcceptActiveRevision() {
   pageError.value = ''
   revisionActionLoading.value = true
   try {
-    await segmentStore.acceptRevision(revision.id)
+    const result = await segmentStore.acceptRevision(revision.id)
     openRevisionMenu.value = null
-    toast.success(t('workbench.ribbon.messages.currentRevisionAccepted'))
+    if (!result.review_sync_result) toast.success(t('workbench.ribbon.messages.currentRevisionAccepted'))
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.ribbon.messages.currentRevisionAcceptFailed'))
   } finally {
@@ -8076,9 +8076,9 @@ async function handleRejectActiveRevision() {
   pageError.value = ''
   revisionActionLoading.value = true
   try {
-    await segmentStore.rejectRevision(revision.id)
+    const result = await segmentStore.rejectRevision(revision.id)
     openRevisionMenu.value = null
-    toast.success(t('workbench.ribbon.messages.currentRevisionRejected'))
+    if (!result.review_sync_result) toast.success(t('workbench.ribbon.messages.currentRevisionRejected'))
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.ribbon.messages.currentRevisionRejectFailed'))
   } finally {
@@ -10230,6 +10230,10 @@ onBeforeRouteLeave(async () => {
             </button>
           </span>
           <span class="tool-col align-left revision-action-col">
+            <button v-if="Object.keys(segmentStore.reviewSyncFailures).length" type="button"
+              class="tool-line tool-button" data-testid="review-sync-retry"
+              title="当前编辑已保存，点击重试未完成的修订同步"
+              @click="segmentStore.retryReviewSync()">重试修订同步</button>
             <div class="workbench-revision-menu workbench-revision-menu--ribbon">
               <button
                 class="tool-line tool-button"
@@ -10255,7 +10259,7 @@ onBeforeRouteLeave(async () => {
                   :disabled="revisionActionLoading || !activePendingRevision"
                   @click="void handleAcceptActiveRevision()"
                 >
-                  {{ t('workbench.ribbon.acceptCurrentRevision') }}
+                  {{ activePendingRevision?.review_sync_group_id ? `接受关联修订（${activePendingRevision.review_sync_count || 1} 个片段）` : t('workbench.ribbon.acceptCurrentRevision') }}
                 </button>
                 <button
                   data-testid="workbench-revision-accept-all"
@@ -10293,7 +10297,7 @@ onBeforeRouteLeave(async () => {
                   :disabled="revisionActionLoading || !activePendingRevision"
                   @click="void handleRejectActiveRevision()"
                 >
-                  {{ t('workbench.ribbon.rejectCurrentRevision') }}
+                  {{ activePendingRevision?.review_sync_group_id ? `拒绝关联修订（${activePendingRevision.review_sync_count || 1} 个片段）` : t('workbench.ribbon.rejectCurrentRevision') }}
                 </button>
                 <button
                   class="is-danger"
