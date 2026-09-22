@@ -111,6 +111,30 @@ class ReviewSyncIntegrationTests(unittest.TestCase):
         self.assertEqual(result["updated_count"], 3)
         self.assertEqual([s.target_text for s in (self.source, self.target, self.same_file)], ["A"] * 3)
 
+    def test_legacy_machine_history_does_not_block_manual_revision_sync(self):
+        history = []
+        for segment, source in ((self.source, "llm"), (self.target, "llm"), (self.same_file, "tm")):
+            revision = SegmentRevision(file_record_id=segment.file_record_id, segment_id=segment.id,
+                sentence_id=segment.sentence_id, before_text="", after_text="A", source=source,
+                status="pending", author_id=self.user.id)
+            self.db.add(revision)
+            history.append(revision)
+        self.db.commit()
+        self.edit("B")
+        result = self.propagate()
+        self.assertEqual(result["updated_count"], 2)
+        self.assertEqual(result["skipped_count"], 0)
+        for segment in (self.source, self.target, self.same_file):
+            member = active_member(self.db, segment.id)
+            revision = self.db.get(SegmentRevision, member.revision_id)
+            self.assertEqual((revision.source, revision.before_text, revision.after_text), ("manual", "A", "B"))
+        result = resolve_group(self.db, revision, "rejected", self.user)
+        self.db.commit()
+        self.assertEqual(result["updated_count"], 3)
+        self.assertEqual([s.target_text for s in (self.source, self.target, self.same_file)], ["A"] * 3)
+        for revision in history:
+            self.assertEqual((revision.status, revision.before_text, revision.after_text), ("pending", "", "A"))
+
     def test_first_input_into_empty_translation_creates_group_before_confirmation(self):
         for segment in (self.source, self.target, self.same_file):
             segment.target_text = ""

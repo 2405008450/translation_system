@@ -264,7 +264,9 @@ def process_task(db: Session, task_id: UUID) -> dict | None:
             if (segment.target_text or "") != group.before_text:
                 _skip(result, "different_translation")
                 continue
-            if db.query(SegmentRevision.id).filter_by(segment_id=segment.id, status="pending").first() or active_member(db, segment.id):
+            # 旧版本曾为机器翻译/记忆库结果保留 pending 记录；它们不是人工待审修订。
+            # 与修订面板及 create_revision 的口径一致，只保护独立人工修订。
+            if db.query(SegmentRevision.id).filter_by(segment_id=segment.id, source="manual", status="pending").first() or active_member(db, segment.id):
                 _skip(result, "independent_revision")
                 continue
             member = ReviewSyncMember(group_id=group.id, segment_id=segment.id, before_text=segment.target_text or "",
