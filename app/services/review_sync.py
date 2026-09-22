@@ -59,6 +59,9 @@ def record_edit(db: Session, segment: Segment, before_text: str, user: User | No
         member = None
     if not enabled or (before_text or "") == (segment.target_text or "") and group is None:
         return
+    # 生产会话关闭 autoflush；先落库本次新增/合并/删除的修订，
+    # 再查询基线，否则首次编辑会被分流却无法建立同步组。
+    db.flush()
     revision = (db.query(SegmentRevision).filter(SegmentRevision.segment_id == segment.id,
                 SegmentRevision.source == "manual", SegmentRevision.status == "pending")
                 .order_by(SegmentRevision.created_at, SegmentRevision.id).first())

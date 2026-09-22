@@ -49,7 +49,8 @@ class ReviewSyncIntegrationTests(unittest.TestCase):
         cls.admin_engine.dispose()
 
     def setUp(self):
-        self.db = Session(self.engine)
+        # 必须与生产 SessionLocal 一致，避免查询隐式 flush 掩盖同步分流缺陷。
+        self.db = Session(self.engine, autoflush=False)
         self.addCleanup(self.db.close)
         self.publish = patch("app.services.review_sync.publish_segment_changes")
         self.publish.start()
@@ -109,6 +110,19 @@ class ReviewSyncIntegrationTests(unittest.TestCase):
         self.db.commit()
         self.assertEqual(result["updated_count"], 3)
         self.assertEqual([s.target_text for s in (self.source, self.target, self.same_file)], ["A"] * 3)
+
+    def test_first_input_into_empty_translation_creates_group_before_confirmation(self):
+        for segment in (self.source, self.target, self.same_file):
+            segment.target_text = ""
+            segment.status = "none"
+        self.db.commit()
+        member = self.edit("First translation")
+        self.assertIsNotNone(member)
+        revision = self.db.get(SegmentRevision, member.revision_id)
+        self.assertEqual(revision.before_text, "")
+        self.assertEqual(self.propagate()["updated_count"], 2)
+        self.assertEqual([s.target_text for s in (self.source, self.target, self.same_file)],
+                         ["First translation"] * 3)
 
     def test_continuous_autosaves_keep_first_baseline_and_are_idempotent(self):
         self.edit("B")
@@ -217,7 +231,7 @@ class ReviewSyncIntegrationTests(unittest.TestCase):
         task_id = task.id
         self.db.commit()
         def run():
-            with Session(self.engine) as db:
+            with Session(self.engine, autoflush=False) as db:
                 return process_task(db, task_id)
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = list(executor.map(lambda _: run(), range(2)))
@@ -235,7 +249,7 @@ class ReviewSyncIntegrationTests(unittest.TestCase):
         done = Event()
         def run():
             started.set()
-            with Session(self.engine) as db:
+            with Session(self.engine, autoflush=False) as db:
                 process_task(db, task_id)
             done.set()
         lock_project(self.db, project_id)
@@ -291,7 +305,7 @@ class ReviewSyncIntegrationTests(unittest.TestCase):
         task = self.queue()
         task_id = task.id
         self.db.commit()
-        with patch("app.services.review_sync.SessionLocal", side_effect=lambda: Session(self.engine)), \
+        with patch("app.services.review_sync.SessionLocal", side_effect=lambda: Session(self.engine, autoflush=False)), \
              patch("app.services.review_sync._finish_files", side_effect=RuntimeError("test failure")), \
              patch("app.services.review_sync.logger.exception"):
             for _ in range(3):
