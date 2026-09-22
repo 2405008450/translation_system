@@ -921,6 +921,10 @@ def _ensure_runtime_schema_once() -> None:
 
         missing_items = _collect_missing_schema(inspector)
         length_items, length_statements = _collect_column_length_migrations(inspector)
+        from app.services.review_sync_schema import DEFAULT_ENABLED_MIGRATION, default_needs_upgrade
+        if default_needs_upgrade(inspector):
+            length_items.append("projects.review_sync_enabled_default")
+            length_statements.append(DEFAULT_ENABLED_MIGRATION)
         all_missing_items = [*missing_items, *length_items]
         if not all_missing_items:
             return
@@ -964,6 +968,8 @@ def _ensure_runtime_schema_once() -> None:
             *_collect_missing_schema(inspector),
             *_collect_column_length_migrations(inspector)[0],
         ]
+        if default_needs_upgrade(inspector):
+            remaining_items.append("projects.review_sync_enabled_default")
     if remaining_items:
         remaining_text = ", ".join(remaining_items)
         raise RuntimeError(

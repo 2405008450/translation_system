@@ -60,7 +60,7 @@ class Project(Base):
         Boolean, nullable=False, server_default=text("true")
     )
     review_sync_enabled: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=text("false")
+        Boolean, nullable=False, default=True, server_default=text("true")
     )
     # 项目级翻译校对规则（从上传文件提取的纯文本）
     translation_rules: Mapped[str] = mapped_column(

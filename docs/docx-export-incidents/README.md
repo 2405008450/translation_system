@@ -23,4 +23,5 @@
 
 ## 当前记录
 
+- [2026-09-22 稳定版导出字体与字号保留](2026-09-22-preserve-source-fonts.md)
 - [2026-09-04 连续富文本标记泄漏与句段丢失](2026-09-04-consecutive-format-marker-leak.md)

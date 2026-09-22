@@ -152,7 +152,6 @@ def _dump_source_and_target_blocks(
 DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XML_SPACE_ATTR = "{http://www.w3.org/XML/1998/namespace}space"
 MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
-EXPORT_FONT_FAMILY = "Times New Roman"
 BILINGUAL_LAYOUT_SOURCE_FIRST = "source_first"
 BILINGUAL_LAYOUT_TARGET_FIRST = "target_first"
 BlockKey = tuple[str, int, int | None, int | None]
@@ -183,6 +182,7 @@ INTERNAL_EXPORT_MARKERS = (
     (FORMAT_MARKER_PREFIX, "format"),
     (REVISION_MARKER_PREFIX, "revision"),
 )
+# 仅清理编辑器负责的基础格式；字体、字号、颜色等仍继承源 run。
 EXPLICIT_FORMAT_RUN_PROPERTIES = {
     "b",
     "bCs",
@@ -192,14 +192,6 @@ EXPLICIT_FORMAT_RUN_PROPERTIES = {
     "strike",
     "dstrike",
     "vertAlign",
-    "color",
-    "highlight",
-    "shd",
-    "sz",
-    "szCs",
-    "rFonts",
-    "smallCaps",
-    "caps",
 }
 WORD_RUN_PROPERTY_ORDER = (
     "rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps",
@@ -253,7 +245,7 @@ class FormattedTextFragment:
 
     @property
     def has_style(self) -> bool:
-        return bool(self.formats) or any(
+        return any(self.formats) or any(
             (
                 self.font_color,
                 self.background_color,
@@ -620,7 +612,6 @@ class TextToken:
     start: int = 0
     end: int = 0
     edits: list[tuple[int, int, str]] = field(default_factory=list)
-    apply_export_font: bool = False
     is_math: bool = False
     is_hyperlink: bool = False
     hyperlink_element: object | None = None
@@ -2773,6 +2764,7 @@ def _replace_block_tokens(
     previous_span: SentenceSpan | None = None
     pending_revision_markers: list[tuple[str, ExportSegment, str, str]] = []
     pending_format_markers: list[tuple[str, str]] = []
+    format_reference_runs: dict[str, list[ET.Element | None]] = {}
     for span in spans:
         sentence_source = _normalize_segment_source_text(_collect_span_text(tokens, span, use_source=True))
         if not sentence_source:
@@ -2866,6 +2858,9 @@ def _replace_block_tokens(
                 inline_marker=format_marker,
             ):
                 pending_format_markers.append((format_marker, segment.target_html))
+                format_reference_runs[format_marker] = _select_formatted_reference_runs(
+                    tokens, span, _parse_formatted_html(segment.target_html)
+                )
         else:
             _queue_sentence_replacement(tokens, span, replacement)
 
@@ -2873,7 +2868,7 @@ def _replace_block_tokens(
         previous_span = span
 
     _apply_token_edits(tokens)
-    _expand_formatted_markers(tokens, pending_format_markers)
+    _expand_formatted_markers(tokens, pending_format_markers, format_reference_runs)
     _expand_word_revision_markers(tokens, pending_revision_markers)
 
 
@@ -3731,7 +3726,6 @@ def _queue_text_range_edit(
     for index, (token, local_start, local_end) in enumerate(writable_overlaps):
         if index == replacement_index:
             token.edits.append((local_start, local_end, replacement_text))
-            token.apply_export_font = bool(replacement_text)
         else:
             token.edits.append((local_start, local_end, ""))
 
@@ -3770,7 +3764,6 @@ def _queue_structural_word_text_range_edit(
 
     for token, local_start, local_end in writable_overlaps:
         token.edits.append((local_start, local_end, ""))
-        token.apply_export_font = False
 
     _remove_structural_line_break_tokens(structural_line_break_tokens)
     return True
@@ -3879,14 +3872,12 @@ def _build_inserted_word_run(text: str, reference_run: ET.Element | None) -> ET.
     if _needs_space_preserve(text):
         text_element.set(XML_SPACE_ATTR, "preserve")
     run_element.append(text_element)
-    _apply_export_font(run_element)
     return run_element
 
 
 def _build_inserted_word_break_run(reference_run: ET.Element | None) -> ET.Element:
     run_element = _build_word_run_shell(reference_run)
     run_element.append(ET.Element(_qn("w", "br")))
-    _apply_export_font(run_element)
     return run_element
 
 
@@ -3923,6 +3914,47 @@ def _collect_span_text(
         pieces.append(base_text[local_start:local_end])
 
     return "".join(pieces)
+
+
+def _select_formatted_reference_runs(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    fragments: list[FormattedTextFragment],
+) -> list[ET.Element | None]:
+    """保留可定位片段的原生样式，其余片段采用句段中占比最高的样式。
+
+    不按翻译后的字符数硬切源 run；无法定位的片段不能准确推断格式边界。
+    在修改 XML 前复制参考 run，供延迟展开的格式标记使用。
+    """
+    candidates: list[tuple[str, ET.Element, bytes]] = []
+    weights: dict[bytes, int] = {}
+    representatives: dict[bytes, ET.Element] = {}
+    for token in tokens:
+        run = token.run_element
+        if run is None or _namespace_uri(run.tag) != NS["w"]:
+            continue
+        start, end = max(span.start, token.start), min(span.end, token.end)
+        if end <= start:
+            continue
+        text = token.display_text[start - token.start:end - token.start]
+        properties = run.find("w:rPr", NS)
+        key = ET.tostring(properties) if properties is not None else b""
+        candidates.append((text, run, key))
+        weights[key] = weights.get(key, 0) + len(re.sub(r"\s", "", text))
+        representatives.setdefault(key, run)
+
+    if not candidates:
+        return [None for _ in fragments]
+    default_run = representatives[max(weights, key=weights.get)]
+    references: list[ET.Element | None] = []
+    for fragment in fragments:
+        text = _collapse_html_projection_whitespace(fragment.text)
+        matches = [
+            run for source, run, _ in candidates
+            if text and _collapse_html_projection_whitespace(source) == text
+        ]
+        references.append(deepcopy(matches[0] if len(matches) == 1 else default_run))
+    return references
 
 
 def _queue_formatted_sentence_replacement(
@@ -3976,11 +4008,12 @@ def _queue_formatted_sentence_replacement(
         anchor = first_token.anchor_element if first_token.anchor_element is not None else first_token.run_element
         insert_index = list(parent).index(anchor)
 
-        # 为每个格式化片段创建一个 run
-        for i, fragment in enumerate(fragments):
+        # 使用片段对应的源 run；无法定位时继承句段主要样式。
+        references = _select_formatted_reference_runs(tokens, span, fragments)
+        for i, (fragment, reference) in enumerate(zip(fragments, references, strict=True)):
             if not fragment.text:
                 continue
-            run = _build_formatted_word_run(fragment, first_token.run_element)
+            run = _build_formatted_word_run(fragment, reference)
             parent.insert(insert_index + i, run)
 
     return False
@@ -3989,6 +4022,7 @@ def _queue_formatted_sentence_replacement(
 def _expand_formatted_markers(
     tokens: list[TextToken],
     pending_markers: list[tuple[str, str]],
+    reference_runs_by_marker: Mapping[str, list[ET.Element | None]] | None = None,
 ) -> None:
     if not pending_markers:
         return
@@ -4034,12 +4068,15 @@ def _expand_formatted_markers(
         _sync_word_text_space_attribute(element)
         insert_index = list(parent).index(run) + 1
         inserted_count = 0
-        for fragment in fragments:
+        references = (reference_runs_by_marker or {}).get(marker)
+        for fragment_index, fragment in enumerate(fragments):
             if not fragment.text:
                 continue
             parent.insert(
                 insert_index + inserted_count,
-                _build_formatted_word_run(fragment, run),
+                _build_formatted_word_run(
+                    fragment, references[fragment_index] if references is not None else run
+                ),
             )
             inserted_count += 1
 
@@ -4129,6 +4166,8 @@ def _build_formatted_word_run(
         run_properties = ET.Element(_qn("w", "rPr"))
         run_element.insert(0, run_properties)
 
+    # HTML 的基础格式标签描述加粗、下划线等编辑结果；缺少字体/字号等 CSS
+    # 不代表用户要求清除它们。保留原生属性，避免丢失四槽位字体和主题继承。
     _clear_explicit_format_run_properties(run_properties)
 
     # 应用格式
@@ -4164,11 +4203,6 @@ def _build_formatted_word_run(
     if _needs_space_preserve(fragment_text):
         text_element.set(XML_SPACE_ATTR, "preserve")
     run_element.append(text_element)
-
-    # 应用导出字体；若源 run 指定字体，最后恢复该字体，避免全局导出字体覆盖它。
-    _apply_export_font(run_element)
-    if fragment.font_family:
-        _set_run_font_family(run_element.find("w:rPr", NS), fragment.font_family)
 
     return run_element
 
@@ -4371,7 +4405,6 @@ def _queue_checkbox_macro_replacement(
 
     for token, replacement_part in zip(overlapping_tokens, replacement_parts, strict=True):
         token.edits.append((0, len(token.display_text), replacement_part))
-        token.apply_export_font = False
     return True
 
 
@@ -4537,57 +4570,10 @@ def _apply_token_edits(tokens: list[TextToken]) -> None:
             token.element.set(XML_SPACE_ATTR, "preserve")
         else:
             token.element.attrib.pop(XML_SPACE_ATTR, None)
-        if (
-            token.apply_export_font
-            and token.field_instruction_prefix is None
-            and token.run_element is not None
-        ):
-            _apply_export_font(token.run_element)
 
 
 def _needs_space_preserve(text: str) -> bool:
     return bool(text) and (text[0].isspace() or text[-1].isspace())
-
-
-def _apply_export_font(run_element: ET.Element) -> None:
-    run_tag = _local_name(run_element.tag)
-    if run_tag != "r":
-        return
-
-    namespace_uri = _namespace_uri(run_element.tag)
-    if namespace_uri == NS["w"]:
-        _apply_word_run_font(run_element)
-        return
-    if namespace_uri == NS["a"]:
-        _apply_drawingml_run_font(run_element)
-
-
-def _apply_word_run_font(run_element: ET.Element) -> None:
-    run_properties = run_element.find("w:rPr", NS)
-    if run_properties is None:
-        run_properties = ET.Element(_qn("w", "rPr"))
-        run_element.insert(0, run_properties)
-
-    fonts = _upsert_ordered_run_property(run_properties, "rFonts")
-
-    for attr_name in ("ascii", "hAnsi", "cs", "eastAsia"):
-        fonts.set(_qn("w", attr_name), EXPORT_FONT_FAMILY)
-    for theme_attr in ("asciiTheme", "hAnsiTheme", "csTheme", "eastAsiaTheme"):
-        fonts.attrib.pop(_qn("w", theme_attr), None)
-
-
-def _apply_drawingml_run_font(run_element: ET.Element) -> None:
-    run_properties = run_element.find("a:rPr", NS)
-    if run_properties is None:
-        run_properties = ET.Element(_qn("a", "rPr"))
-        run_element.insert(0, run_properties)
-
-    for child_name in ("latin", "ea", "cs"):
-        font_element = run_properties.find(f"a:{child_name}", NS)
-        if font_element is None:
-            font_element = ET.Element(_qn("a", child_name))
-            run_properties.append(font_element)
-        font_element.set("typeface", EXPORT_FONT_FAMILY)
 
 
 def _apply_rtl_document_direction(
@@ -4755,7 +4741,6 @@ def _localize_numbering_definitions(
         _set_level_child_value(level, "numFmt", num_fmt_value)
         _set_level_child_value(level, "lvlText", lvl_text_value)
         _set_level_child_value(level, "suff", suffix_value)
-        _apply_numbering_level_font(level)
 
 
 def _build_localized_numbering_definition(
@@ -4821,23 +4806,6 @@ def _set_level_child_value(level: ET.Element, child_name: str, value: str) -> No
         child = ET.Element(_qn("w", child_name))
         level.append(child)
     child.set(_qn("w", "val"), value)
-
-
-def _apply_numbering_level_font(level: ET.Element) -> None:
-    run_properties = level.find("./w:rPr", NS)
-    if run_properties is None:
-        run_properties = ET.Element(_qn("w", "rPr"))
-        level.append(run_properties)
-
-    fonts = run_properties.find("./w:rFonts", NS)
-    if fonts is None:
-        fonts = ET.Element(_qn("w", "rFonts"))
-        run_properties.insert(0, fonts)
-
-    for attr_name in ("ascii", "hAnsi", "cs", "eastAsia"):
-        fonts.set(_qn("w", attr_name), EXPORT_FONT_FAMILY)
-    for theme_attr in ("asciiTheme", "hAnsiTheme", "csTheme", "eastAsiaTheme"):
-        fonts.attrib.pop(_qn("w", theme_attr), None)
 
 
 def _build_modified_docx(

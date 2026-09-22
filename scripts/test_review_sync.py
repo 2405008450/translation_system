@@ -311,10 +311,30 @@ class ReviewSyncIntegrationTests(unittest.TestCase):
             for statement in schema_statements():
                 self.db.execute(text(statement))
         self.db.commit()
-        project = Project(name="默认关闭")
+        project = Project(name="默认开启")
         self.db.add(project)
         self.db.commit()
-        self.assertFalse(project.review_sync_enabled)
+        self.assertTrue(project.review_sync_enabled)
+
+    def test_upgrade_enables_existing_projects_only_once(self):
+        from app.services.review_sync_schema import DEFAULT_ENABLED_MIGRATION, default_needs_upgrade
+        from sqlalchemy import inspect
+        self.db.execute(text("ALTER TABLE projects ALTER COLUMN review_sync_enabled SET DEFAULT FALSE"))
+        self.project.review_sync_enabled = False
+        self.db.commit()
+        self.assertTrue(default_needs_upgrade(inspect(self.db.connection())))
+        self.db.execute(text(DEFAULT_ENABLED_MIGRATION))
+        self.db.commit()
+        self.assertTrue(self.project.review_sync_enabled)
+        self.assertFalse(default_needs_upgrade(inspect(self.db.connection())))
+        self.project.review_sync_enabled = False
+        self.db.commit()
+        self.db.execute(text(DEFAULT_ENABLED_MIGRATION))
+        self.db.commit()
+        self.assertFalse(self.project.review_sync_enabled)
+        project_id = self.db.execute(text("INSERT INTO projects (name, status) VALUES ('database default', 'draft') RETURNING id")).scalar_one()
+        self.db.commit()
+        self.assertTrue(self.db.get(Project, project_id).review_sync_enabled)
 
 
 if __name__ == "__main__":
