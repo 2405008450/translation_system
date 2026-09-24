@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import shutil
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -14,14 +15,15 @@ from uuid import UUID
 
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
-from sqlalchemy import inspect, text
+from sqlalchemy import BigInteger, inspect, text
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database import SessionLocal, engine
 from app.models import FileExportTask, FileRecord, User
-from app.services.adapters import export_file
+from app.services.adapters import export_file, export_file_to_path
+from app.services.adapters.exceptions import ExportError
 from app.services.document_exporter import apply_docx_rtl_direction
 from app.services.task_file_service import (
     BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS,
@@ -38,6 +40,7 @@ from app.services.task_file_service import (
 from app.services.file_record_service import (
     get_file_record as get_file_record_model,
     get_file_record_source_filename,
+    get_file_record_source_path,
     list_segments_for_file_record,
     load_file_record_source,
 )
@@ -58,6 +61,10 @@ PROOFREADING_EXPORT_TYPES = {
     "proofreading_audit_xlsx",
     "proofreading_xlsx_original",
 }
+
+# 导出完成消息的固定前缀。附加提示（如部分画板已转位图）直接拼在其后，
+# 前端按该前缀切分出提示部分单独展示，因此两端必须保持一致。
+EXPORT_COMPLETED_MESSAGE = "导出完成。"
 
 _FILE_EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="file-export")
 _SCHEMA_READY = False
@@ -116,7 +123,7 @@ _FILE_EXPORT_SCHEMA_STATEMENTS = [
         result_path TEXT,
         filename VARCHAR(255),
         media_type VARCHAR(120),
-        size_bytes INTEGER,
+        size_bytes BIGINT,
         error TEXT,
         created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
         created_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -158,7 +165,11 @@ _FILE_EXPORT_SCHEMA_STATEMENTS = [
     """,
     """
     ALTER TABLE IF EXISTS file_export_tasks
-    ADD COLUMN IF NOT EXISTS size_bytes INTEGER
+    ADD COLUMN IF NOT EXISTS size_bytes BIGINT
+    """,
+    """
+    ALTER TABLE IF EXISTS file_export_tasks
+    ALTER COLUMN size_bytes TYPE BIGINT USING size_bytes::BIGINT
     """,
     """
     ALTER TABLE IF EXISTS file_export_tasks
@@ -234,6 +245,7 @@ def queue_file_export(
     current_user: User | None,
     style_settings: dict[str, Any] | None = None,
     include_revision_marks: bool = False,
+    defer_execution: bool = False,
 ) -> dict[str, Any]:
     ensure_file_export_tasks_schema()
     export_type = normalize_file_export_type(export_type)
@@ -262,13 +274,37 @@ def queue_file_export(
     db.commit()
     db.refresh(task)
 
-    _store_style_settings(task.id, style_settings)
-    _store_revision_mark_option(task.id, include_revision_marks)
+    if not defer_execution:
+        _store_style_settings(task.id, style_settings)
+        _store_revision_mark_option(task.id, include_revision_marks)
 
     _cleanup_expired_file_exports(db)
-    future = _FILE_EXPORT_EXECUTOR.submit(_run_file_export_task, task.id)
-    future.add_done_callback(_log_file_export_task_failure)
+    if not defer_execution:
+        dispatch_file_export_task(task.id)
     return serialize_file_export_task(task)
+
+
+def dispatch_file_export_task(task_id: UUID) -> None:
+    future = _FILE_EXPORT_EXECUTOR.submit(_run_file_export_task, task_id)
+    future.add_done_callback(_log_file_export_task_failure)
+
+
+def run_file_export_task(
+    task_id: UUID,
+    style_settings: dict[str, Any] | None = None,
+) -> None:
+    """供专用 ARQ worker 的隔离子进程调用。"""
+    _run_file_export_task(task_id, style_settings=style_settings)
+
+
+def fail_file_export_task(task_id: UUID, error: str) -> None:
+    with SessionLocal() as db:
+        task = db.query(FileExportTask).filter(FileExportTask.id == task_id).first()
+        if task is None or task.status in {"completed", "failed"}:
+            return
+        _cleanup_file_export_task_artifacts(task_id)
+        task.error = error
+        _set_file_export_task_status(db, task, "failed", progress=100, message="导出失败。")
 
 
 def get_file_export_task(db: Session, task_id: UUID) -> FileExportTask:
@@ -317,6 +353,11 @@ def build_file_export_download_response(task: FileExportTask) -> FileResponse:
             ),
             # FileResponse 本身会分块发送文件；同时禁止 Nginx 缓冲整个大文件响应。
             "X-Accel-Buffering": "no",
+            # 同一源文件多次导出的下载名相同；禁止浏览器或代理复用旧任务的
+            # DWG 响应，否则用户重新导出后仍可能打开上一次的单行 TEXT 文件。
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
         },
     )
 
@@ -371,14 +412,18 @@ def _collect_file_export_schema_missing_items(connection) -> list[str]:
     if not inspector.has_table(table_name):
         return [table_name]
 
-    existing_columns = {
-        column["name"]
+    existing_column_definitions = {
+        column["name"]: column
         for column in inspector.get_columns(table_name)
     }
+    existing_columns = set(existing_column_definitions)
     missing_items = [
         f"{table_name}.{column_name}"
         for column_name in sorted(_FILE_EXPORT_REQUIRED_COLUMNS - existing_columns)
     ]
+    size_column = existing_column_definitions.get("size_bytes")
+    if size_column is not None and not isinstance(size_column["type"], BigInteger):
+        missing_items.append(f"{table_name}.size_bytes(BIGINT)")
 
     existing_indexes = {
         index["name"]
@@ -408,8 +453,13 @@ def _resolve_file_record_export_language_pair(file_record: FileRecord) -> tuple[
     return require_language_pair(source_language, target_language)
 
 
-def _run_file_export_task(task_id: UUID) -> None:
-    style_settings = _pop_style_settings(task_id)
+def _run_file_export_task(
+    task_id: UUID,
+    *,
+    style_settings: dict[str, Any] | None = None,
+) -> None:
+    if style_settings is None:
+        style_settings = _pop_style_settings(task_id)
     include_revision_marks = _pop_revision_mark_option(task_id)
     temporary_output_path: Path | None = None
     try:
@@ -428,6 +478,9 @@ def _run_file_export_task(task_id: UUID) -> None:
                 raise ValueError("File record not found.")
 
             _set_file_export_task_status(db, task, "running", progress=20, message="正在读取文件和句段。")
+            output_dir = _ensure_export_dir()
+            _cleanup_expired_export_files(output_dir)
+            output_base = output_dir / str(task_id)
             report_context = {
                 "file_record_id": file_record_id,
                 "export_task_id": export_task_id,
@@ -443,6 +496,7 @@ def _run_file_export_task(task_id: UUID) -> None:
                 report_context=report_context,
                 include_revision_marks=include_revision_marks,
                 release_transaction_before_render=True,
+                output_path_base=output_base,
             )
 
         output_dir = _ensure_export_dir()
@@ -450,7 +504,13 @@ def _run_file_export_task(task_id: UUID) -> None:
         suffix = Path(exported_file.filename).suffix or ".bin"
         output_path = output_dir / f"{task_id}{suffix}"
         temporary_output_path = output_dir / f".{task_id}{suffix}.tmp"
-        temporary_output_path.write_bytes(exported_file.content)
+        if getattr(exported_file, "path", None) is not None:
+            with Path(exported_file.path).open("rb") as source, temporary_output_path.open("wb") as destination:
+                shutil.copyfileobj(source, destination, length=1024 * 1024)
+        elif exported_file.content is not None:
+            temporary_output_path.write_bytes(exported_file.content)
+        else:
+            raise ValueError("导出器未生成文件内容。")
         temporary_output_path.replace(output_path)
         temporary_output_path = None
         size_bytes = output_path.stat().st_size
@@ -464,15 +524,27 @@ def _run_file_export_task(task_id: UUID) -> None:
             task.filename = exported_file.filename
             task.media_type = exported_file.media_type
             task.size_bytes = size_bytes
-            _set_file_export_task_status(db, task, "completed", progress=100, message="导出完成。")
+            _set_file_export_task_status(
+                db,
+                task,
+                "completed",
+                progress=100,
+                message=_build_export_completion_message(getattr(exported_file, "notes", None)),
+            )
     except Exception as exc:
         logger.exception("file export task failed task_id=%s", task_id)
         if temporary_output_path is not None:
             temporary_output_path.unlink(missing_ok=True)
+        # ExportError 已经带有可读的中文 reason，前端直接展示即可；
+        # 保留 str(exc) 会多一层 "Failed to export XXX:" 英文前缀，观感较差。
+        if isinstance(exc, ExportError) and exc.reason:
+            error_message = exc.reason
+        else:
+            error_message = str(exc)
         with SessionLocal(expire_on_commit=False) as db:
             task = db.query(FileExportTask).filter(FileExportTask.id == task_id).first()
             if task is not None:
-                task.error = str(exc)
+                task.error = error_message
                 _set_file_export_task_status(db, task, "failed", progress=100, message="导出失败。")
 
 
@@ -489,6 +561,28 @@ def _resolve_export_filename(file_record: FileRecord, source_filename: str) -> s
     return f"{translated_stem}{extension}"
 
 
+def _build_export_completion_message(notes: list[str] | None) -> str:
+    """拼装导出完成消息；有提示时追加在固定前缀之后，供前端切分展示。"""
+    if not notes:
+        return EXPORT_COMPLETED_MESSAGE
+    return EXPORT_COMPLETED_MESSAGE + " ".join(note for note in notes if note)
+
+
+def _build_export_segment_dicts(segments: list[Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "segment_id": seg.sentence_id,
+            "source_text": seg.source_text,
+            "target_text": seg.target_text,
+            "status": seg.status,
+            "matched_source_text": seg.matched_source_text,
+            "segment_metadata": seg.segment_metadata,
+            "sequence_index": getattr(seg, "sequence_index", None),
+        }
+        for seg in segments
+    ]
+
+
 def build_file_record_exported_file(
     db: Session,
     file_record: FileRecord,
@@ -497,8 +591,9 @@ def build_file_record_exported_file(
     report_context: dict[str, Any] | None = None,
     include_revision_marks: bool = False,
     release_transaction_before_render: bool = False,
+    output_path_base: Path | None = None,
 ):
-    raw_bytes = load_file_record_source(file_record)
+    source_path = get_file_record_source_path(file_record)
     source_filename = get_file_record_source_filename(file_record)
     export_filename = _resolve_export_filename(file_record, source_filename)
 
@@ -563,10 +658,10 @@ def build_file_record_exported_file(
         )
 
     if export_type == "source":
-        if raw_bytes is None:
+        if source_path is None:
             raise ValueError("The source file is unavailable.")
         return _GenericExportedFile(
-            content=raw_bytes,
+            path=source_path,
             media_type=mimetypes.guess_type(source_filename)[0] or "application/octet-stream",
             filename=source_filename,
         )
@@ -576,6 +671,35 @@ def build_file_record_exported_file(
     document_parse_options = normalize_document_parse_options(
         getattr(file_record, "document_parse_options", None),
         document_parse_mode,
+    )
+
+    extension = get_task_file_extension(source_filename)
+    if extension == ".ai" and export_type in {"translated_pdf", "translated_svg"}:
+        if source_path is None:
+            raise ValueError("AI 源文件缺失，无法导出。")
+        if output_path_base is None:
+            raise ValueError("AI 路径导出缺少目标路径。")
+        segment_dicts = _build_export_segment_dicts(segments)
+        output_suffix = ".pdf" if export_type == "translated_pdf" else ".svg"
+        _release_read_transaction(db, enabled=release_transaction_before_render)
+        result_path, media_type, export_filename, export_notes = export_file_to_path(
+            export_type=export_type,
+            segments=segment_dicts,
+            filename=file_record.filename,
+            original_path=source_path,
+            output_path=output_path_base.with_suffix(output_suffix),
+        )
+        return _GenericExportedFile(
+            path=result_path,
+            media_type=media_type,
+            filename=export_filename,
+            notes=export_notes,
+        )
+
+    raw_bytes = (
+        source_path.read_bytes()
+        if source_path is not None and extension != ".ai"
+        else None
     )
 
     if export_type == "original":
@@ -657,17 +781,7 @@ def build_file_record_exported_file(
             report_context,
         )
 
-    segment_dicts = [
-        {
-            "segment_id": seg.sentence_id,
-            "source_text": seg.source_text,
-            "target_text": seg.target_text,
-            "status": seg.status,
-            "matched_source_text": seg.matched_source_text,
-            "sequence_index": getattr(seg, "sequence_index", None),
-        }
-        for seg in segments
-    ]
+    segment_dicts = _build_export_segment_dicts(segments)
     export_kwargs = {
         "export_type": export_type,
         "segments": segment_dicts,
@@ -797,10 +911,23 @@ def _apply_pptx_layout_settings(
 
 
 class _GenericExportedFile:
-    def __init__(self, *, content: bytes, media_type: str, filename: str) -> None:
+    def __init__(
+        self,
+        *,
+        media_type: str,
+        filename: str,
+        content: bytes | None = None,
+        path: str | Path | None = None,
+        notes: list[str] | None = None,
+    ) -> None:
+        if content is None and path is None:
+            raise ValueError("导出结果必须提供 content 或 path。")
         self.content = content
+        self.path = Path(path) if path is not None else None
         self.media_type = media_type
         self.filename = filename
+        # 面向使用者的导出提示（如 AI 转 SVG 时部分画板已转为位图）。
+        self.notes = list(notes or [])
 
 
 def _release_read_transaction(db: Session, *, enabled: bool) -> None:
@@ -831,6 +958,21 @@ def _ensure_export_dir() -> Path:
     output_dir = Path(get_settings().export_task_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+def _cleanup_file_export_task_artifacts(task_id: UUID) -> None:
+    """清理隔离进程被强制终止时可能遗留的最终文件和隐藏临时文件。"""
+    output_dir = Path(get_settings().export_task_dir)
+    if not output_dir.is_dir():
+        return
+    task_prefix = str(task_id)
+    for pattern in (f"{task_prefix}.*", f".{task_prefix}.*", f"..{task_prefix}.*"):
+        for path in output_dir.glob(pattern):
+            try:
+                if path.is_file():
+                    path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("failed to cleanup file export artifact path=%s", path, exc_info=True)
 
 
 def _cleanup_expired_file_exports(db: Session) -> None:

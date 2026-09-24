@@ -28,6 +28,7 @@ from app.services.document_storage import (
     load_source_file,
     resolve_source_file_path,
     save_source_file,
+    save_source_file_from_path,
 )
 from app.services.document_statistics import (
     normalize_document_statistics,
@@ -280,6 +281,14 @@ def _record_initial_translation_events(db: Session, segments: list[Segment]) -> 
         )
 
 
+def _hash_file_path(source_path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(source_path).open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def create_file_record_with_segments(
     db: Session,
     raw_bytes: bytes,
@@ -315,6 +324,49 @@ def create_file_record_with_segments(
         file_hash=file_hash,
         workspace_data=workspace_data,
         raw_bytes=raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
+
+
+def create_file_record_with_segments_from_path(
+    db: Session,
+    source_path: str | Path,
+    filename: str,
+    similarity_threshold: float = 0.6,
+    workspace_data: dict | None = None,
+    collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
+) -> FileRecord:
+    """从磁盘路径创建文件记录，全程不物化完整源文件。"""
+
+    path = Path(source_path)
+    file_hash = _hash_file_path(path)
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    if workspace_data is None:
+        workspace_data = build_task_workspace(
+            db=db,
+            raw_bytes=None,
+            source_path=path,
+            filename=filename,
+            similarity_threshold=similarity_threshold,
+            collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
+            document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
+        )
+
+    return _create_file_record_from_workspace(
+        db=db,
+        filename=filename,
+        file_hash=file_hash,
+        workspace_data=workspace_data,
+        source_path=path,
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
     )
@@ -369,8 +421,8 @@ def create_file_record_copy_shell(
     current_user: User | None,
     target_language: str | None = None,
     preserve_language_resources: bool = True,
-) -> tuple[FileRecord, bytes | None]:
-    source_bytes = load_file_record_source(source_record)
+) -> tuple[FileRecord, bytes | Path | None]:
+    source_bytes = get_file_record_source_path(source_record)
     duplicate = FileRecord(
         project_id=project_id,
         filename=filename,
@@ -421,7 +473,7 @@ def copy_file_record_source(
     db: Session,
     source_record: FileRecord,
     duplicate: FileRecord,
-    source_bytes: bytes | None,
+    source_bytes: bytes | Path | None,
 ) -> None:
     if source_bytes is None:
         return
@@ -430,7 +482,10 @@ def copy_file_record_source(
         duplicate.filename,
     )
     _remember_pending_source_file(db, duplicate.id, duplicate_source_filename)
-    save_source_file(duplicate.id, duplicate_source_filename, source_bytes)
+    if isinstance(source_bytes, Path):
+        save_source_file_from_path(duplicate.id, duplicate_source_filename, source_bytes)
+    else:
+        save_source_file(duplicate.id, duplicate_source_filename, source_bytes)
 
 
 def duplicate_file_record(
@@ -509,6 +564,7 @@ def _create_file_record_from_workspace(
     file_hash: str,
     workspace_data: dict,
     raw_bytes: bytes | None = None,
+    source_path: str | Path | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: dict[str, object] | str | None = None,
 ) -> FileRecord:
@@ -574,6 +630,9 @@ def _create_file_record_from_workspace(
     source_filename = workspace_data.get(_WORKSPACE_SOURCE_FILENAME_KEY, filename)
     if source_bytes is not None:
         save_source_file(file_record.id, source_filename, source_bytes)
+        _remember_pending_source_file(db, file_record.id, source_filename)
+    elif source_path is not None:
+        save_source_file_from_path(file_record.id, source_filename, source_path)
         _remember_pending_source_file(db, file_record.id, source_filename)
     db.flush()
     _record_initial_translation_events(db, created_segments)
@@ -714,6 +773,15 @@ def get_file_record(db: Session, file_record_id: UUID) -> FileRecord | None:
 
 def load_file_record_source(file_record: FileRecord) -> bytes | None:
     return load_source_file(file_record.id, file_record.filename)
+
+
+def get_file_record_source_path(file_record: FileRecord) -> Path | None:
+    return resolve_source_file_path(file_record.id, file_record.filename)
+
+
+def get_file_record_source_size(file_record: FileRecord) -> int | None:
+    source_path = get_file_record_source_path(file_record)
+    return source_path.stat().st_size if source_path is not None else None
 
 
 def get_file_record_source_filename(file_record: FileRecord) -> str:
@@ -1387,14 +1455,21 @@ def update_segment_by_sentence_id(
     track_revision: bool = True,
     confirm: bool = False,
     defer_commit: bool = False,
+    *,
+    segment_id: UUID | None = None,
+    commit: bool = True,
 ) -> Segment | None:
     from app.services.review_sync import lock_file_project, record_edit
     lock_file_project(db, file_record_id)
-    segment = (
-        db.query(Segment)
-        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
-        .first()
-    )
+    query = db.query(Segment)
+    if segment_id is not None:
+        query = query.filter(Segment.id == segment_id, Segment.file_record_id == file_record_id)
+    else:
+        query = query.filter(
+            Segment.file_record_id == file_record_id,
+            Segment.sentence_id == sentence_id,
+        )
+    segment = query.first()
     if not segment:
         return None
 
@@ -1441,11 +1516,11 @@ def update_segment_by_sentence_id(
     )
 
     sync_file_record_status(db, segment.file_record_id)
-    if defer_commit:
-        db.flush()
-    else:
+    if commit and not defer_commit:
         db.commit()
         db.refresh(segment)
+    else:
+        db.flush()
     return segment
 
 

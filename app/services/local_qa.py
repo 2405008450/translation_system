@@ -936,10 +936,20 @@ def detect_missing_space_after_punctuation(
 ) -> list[CleanedLocalIssue]:
     if not target_text:
         return []
+
+    # 邮箱和 URL 内的点号属于 token 本身，不能当作遗漏空格处理。
+    # 这些正则定义在内容一致性规则区；detector 实际执行时模块已完成初始化。
+    protected_ranges = tuple(
+        match.span()
+        for pattern in (_EMAIL_TOKEN_RE, _URL_TOKEN_RE)
+        for match in pattern.finditer(target_text)
+    )
     issues: list[CleanedLocalIssue] = []
     n = len(target_text)
     for i, ch in enumerate(target_text):
         if ch not in WESTERN_PUNCTUATION_FOR_SPACING:
+            continue
+        if any(start <= i < end for start, end in protected_ranges):
             continue
         if i == n - 1:
             continue
@@ -1709,11 +1719,13 @@ _PLACEHOLDER_BRACE_RE = re.compile(r"\{[A-Za-z0-9_][\w.\-]*\}")
 _PLACEHOLDER_PRINTF_RE = re.compile(r"%\([\w.]+\)[sdifxoefgc]|%[-+#0 ]?\d*(?:\.\d+)?[sdifxoefgcp]")
 # 邮箱。
 _EMAIL_TOKEN_RE = re.compile(r"[\w.%+\-]+@[\w.\-]+\.[A-Za-z]{2,}")
-# URL（http/https，含 ``www.`` 简写）。
+# URL（http/https，含 ``www.`` 简写）。正则先宽松匹配，再由提取函数
+# 去掉自然语言中的句末标点；不能直接排除点号，否则会截断域名和文件路径。
 _URL_TOKEN_RE = re.compile(
     r"(?:https?://|www\.)[^\s<>\"'\u3000\u3001\u3002\uff0c\uff01\uff1f]+",
     re.IGNORECASE,
 )
+_URL_TRAILING_SENTENCE_MARKS = ".,;:!?，。；：！？、"
 # 特殊符号：® ™ © § ¶ 以及 Unicode 货币符号范围。
 _SPECIAL_SYMBOL_RE = re.compile(
     "[\u0024"  # $
@@ -1897,7 +1909,11 @@ def detect_link_mismatch(
         "链接",
         source_text,
         target_text,
-        lambda text: _extract_tokens(_URL_TOKEN_RE, text),
+        # 英文句点等句末标点不属于链接；先保留域名内部的点号，再仅从尾部剥离。
+        lambda text: [
+            token.rstrip(_URL_TRAILING_SENTENCE_MARKS)
+            for token in _extract_tokens(_URL_TOKEN_RE, text)
+        ],
     )
 
 
@@ -2202,6 +2218,7 @@ def check_segments_local_qa(
     file_record: FileRecord,
     segments: list[Segment],
     rule_keys: Iterable[str] | None = None,
+    commit: bool = True,
 ) -> int:
     """针对给定句段运行所有本地 QA 规则。
 
@@ -2283,7 +2300,10 @@ def check_segments_local_qa(
                 changed_count += 1
 
     if changed_count:
-        db.commit()
+        if commit:
+            db.commit()
+        else:
+            db.flush()
     return changed_count
 
 

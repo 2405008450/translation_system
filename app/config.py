@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     # 资源库实际导入的写库批次大小，控制单批 ORM 对象和向量同步 payload 的内存峰值。
     resource_import_batch_size: int = 1000
     resource_import_max_size_mb: int = 1024
+    # multipart 边界与表单字段不计入资源文件上限，额外预留少量请求体空间。
+    resource_import_request_overhead_mb: int = 10
     file_storage_dir: str = "data/file_records"
     export_task_dir: str = "data/export_tasks"
     import_task_dir: str = "data/import_tasks"
@@ -39,8 +41,43 @@ class Settings(BaseSettings):
     upload_max_size_mb: int = 100
     upload_max_files_per_batch: int = 50
     upload_max_files_per_selection: int = 200
-    upload_max_total_size_mb: int = 500
+    upload_max_total_size_mb: int = 2048
+    # HTTP 请求体上限应略高于批量文件总上限，为 multipart 边界和表单字段预留空间。
+    upload_max_request_size_mb: int = 2060
     upload_max_expanded_files: int = 100
+    # AI 使用独立 path-based 链路；超过 inline 阈值时必须投递到专用 ARQ worker。
+    ai_max_file_size_mb: int = 2048
+    ai_inline_max_size_mb: int = 100
+    ai_min_free_disk_mb: int = 8192
+    ai_worker_job_timeout_seconds: int = 1800
+    ai_worker_memory_limit_mb: int = 4096
+    # PDF-compatible AI 复杂度预算，防止体积不大但对象/页面异常的文件耗尽内存。
+    ai_max_pages: int = 200
+    ai_max_xref_objects: int = 250000
+    ai_max_text_lines: int = 100000
+    ai_max_text_spans: int = 250000
+    ai_max_text_characters: int = 5000000
+    # 对 Illustrator 转曲文字按需启用本地 OCR；仅含疑似字形填充路径的画板会渲染。
+    ai_ocr_enabled: bool = True
+    ai_ocr_scale: float = 3.0
+    ai_ocr_min_confidence: float = 0.85
+    ai_ocr_max_pixels: int = 12000000
+    # 只能在 PyMuPDF 单页调用返回后检测；生产环境硬超时仍应由独立 worker 进程保证。
+    ai_max_page_parse_seconds: float = 10.0
+    ai_max_total_parse_seconds: float = 120.0
+    ai_max_svg_xref_objects: int = 100000
+    ai_max_svg_output_mb: int = 128
+    # 单个画板的矢量 SVG 超过该体积时，改为“位图底图 + 矢量文字层”混合输出：
+    # 图形部分栅格化成内嵌位图，文字仍保留为可选中、可编辑的 <text>。
+    ai_svg_page_raster_threshold_mb: int = 8
+    # 混合输出时底图的渲染分辨率；同时受 ai_svg_raster_max_pixels 像素总量约束。
+    ai_svg_raster_dpi: int = 150
+    ai_svg_raster_max_pixels: int = 40000000
+    # 底图编码：jpeg 体积约为 png 的 1/10，是超大画板能落在体积上限内的关键；
+    # 需要无损底图（如底图含硬边线稿且不接受压缩振铃）时可改为 png。
+    ai_svg_raster_format: str = "jpeg"
+    ai_svg_raster_jpeg_quality: int = 85
+    ai_export_font_path: str | None = None
     default_similarity_threshold: float = 0.80
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
@@ -111,6 +148,7 @@ class Settings(BaseSettings):
     arq_auto_tm_max_jobs: int | None = None
     arq_segment_sync_max_jobs: int | None = None
     arq_pretranslation_max_jobs: int | None = None
+    arq_ai_max_jobs: int | None = 1
     # 单个项目预翻译批次内，同时处理的文件任务数。仍会叠加 LLM_MAX_CONCURRENCY 的限制。
     pretranslation_run_file_concurrency: int = 2
     auto_tm_outbox_max_batches_per_run: int = 5
@@ -187,13 +225,13 @@ class Settings(BaseSettings):
     dwg_llm_verify_max_items: int = 60
     dwg_llm_verify_model: str = "google/gemini-2.5-flash"
     dwg_llm_verify_provider: str = "openrouter"
-    # DWG 空间合并 L6：GPT-5 Mini 对局部候选区域做结构化语义分组
+    # DWG 空间合并 L6：GPT-5.4 Mini 对局部候选区域做结构化语义分组
     dwg_llm_layout_enabled: bool = True
     # 两个碎片（如序号+正文）也必须进入判断；区域过大则预先切成局部窗口
     dwg_llm_layout_min_bucket: int = 2
     dwg_llm_layout_max_bucket: int = 30
     dwg_llm_layout_concurrency: int = 3
-    dwg_llm_layout_model: str = "openai/gpt-5-mini"
+    dwg_llm_layout_model: str = "openai/gpt-5.4-mini"
     dwg_llm_layout_provider: str = "openrouter"
     # DWG 空间合并诊断：竖线/管道分隔的正则片段列表，命中则 dump 该实体及其邻居
     # 例如 DWG_DEBUG_TEXT_PATTERNS="JZ3|DN150|316L"

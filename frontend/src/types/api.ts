@@ -275,6 +275,8 @@ export interface DocumentParseOptions {
   custom_parse_config: boolean
   translate_idml_comments: boolean
   translate_idml_hidden_layers: boolean
+  psd_translate_hidden_layers: boolean
+  psd_translate_locked_layers: boolean
   pptx_translate_comments: boolean
   pptx_translate_notes: boolean
   pptx_translate_document_properties: boolean
@@ -697,6 +699,12 @@ export interface WorkbenchQAResultItem {
   message: string
   detail: string
   suggestion: string
+  can_auto_fix: boolean
+  fixed_target_text: string
+  fix_offset: number | null
+  fix_length: number | null
+  fix_replacement: string
+  fix_unavailable_reason: string
   source_term: string
   expected_target_term: string
   term_base_name: string
@@ -1931,14 +1939,36 @@ export interface ReferenceSentencePair {
   similarity: number
 }
 
-export interface ReferenceAnalyzeResponse {
-  profile_id: string
-  source_files: string[]
-  terminology_count: number
-  tm_count: number
-  style: ReferenceStyleGuide | null
-  analysis_report: ReferenceAnalysisReport | null
-  overall_confidence: number
+export interface ReferenceExactMatch {
+  match_type: 'reference-exact'
+  segment_id: string
+  source: string
+  target: string
+  source_file: string | null
+  similarity: number
+}
+
+export interface ReferenceFuzzyMatch {
+  match_type: 'reference-fuzzy'
+  segment_id: string
+  source: string
+  matched_source: string
+  target: string
+  source_file: string | null
+  similarity: number
+}
+
+export interface ReferenceTermMatchItem {
+  source: string
+  target: string
+  source_file?: string | null
+  category?: string | null
+}
+
+export interface ReferenceTermMatch {
+  segment_id: string
+  source_file: string | null
+  terms: ReferenceTermMatchItem[]
 }
 
 export interface ReferenceMatchResult {
@@ -1950,34 +1980,14 @@ export interface ReferenceMatchResult {
   term_count: number
 }
 
-export interface ReferenceExactMatch {
-  segment_id: string
-  source: string
-  target: string
-  match_type: 'reference-exact'
-  similarity: number
-  source_file: string
-}
-
-export interface ReferenceFuzzyMatch {
-  segment_id: string
-  source: string
-  matched_source: string
-  target: string
-  similarity: number
-  match_type: 'reference-fuzzy'
-  source_file: string
-}
-
-export interface ReferenceTermMatch {
-  segment_id: string
-  terms: Array<{
-    source: string
-    target: string
-    category: string | null
-    source_file: string
-  }>
-  source_file: string
+export interface ReferenceAnalyzeResponse {
+  profile_id: string
+  source_files: string[]
+  terminology_count: number
+  tm_count: number
+  style: ReferenceStyleGuide | null
+  analysis_report: ReferenceAnalysisReport | null
+  overall_confidence: number
 }
 
 export interface ReferenceApplyResult {

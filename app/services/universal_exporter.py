@@ -398,12 +398,26 @@ def _extract_merged_text_info(segments: List, translations: Dict[str, str]) -> L
             
         is_merged = metadata.get('is_merged', False)
         is_table_cell = metadata.get('cad_table_cell', False)
+        entity_type = str(metadata.get('entity_type', '') or '').upper()
+        is_single_text_block = bool(
+            not is_merged
+            and not is_table_cell
+            and entity_type in {'TEXT', 'ATTRIB', 'ATTDEF'}
+            and (
+                metadata.get('cad_text_block', False)
+                or (
+                    metadata.get('merged_handles')
+                    and metadata.get('group_width')
+                    and metadata.get('group_height')
+                )
+            )
+        )
         merged_handles = metadata.get('merged_handles', [])
         
         if is_merged:
             segments_with_is_merged += 1
         
-        if (not is_merged and not is_table_cell) or not merged_handles:
+        if not (is_merged or is_table_cell or is_single_text_block) or not merged_handles:
             continue
         
         # 如果没有译文，尝试从 translations 中查找
@@ -429,7 +443,9 @@ def _extract_merged_text_info(segments: List, translations: Dict[str, str]) -> L
             'group_y_top': metadata.get('group_y_top', metadata.get('primary_y', 0)),
             'group_width': metadata.get('group_width', 0),
             'group_height': metadata.get('group_height', 0),
+            'first_line_indent': metadata.get('group_first_line_indent', 0),
             'cad_table_cell': metadata.get('cad_table_cell', False),
+            'single_text_block': is_single_text_block,
             'scope': metadata.get('scope', ''),
             'layer': metadata.get('layer', '0'),
         }

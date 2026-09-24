@@ -84,7 +84,18 @@ class SegmentExtractor:
                     node.metadata.get("preserve_as_single_segment", False)
                 )
 
-                if is_cad_entity:
+                preserve_merged_cad_unit = bool(
+                    is_cad_entity
+                    and (node.metadata.get("is_merged") or int(node.metadata.get("merged_count", 1) or 1) > 1)
+                )
+                if preserve_merged_cad_unit:
+                    segments.append(self._create_segment(
+                        source_text=self._normalize_text(text),
+                        display_text=text,
+                        block_path=path,
+                        metadata=dict(node.metadata),
+                    ))
+                elif is_cad_entity:
                     # DWG/DXF 的 CAD 文本采用 Lin 分支的分句方案，并通过分组元数据
                     # 在导出时重新组合，从而支持长文本翻译后的布局优化。
                     raw_sentences = [

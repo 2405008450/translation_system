@@ -465,7 +465,7 @@ class FileExportTask(Base):
     result_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
     media_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),

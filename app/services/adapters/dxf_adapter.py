@@ -37,6 +37,7 @@ from app.services.adapters.models import (
 from app.services.adapters.segment_extractor import extract_segments
 from app.services.adapters.text_reconstruction import (
     TextEntity,
+    TextFlowGraph,
     TextReconstructor,
     Sentence,
     estimate_text_width,
@@ -129,17 +130,43 @@ _YEAR_FRAGMENT_RE = re.compile(r"^[()（）]?\s*(?:19|20)\d{2}\s*[()（）]?$")
 # 单独的开/闭括号（半/全角）：CAD 常见的"(" / "（" 单字实体，合并层放行后
 # 由几何位置决定要不要拼进相邻文本。
 _LONE_BRACKET_RE = re.compile(r"^[()（）\[\]【】《》〈〉『』]+$")
+# 管径/口径代码是 CAD 标注，不应作为可译单词送入模型。除了单个
+# ``DN15``，还要识别 ``DN150 6in`` 和由 \P 分隔的纯管径列表。
+_CAD_DIAMETER_CODE_RE = re.compile(
+    r"^(?:DN|DE|OD|ID)\s*\d+(?:\.\d+)?(?:\s*[x×]\s*\d+(?:\.\d+)?)?$",
+    re.IGNORECASE,
+)
+_CAD_DIAMETER_LINE_RE = re.compile(
+    r"^(?:DN|DE|OD|ID)\s*\d+(?:\.\d+)?"
+    r"(?:\s*[x×]\s*\d+(?:\.\d+)?)?"
+    r"(?:\s*/?\s*[（(]\s*\d+(?:\.\d+)?\s*(?:in(?:ch(?:es)?)?|[\"″])\s*[）)]"
+    r"|\s+\d+(?:\.\d+)?\s*(?:in(?:ch(?:es)?)?|[\"″]))?"
+    r"[.,;，。；]?$",
+    re.IGNORECASE,
+)
+
+
+def _is_cad_diameter_block(text: str) -> bool:
+    """纯管径单行或多行列表不属于自然语言翻译单元。"""
+    lines = [
+        line.strip()
+        for line in re.split(r"\r?\n+", clean_mtext(text or ""))
+        if line.strip()
+    ]
+    return bool(lines) and all(
+        _CAD_DIAMETER_LINE_RE.fullmatch(line) for line in lines
+    )
 
 
 def is_translatable_text(text: str) -> bool:
     """判断 DXF 文本是否包含可翻译字符（含 CJK 范围）。"""
     if not text:
         return False
+    stripped = text.strip()
+    if not stripped or _is_cad_diameter_block(stripped):
+        return False
     if re.search(r"[A-Za-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", text):
         return True
-    stripped = text.strip()
-    if not stripped:
-        return False
     # 白名单：标准年份后缀 & 括号年份碎片，让它们进入合并候选，
     # 由合并层与前后文的字母/CJK 段一起拼回原句。
     if _STANDARD_YEAR_SUFFIX_RE.match(stripped):
@@ -161,6 +188,8 @@ def _is_dimension_like(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return False
+    if _is_cad_diameter_block(stripped):
+        return True
     # 白名单：形如 "98-2014" / "155-2011" 的年份编号片段先放行
     if _STANDARD_YEAR_SUFFIX_RE.match(stripped):
         return False
@@ -485,8 +514,11 @@ class DxfAdapter(FormatAdapter):
         expanded_blocks: set[str] = set()
         # 直出节点通道：DIMENSION / MULTILEADER / ACAD_TABLE 不进合并
         standalone_nodes: List[BlockNode] = []
-        # 参与合并的文本实体
+        # 通过前置翻译过滤、实际参与重建的文本实体
         all_entities: List[TextEntity] = []
+        # 保留全部原始文本候选。表格里的编号/设备代码（如 1、X1、X2）本身
+        # 不可翻译，但必须与同格正文一起重建，否则导出时旧 TEXT 会压在译文上。
+        table_candidate_entities: List[TextEntity] = []
         # L2 网格线阻挡索引（按 scope 分桶的水平/垂直线段集合）
         from app.services.adapters.text_reconstruction import BarrierIndex, BarrierLine
         barrier_index = BarrierIndex()
@@ -518,6 +550,14 @@ class DxfAdapter(FormatAdapter):
                 )
                 return False
             return True
+
+        def _collect_text_candidate(text_entity: Optional[TextEntity]) -> None:
+            """统一收集文本，并为表格保留被前置过滤的结构化短代码。"""
+            if text_entity is None:
+                return
+            table_candidate_entities.append(text_entity)
+            if _accept_entity(text_entity):
+                all_entities.append(text_entity)
 
         def _emit_standalone(entity, *, scope: str, entity_type: str) -> None:
             """DIMENSION / MULTILEADER / ACAD_TABLE：不走几何合并，直接出 BlockNode。"""
@@ -655,8 +695,7 @@ class DxfAdapter(FormatAdapter):
                             insert_handle=sub_handle,
                             block_name=sub_block_name,
                         )
-                        if _accept_entity(text_entity):
-                            all_entities.append(text_entity)
+                        _collect_text_candidate(text_entity)
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -694,8 +733,7 @@ class DxfAdapter(FormatAdapter):
                     )
                     if split_entities:
                         for te in split_entities:
-                            if _accept_entity(te):
-                                all_entities.append(te)
+                            _collect_text_candidate(te)
                         return
 
                 text_entity = self._extract_text_entity(
@@ -705,8 +743,7 @@ class DxfAdapter(FormatAdapter):
                     insert_handle=insert_handle,
                     block_name=block_name,
                 )
-                if _accept_entity(text_entity):
-                    all_entities.append(text_entity)
+                _collect_text_candidate(text_entity)
                 return
 
         # 模型空间 + 各 paper space layout
@@ -726,6 +763,118 @@ class DxfAdapter(FormatAdapter):
             scope = f"block:{name}"
             for entity in block:
                 visit(entity, scope=scope, block_name=name)
+
+        # 纯多级编号本身不可翻译，但若它紧邻同行右侧的可译正文，就必须补回
+        # 重建池。TextFlowGraph 已有编号专用的跨图层/大间距规则；此前编号在
+        # 前置过滤阶段就被丢弃，导致这些规则永远无法生效，导出后仍残留为
+        # 独立 TEXT。
+        accepted_ids = {id(entity) for entity in all_entities}
+        accepted_text_entities = tuple(all_entities)
+        recovered_numbering_fragments = 0
+        for entity in table_candidate_entities:
+            if id(entity) in accepted_ids:
+                continue
+            if not TextFlowGraph._is_hierarchical_number_only(entity.text):
+                continue
+            has_adjacent_text = False
+            for other in accepted_text_entities:
+                if other.scope != entity.scope:
+                    continue
+                if TextFlowGraph._is_hierarchical_number_only(other.text):
+                    continue
+                avg_height = max((entity.height + other.height) / 2.0, 1e-6)
+                if abs(entity.y - other.y) > avg_height * 0.8:
+                    continue
+                gap = other.x - entity.right_edge
+                if -avg_height <= gap <= avg_height * 20:
+                    has_adjacent_text = True
+                    break
+            if not has_adjacent_text:
+                continue
+            all_entities.append(entity)
+            accepted_ids.add(id(entity))
+            recovered_numbering_fragments += 1
+        if recovered_numbering_fragments:
+            logger.info(
+                "DXF 补回 %d 个同行多级编号片段参与语义重建",
+                recovered_numbering_fragments,
+            )
+
+        # “表”与“8-3”常被 CAD 拆成两个 TEXT。连字符编号本身不可翻译，
+        # 但必须在同行右侧紧邻独立表号前缀时补回，才能形成单独的“表8-3”
+        # 翻译单元，而不是在导出阶段被错误追加到上方正文。
+        accepted_text_entities = tuple(all_entities)
+        recovered_table_references = 0
+        for entity in table_candidate_entities:
+            if id(entity) in accepted_ids:
+                continue
+            if not TextFlowGraph._is_table_reference_number_only(entity.text):
+                continue
+            for other in accepted_text_entities:
+                if other.scope != entity.scope:
+                    continue
+                if not TextFlowGraph._is_table_reference_prefix_only(other.text):
+                    continue
+                avg_height = max((entity.height + other.height) / 2.0, 1e-6)
+                if abs(entity.y - other.y) > avg_height * 0.8:
+                    continue
+                gap = entity.x - other.right_edge
+                if -avg_height <= gap <= avg_height * 8:
+                    all_entities.append(entity)
+                    accepted_ids.add(id(entity))
+                    recovered_table_references += 1
+                    break
+        if recovered_table_references:
+            logger.info(
+                "DXF 补回 %d 个同行连字符表号片段参与语义重建",
+                recovered_table_references,
+            )
+
+        # 单行管径和紧邻闭合标点虽然不需要单独翻译，但它们是说明文字的
+        # 行内组成部分，必须进入重建句段并在导出时随组清空。独立多行 DN
+        # 列表仍保持结构化参数块，避免再次与标题/字段串成自然语言句子。
+        inline_punctuation_re = re.compile(r"^[()（）\[\]【】,，。.;；:：]+$")
+        accepted_text_entities = list(all_entities)
+        recovered_inline_fragments = 0
+        for entity in table_candidate_entities:
+            if id(entity) in accepted_ids:
+                continue
+            cleaned = clean_mtext(entity.text or "").strip()
+            is_single_diameter = bool(
+                cleaned
+                and "\n" not in cleaned
+                and "\r" not in cleaned
+                and _is_cad_diameter_block(cleaned)
+            )
+            is_closing_punctuation = bool(
+                len(cleaned) <= 6
+                and inline_punctuation_re.fullmatch(cleaned)
+                and any(char in cleaned for char in ")）]】")
+            )
+            if not (is_single_diameter or is_closing_punctuation):
+                continue
+
+            for other in accepted_text_entities:
+                if other.scope != entity.scope or other.layer != entity.layer:
+                    continue
+                average_height = max((entity.height + other.height) / 2.0, 1e-6)
+                if abs(entity.y - other.y) > average_height * 0.8:
+                    continue
+                left, right = (
+                    (entity, other) if entity.x <= other.x else (other, entity)
+                )
+                horizontal_gap = right.x - left.right_edge
+                if -average_height * 2 <= horizontal_gap <= average_height * 20:
+                    all_entities.append(entity)
+                    accepted_text_entities.append(entity)
+                    accepted_ids.add(id(entity))
+                    recovered_inline_fragments += 1
+                    break
+        if recovered_inline_fragments:
+            logger.info(
+                "DXF 补回 %d 个同行管径/闭合标点片段参与语义重建",
+                recovered_inline_fragments,
+            )
         
         # Step 2: 使用 TextReconstructor 进行语义重建
         settings = get_settings()
@@ -763,10 +912,9 @@ class DxfAdapter(FormatAdapter):
 
         # 闭合线框内的文本按单元格归组。普通语义重建会把编号条目视为独立句，
         # 但 CAD 表格导出需要一个 MTEXT 承载整格内容，才能按格宽自动折行。
-        cell_by_entity_id: dict[int, tuple[float, float, float, float]] = {}
-        cell_groups: dict[tuple, List[TextEntity]] = {}
-        non_cell_entities: List[TextEntity] = []
-        for text_entity in all_entities:
+        def _grid_cell_for(
+            text_entity: TextEntity,
+        ) -> Optional[tuple[float, float, float, float]]:
             cell = barrier_index.enclosing_cell(
                 text_entity.scope,
                 text_entity.x,
@@ -774,14 +922,12 @@ class DxfAdapter(FormatAdapter):
                 text_entity.height,
             )
             if cell is None:
-                non_cell_entities.append(text_entity)
-                continue
+                return None
             left, right, bottom, top = cell
             # 排除整张图框、房间轮廓等大闭合区域，只把接近表格行高的线框当候选。
             char_height = max(text_entity.height, 1e-6)
             if right - left > char_height * 300 or top - bottom > char_height * 50:
-                non_cell_entities.append(text_entity)
-                continue
+                return None
             # 闭合矩形也可能是带引线的说明框。只有边界与相邻行/列连续、
             # 确实形成多格网格时，才按表格单元格归组并在导出时居中。
             if not barrier_index.is_grid_cell(
@@ -789,10 +935,93 @@ class DxfAdapter(FormatAdapter):
                 cell,
                 tolerance=char_height * 0.1,
             ):
+                return None
+            return cell
+
+        # 先对未过滤的候选识别单元格，再把与可译正文处于同一格的编号、设备
+        # 代码和符号补回。它们不单独进入翻译，但会作为同一句段的一部分被原样保留。
+        candidate_cells = {
+            id(entity): cell
+            for entity in table_candidate_entities
+            if (cell := _grid_cell_for(entity)) is not None
+        }
+        candidates_by_cell: dict[tuple, List[TextEntity]] = {}
+        for entity in table_candidate_entities:
+            cell = candidate_cells.get(id(entity))
+            if cell is not None:
+                candidates_by_cell.setdefault((entity.scope, *cell), []).append(entity)
+
+        def _is_force_merge_cell(entities: List[TextEntity]) -> bool:
+            """仅合并单一说明段；标签、代码和值组成的标注框保持独立。"""
+            short_colon_labels = []
+            diameter_blocks: List[TextEntity] = []
+            natural_language_entities: List[TextEntity] = []
+            for entity in entities:
+                text = (entity.text or "").strip()
+                if _is_cad_diameter_block(text):
+                    diameter_blocks.append(entity)
+                    continue
+                if is_translatable_text(text):
+                    natural_language_entities.append(entity)
+                if len(text) <= 32 and text.endswith((":", "：")):
+                    short_colon_labels.append(text)
+
+            multiline_diameter_blocks = [
+                entity for entity in diameter_blocks
+                if "\n" in clean_mtext(entity.text or "")
+            ]
+            # “字段名 + 多行 DN150/DN65...”是多个视觉对象，不是一个翻译句段。
+            # 单行 DN 代码仍可作为同行标签的一部分参与普通重建。
+            if multiline_diameter_blocks and natural_language_entities:
+                return False
+            if multiline_diameter_blocks:
+                return False
+            if len(short_colon_labels) >= 2:
+                return False
+            # 某些 CAD 把“平面：系统：”预先放在一个短实体中；它同样是
+            # 图例标注而不是一段说明文字，不能把同格 DN15 等代码吸进来。
+            if any(label.count(":") + label.count("：") >= 2 for label in short_colon_labels):
+                return False
+            return True
+
+        force_merge_cell_keys = {
+            key for key, entities in candidates_by_cell.items()
+            if _is_force_merge_cell(entities)
+        }
+        accepted_ids = {id(entity) for entity in all_entities}
+        accepted_cell_keys = {
+            (entity.scope, *candidate_cells[id(entity)])
+            for entity in all_entities
+            if id(entity) in candidate_cells
+            and (entity.scope, *candidate_cells[id(entity)]) in force_merge_cell_keys
+        }
+        recovered_table_fragments = 0
+        for entity in table_candidate_entities:
+            cell = candidate_cells.get(id(entity))
+            if cell is None or id(entity) in accepted_ids:
+                continue
+            if (entity.scope, *cell) not in accepted_cell_keys:
+                continue
+            all_entities.append(entity)
+            accepted_ids.add(id(entity))
+            recovered_table_fragments += 1
+        if recovered_table_fragments:
+            logger.info(
+                "DXF 表格补回 %d 个非译结构片段（编号/设备代码/符号）",
+                recovered_table_fragments,
+            )
+
+        cell_by_entity_id: dict[int, tuple[float, float, float, float]] = {}
+        cell_groups: dict[tuple, List[TextEntity]] = {}
+        non_cell_entities: List[TextEntity] = []
+        for text_entity in all_entities:
+            cell = candidate_cells.get(id(text_entity))
+            cell_key = (text_entity.scope, *cell) if cell is not None else None
+            if cell is None or cell_key not in force_merge_cell_keys:
                 non_cell_entities.append(text_entity)
                 continue
             cell_by_entity_id[id(text_entity)] = cell
-            cell_groups.setdefault((text_entity.scope, *cell), []).append(text_entity)
+            cell_groups.setdefault(cell_key, []).append(text_entity)
 
         # 诊断：按 (scope, layer) 分桶后每桶大小分布——桶太碎（大量 1 元素桶）
         # 就说明 scope/layer 天然把同一段拆开了，几何阈值再宽也合不了。
@@ -820,22 +1049,228 @@ class DxfAdapter(FormatAdapter):
                 continue
 
             # 单元格内按视觉行保留换行；同一行的碎片仍按原间距规则拼接。
+            # 若整组实体都在同一 INSERT scope 内且带局部坐标，就用 local_x/local_y
+            # 分行和排序，避开 INSERT rotation/mirror 让 world y 挤在一起的坑。
+            use_local_cell = bool(sentence.entities) and all(
+                ":insert:" in (item.scope or "")
+                and item.local_y is not None
+                and item.local_x is not None
+                for item in sentence.entities
+            )
+            row_y = (
+                (lambda item: item.local_y) if use_local_cell else (lambda item: item.y)
+            )
+            row_x = (
+                (lambda item: item.local_x) if use_local_cell else (lambda item: item.x)
+            )
+            # 分行判定：cell_groups 是强合通路，不走 _compute_edge，因此需要在
+            # 分行处自带字高/语言硬门槛，避免字高显著不同的中英对照段落被
+            # 误判为同一视觉行（例如某印章 block 把 480 高的中文、250 高的英文
+            # 和 257 高的英文说明堆在 y 差 20~150 的极近距离，若只按字高 * 0.8
+            # 就会拼成一整行）。
+            height_tolerance = getattr(settings, "dwg_height_ratio_tolerance", 0.30)
+
+            def _same_visual_row(prev_line: List[TextEntity], candidate: TextEntity) -> bool:
+                # 用行内"最后一个"实体作为参考，避免 J G A D I 这种 y 微波动
+                # 的字母序列因累积漂移被拆成多段（每个字母比较的是相邻字母，
+                # 只要相邻 y 差 <=阈值就归为同一行）。
+                anchor = prev_line[-1]
+                y_prev = row_y(anchor)
+                y_curr = row_y(candidate)
+                # y 阈值宽一些（0.7）让同字高的碎片（比如印章顶部逐字母
+                # 排列的 "J G A D I"）能合成一行；真正需要拆的场景交给下面
+                # 的字高比例硬门槛判定。
+                min_h = max(min(anchor.height, candidate.height), 1e-6)
+                if abs(y_prev - y_curr) > min_h * 0.7:
+                    return False
+                # 字高相差超过阈值：视为不同文本流硬断。防止 480 高的中文
+                # 名称、250 高的英文对照、257 高的英文说明被 y 挤得很近就拼
+                # 成一整行（对应 handle=100A 那类特殊 block 排版）。
+                h_max = max(anchor.height, candidate.height, 1e-6)
+                h_min = max(min(anchor.height, candidate.height), 1e-6)
+                if (h_max - h_min) / h_max > height_tolerance:
+                    return False
+                return True
+
             line_groups: List[List[TextEntity]] = []
             for entity in sentence.entities:
-                if not line_groups:
+                if not line_groups or not _same_visual_row(line_groups[-1], entity):
                     line_groups.append([entity])
-                    continue
-                current_line = line_groups[-1]
-                avg_height = sum(item.height for item in current_line) / len(current_line)
-                if abs(entity.y - current_line[0].y) <= max(avg_height, entity.height) * 0.8:
-                    current_line.append(entity)
                 else:
-                    line_groups.append([entity])
+                    line_groups[-1].append(entity)
             sentence.text = "\n".join(
-                reconstructor._merge_texts(sorted(line, key=lambda item: item.x))
+                reconstructor._merge_texts(sorted(line, key=row_x))
                 for line in line_groups
             )
             sentences.append(sentence)
+
+        # 参数化引线标注可能被编辑框/引线 barrier 拆成“上行说明 + 下行字段 +
+        # 下行 DN 参数”三个 Sentence。它们在语义上是一句完整说明，必须在生成
+        # Segment 前确定性合回，避免三个残句分别送给翻译模型。
+        inline_diameter_pattern = re.compile(
+            r"(?:DN|DE|OD|ID)\s*\d+(?:\.\d+)?",
+            re.IGNORECASE,
+        )
+
+        def _same_context(first: Sentence, second: Sentence) -> bool:
+            first_primary = first.primary_entity
+            second_primary = second.primary_entity
+            return bool(
+                first_primary is not None
+                and second_primary is not None
+                and first_primary.scope == second_primary.scope
+                and first_primary.layer == second_primary.layer
+            )
+
+        def _join_annotation_text(left: str, right: str) -> str:
+            left = (left or "").rstrip()
+            right = (right or "").lstrip()
+            if not left or not right:
+                return left + right
+            left_char = left[-1]
+            right_char = right[0]
+            needs_space = bool(
+                (
+                    left_char.isascii()
+                    and right_char.isascii()
+                    and (
+                        left_char.isalnum()
+                        or right_char.isalnum()
+                        or left_char in ",;:"
+                    )
+                )
+                and not re.search(r"[\u4e00-\u9fff]$", left)
+                and not re.match(r"^[\u4e00-\u9fff]", right)
+            )
+            return left + (" " if needs_space else "") + right
+
+        replacements: dict[int, Sentence] = {}
+        consumed_sentence_indices: set[int] = set()
+        for label_index, label_sentence in enumerate(sentences):
+            if label_index in consumed_sentence_indices:
+                continue
+            label_text = (label_sentence.text or "").strip()
+            label_primary = label_sentence.primary_entity
+            if (
+                label_primary is None
+                or not label_text
+                or len(label_text) > 64
+                or len(label_sentence.entities) > 2
+                or inline_diameter_pattern.search(label_text)
+                or not is_translatable_text(label_text)
+            ):
+                continue
+
+            code_candidates: List[tuple[float, int, Sentence]] = []
+            for code_index, code_sentence in enumerate(sentences):
+                if code_index == label_index or code_index in consumed_sentence_indices:
+                    continue
+                code_primary = code_sentence.primary_entity
+                if (
+                    code_primary is None
+                    or not _same_context(label_sentence, code_sentence)
+                    or not _is_cad_diameter_block(code_sentence.text)
+                ):
+                    continue
+                average_height = max(
+                    (label_primary.height + code_primary.height) / 2.0,
+                    1e-6,
+                )
+                if abs(label_primary.y - code_primary.y) > average_height * 0.8:
+                    continue
+                if code_primary.x < label_primary.x - average_height * 2.0:
+                    continue
+                horizontal_gap = code_primary.x - label_primary.right_edge
+                if horizontal_gap > average_height * 20.0:
+                    continue
+                code_candidates.append((
+                    abs(label_primary.y - code_primary.y)
+                    + abs(horizontal_gap) * 0.05,
+                    code_index,
+                    code_sentence,
+                ))
+            if not code_candidates:
+                continue
+            _, code_index, code_sentence = min(
+                code_candidates, key=lambda item: item[0]
+            )
+
+            upper_candidates: List[tuple[float, int, Sentence]] = []
+            for upper_index, upper_sentence in enumerate(sentences):
+                if upper_index in {label_index, code_index}:
+                    continue
+                if upper_index in consumed_sentence_indices:
+                    continue
+                upper_primary = upper_sentence.primary_entity
+                if (
+                    upper_primary is None
+                    or not _same_context(label_sentence, upper_sentence)
+                    or not inline_diameter_pattern.search(upper_sentence.text or "")
+                    or not (upper_sentence.text or "").rstrip().endswith(
+                        (",", "，", ";", "；", ":", "：")
+                    )
+                ):
+                    continue
+                average_height = max(
+                    (upper_primary.height + label_primary.height) / 2.0,
+                    1e-6,
+                )
+                vertical_gap = upper_primary.y - label_primary.y
+                if not (average_height * 0.8 < vertical_gap <= average_height * 3.0):
+                    continue
+                if abs(upper_primary.x - label_primary.x) > average_height * 1.5:
+                    continue
+                upper_candidates.append((vertical_gap, upper_index, upper_sentence))
+            if not upper_candidates:
+                continue
+            _, upper_index, upper_sentence = min(
+                upper_candidates, key=lambda item: item[0]
+            )
+
+            merged_entities: List[TextEntity] = []
+            seen_entity_handles: set[str] = set()
+            for entity in (
+                *upper_sentence.entities,
+                *label_sentence.entities,
+                *code_sentence.entities,
+            ):
+                if entity.handle in seen_entity_handles:
+                    continue
+                seen_entity_handles.add(entity.handle)
+                merged_entities.append(entity)
+            merged_text = _join_annotation_text(
+                _join_annotation_text(upper_sentence.text, label_sentence.text),
+                code_sentence.text,
+            )
+            replacements[upper_index] = Sentence(
+                sentence_id=upper_sentence.sentence_id,
+                text=merged_text,
+                entities=merged_entities,
+                primary_entity=upper_sentence.primary_entity,
+                merge_confidence=min(
+                    upper_sentence.merge_confidence,
+                    label_sentence.merge_confidence,
+                    code_sentence.merge_confidence,
+                ),
+            )
+            consumed_sentence_indices.update({label_index, code_index})
+            logger.info(
+                "DXF 参数化标注完整句重建：%s + %s + %s -> %s",
+                upper_sentence.sentence_id,
+                label_sentence.sentence_id,
+                code_sentence.sentence_id,
+                merged_text[:120],
+            )
+
+        if replacements:
+            rebuilt_sentences: List[Sentence] = []
+            for sentence_index, sentence in enumerate(sentences):
+                replacement = replacements.get(sentence_index)
+                if replacement is not None:
+                    rebuilt_sentences.append(replacement)
+                elif sentence_index not in consumed_sentence_indices:
+                    rebuilt_sentences.append(sentence)
+            sentences = rebuilt_sentences
 
         # 诊断：合并前后对比
         merged_groups = sum(1 for s in sentences if len(s.entities) > 1)
@@ -1028,6 +1463,10 @@ class DxfAdapter(FormatAdapter):
                 "handle": root_primary,
                 "layer": sentence.layer,
                 "scope": primary.scope if primary else "",
+                # 所有经过 CAD 语义重建并带有几何范围的句段都是文本块；
+                # is_merged 只表示它是否由多个底层实体组成，不能再被当成
+                # “是否允许按文本框换行”的判据。
+                "cad_text_block": True,
                 "is_merged": is_merged,
                 "merged_handles": root_handles,
                 "merged_count": len(handles),
@@ -1073,6 +1512,37 @@ class DxfAdapter(FormatAdapter):
                 metadata["group_width"] = max(e.right_edge for e in sentence.entities) - metadata["group_x"]
                 metadata["group_height"] = metadata["group_y_top"] - min(e.y for e in sentence.entities)
 
+                # 原图正文通常使用首行缩进：首行 TEXT 的 x 大于后续行左边界。
+                # MTEXT 重建必须显式保存该偏移，否则译文会全部贴到 group_x。
+                top_y = max(e.y for e in sentence.entities)
+                average_height = max(
+                    sum(max(e.height, 1e-6) for e in sentence.entities)
+                    / len(sentence.entities),
+                    1e-6,
+                )
+                first_line_entities = [
+                    e for e in sentence.entities
+                    if abs(e.y - top_y) <= average_height * 0.8
+                ]
+                first_line_x = min(
+                    (e.x for e in first_line_entities),
+                    default=metadata["group_x"],
+                )
+                metadata["group_first_line_indent"] = max(
+                    first_line_x - metadata["group_x"],
+                    0.0,
+                )
+                metadata["cad_visual_heading"] = bool(
+                    len(sentence.entities) <= 2
+                    and len((sentence.text or "").strip()) <= 64
+                    and re.match(
+                        r"^(?:[一二三四五六七八九十百]+[、．.]|"
+                        r"[IVXLCDM]+[．.]|\d+(?:\.\d+)*[、．.])",
+                        (sentence.text or "").strip(),
+                        re.IGNORECASE,
+                    )
+                )
+
             cell = cell_by_entity_id.get(id(primary)) if primary is not None else None
             if cell is not None:
                 left, right, bottom, top = cell
@@ -1100,6 +1570,10 @@ class DxfAdapter(FormatAdapter):
                     "width": e.width,
                     "entity_type": e.entity_type,
                     "rotation": e.rotation,
+                    # INSERT 内实体保留 block 局部坐标，供导出/诊断时区分
+                    # 世界坐标与 block 内部原始坐标（rotation/mirror 后者更稳定）。
+                    "local_x": e.local_x,
+                    "local_y": e.local_y,
                 }
                 for e in sentence.entities
             ], ensure_ascii=False)
@@ -1348,12 +1822,20 @@ class DxfAdapter(FormatAdapter):
             world_height = nominal_height * sy
             world_rotation = rotation + self._transform_rotation_deg(transform)
             bbox_source = "align"
+            # 只有落在 INSERT 内部（transform 非 None）才保存 block 局部坐标，
+            # 用于后续同 INSERT scope 的归行判断，避开 rotation/mirror 打乱 y。
+            local_coord_x: Optional[float] = float(local_x)
+            local_coord_y: Optional[float] = float(local_y)
+            local_coord_width: Optional[float] = float(local_width) if local_width else None
         else:
             world_x, world_y = local_x, local_y
             world_width = local_width
             world_height = nominal_height
             world_rotation = rotation
             bbox_source = "nominal"
+            local_coord_x = None
+            local_coord_y = None
+            local_coord_width = None
 
         return TextEntity(
             handle=handle,
@@ -1374,6 +1856,9 @@ class DxfAdapter(FormatAdapter):
             color=color,
             true_color=true_color,
             transparency=transparency,
+            local_x=local_coord_x,
+            local_y=local_coord_y,
+            local_width=local_coord_width,
         )
 
     # ------------------------------------------------------------------

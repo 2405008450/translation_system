@@ -1,0 +1,11 @@
+{
+  "name": "translation-system-psd-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local PSD parsing and text-layer write-back runtime",
+  "type": "commonjs",
+  "dependencies": {
+    "@napi-rs/canvas": "1.0.8",
+    "ag-psd": "31.0.2"
+  }
+}

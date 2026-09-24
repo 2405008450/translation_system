@@ -15,7 +15,10 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from app.config import get_settings
-from app.services.adapters.text_reconstruction import TextEntity
+from app.services.adapters.text_reconstruction import (
+    TextEntity,
+    is_independent_legend_label_pair,
+)
 from app.services.llm_service import request_chat_completion
 
 if TYPE_CHECKING:
@@ -33,7 +36,30 @@ Use meaning and reading order, but obey these hard rules:
 Return one JSON object only: {\"groups\":[{\"ids\":[\"id\"],\"relation\":\"short reason\"}]}.
 Do not rewrite text and preserve the supplied reading order inside each group."""
 
-_NUMBER_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)+|\d+[.)、]|[A-Za-z][.)])\s*$")
+_NUMBER_RE = re.compile(
+    r"^\s*(?:\d+(?:\.\d+)+|\d+(?:-\d+)+|\d+[.)、]|[A-Za-z][.)])\s*$"
+)
+_TABLE_REFERENCE_PREFIX_RE = re.compile(
+    r"^\s*(?:表|table|tabla|tabelle|tableau|tabella|tabela|таблица)\s*$",
+    re.IGNORECASE,
+)
+_TABLE_REFERENCE_NUMBER_RE = re.compile(r"^\s*\d+(?:-\d+)+\s*$")
+
+
+def _is_table_reference_pair(first: TextEntity, second: TextEntity) -> bool:
+    """表号前缀与连字符编号只能彼此成组，不能被正文或表名吸收。"""
+    return bool(
+        (
+            _TABLE_REFERENCE_PREFIX_RE.fullmatch(first.text or "")
+            and _TABLE_REFERENCE_NUMBER_RE.fullmatch(second.text or "")
+        )
+        or (
+            _TABLE_REFERENCE_PREFIX_RE.fullmatch(second.text or "")
+            and _TABLE_REFERENCE_NUMBER_RE.fullmatch(first.text or "")
+        )
+    )
+
+
 @dataclass(frozen=True)
 class LayoutRegion:
     key: str
@@ -89,6 +115,15 @@ def _compatible_for_region(
     barrier_index: Optional["BarrierIndex"],
 ) -> bool:
     if first.scope != second.scope:
+        return False
+    if is_independent_legend_label_pair(first, second):
+        return False
+    if (
+        _TABLE_REFERENCE_PREFIX_RE.fullmatch(first.text or "")
+        or _TABLE_REFERENCE_PREFIX_RE.fullmatch(second.text or "")
+    ) and not _is_table_reference_pair(first, second):
+        # “表”是独立表号前缀。即便它与“套管尺寸表：”同排，也不能把两个
+        # 不同锚点合成一个翻译单元；否则导出会清空右侧表号并把 8-3 补到正文。
         return False
     if (first.text or "").rstrip().endswith((":", "：")) and (
         second.text or ""
@@ -231,6 +266,28 @@ def _parse_groups(raw: str, allowed_ids: set[str]) -> Optional[List[List[str]]]:
     return groups if seen == allowed_ids else None
 
 
+def _group_is_connected(
+    members: Sequence[TextEntity],
+    barrier_index: Optional["BarrierIndex"],
+) -> bool:
+    """LLM 组必须靠组内成员自身连通，不能借未入组的邻近文字桥接。"""
+    if len(members) < 2:
+        return True
+    visited = {0}
+    pending = [0]
+    while pending:
+        current = pending.pop()
+        for index, candidate in enumerate(members):
+            if index in visited:
+                continue
+            if _compatible_for_region(
+                members[current], candidate, barrier_index
+            ):
+                visited.add(index)
+                pending.append(index)
+    return len(visited) == len(members)
+
+
 def _groups_respect_geometry(
     groups: Sequence[Sequence[str]],
     entities: Sequence[TextEntity],
@@ -239,12 +296,34 @@ def _groups_respect_geometry(
     by_id = {entity.handle: entity for entity in entities}
     for group in groups:
         members = [by_id[item] for item in group]
+        member_types = {member.entity_type for member in members}
+        # INSERT 实例 ATTRIB 使用世界坐标且只属于该实例；块定义 TEXT/ATTDEF
+        # 使用局部坐标并由所有引用共享，二者绝不能形成同一重建句段。
+        if "ATTRIB" in member_types and any(
+            entity_type != "ATTRIB" for entity_type in member_types
+        ):
+            return False
+        if not _group_is_connected(members, barrier_index):
+            return False
         colon_labels = [
             member for member in members
             if (member.text or "").rstrip().endswith((":", "："))
         ]
         if len(colon_labels) > 1:
             return False
+        table_reference_prefixes = [
+            member for member in members
+            if _TABLE_REFERENCE_PREFIX_RE.fullmatch(member.text or "")
+        ]
+        for prefix in table_reference_prefixes:
+            # 独立“表/Table”只能和连字符编号（8-3）组成表号。任何正文、
+            # 表名或说明文字混入都说明 LLM 跨锚点误合并，必须整组回退。
+            if any(
+                member is not prefix
+                and not _TABLE_REFERENCE_NUMBER_RE.fullmatch(member.text or "")
+                for member in members
+            ):
+                return False
         # 短冒号标签处在独立行时通常是标题或表名，不能与上方正文合并。
         # 例如“套管尺寸表：”若被并入前一段，导出时会随正文一起清空，
         # 最终表现为标题漏翻译。
@@ -272,6 +351,8 @@ def _groups_respect_geometry(
             return False
         for index, first in enumerate(members):
             for second in members[index + 1:]:
+                if is_independent_legend_label_pair(first, second):
+                    return False
                 if _barrier_between(first, second, barrier_index):
                     return False
     return True
@@ -282,7 +363,7 @@ async def _call_llm(
     barrier_index: Optional["BarrierIndex"],
 ) -> Optional[List[List[str]]]:
     settings = get_settings()
-    model = getattr(settings, "dwg_llm_layout_model", "openai/gpt-5-mini")
+    model = getattr(settings, "dwg_llm_layout_model", "openai/gpt-5.4-mini")
     provider = getattr(settings, "dwg_llm_layout_provider", "openrouter")
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},

@@ -230,7 +230,12 @@ def _run_project_file_zip_export_task(
                         release_transaction_before_render=True,
                     )
                 archive_name = _deduplicate_archive_name(exported_file.filename, used_names)
-                archive.writestr(archive_name, exported_file.content)
+                if getattr(exported_file, "path", None) is not None:
+                    archive.write(exported_file.path, archive_name)
+                elif exported_file.content is not None:
+                    archive.writestr(archive_name, exported_file.content)
+                else:
+                    raise ValueError(f"文件 {source_filename} 未生成导出内容。")
                 _set_project_file_zip_export_task_status(
                     task_id,
                     "running",

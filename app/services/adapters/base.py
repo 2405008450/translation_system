@@ -23,6 +23,8 @@ FORMAT_SIZE_LIMITS: Dict[str, int] = {
     ".xlsx": 100 * 1024 * 1024,  # 100 MB
     ".pdf": 100 * 1024 * 1024,   # 100 MB
     ".pptx": 200 * 1024 * 1024,  # 200 MB
+    ".ai": 2048 * 1024 * 1024,  # 2 GiB；AiAdapter 会优先使用运行时配置
+    ".psd": 100 * 1024 * 1024,   # 100 MB
     ".dita": 10 * 1024 * 1024,   # 10 MB
     ".ditamap": 10 * 1024 * 1024,# 10 MB
     ".xml": 10 * 1024 * 1024,    # 10 MB
@@ -105,12 +107,31 @@ class FormatAdapter(ABC):
         filename: str = "<unknown>",
         options: Optional[dict] = None,
     ) -> ParseResult:
-        """带文件大小验证和解析选项的解析。
-
-        默认适配器不使用额外选项；需要格式专属开关时由子类覆盖。
-        """
+        """带文件大小验证和解析选项的解析。"""
         self.validate_file_size(raw_bytes, filename)
         return self.parse(raw_bytes)
+
+    def validate_file_path_size(self, source_path: str | Path, filename: str = "<unknown>") -> None:
+        """不读取文件内容，仅通过 stat 校验 path-based 输入大小。"""
+        path = Path(source_path)
+        size = path.stat().st_size
+        max_size = self.get_max_file_size()
+        if size > max_size:
+            raise FileTooLargeError(filename=filename, size=size, max_size=max_size)
+
+    def parse_path_with_options(
+        self,
+        source_path: str | Path,
+        filename: str = "<unknown>",
+        options: Optional[dict] = None,
+    ) -> ParseResult:
+        """从磁盘路径解析；子类可覆盖以避免把大型文件整体读入内存。"""
+        self.validate_file_path_size(source_path, filename)
+        return self.parse_path(source_path)
+
+    def parse_path(self, source_path: str | Path) -> ParseResult:
+        """默认兼容实现；大型格式必须覆盖此方法提供真正的路径解析。"""
+        return self.parse(Path(source_path).read_bytes())
 
     @abstractmethod
     def parse(self, raw_bytes: bytes) -> ParseResult:

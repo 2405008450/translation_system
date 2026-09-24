@@ -29,6 +29,7 @@ import { useAuthStore } from '../stores/auth'
 import type { MergeView, WorkflowProgress } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import {
+  extractExportNotice,
   getExportOptionExtensionLabel,
   groupExportOptions,
   type FileExportOption,
@@ -429,7 +430,8 @@ async function toggleTaskExportMenu() {
   showTaskExportMenu.value = true
 }
 
-async function downloadTaskFileExport(row: ProjectRow, exportType: string) {
+/** 返回后端携带的导出提示（如部分画板已转为位图），无提示时为空串。 */
+async function downloadTaskFileExport(row: ProjectRow, exportType: string): Promise<string> {
   const filename = String(row.filename || 'export')
   const { data: task } = await http.post<FileExportTask>(
     `/file-records/${String(row.id)}/exports`,
@@ -445,6 +447,7 @@ async function downloadTaskFileExport(row: ProjectRow, exportType: string) {
     getTaskExportFallbackName(filename, exportType),
   )
   downloadBlob(response.data, downloadName)
+  return extractExportNotice(completedTask.message)
 }
 
 async function exportSelectedTasks(exportType: string) {
@@ -458,20 +461,35 @@ async function exportSelectedTasks(exportType: string) {
   pageError.value = ''
 
   try {
+    const notices: string[] = []
     for (let index = 0; index < rows.length; index += 1) {
       const current = rows[index]
       exportingTaskId.value = String(current.id)
       exportingTaskType.value = exportType
       taskExportProgress.value = 0
       taskExportMessage.value = `导出 ${index + 1}/${rows.length} 提交中。`
-      await downloadTaskFileExport(current, exportType)
+      const notice = await downloadTaskFileExport(current, exportType)
+      if (notice) {
+        notices.push(rows.length > 1 ? `${current.filename}：${notice}` : notice)
+      }
     }
     toast.success(getTaskExportSuccessMessage(exportType, rows.length))
+    if (notices.length > 0) {
+      toast.warn({
+        title: '导出结果为混合内容',
+        message: notices.join('\n'),
+        duration: 0,
+      })
+    }
   } catch (error) {
-    pageError.value = getErrorMessage(
+    const message = getErrorMessage(
       error,
       exportType === 'source' ? '源文件导出失败。' : '导出失败。',
     )
+    pageError.value = message
+    // 导出错误可能包含较长的处置建议（如 AI 转 SVG 超限），
+    // 使用常驻 toast 弹窗，避免被顶部单行红字截断。
+    toast.error({ title: '导出失败', message, duration: 0 })
   } finally {
     clearTaskExportPollTimer()
     exportingTaskId.value = ''

@@ -2356,6 +2356,8 @@ body.modal-open {
   color: var(--text-secondary);
   font-size: 13px;
   line-height: 1.55;
+  /* 批量导出的多条提示以换行拼接，需要保留换行但仍折叠多余空格。 */
+  white-space: pre-line;
 }
 
 .toast__close {

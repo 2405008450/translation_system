@@ -37,6 +37,30 @@ def _sanitize_staging_basename(filename: str) -> str:
     return sanitized[:200] or "source.txt"
 
 
+def get_seekable_stream_size(stream: BinaryIO) -> int | None:
+    """返回可 seek 流的总字节数；不可 seek 时返回 None 并由流式计数兜底。"""
+
+    try:
+        original_position = stream.tell()
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+    size: int | None = None
+    try:
+        stream.seek(0, 2)
+        size = int(stream.tell())
+    except (AttributeError, OSError, TypeError, ValueError):
+        size = None
+
+    try:
+        stream.seek(original_position)
+    except (AttributeError, OSError, TypeError, ValueError):
+        # 无法恢复调用方游标时，不能声称预检成功，也不擅自把游标移到 0。
+        return None
+
+    return max(size, 0) if size is not None else None
+
+
 def _resolve_staged_file_path(path_value: str) -> Path:
     file_path = Path(path_value).resolve()
     root = ensure_import_task_root().resolve()
@@ -85,6 +109,45 @@ def stage_import_file_streams(
     if total_limit is None:
         total_limit = settings.upload_max_total_size_mb * 1024 * 1024
     resolve_max_size = max_size_resolver or get_max_upload_size_bytes
+
+    # FastAPI 的 UploadFile 通常是可 seek 的 SpooledTemporaryFile。先用 seek/tell
+    # O(1) 获取真实大小，可避免超大文件先被复制到格式上限才收到 413。
+    known_total_size = 0
+    known_ai_size = 0
+    for filename, stream in files:
+        original_filename = filename or "source.txt"
+        known_size = get_seekable_stream_size(stream)
+        if known_size is None:
+            continue
+        if known_size <= 0:
+            raise UploadLimitError(f"文件 {original_filename} 为空。", status_code=400)
+        max_size = resolve_max_size(original_filename)
+        if known_size > max_size:
+            max_mb = round(max_size / (1024 * 1024), 2)
+            raise UploadLimitError(
+                f"文件 {original_filename} 超过大小限制（{max_mb} MB）。",
+                status_code=413,
+            )
+        known_total_size += known_size
+        if Path(original_filename).suffix.lower() == ".ai":
+            known_ai_size += known_size
+        if known_total_size > total_limit:
+            max_total_mb = round(total_limit / (1024 * 1024), 2)
+            raise UploadLimitError(
+                f"上传总大小超过限制（{max_total_mb} MB）。",
+                status_code=413,
+            )
+
+    if known_ai_size:
+        reserve_bytes = max(int(settings.ai_min_free_disk_mb), 1) * 1024 * 1024
+        free_bytes = shutil.disk_usage(ensure_import_task_root()).free
+        required_bytes = known_ai_size + reserve_bytes
+        if free_bytes < required_bytes:
+            required_gib = round(required_bytes / (1024 ** 3), 2)
+            raise UploadLimitError(
+                f"磁盘空间不足，暂存 AI 至少需要 {required_gib} GiB 可用空间。",
+                status_code=507,
+            )
 
     task_dir = get_import_task_staging_dir(task_id)
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -143,6 +206,34 @@ def stage_import_file_payload(
     raw_bytes: bytes,
 ) -> dict[str, str]:
     return stage_import_file_payloads(task_id, [(filename, raw_bytes)])[0]
+
+
+def get_import_file_size(file_payload: dict[str, Any]) -> int:
+    """获取暂存 payload 大小，不读取完整文件内容。"""
+
+    content = file_payload.get("content")
+    if isinstance(content, (bytes, bytearray)):
+        return len(content)
+
+    path_value = file_payload.get("path")
+    if not path_value:
+        raise ValueError("导入文件缺少 content 或 path。")
+    file_path = _resolve_staged_file_path(str(path_value))
+    if not file_path.is_file():
+        raise FileNotFoundError(f"导入暂存文件不存在：{file_path}")
+    return file_path.stat().st_size
+
+
+def get_import_file_path(file_payload: dict[str, Any]) -> Path:
+    """返回受导入暂存根目录约束的文件路径，不读取文件内容。"""
+
+    path_value = file_payload.get("path")
+    if not path_value:
+        raise ValueError("导入文件缺少 path。")
+    file_path = _resolve_staged_file_path(str(path_value))
+    if not file_path.is_file():
+        raise FileNotFoundError(f"导入暂存文件不存在：{file_path}")
+    return file_path
 
 
 def read_import_file_bytes(file_payload: dict[str, Any]) -> bytes:

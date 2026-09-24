@@ -40,6 +40,20 @@ EXPORT_OPTIONS = {
         extension="",  # 使用原扩展名
         mime_type="",  # 使用原 MIME 类型
     ),
+    "translated_pdf": ExportOption(
+        id="translated_pdf",
+        name="翻译后 PDF",
+        description="将 PDF-compatible AI 中的译文写回版面并导出为 PDF",
+        extension=".pdf",
+        mime_type="application/pdf",
+    ),
+    "translated_svg": ExportOption(
+        id="translated_svg",
+        name="翻译后 SVG",
+        description="将 PDF-compatible AI 中的译文写回版面并导出为 SVG",
+        extension=".svg",
+        mime_type="image/svg+xml",
+    ),
     "bilingual": ExportOption(
         id="bilingual",
         name="双语文件",
@@ -154,6 +168,7 @@ FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
         "tmx",
         "xliff",
     ],
+    ".ai": ["translated_pdf", "translated_svg", "bilingual_docx", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
     ".xlsx": ["original", "bilingual_excel_original", "bilingual_docx", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
 
     # 纯文本
@@ -191,6 +206,7 @@ FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
     # 工程/设计文件
     ".dxf": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
     ".dwg": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".psd": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
     ".idml": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
     ".mif": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
 

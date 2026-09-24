@@ -22,6 +22,7 @@ htmlcov
 coverage
 
 frontend/node_modules
+psd_runtime/node_modules
 frontend/dist
 frontend/.vite
 frontend/coverage

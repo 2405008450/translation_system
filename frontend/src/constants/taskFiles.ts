@@ -22,6 +22,8 @@ export const supportedTaskExtensions = [
   '.ditamap',
   '.xml',
   '.svg',
+  '.ai',
+  '.psd',
   '.sdlxliff',
   '.txml',
   '.dxf',

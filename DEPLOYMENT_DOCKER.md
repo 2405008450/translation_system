@@ -6,13 +6,15 @@
 
 ```text
 公网 :80 (nginx) ──► app:19013
-                    ├── import-worker / worker / auto-tm-worker / segment-sync-worker / pretranslation-worker
+                    ├── import-worker / worker / auto-tm-worker / segment-sync-worker / pretranslation-worker / ai-worker
                     ├── postgres / pgbouncer / redis / languagetool
                     └── 共享卷：file_records / export_tasks / import_tasks
 
 可选 USE_NGINX=0：
 公网 :80 (app 直连) ──► app:19013
 ```
+
+其中 `ai-worker` 专门消费 `arq:ai` 队列，处理超过 `AI_INLINE_MAX_SIZE_MB`（默认 100 MB）的 Adobe Illustrator (`.ai`) 文件；未部署该服务时，大型 AI 上传会因“ai-worker 不可用”被拒绝。
 
 ## 1. 服务器准备
 
@@ -58,6 +60,20 @@ nano .env.prod
 
 nginx 的 `client_max_body_size` 在 `docker/nginx/default.conf`，默认 **500m**，需与 `UPLOAD_MAX_TOTAL_SIZE_MB` 保持一致。
 
+**大型 AI 与 OCR 相关（可选，均有默认值）：**
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `AI_MAX_FILE_SIZE_MB` | 2048 | 单个 AI 文件大小上限 |
+| `AI_INLINE_MAX_SIZE_MB` | 100 | 小于该值走 web 进程内联解析，超出投递到 `arq:ai` 队列 |
+| `AI_MIN_FREE_DISK_MB` | 8192 | 处理 AI 前所需的最少可用磁盘空间（MB） |
+| `AI_WORKER_JOB_TIMEOUT_SECONDS` | 1800 | `ai-worker` 单任务硬超时 |
+| `AI_WORKER_MEMORY_LIMIT_MB` | 4096 | `ai-worker` 容器内存上限（对应 compose `mem_limit`） |
+| `AI_OCR_ENABLED` | true | 对 Illustrator 转曲文字启用本地 PaddleOCR 补充提取 |
+| `AI_OCR_SCALE` | 3.0 | OCR 渲染分辨率倍数（越高越准但越慢） |
+| `AI_OCR_MIN_CONFIDENCE` | 0.85 | OCR 置信度阈值，低于该值的识别结果丢弃 |
+| `AI_OCR_MAX_PIXELS` | 12000000 | 单画板渲染像素数上限，超出会自动降采样 |
+
 **队列并发（资源充足时可调）：**
 
 | 变量 | 推荐起点 | 说明 |
@@ -68,6 +84,7 @@ nginx 的 `client_max_body_size` 在 `docker/nginx/default.conf`，默认 **500m
 | `ARQ_SEGMENT_SYNC_MAX_JOBS` | 1 | 项目重复句段同步队列并发，建议先保持 1 |
 | `ARQ_PRETRANSLATION_MAX_JOBS` | 2 | 项目预翻译 run 队列并发 |
 | `PRETRANSLATION_RUN_FILE_CONCURRENCY` | 2 | 单个预翻译 run 内同时处理的文件数 |
+| `ARQ_AI_MAX_JOBS` | 1 | 大型 AI (`arq:ai`) 队列并发，建议保持 1，单任务内存占用可达数 GiB |
 | `AUTO_TM_OUTBOX_MAX_BATCHES_PER_RUN` | 5 | 单个 auto-TM job 最多处理多少批已确认句段，每批 200 条 |
 | `AUTO_TM_REMATCH_MAX_FILES_PER_RUN` | 1 | 单个 auto-TM job 最多刷新多少个文件的未确认句段匹配 |
 | `LLM_MAX_CONCURRENCY` | 3 | 单个文件 LLM 阶段的模型请求并发 |
@@ -135,8 +152,30 @@ git pull
 scripts/deploy_prod.sh restart
 # 或完整重建：
 scripts/deploy_prod.sh build
-docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml up -d --force-recreate app import-worker worker auto-tm-worker segment-sync-worker pretranslation-worker nginx
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml up -d --force-recreate app import-worker worker auto-tm-worker segment-sync-worker pretranslation-worker ai-worker nginx
 ```
+
+### 大型 AI 处理服务 (`ai-worker`)
+
+`docker-compose.prod.yml` 中新增 `ai-worker` 容器，作用：
+
+- 独立消费 `arq:ai` 队列，专门处理大型 AI 文件的解析（PDF 兼容层 + 转曲文字 OCR）。
+- 与 `app` 共享 `file_records / export_tasks / import_tasks / logs` 卷。
+- 默认 `mem_limit: 4g`、`ARQ_AI_MAX_JOBS=1`、`AI_WORKER_JOB_TIMEOUT_SECONDS=1800`。
+
+启动方式（Compose 会自动拉起）：
+
+```bash
+docker compose --env-file .env.prod -f docker-compose.prod.yml up -d ai-worker
+```
+
+本地开发不使用 Docker 时，先启动 Redis，再运行：
+
+```powershell
+.\.venv\Scripts\arq.exe app.routers.api.AiWorkerSettings
+```
+
+未启动 `ai-worker` 时，超过 `AI_INLINE_MAX_SIZE_MB` 的 AI 上传会返回“ai-worker 不可用”并中止；小于该阈值的 AI 仍由 `app` 内联处理。
 
 ## 4. 验证
 
@@ -146,7 +185,7 @@ scripts/deploy_prod.sh health
 curl http://127.0.0.1/api/health
 curl http://<公网IP>/
 
-docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml logs --tail=100 app import-worker worker auto-tm-worker segment-sync-worker pretranslation-worker nginx
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml logs --tail=100 app import-worker worker auto-tm-worker segment-sync-worker pretranslation-worker ai-worker nginx
 ```
 
 浏览器访问（将 IP 换成你的服务器）：
@@ -184,7 +223,7 @@ HTTPS：当前仅 HTTP。接入 TLS 时可挂载证书到 nginx，或使用云�
 
 ## 7. 数据恢复
 
-1. 停 app / import-worker / worker / auto-tm-worker / segment-sync-worker / pretranslation-worker / nginx
+1. 停 app / import-worker / worker / auto-tm-worker / segment-sync-worker / pretranslation-worker / ai-worker / nginx
 2. 备份 `postgres_data`、`app_file_storage`、`app_export_tasks`、`app_import_tasks`
 3. 恢复 PostgreSQL dump 与文件卷
 4. 启动并检查 `/api/health`
@@ -202,17 +241,17 @@ git pull
 
 docker compose --env-file .env.prod -f docker-compose.prod.yml build app
 docker compose --env-file .env.prod -f docker-compose.prod.yml up --force-recreate db-migrate
-docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml up -d --force-recreate app import-worker worker auto-tm-worker segment-sync-worker pretranslation-worker nginx
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml up -d --force-recreate app import-worker worker auto-tm-worker segment-sync-worker pretranslation-worker ai-worker nginx
 ```
 
-**必须重建 app + import-worker + worker + auto-tm-worker + segment-sync-worker + pretranslation-worker**，否则新卷 `app_import_tasks` 不会挂载，ARQ 导入会报「暂存文件不存在」。
+**必须重建 app + import-worker + worker + auto-tm-worker + segment-sync-worker + pretranslation-worker + ai-worker**，否则新卷 `app_import_tasks` 不会挂载，ARQ 导入会报「暂存文件不存在」；未拉起 `ai-worker` 时大型 AI 上传会被拒绝。
 
 如同时叠加 Mihomo 代理，可使用完整 Compose 文件组合：
 
 ```bash
 sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml -f docker-compose.nginx.yml build app
 sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml -f docker-compose.nginx.yml up --force-recreate db-migrate
-sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml -f docker-compose.nginx.yml up -d --force-recreate app import-worker worker auto-tm-worker segment-sync-worker pretranslation-worker nginx
+sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml -f docker-compose.nginx.yml up -d --force-recreate app import-worker worker auto-tm-worker segment-sync-worker pretranslation-worker ai-worker nginx
 ```
 
 ## 10. 常见问题
@@ -235,3 +274,10 @@ sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-co
 **nginx 改端口**
 
 - 设置 `NGINX_HTTP_PORT`，例如 `NGINX_HTTP_PORT=19080 scripts/deploy_prod.sh up`。
+
+**大型 AI 上传返回「ai-worker 不可用 / 大型 AI 专用处理队列不可用」**
+
+- 确认 `ai-worker` 容器已启动：`docker compose --env-file .env.prod -f docker-compose.prod.yml ps ai-worker`
+- 查看日志：`docker logs -f ai-translation-ai-worker`
+- 检查 Redis 连通性与 `arq:ai` 队列：`sudo docker exec ai-translation-redis redis-cli ZCARD arq:ai`
+- `ai-worker` 被 OOM 时提高 `AI_WORKER_MEMORY_LIMIT_MB` 或改用更大规格宿主机
