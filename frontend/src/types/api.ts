@@ -262,6 +262,7 @@ export type DocumentParseMode = 'full' | 'body_only'
 export type DocxNumberingLocalization = 'auto' | 'preserve'
 
 export interface DocumentParseOptions {
+  segmentation_profile?: 'legacy' | 'en_docx_v1'
   include_headers_footers: boolean
   include_footnotes_endnotes: boolean
   include_comments: boolean

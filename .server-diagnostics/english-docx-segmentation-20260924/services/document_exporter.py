@@ -1061,8 +1061,6 @@ def _docx_origin_key(segment: Any) -> tuple | None:
     if not isinstance(metadata, dict):
         return None
     mapping = metadata.get("docx_segmentation") or {}
-    if not isinstance(mapping, dict):
-        return None
     if mapping.get("profile") != "en_docx_v1":
         return None
     sources = mapping.get("sources") or []

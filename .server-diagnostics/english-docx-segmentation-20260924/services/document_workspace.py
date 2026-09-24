@@ -2305,8 +2305,6 @@ def _collect_inline_content(
         return [InlineFragment(display_text="\t", source_text="\t", css=inherited_css, href=hyperlink)], [], []
 
     if node.tag == _qn("w", "lastRenderedPageBreak"):
-        if story.parse_options.get("segmentation_profile") == "en_docx_v1":
-            return [], [], []
         return [PAGE_BREAK_FRAGMENT], [], []
 
     if node.tag in {_qn("w", "br"), _qn("w", "cr")}:
