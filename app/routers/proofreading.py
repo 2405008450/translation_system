@@ -442,20 +442,26 @@ def get_file_proofreading_baselines(
             .order_by(TranslationReviewReport.created_at.desc())
             .first()
         )
-        if latest_report is not None:
-            review_items = (
-                db.query(TranslationReviewReportItem)
-                .filter(
-                    TranslationReviewReportItem.report_id == latest_report.id,
-                    TranslationReviewReportItem.file_record_id == file_record_id,
-                    TranslationReviewReportItem.segment_id.is_not(None),
-                )
-                .order_by(TranslationReviewReportItem.created_at.desc())
-                .all()
+        # 每个句段取跨轮次中最新的一条记录：仅重试失败项或被取消的运行只会产生部分
+        # 报告，不能让此前成功修改的句段丢失修改理由。已解决的失败项不再展示。
+        review_items = (
+            db.query(TranslationReviewReportItem)
+            .join(TranslationReviewReport, TranslationReviewReport.id == TranslationReviewReportItem.report_id)
+            .filter(
+                TranslationReviewReport.proofreading_batch_id == binding.batch_id,
+                TranslationReviewReportItem.file_record_id == file_record_id,
+                TranslationReviewReportItem.segment_id.is_not(None),
+                TranslationReviewReportItem.status != "resolved",
             )
-            for review_item in review_items:
-                if review_item.segment_id is not None:
-                    review_items_by_segment.setdefault(review_item.segment_id, review_item)
+            .order_by(
+                TranslationReviewReport.created_at.desc(),
+                TranslationReviewReportItem.created_at.desc(),
+            )
+            .all()
+        )
+        for review_item in review_items:
+            if review_item.segment_id is not None:
+                review_items_by_segment.setdefault(review_item.segment_id, review_item)
         latest_llm_segment = (
             db.query(Segment)
             .filter(

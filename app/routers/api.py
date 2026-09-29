@@ -12271,28 +12271,26 @@ def _apply_segment_scope_filter(query, scope: str):
             != func.coalesce(ProofreadingSegmentBaseline.original_target_text, ""),
         )
     if normalized_scope == "proofreading_failed":
-        latest_report_id = (
-            select(TranslationReviewReport.id)
+        # 失败项在后续任意一轮成功处理后会被置为 resolved，因此这里只看仍为 open 的失败记录。
+        has_open_generation_error = exists(
+            select(1)
+            .select_from(TranslationReviewReportItem)
+            .join(
+                TranslationReviewReport,
+                TranslationReviewReport.id == TranslationReviewReportItem.report_id,
+            )
             .where(
+                TranslationReviewReportItem.segment_id == Segment.id,
+                TranslationReviewReportItem.category_key == "generation_error",
+                TranslationReviewReportItem.status == "open",
                 TranslationReviewReport.proofreading_batch_id
                 == ProofreadingSegmentBaseline.batch_id,
-            )
-            .order_by(TranslationReviewReport.created_at.desc())
-            .limit(1)
-            .correlate(ProofreadingSegmentBaseline)
-            .scalar_subquery()
-        )
-        has_latest_generation_error = exists(
-            select(1).where(
-                TranslationReviewReportItem.segment_id == Segment.id,
-                TranslationReviewReportItem.report_id == latest_report_id,
-                TranslationReviewReportItem.category_key == "generation_error",
             )
         )
         return query.join(
             ProofreadingSegmentBaseline,
             ProofreadingSegmentBaseline.segment_id == Segment.id,
-        ).filter(has_latest_generation_error)
+        ).filter(has_open_generation_error)
     return query
 
 

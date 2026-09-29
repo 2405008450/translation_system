@@ -500,11 +500,29 @@ const proofreadingGenerationButtonLabel = computed(() => {
   return '开始 LLM 校对'
 })
 
+const PROOFREADING_OPENROUTER_MODELS = [
+  { value: 'google/gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
+  { value: 'google/gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
+  { value: 'google/gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
+  { value: 'google/gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
+  { value: 'google/gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro Preview' },
+  { value: 'google/gemini-3-flash-preview', label: 'Gemini 3 Flash Preview' },
+]
+const PROOFREADING_DEFAULT_OPENROUTER_MODEL = 'google/gemini-3.7-flash'
+
+// 批次里保存过的历史模型若不在预置列表中，也要保留为可选项，避免下拉框显示空白。
+const proofreadingOpenRouterModelOptions = computed(() => {
+  const current = proofreadingGenerationDraft.model
+  return current && !PROOFREADING_OPENROUTER_MODELS.some((option) => option.value === current)
+    ? [...PROOFREADING_OPENROUTER_MODELS, { value: current, label: current }]
+    : PROOFREADING_OPENROUTER_MODELS
+})
+
 function handleProofreadingProviderChange() {
   proofreadingGenerationDraft.model = proofreadingGenerationDraft.provider === 'deepseek'
     ? 'deepseek-chat'
     : proofreadingGenerationDraft.provider === 'openrouter'
-      ? 'google/gemini-3-flash-preview'
+      ? PROOFREADING_DEFAULT_OPENROUTER_MODEL
       : ''
 }
 
@@ -520,7 +538,8 @@ function openProofreadingGenerateDialog() {
   proofreadingGenerationDraft.provider = ['auto', 'deepseek', 'openrouter'].includes(context.provider)
     ? context.provider as ProofreadingProvider
     : 'auto'
-  proofreadingGenerationDraft.model = context.model || ''
+  proofreadingGenerationDraft.model = context.model
+    || (proofreadingGenerationDraft.provider === 'openrouter' ? PROOFREADING_DEFAULT_OPENROUTER_MODEL : '')
   proofreadingGenerationDraft.userInstructions = context.user_instructions || ''
   proofreadingGenerationDraft.retryScope = context.failed_segments > 0 ? 'failed_only' : 'all'
   proofreadingGenerateError.value = ''
@@ -13478,7 +13497,15 @@ onBeforeRouteLeave(async () => {
             >
               <option v-if="proofreadingGenerationDraft.provider === 'auto'" value="">自动选择默认模型</option>
               <option v-if="proofreadingGenerationDraft.provider === 'deepseek'" value="deepseek-chat">DeepSeek Chat</option>
-              <option v-if="proofreadingGenerationDraft.provider === 'openrouter'" value="google/gemini-3-flash-preview">Gemini 3 Flash Preview</option>
+              <template v-if="proofreadingGenerationDraft.provider === 'openrouter'">
+                <option
+                  v-for="option in proofreadingOpenRouterModelOptions"
+                  :key="option.value"
+                  :value="option.value"
+                >
+                  {{ option.label }}
+                </option>
+              </template>
             </select>
           </label>
         </div>
@@ -13491,7 +13518,7 @@ onBeforeRouteLeave(async () => {
             <input v-model="proofreadingGenerationDraft.retryScope" type="radio" value="all">
             <span>
               <strong>全部可校对句段</strong>
-              <small>重新处理当前批次中所有尚未确认的句段。</small>
+              <small>重新处理当前批次中所有尚未确认的句段；已人工修改但未确认的句段也会被重新校对，确认后可避免被覆盖。</small>
             </span>
           </label>
           <label

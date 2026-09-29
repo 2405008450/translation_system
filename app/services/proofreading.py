@@ -44,8 +44,12 @@ from app.services.file_record_service import load_file_record_source, sync_file_
 from app.services.glossary_matcher import build_glossary_matches_by_text
 from app.services.language_pairs import LANGUAGE_LABELS, normalize_language_code, require_language_pair
 from app.services.llm_service import (
+    LINE_BREAK_VALIDATION_ERROR_MESSAGE,
     LLMResponseValidationError,
     LLMTranslationTask,
+    _decode_line_break_placeholders,
+    _encode_line_break_placeholders,
+    _line_break_count,
     _validate_translation_output,
     request_chat_completion,
 )
@@ -58,6 +62,9 @@ logger = logging.getLogger(__name__)
 
 PROOFREADING_BATCH_SIZE = 20
 PROOFREADING_BATCH_CHAR_LIMIT = 24000
+PROOFREADING_REVIEW_ATTEMPTS = 2
+GENERATION_ERROR_CATEGORY = "generation_error"
+GENERATION_ERROR_RESOLVED_STATUS = "resolved"
 PROOFREADING_SOURCE = "llm_review"
 IMPORTED_TRANSLATION_SOURCE = "imported_translation"
 
@@ -118,7 +125,7 @@ def _finalize_canceled_batch(
     for file_id in file_ids or []:
         sync_file_record_status(db, file_id)
     _refresh_batch_change_stats(db, batch)
-    batch.failed_segments = failed_count
+    batch.failed_segments = max(failed_count, len(get_latest_generation_error_segment_ids(db, batch.id)))
     batch.status = "canceled"
     batch.message = "校对已取消。"
     batch.finished_at = _utcnow_naive()
@@ -635,7 +642,9 @@ def _build_prompt(
 ) -> str:
     items = []
     for seq, group in enumerate(groups):
-        variants = "\n".join(f"    - {value}" for value in group["variants"])
+        variants = "\n".join(
+            f"    - {_encode_line_break_placeholders(value)}" for value in group["variants"]
+        )
         glossary = "\n".join(
             f"    - {item['source_text']} → {item['target_text']}"
             for item in group.get("glossary_references", [])
@@ -651,7 +660,7 @@ def _build_prompt(
             )
         source_label = (
             "（译文侧新增，无对应原文；只检查目标语表达，不判断翻译准确性）"
-            if group.get("translation_only") else group["source_text"]
+            if group.get("translation_only") else _encode_line_break_placeholders(group["source_text"])
         )
         items.append(
             f"[{seq}] <sid={group['sid']}>\n"
@@ -670,8 +679,48 @@ def _build_prompt(
         "confidence 只能是 high/medium/low。不得省略任何输入项。\n\n"
         "对于标记为‘译文侧新增、无对应原文’的项目，只校对目标语语法、术语、流畅度和格式，"
         "不得补写、删减或声称核验了翻译准确性。\n\n"
+        "版式换行在原文和译文中以 ⟦LB_1⟧、⟦LB_2⟧ 等占位符表示。reviewed_target_text 必须在与现有译文相同的位置"
+        "原样保留全部 ⟦LB_n⟧ 占位符（数量和顺序一致），不得改写为真实换行、删除或合并；"
+        "若现有译文不含占位符，则输出也不得包含。\n\n"
         + "\n\n".join(items)
     )
+
+
+def _validate_reviewed_text(
+    group: dict[str, Any],
+    text_value: str,
+    *,
+    source_language: str,
+    target_language: str,
+) -> None:
+    """校验校对结果。
+
+    校对对象是已有译文，其版式换行可能与原文不同（如多行原文被译成一段），
+    因此换行以现有译文为准，而不是套用翻译链路“与原文换行数相同”的规则。
+    """
+    try:
+        _validate_translation_output(
+            LLMTranslationTask(
+                sentence_id=group["sid"],
+                status="none",
+                source_text=group["source_text"],
+                source_language=source_language,
+                target_language=target_language,
+            ),
+            text_value,
+        )
+    except LLMResponseValidationError as exc:
+        if str(exc) != LINE_BREAK_VALIDATION_ERROR_MESSAGE:
+            raise
+    _validate_target_language_script(text_value, target_language)
+    expected_breaks = {_line_break_count(value.strip()) for value in group["variants"]}
+    actual_breaks = _line_break_count(text_value)
+    if expected_breaks and actual_breaks not in expected_breaks:
+        expected_text = "/".join(str(value) for value in sorted(expected_breaks))
+        raise LLMResponseValidationError(
+            f"校对译文的换行数（{actual_breaks}）与现有译文（{expected_text}）不一致，"
+            "请按 ⟦LB_n⟧ 占位符原样保留换行。"
+        )
 
 
 async def _review_group_batch(
@@ -684,13 +733,32 @@ async def _review_group_batch(
     provider: str,
     model: str | None,
 ) -> tuple[dict[str, dict[str, Any]], str, str]:
-    prompt = _build_prompt(groups, source_language, target_language, rules_text, user_instructions)
-    expected = {index: group["sid"] for index, group in enumerate(groups)}
-    last_error = "LLM 返回格式无效。"
-    for attempt in range(2):
+    """校对一批原文组。
+
+    返回 sid -> 结果。个别项校验失败时不拖累整批：失败项以 {"error": 原因} 返回，
+    仅在整批都没拿到模型响应时才抛出异常。第二轮只重试尚未成功的项。
+    """
+    results: dict[str, dict[str, Any]] = {}
+    errors: dict[str, str] = {}
+    pending = list(groups)
+    request_error = "LLM 返回格式无效。"
+    got_completion = False
+    actual_provider = provider
+    actual_model = model or ""
+
+    for attempt in range(PROOFREADING_REVIEW_ATTEMPTS):
+        if not pending:
+            break
+        prompt = _build_prompt(pending, source_language, target_language, rules_text, user_instructions)
+        hint = ""
+        if attempt:
+            previous_errors = "; ".join(
+                dict.fromkeys(errors.get(group["sid"]) or request_error for group in pending)
+            )
+            hint = f"\n\n上次错误：{previous_errors}，请修正后重试。"
         messages = [
             {"role": "system", "content": "你是资深本地化校对专家。严格返回 JSON，不要解释。"},
-            {"role": "user", "content": prompt + (f"\n\n上次错误：{last_error}，请修正后重试。" if attempt else "")},
+            {"role": "user", "content": prompt + hint},
         ]
         try:
             async with llm_gate():
@@ -702,75 +770,126 @@ async def _review_group_batch(
                     allow_fallback=provider == "auto",
                 )
         except Exception as exc:  # noqa: BLE001
-            last_error = str(exc)
+            request_error = str(exc)
             continue
-        parsed = _safe_json_array(completion.content)
-        results: dict[str, dict[str, Any]] = {}
-        validation_errors: list[str] = []
-        for item in parsed:
-            try:
-                seq = int(item.get("seq"))
-            except (TypeError, ValueError):
-                continue
+        got_completion = True
+        actual_provider = completion.provider
+        actual_model = completion.model
+        pending_by_sid = {group["sid"]: group for group in pending}
+        for item in _safe_json_array(completion.content):
             sid = str(item.get("sid") or "")
-            if expected.get(seq) != sid or not isinstance(item.get("changed"), bool):
-                continue
-            text_value = str(item.get("reviewed_target_text") or "").strip()
-            group = groups[seq]
+            group = pending_by_sid.get(sid)
+            if group is None:
+                try:
+                    seq = int(item.get("seq"))
+                except (TypeError, ValueError):
+                    continue
+                if not 0 <= seq < len(pending):
+                    continue
+                group = pending[seq]
+                sid = group["sid"]
+            text_value = _decode_line_break_placeholders(str(item.get("reviewed_target_text") or "")).strip()
             try:
-                _validate_translation_output(
-                    LLMTranslationTask(
-                        sentence_id=sid,
-                        status="none",
-                        source_text=group["source_text"],
-                        source_language=source_language,
-                        target_language=target_language,
-                    ),
+                _validate_reviewed_text(
+                    group,
                     text_value,
+                    source_language=source_language,
+                    target_language=target_language,
                 )
-                _validate_target_language_script(text_value, target_language)
             except LLMResponseValidationError as exc:
-                validation_errors.append(f"{sid}: {exc}")
+                errors[sid] = str(exc)
                 continue
             confidence = str(item.get("confidence") or "medium").lower()
             if confidence not in {"high", "medium", "low"}:
                 confidence = "medium"
             results[sid] = {
                 "reviewed_target_text": text_value,
-                "changed": item["changed"],
+                "changed": item["changed"] if isinstance(item.get("changed"), bool) else None,
                 "reason": str(item.get("reason") or "")[:1000],
                 "category": str(item.get("category") or "校对改写")[:40],
                 "confidence": confidence,
             }
-        if len(results) == len(groups):
-            return results, completion.provider, completion.model
-        last_error = "; ".join(validation_errors) or f"仅返回 {len(results)}/{len(groups)} 项有效结果。"
-    raise ValueError(last_error)
+            errors.pop(sid, None)
+        pending = [group for group in pending if group["sid"] not in results]
+
+    if not got_completion:
+        raise ValueError(request_error)
+    for group in pending:
+        results[group["sid"]] = {"error": errors.get(group["sid"]) or "模型未返回该项的有效校对结果。"}
+    return results, actual_provider, actual_model
 
 
 def get_latest_generation_error_segment_ids(db: Session, batch_id: UUID) -> set[UUID]:
-    """返回批次最新一轮校对中仍然生成失败的句段。"""
-    latest_report = (
-        db.query(TranslationReviewReport)
-        .filter(TranslationReviewReport.proofreading_batch_id == batch_id)
-        .order_by(TranslationReviewReport.created_at.desc())
-        .first()
-    )
-    if latest_report is None:
-        return set()
+    """返回批次内仍未解决的生成失败句段。
+
+    失败项在被后续任意一轮成功处理时会置为 resolved，因此“仅重试失败项”或被取消的
+    部分运行不会让更早的失败记录丢失。
+    """
     return {
         segment_id
         for (segment_id,) in (
             db.query(TranslationReviewReportItem.segment_id)
+            .join(TranslationReviewReport, TranslationReviewReport.id == TranslationReviewReportItem.report_id)
             .filter(
-                TranslationReviewReportItem.report_id == latest_report.id,
-                TranslationReviewReportItem.category_key == "generation_error",
+                TranslationReviewReport.proofreading_batch_id == batch_id,
+                TranslationReviewReportItem.category_key == GENERATION_ERROR_CATEGORY,
+                TranslationReviewReportItem.status == "open",
                 TranslationReviewReportItem.segment_id.is_not(None),
             )
             .all()
         )
         if segment_id is not None
     }
+
+
+def _add_generation_error_items(
+    db: Session,
+    batch: ProofreadingBatch,
+    report: TranslationReviewReport,
+    groups: list[dict[str, Any]],
+    error_text: str,
+) -> int:
+    count = 0
+    for group in groups:
+        for baseline, segment in group["segments"]:
+            db.add(TranslationReviewReportItem(
+                report_id=report.id,
+                project_id=batch.project_id,
+                file_record_id=segment.file_record_id,
+                segment_id=segment.id,
+                sentence_id=segment.sentence_id,
+                file_name=segment.file_record.filename,
+                display_index=segment.display_index,
+                sequence_index=segment.sequence_index,
+                category_key=GENERATION_ERROR_CATEGORY,
+                severity="error",
+                origin="ai",
+                source_text=segment.source_text,
+                target_text=baseline.original_target_text,
+                reason=error_text,
+                confidence="low",
+                apply_mode="manual",
+                locate_status="invalid",
+                original_target_text=baseline.original_target_text,
+                applied=False,
+                status="open",
+                block_index=segment.block_index,
+                row_index=segment.row_index,
+                cell_index=segment.cell_index,
+            ))
+            count += 1
+    return count
+
+
+def _resolve_generation_errors(db: Session, segment_ids: list[UUID], *, keep_report_id: UUID) -> None:
+    if not segment_ids:
+        return
+    db.query(TranslationReviewReportItem).filter(
+        TranslationReviewReportItem.segment_id.in_(segment_ids),
+        TranslationReviewReportItem.category_key == GENERATION_ERROR_CATEGORY,
+        TranslationReviewReportItem.status == "open",
+        TranslationReviewReportItem.report_id != keep_report_id,
+    ).update({"status": GENERATION_ERROR_RESOLVED_STATUS}, synchronize_session=False)
 
 
 async def generate_batch(
@@ -839,6 +958,7 @@ async def generate_batch(
         bindings_by_language[binding.target_language].append(binding)
 
     total_groups = 0
+    loaded_versions: dict[UUID, int] = {}
     grouped_by_language: dict[str, list[dict[str, Any]]] = {}
     for target_language, language_bindings in bindings_by_language.items():
         if _batch_cancel_requested(db, batch.id):
@@ -867,6 +987,7 @@ async def generate_batch(
                 continue
             if not normalize_text(baseline.original_target_text) or segment.status == "confirmed":
                 continue
+            loaded_versions[segment.id] = int(segment.version or 1)
             source_hash = segment.source_hash or build_source_hash(segment.source_text)
             try:
                 segment_metadata = json.loads(segment.segment_metadata or "{}")
@@ -922,37 +1043,10 @@ async def generate_batch(
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("proofreading batch=%s language=%s group failed: %s", batch.id, target_language, exc)
-                packed_failed_count = sum(len(group["segments"]) for group in packed)
-                failed_count += packed_failed_count
-                category_counts["generation_error"] += packed_failed_count
                 error_text = str(exc)[:1000]
-                for group in packed:
-                    for baseline, segment in group["segments"]:
-                        db.add(TranslationReviewReportItem(
-                            report_id=report.id,
-                            project_id=batch.project_id,
-                            file_record_id=segment.file_record_id,
-                            segment_id=segment.id,
-                            sentence_id=segment.sentence_id,
-                            file_name=segment.file_record.filename,
-                            display_index=segment.display_index,
-                            sequence_index=segment.sequence_index,
-                            category_key="generation_error",
-                            severity="error",
-                            origin="ai",
-                            source_text=segment.source_text,
-                            target_text=baseline.original_target_text,
-                            reason=error_text,
-                            confidence="low",
-                            apply_mode="manual",
-                            locate_status="invalid",
-                            original_target_text=baseline.original_target_text,
-                            applied=False,
-                            status="open",
-                            block_index=segment.block_index,
-                            row_index=segment.row_index,
-                            cell_index=segment.cell_index,
-                        ))
+                packed_failed_count = _add_generation_error_items(db, batch, report, packed, error_text)
+                failed_count += packed_failed_count
+                category_counts[GENERATION_ERROR_CATEGORY] += packed_failed_count
                 processed_groups += len(packed)
                 batch.progress = min(99, round(processed_groups / max(total_groups, 1) * 100))
                 batch.message = f"{target_language} 部分句段校对失败，继续处理其余内容。"
@@ -961,10 +1055,30 @@ async def generate_batch(
 
             report.provider = actual_provider
             report.model = actual_model
+
+            # 模型调用期间用户可能已编辑或确认句段：重新读取最新状态，避免覆盖人工修改。
+            packed_segment_ids = [segment.id for group in packed for _, segment in group["segments"]]
+            db.query(Segment).filter(Segment.id.in_(packed_segment_ids)).populate_existing().all()
+
+            failed_groups = [group for group in packed if "error" in (results.get(group["sid"]) or {"error": ""})]
+            for group in failed_groups:
+                error_text = str((results.get(group["sid"]) or {}).get("error") or "模型未返回该项的有效校对结果。")[:1000]
+                group_failed_count = _add_generation_error_items(db, batch, report, [group], error_text)
+                failed_count += group_failed_count
+                category_counts[GENERATION_ERROR_CATEGORY] += group_failed_count
+            if failed_groups:
+                batch.message = f"{target_language} 部分句段校对失败，继续处理其余内容。"
+
+            resolved_segment_ids: list[UUID] = []
             for group in packed:
-                result = results[group["sid"]]
+                result = results.get(group["sid"])
+                if not result or "error" in result:
+                    continue
                 reviewed_text = result["reviewed_target_text"]
                 for baseline, segment in group["segments"]:
+                    if segment.status == "confirmed" or int(segment.version or 1) != loaded_versions.get(segment.id):
+                        continue
+                    resolved_segment_ids.append(segment.id)
                     before_text = segment.target_text or ""
                     checked_count += 1
                     segment.source = PROOFREADING_SOURCE
@@ -1025,19 +1139,22 @@ async def generate_batch(
                         cell_index=segment.cell_index,
                     ))
                     changed_count += 1
+            _resolve_generation_errors(db, resolved_segment_ids, keep_report_id=report.id)
             processed_groups += len(packed)
             batch.progress = min(99, round(processed_groups / max(total_groups, 1) * 100))
-            batch.message = f"正在校对 {target_language}。"
+            if not failed_groups:
+                batch.message = f"正在校对 {target_language}。"
             report.progress = json.dumps({"overall_percent": batch.progress, "target_language": target_language}, ensure_ascii=False)
             db.commit()
 
     for file_id in file_ids:
         sync_file_record_status(db, file_id)
     _refresh_batch_change_stats(db, batch)
-    batch.failed_segments = failed_count
+    unresolved_failed_count = len(get_latest_generation_error_segment_ids(db, batch.id))
+    batch.failed_segments = unresolved_failed_count
     batch.progress = 100
-    batch.status = "partial_failed" if failed_count else "completed"
-    batch.message = "校对部分完成。" if failed_count else "校对完成，可复核或导出。"
+    batch.status = "partial_failed" if unresolved_failed_count else "completed"
+    batch.message = "校对部分完成。" if unresolved_failed_count else "校对完成，可复核或导出。"
     batch.finished_at = _utcnow_naive()
     report.total_segments = checked_count
     report.checked_segments = checked_count

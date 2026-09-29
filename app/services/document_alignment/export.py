@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from io import BytesIO, StringIO
 import json
+import logging
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -24,6 +25,8 @@ from app.services.normalizer import compact_match_core
 from .parser import AlignUnit, parse_side
 from .segments import TRANSLATION_ONLY_SOURCE_LABEL, ensure_document_pair_segments_complete
 from .service import target_cache_path
+
+logger = logging.getLogger(__name__)
 
 MISSING_TRANSLATION_LABEL = "【译文缺失】"
 TRANSLATION_ONLY_EXPORT_LABEL = "【增译】"
@@ -227,36 +230,103 @@ def _project_boundaries(before: str, after: str, boundaries: list[int]) -> list[
     return projected
 
 
+PAIR_TARGET_JOINER = "\n"
+
+
+def _part_spans(parts: list[str], joiner: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for index, part in enumerate(parts):
+        end = cursor + len(part)
+        spans.append((cursor, end))
+        cursor = end + (len(joiner) if index < len(parts) - 1 else 0)
+    return spans
+
+
+def _split_text_by_projection(parts: list[str], joiner: str, reviewed: str) -> list[str]:
+    """按原有片段边界拆分修改后的文本，各片段首尾相接，不丢失任何字符。"""
+    if not parts:
+        return []
+    boundaries = [end for _, end in _part_spans(parts, joiner)[:-1]]
+    cuts = [0, *_project_boundaries(joiner.join(parts), reviewed, boundaries), len(reviewed)]
+    return [reviewed[cuts[index]:cuts[index + 1]] for index in range(len(parts))]
+
+
 def _split_reviewed_text(original_parts: list[str], reviewed: str) -> list[str]:
+    """把一个对齐对的校对后译文拆回它所含的目标单元。
+
+    对齐对的 target_text 由单元文本以换行连接而成，拆分必须使用同一连接符，
+    否则未修改的多单元对齐对也会在后续单元前多出换行。
+    """
     if not original_parts:
         return []
     if len(original_parts) == 1:
         return [reviewed]
-    original = "".join(original_parts)
-    boundaries: list[int] = []
-    cursor = 0
-    for part in original_parts[:-1]:
-        cursor += len(part)
-        boundaries.append(cursor)
-    cuts = [0, *_project_boundaries(original, reviewed, boundaries), len(reviewed)]
-    return [reviewed[cuts[index]:cuts[index + 1]] for index in range(len(original_parts))]
+    if reviewed == PAIR_TARGET_JOINER.join(original_parts):
+        return list(original_parts)
+    lines = reviewed.split(PAIR_TARGET_JOINER)
+    if len(lines) == len(original_parts):
+        return lines
+    return _split_text_by_projection(original_parts, PAIR_TARGET_JOINER, reviewed)
 
 
-def _split_block_text(original_parts: list[str], joiner: str, reviewed: str) -> list[str]:
-    """按原 DOCX 句段边界拆分块文本，不把解析时的人造连接符写回句段。"""
-    if not original_parts:
-        return []
-    original = joiner.join(original_parts)
-    spans: list[tuple[int, int]] = []
-    cursor = 0
-    for index, part in enumerate(original_parts):
-        start = cursor
-        end = start + len(part)
-        spans.append((start, end))
-        cursor = end + (len(joiner) if index < len(original_parts) - 1 else 0)
-    boundary_values = [value for span in spans for value in span]
-    mapped = _project_boundaries(original, reviewed, boundary_values)
-    return [reviewed[mapped[index * 2]:mapped[index * 2 + 1]] for index in range(len(spans))]
+def _trim_edit(old_text: str, start: int, end: int, replacement: str) -> tuple[int, int, str]:
+    """去掉编辑前后与原文相同的部分，使编辑只覆盖真正变化的字符。
+
+    一个对齐单元可能横跨多个 DOCX 句段（如同一单元格内的两句），整段替换会让偏移映射
+    只能按比例分配。收缩后未变化的句段不再受影响。被替换的旧文本至少保留 1 个字符，
+    避免纯插入落在句段之间的连接符上而丢失。
+    """
+    old_slice = old_text[start:end]
+    limit = min(len(old_slice), len(replacement))
+    prefix = 0
+    while prefix < limit and old_slice[prefix] == replacement[prefix]:
+        prefix += 1
+    suffix = 0
+    while suffix < limit - prefix and old_slice[-1 - suffix] == replacement[-1 - suffix]:
+        suffix += 1
+    if prefix + suffix >= len(old_slice):
+        if suffix:
+            suffix -= 1
+        elif prefix:
+            prefix -= 1
+    return (
+        start + prefix,
+        end - suffix,
+        replacement[prefix:len(replacement) - suffix],
+    )
+
+
+def _map_offset(position: int, edits: list[tuple[int, int, str]]) -> int:
+    """按已知编辑把旧文本偏移换算为新文本偏移；未被编辑的文字偏移只做平移。"""
+    delta = 0
+    for start, end, replacement in edits:
+        if position <= start:
+            break
+        if position < end:
+            ratio = (position - start) / (end - start)
+            return start + delta + round(ratio * len(replacement))
+        delta += len(replacement) - (end - start)
+    return position + delta
+
+
+def _apply_block_edits(
+    parts: list[str],
+    joiner: str,
+    edits: list[tuple[int, int, str]],
+) -> list[str]:
+    """把编辑应用到由 parts 拼成的块文本，并按原句段边界拆回各句段。
+
+    edits 为按起点升序、互不重叠的 (start, end, replacement)，偏移基于 joiner.join(parts)。
+    """
+    old_text = joiner.join(parts)
+    new_text = old_text
+    for start, end, replacement in reversed(edits):
+        new_text = f"{new_text[:start]}{replacement}{new_text[end:]}"
+    return [
+        new_text[_map_offset(start, edits):_map_offset(end, edits)]
+        for start, end in _part_spans(parts, joiner)
+    ]
 
 
 def _workspace_block_key(segment: dict[str, Any]) -> tuple[int, int | None, int | None]:
@@ -271,28 +341,17 @@ def _unit_block_key(unit: AlignUnit) -> tuple[int, int | None, int | None]:
     return (unit.block_index, unit.row_index, unit.cell_index)
 
 
-def _build_target_revision_payload(
-    db: Session,
-    batch: ProofreadingBatch,
-    target_bytes: bytes,
-    target_filename: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """将对齐对的校对结果重新投影到目标 DOCX 的原始句段。"""
-    from app.services.document_workspace import parse_docx_workspace
+def _project_pair_texts_onto_units(
+    pairs: list[DocumentAlignmentPair],
+    text_by_pair: dict[str, str],
+    units_by_index: dict[int, AlignUnit],
+    target_units: list[AlignUnit],
+) -> dict[int, str]:
+    """把每个对齐对的译文投影到目标 DOCX 单元，返回 单元序号 -> 新文本。
 
-    config = _batch_config(batch)
-    granularity = str(config.get("granularity") or "sentence")
-    target_units = parse_side(target_bytes, target_filename, granularity)
-    units_by_index = {unit.index: unit for unit in target_units}
-    reviewed_by_pair = {
-        row.pair_id: row.reviewed_target_text
-        for row in build_proofreading_export_rows(db, batch)[0]
-    }
-    pairs = db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(
-        DocumentAlignmentPair.pair_order,
-    ).all()
-
-    replacement_by_unit = {unit.index: unit.text for unit in target_units}
+    只记录文本确实不同于目标原件的单元；未记录的单元原样保留。
+    """
+    replacement_by_unit: dict[int, str] = {}
     deferred_insertions: list[tuple[int, str]] = []
     last_target_index: int | None = None
     for pair in pairs:
@@ -309,23 +368,94 @@ def _build_target_revision_payload(
             if normalized_index in units_by_index:
                 valid_indices.append(normalized_index)
         indices = valid_indices
-        reviewed = str(reviewed_by_pair.get(str(pair.id), pair.target_text or "") or "")
+        text = str(text_by_pair.get(str(pair.id), pair.target_text or "") or "")
         if indices:
-            pieces = _split_reviewed_text([units_by_index[index].text for index in indices], reviewed)
+            original_parts = [units_by_index[index].text for index in indices]
+            pieces = _split_reviewed_text(original_parts, text.strip())
             for index, piece in zip(indices, pieces):
-                replacement_by_unit[index] = piece
+                piece = piece.strip()
+                if piece != units_by_index[index].text:
+                    replacement_by_unit[index] = piece
             last_target_index = indices[-1]
-        elif reviewed:
+        elif text:
             # 原文有而目标文档无的段落没有天然版式锚点，先挂到前一目标单元；
             # 若位于文首，则在完成遍历后挂到后一目标单元之前。
-            deferred_insertions.append((last_target_index if last_target_index is not None else -1, reviewed))
+            deferred_insertions.append((last_target_index if last_target_index is not None else -1, text))
+
+    def current_unit_text(index: int) -> str:
+        return replacement_by_unit.get(index, units_by_index[index].text)
 
     for anchor_index, inserted in deferred_insertions:
-        if anchor_index >= 0 and anchor_index in replacement_by_unit:
-            replacement_by_unit[anchor_index] = f"{replacement_by_unit[anchor_index]}\n{inserted}"
+        if anchor_index >= 0 and anchor_index in units_by_index:
+            replacement_by_unit[anchor_index] = f"{current_unit_text(anchor_index)}\n{inserted}"
         elif target_units:
             first = target_units[0].index
-            replacement_by_unit[first] = f"{inserted}\n{replacement_by_unit[first]}"
+            replacement_by_unit[first] = f"{inserted}\n{current_unit_text(first)}"
+    return replacement_by_unit
+
+
+def _apply_unit_replacements_to_block(
+    source_parts: list[str],
+    joiner: str,
+    block_units: list[AlignUnit],
+    replacement_by_unit: dict[int, str],
+    *,
+    batch_id: Any,
+) -> list[str]:
+    """把单元级替换应用到一个块，并按原句段边界拆回各句段文本。"""
+    old_block = joiner.join(source_parts)
+    # 对齐单元的偏移相对于“去掉首尾空白后的块文本”，这里换算到未裁剪的拼接文本。
+    leading = len(old_block) - len(old_block.lstrip())
+    edits: list[tuple[int, int, str]] = []
+    for unit in block_units:
+        replacement = replacement_by_unit.get(unit.index)
+        if replacement is None:
+            continue
+        start = unit.source_start + leading
+        end = unit.source_end + leading
+        span_text = old_block[start:end]
+        if span_text.strip() != unit.text:
+            logger.warning(
+                "target revision export skipped edit: unit %s offsets do not match block text (batch=%s)",
+                unit.index, batch_id,
+            )
+            continue
+        left_pad = len(span_text) - len(span_text.lstrip())
+        right_pad = len(span_text) - len(span_text.rstrip())
+        edits.append(_trim_edit(old_block, start + left_pad, end - right_pad, replacement))
+    if not edits:
+        return list(source_parts)
+    edits.sort()
+    return _apply_block_edits(source_parts, joiner, edits)
+
+
+def _build_target_revision_payload(
+    db: Session,
+    batch: ProofreadingBatch,
+    target_bytes: bytes,
+    target_filename: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """将对齐对的校对结果投影到目标 DOCX 的原始句段，并生成校对阶段的修订。
+
+    修订基线是进入校对阶段时的译文（ProofreadingSegmentBaseline），而不是目标 DOCX 原件：
+    用户在对齐阶段手动调整的译文属于基线，会静默写入导出文档，不带修订痕迹。
+    做法是把“基线译文”和“当前译文”各自投影一遍，仅当同一句段两次结果不同才生成修订。
+    """
+    from app.services.document_workspace import parse_docx_workspace
+
+    config = _batch_config(batch)
+    granularity = str(config.get("granularity") or "sentence")
+    target_units = parse_side(target_bytes, target_filename, granularity)
+    units_by_index = {unit.index: unit for unit in target_units}
+    rows = build_proofreading_export_rows(db, batch)[0]
+    reviewed_by_pair = {row.pair_id: row.reviewed_target_text for row in rows}
+    baseline_by_pair = {row.pair_id: row.original_target_text for row in rows}
+    pairs = db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(
+        DocumentAlignmentPair.pair_order,
+    ).all()
+
+    final_replacements = _project_pair_texts_onto_units(pairs, reviewed_by_pair, units_by_index, target_units)
+    baseline_replacements = _project_pair_texts_onto_units(pairs, baseline_by_pair, units_by_index, target_units)
 
     workspace_segments = list(parse_docx_workspace(target_bytes).get("segments", []))
     grouped: dict[tuple[int, int | None, int | None], list[dict[str, Any]]] = {}
@@ -340,28 +470,31 @@ def _build_target_revision_payload(
     for block_key, block_segments in grouped.items():
         block_type = str(block_segments[0].get("block_type") or "paragraph")
         if granularity == "sentence":
-            source_parts = [
+            raw_parts = [
                 str(item.get("display_text") or item.get("source_text") or "").strip()
                 for item in block_segments
             ]
             joiner = "\n" if block_type == "table_cell" else " "
         else:
-            source_parts = [
+            raw_parts = [
                 str(item.get("display_text") or item.get("source_text") or "")
                 for item in block_segments
             ]
             joiner = ""
-        source_parts = [part for part in source_parts if part]
-        old_block = joiner.join(source_parts).strip()
-        edits = []
-        for unit in units_by_block.get(block_key, []):
-            edits.append((unit.source_start, unit.source_end, replacement_by_unit.get(unit.index, unit.text)))
-        new_block = old_block
-        for start, end, replacement in sorted(edits, reverse=True):
-            new_block = f"{new_block[:start]}{replacement}{new_block[end:]}"
+        kept_pairs = [(segment, part) for segment, part in zip(block_segments, raw_parts) if part]
+        if not kept_pairs:
+            continue
+        kept_segments = [segment for segment, _ in kept_pairs]
+        source_parts = [part for _, part in kept_pairs]
+        block_units = units_by_block.get(block_key, [])
 
-        corrected_parts = _split_block_text(source_parts, joiner, new_block)
-        for segment, before_text, after_text in zip(block_segments, source_parts, corrected_parts):
+        final_parts = _apply_unit_replacements_to_block(
+            source_parts, joiner, block_units, final_replacements, batch_id=batch.id,
+        )
+        baseline_parts = _apply_unit_replacements_to_block(
+            source_parts, joiner, block_units, baseline_replacements, batch_id=batch.id,
+        )
+        for segment, before_text, after_text in zip(kept_segments, baseline_parts, final_parts):
             payload = dict(segment)
             payload["target_text"] = after_text
             payload["target_html"] = None
