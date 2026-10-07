@@ -1730,6 +1730,8 @@ def _resolve_pretranslation_run_file_concurrency() -> int:
 class MaintenanceWorkerSettings:
     queue_name = ARQ_MAINTENANCE_QUEUE_NAME
     keep_result = 0
+    # 该队列同样注册了 process_import_task_job，需与导入队列保持一致的超时上限。
+    job_timeout = max(int(get_settings().import_worker_job_timeout_seconds), 60)
     max_jobs = _resolve_arq_worker_max_jobs(
         get_settings().arq_maintenance_max_jobs,
         get_settings().arq_max_jobs,
@@ -1779,6 +1781,9 @@ class SegmentSyncWorkerSettings:
 class ImportWorkerSettings:
     queue_name = ARQ_IMPORT_QUEUE_NAME
     keep_result = 0
+    # arq 默认 job_timeout 仅 300 秒，DWG/大文档解析远超该值会被误判超时，
+    # 且 asyncio.to_thread 无法真正中断线程，导致 arq 判失败但解析仍在后台跑。
+    job_timeout = max(int(get_settings().import_worker_job_timeout_seconds), 60)
     max_jobs = _resolve_arq_worker_max_jobs(
         get_settings().arq_import_max_jobs,
         get_settings().arq_max_jobs,

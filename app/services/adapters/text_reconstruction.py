@@ -825,7 +825,12 @@ class TextFlowGraph:
             # 只有当重叠深度真的超过了较短一段整体宽度的 60%，才算是几何上的真重叠。
             # 这既能挡住"两段文字真的叠在一起"的情况，又能容忍估算误差。
             shorter = min(e1.width, e2.width) if e1.width > 0 and e2.width > 0 else avg_height
-            allowed_overlap = max(avg_height * 2.0, shorter * 0.6)
+            # 容差必须以"左侧段宽度被外推多少"为基准，而不是右侧短段的宽度：
+            # 虚假重叠来自 e1 的 CJK 宽度估算取了上界，深度随 e1 字数线性增长，
+            # 与 e2 多宽毫无关系。只按 shorter * 0.6 衡量时，"长中文正文 + 行尾
+            # 短数值"（如 "…其顶部离地面高度" + "1.5m"）必然被判成深重叠而拆段。
+            cjk_slack = cjk_width_overestimate(e1.text, e1.height)
+            allowed_overlap = max(avg_height * 2.0, shorter * 0.6, cjk_slack)
             if x_gap < -allowed_overlap:
                 # 标准目录里名称和 GB/CJJ 编号常因 CAD 字宽估算偏大而出现
                 # “虚假深重叠”；只要两者同行且都是目录片段，就仍视为一行。
@@ -970,12 +975,17 @@ class TextFlowGraph:
             or cls._is_standard_edition_fragment(left)
         )
 
-    def _classify_semantic_relation(self, prev_text: str, curr_text: str) -> str:
-        """返回三态之一：hard_break / soft_continue / neutral"""
+    @classmethod
+    def _classify_semantic_relation(cls, prev_text: str, curr_text: str) -> str:
+        """返回三态之一：hard_break / soft_continue / neutral
+
+        纯文本判断，不依赖任何实例状态，因此作为 classmethod 暴露，便于
+        L6-LLM 版面校验等模块复用同一套语义边界规则。
+        """
         prev_text = (prev_text or "").strip()
         curr_text = (curr_text or "").strip()
         if not prev_text or not curr_text:
-            return self.SEMANTIC_NEUTRAL
+            return cls.SEMANTIC_NEUTRAL
 
         # ---- 硬断规则 ----
         # 标准/规范清单通常每行以《名称》开头，下一行出现新的书名号即为新条目。
@@ -983,52 +993,52 @@ class TextFlowGraph:
             logger.debug(
                 "L5 硬断(新标准条目) %r → %r", prev_text[:20], curr_text[:20],
             )
-            return self.SEMANTIC_HARD_BREAK
+            return cls.SEMANTIC_HARD_BREAK
 
         # 后文以标题/序号开头
-        if self._TITLE_PATTERN.match(curr_text):
+        if cls._TITLE_PATTERN.match(curr_text):
             logger.debug(
                 "L5 硬断(后文序号) %r → %r", prev_text[:20], curr_text[:20],
             )
-            return self.SEMANTIC_HARD_BREAK
+            return cls.SEMANTIC_HARD_BREAK
         # 前文本身就是简短独立标题（"一、设计依据"这种）
         # 阈值收紧到 12：长条目（如 "1、灰显淡显管线及..." 一整段话开头）不算标题
-        if self._TITLE_PATTERN.match(prev_text) and len(prev_text) <= 12:
+        if cls._TITLE_PATTERN.match(prev_text) and len(prev_text) <= 12:
             logger.debug(
                 "L5 硬断(前文是短标题) %r → %r", prev_text[:20], curr_text[:20],
             )
-            return self.SEMANTIC_HARD_BREAK
+            return cls.SEMANTIC_HARD_BREAK
         # 前文以句尾标点结尾 → 硬断
         # CAD 场景里"上一句以句号结尾"几乎 100% 说明前文完结，即便后文以
         # 顿号（"、具体维修改造..."）、数字（"1、"）或半角括号开头也算新句。
         # 例外：后文以闭合标点开头（如 "），..."），那是被拆碎的续写，不硬断。
         last_char = prev_text[-1]
         first_char = curr_text[0]
-        if last_char in self._SENTENCE_END_CHARS:
+        if last_char in cls._SENTENCE_END_CHARS:
             if first_char not in "）)]】》〕〗":
                 logger.debug(
                     "L5 硬断(句尾标点后新句) %r → %r",
                     prev_text[:20], curr_text[:20],
                 )
-                return self.SEMANTIC_HARD_BREAK
+                return cls.SEMANTIC_HARD_BREAK
 
         # 冒号 / 全角冒号引出编号列表：前文以 "：/:" 结尾 + 后文以 "、/,/1./①..." 开头
         # 这是 CAD 图纸"附注：、灰显..." 这类标题-列表结构，必须硬断。
         if last_char in "：:":
-            if first_char in "、," or self._TITLE_PATTERN.match(curr_text):
+            if first_char in "、," or cls._TITLE_PATTERN.match(curr_text):
                 logger.debug(
                     "L5 硬断(冒号引出列表) %r → %r",
                     prev_text[:20], curr_text[:20],
                 )
-                return self.SEMANTIC_HARD_BREAK
+                return cls.SEMANTIC_HARD_BREAK
             # 前文本身就是"章节标题"（以序号开头 + 以冒号结束），
             # 与后文正文永远不属于同一句，避免"五、维修原则："被并入下一段 MTEXT。
-            if self._TITLE_PATTERN.match(prev_text):
+            if cls._TITLE_PATTERN.match(prev_text):
                 logger.debug(
                     "L5 硬断(标题冒号) %r → %r",
                     prev_text[:20], curr_text[:20],
                 )
-                return self.SEMANTIC_HARD_BREAK
+                return cls.SEMANTIC_HARD_BREAK
 
         # 前文以"、/,"结尾 + 后文也以"、/,"开头 → 两条并列列表项之间
         if last_char in "。！？.!?" or (last_char == "、" and first_char == "、"):
@@ -1038,24 +1048,29 @@ class TextFlowGraph:
                     "L5 硬断(并列列表项) %r → %r",
                     prev_text[:20], curr_text[:20],
                 )
-                return self.SEMANTIC_HARD_BREAK
+                return cls.SEMANTIC_HARD_BREAK
 
         # ---- 软续写规则（不断且加分）----
         # 英文连字符换行：word- + 小写起头
         if last_char == "-" and first_char.isascii() and first_char.islower():
-            return self.SEMANTIC_SOFT_CONTINUE
+            return cls.SEMANTIC_SOFT_CONTINUE
         # 前文以中文虚词结尾
-        for tail in self._CJK_CONTINUATION_TAILS:
+        for tail in cls._CJK_CONTINUATION_TAILS:
             if prev_text.endswith(tail):
-                return self.SEMANTIC_SOFT_CONTINUE
+                return cls.SEMANTIC_SOFT_CONTINUE
         # 前文以逗号、顿号、分句符结尾 → 明显未结束
         if last_char in "，,、":
-            return self.SEMANTIC_SOFT_CONTINUE
+            return cls.SEMANTIC_SOFT_CONTINUE
         # 后文以闭合括号/量词/单位结尾类符号起头 → 明显续写
         if first_char in "）)]】》〕〗":
-            return self.SEMANTIC_SOFT_CONTINUE
+            return cls.SEMANTIC_SOFT_CONTINUE
+        # 前文以未闭合的开括号结尾 → 明显未结束。例如 CAD 常把
+        # "按原规格重新砌筑损坏的砖砌阀门井（" 单独放一个 TEXT，
+        # 下一个 TEXT 填 "JZ3"/"DN150" 等内容；没有后段就语义不完整。
+        if last_char in "（(【[《〈『":
+            return cls.SEMANTIC_SOFT_CONTINUE
 
-        return self.SEMANTIC_NEUTRAL
+        return cls.SEMANTIC_NEUTRAL
 
     # 保留旧 API 名称的兼容包装（find_text_paths 之外的调用不多，但确保外部不炸）
     def _has_semantic_break(self, prev_text: str, curr_text: str) -> bool:
@@ -1739,6 +1754,35 @@ def visual_length(text: str) -> float:
     return total
 
 
+def is_cjk_char(ch: str) -> bool:
+    """是否为 CJK / 全角字符（宽度近似等于字高的方块字）。"""
+    return (
+        "\u4e00" <= ch <= "\u9fff"
+        or "\u3040" <= ch <= "\u30ff"
+        or "\uac00" <= ch <= "\ud7af"
+        or "\uff00" <= ch <= "\uffef"
+    )
+
+
+# estimate_text_width 对 CJK 采用"每字 1.0 × 字高"的保守上界，而 CAD 实际
+# 渲染出来的中文字宽（SHX 扁体字、多数 TrueType 中文字体）普遍只有字高的
+# 0.73~0.85 倍。实测同一张图纸内相邻中文段的字宽比集中在 0.73~0.83，
+# 取 0.3 作为单字外推误差上限，覆盖最坏情况。
+CJK_WIDTH_OVERESTIMATE_RATIO = 0.3
+
+
+def cjk_width_overestimate(text: str, height: float) -> float:
+    """估算一段文本因 CJK 字宽系数取上界而被外推的宽度上限。
+
+    误差随 CJK 字数线性累积：字数越多，right_edge 被推得越远。
+    仅用于放宽几何重叠判定，不参与实际宽度计算。
+    """
+    if not text or height <= 0:
+        return 0.0
+    cjk_count = sum(1 for ch in text if is_cjk_char(ch))
+    return cjk_count * height * CJK_WIDTH_OVERESTIMATE_RATIO
+
+
 def estimate_text_width(text: str, height: float, width_factor: float = 0.6) -> float:
     """估算文本在 CAD 中的宽度。
 
@@ -1748,18 +1792,16 @@ def estimate_text_width(text: str, height: float, width_factor: float = 0.6) -> 
 
     旧实现"CJK 全角按 2 计 × 0.6h = 每字 1.2h"会显著高估中文文本宽度，
     导致后一段短文本的起点落在前段的"虚构 bbox"内部，被 x_overlap_too_deep 误拒。
+
+    注意 CJK 的 1.0 仍是上界而非实测值，几何重叠判定需额外叠加
+    ``cjk_width_overestimate`` 给出的误差余量。
     """
     if not text:
         return 0.0
     ascii_count = 0
     cjk_count = 0
     for ch in text:
-        if (
-            "\u4e00" <= ch <= "\u9fff"
-            or "\u3040" <= ch <= "\u30ff"
-            or "\uac00" <= ch <= "\ud7af"
-            or "\uff00" <= ch <= "\uffef"
-        ):
+        if is_cjk_char(ch):
             cjk_count += 1
         else:
             ascii_count += 1
