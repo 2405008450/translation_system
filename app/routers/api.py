@@ -526,9 +526,11 @@ from app.services.translation_review.service import (
 try:
     from arq import create_pool as arq_create_pool
     from arq.connections import RedisSettings
+    from arq.worker import func as arq_func
 except ModuleNotFoundError:  # pragma: no cover - 本地未安装 ARQ 时使用 FastAPI 后台任务兜底
     arq_create_pool = None
     RedisSettings = None
+    arq_func = None
 
 
 logger = logging.getLogger(__name__)
@@ -1727,18 +1729,29 @@ def _resolve_pretranslation_run_file_concurrency() -> int:
     return max(int(configured or 1), 1)
 
 
-class MaintenanceWorkerSettings:
-    queue_name = ARQ_MAINTENANCE_QUEUE_NAME
-    keep_result = 0
-    max_jobs = _resolve_arq_worker_max_jobs(
-        get_settings().arq_maintenance_max_jobs,
-        get_settings().arq_max_jobs,
-    )
-    functions = [
+def _build_import_arq_functions():
+    jobs = [
         process_import_task_job,
         tm_resource_import_job,
         term_resource_import_job,
         glossary_resource_import_job,
+    ]
+    if arq_func is None:
+        return jobs
+    timeout = max(int(get_settings().import_worker_job_timeout_seconds), 60)
+    return [arq_func(job, timeout=timeout) for job in jobs]
+
+
+class MaintenanceWorkerSettings:
+    queue_name = ARQ_MAINTENANCE_QUEUE_NAME
+    keep_result = 0
+    # 旧版导入任务单独放宽超时，QA、自动 TM、同步仍保持原有 300 秒上限。
+    job_timeout = 300
+    max_jobs = _resolve_arq_worker_max_jobs(
+        get_settings().arq_maintenance_max_jobs,
+        get_settings().arq_max_jobs,
+    )
+    functions = _build_import_arq_functions() + [
         spelling_grammar_qa_segments_job,
         spelling_grammar_qa_project_job,
         auto_tm_background_job,
@@ -1779,16 +1792,14 @@ class SegmentSyncWorkerSettings:
 class ImportWorkerSettings:
     queue_name = ARQ_IMPORT_QUEUE_NAME
     keep_result = 0
+    # arq 默认 job_timeout 仅 300 秒，DWG/大文档解析远超该值会被误判超时，
+    # 且 asyncio.to_thread 无法真正中断线程，导致 arq 判失败但解析仍在后台跑。
+    job_timeout = max(int(get_settings().import_worker_job_timeout_seconds), 60)
     max_jobs = _resolve_arq_worker_max_jobs(
         get_settings().arq_import_max_jobs,
         get_settings().arq_max_jobs,
     )
-    functions = [
-        process_import_task_job,
-        tm_resource_import_job,
-        term_resource_import_job,
-        glossary_resource_import_job,
-    ]
+    functions = _build_import_arq_functions()
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
 

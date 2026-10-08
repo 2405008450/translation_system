@@ -17,6 +17,8 @@ from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 from app.config import get_settings
 from app.services.adapters.text_reconstruction import (
     TextEntity,
+    TextFlowGraph,
+    cjk_width_overestimate,
     is_independent_legend_label_pair,
 )
 from app.services.llm_service import request_chat_completion
@@ -109,6 +111,24 @@ def _barrier_between(
     ) is not None
 
 
+# 同一视觉行上"字距级"相邻的碎片：CAD 常只为换字体/换字高就把一行文字拆成
+# 多个 TEXT（如 "此处为可利用的现状" + "DN150" + "（" + "6in" + "）美标消火栓，"）。
+# 这类相邻关系在几何上几乎确定，LLM 不得把它们分到不同逻辑块。
+_GLUED_ROW_Y_TOLERANCE = 0.5
+_GLUED_ROW_MAX_GAP = 0.75
+
+
+def _same_row_overlap_slack(left: TextEntity, avg_height: float) -> float:
+    """同行"虚假重叠"容差。
+
+    estimate_text_width 对 CJK 取"每字 1.0 × 字高"的上界，实际 CAD 字宽只有
+    0.73~0.85 倍，于是左侧中文段的 right_edge 被外推、与右侧短数值段产生并不
+    存在的重叠，深度随中文字数线性增长。这里与 TextFlowGraph._compute_edge 使用
+    同一套余量，避免 L6 区域构建/连通性判断比几何重建更严格。
+    """
+    return max(avg_height, cjk_width_overestimate(left.text, left.height))
+
+
 def _compatible_for_region(
     first: TextEntity,
     second: TextEntity,
@@ -151,7 +171,7 @@ def _compatible_for_region(
     if same_row:
         left, right = (first, second) if first.x <= second.x else (second, first)
         gap = right.x - left.right_edge
-        return -avg_h <= gap <= avg_h * 20
+        return -_same_row_overlap_slack(left, avg_h) <= gap <= avg_h * 20
 
     vertical_gap = abs(first.y - second.y)
     x_overlap = min(first.right_edge, second.right_edge) - max(first.x, second.x)
@@ -288,11 +308,116 @@ def _group_is_connected(
     return len(visited) == len(members)
 
 
+def _is_glued_same_row(
+    first: TextEntity,
+    second: TextEntity,
+    barrier_index: Optional["BarrierIndex"],
+) -> bool:
+    """两段文字是否同属一条视觉行、且字距内紧邻（无词间空白）。"""
+    if not _compatible_for_region(first, second, barrier_index):
+        return False
+    avg_h = max((first.height + second.height) / 2.0, 1e-6)
+    if abs(first.y - second.y) > avg_h * _GLUED_ROW_Y_TOLERANCE:
+        return False
+    left, right = (first, second) if first.x <= second.x else (second, first)
+    if right.x - left.right_edge > avg_h * _GLUED_ROW_MAX_GAP:
+        return False
+    # 句末标点后紧跟新句时允许分开：几何重建在同一位置也会硬断。
+    return (
+        TextFlowGraph._classify_semantic_relation(left.text, right.text)
+        != TextFlowGraph.SEMANTIC_HARD_BREAK
+    )
+
+
+# 跨行续写判定阈值：下一行 y 差在 [0.8h, 2.5h] 之间、x 起点或范围靠拢，
+# 这正是几何重建 `next_line_gap_factor` 命中的 CAD "折行正文" 结构。
+_NEXT_LINE_Y_MIN = 0.8
+_NEXT_LINE_Y_MAX = 2.5
+_NEXT_LINE_X_START_SLACK = 3.0
+
+
+def _is_glued_next_line_continuation(
+    first: TextEntity,
+    second: TextEntity,
+    barrier_index: Optional["BarrierIndex"],
+) -> bool:
+    """两段文字是否构成"上行 → 下行"的 CAD 折行续写。
+
+    必须同时满足：
+    1. 几何上相容（同 scope / layer、无 barrier、相近 x 等）
+    2. y 差落在 next-line 合并窗口内
+    3. x 起点贴近 或 水平投影有重叠
+    4. 语义关系是 soft_continue —— 由前段末尾是虚词 / 逗号 / 顿号 / 行末
+       闭合括号等信号决定；SEMANTIC_NEUTRAL 不算，避免把"两条独立
+       短标注"也当成续写强合。
+    """
+    if not _compatible_for_region(first, second, barrier_index):
+        return False
+    avg_h = max((first.height + second.height) / 2.0, 1e-6)
+    y_diff = abs(first.y - second.y)
+    if y_diff < avg_h * _NEXT_LINE_Y_MIN or y_diff > avg_h * _NEXT_LINE_Y_MAX:
+        return False
+    x_overlap = min(first.right_edge, second.right_edge) - max(first.x, second.x)
+    x_start_close = abs(first.x - second.x) <= avg_h * _NEXT_LINE_X_START_SLACK
+    if x_overlap <= 0 and not x_start_close:
+        return False
+    upper, lower = (first, second) if first.y >= second.y else (second, first)
+    return (
+        TextFlowGraph._classify_semantic_relation(upper.text, lower.text)
+        == TextFlowGraph.SEMANTIC_SOFT_CONTINUE
+    )
+
+
+def _is_glued_continuation(
+    first: TextEntity,
+    second: TextEntity,
+    barrier_index: Optional["BarrierIndex"],
+) -> bool:
+    """同行紧邻 或 跨行续写：两种 CAD 侧几何确定会合并的关系。"""
+    return _is_glued_same_row(first, second, barrier_index) or (
+        _is_glued_next_line_continuation(first, second, barrier_index)
+    )
+
+
+def _groups_keep_glued_rows(
+    groups: Sequence[Sequence[str]],
+    entities: Sequence[TextEntity],
+    barrier_index: Optional["BarrierIndex"],
+) -> bool:
+    """禁止 LLM 把一条视觉行上紧邻的碎片切到不同组。
+
+    `TextReconstructor.reconstruct` 会先落地 LLM 分组，并把组内 handle 从几何
+    重建池里移除。一旦 LLM 只带走了半行（例如把 "DN150（6in）美标消火栓，"
+    单独成组、把同一行左侧的 "此处为可利用的现状" 留在组外），剩下的碎片就再也
+    无法与之合并，整条标注被永久切碎，句段 ID 与上一版导入也不再对齐，TM 全部
+    失配。这种切分是模型幻觉而非版面事实，命中即整区域回退几何重建。
+    """
+    group_of: Dict[str, int] = {}
+    for index, group in enumerate(groups):
+        for handle in group:
+            group_of[handle] = index
+
+    for index, first in enumerate(entities):
+        for second in entities[index + 1:]:
+            if group_of.get(first.handle) == group_of.get(second.handle):
+                continue
+            if _is_glued_continuation(first, second, barrier_index):
+                logger.warning(
+                    "CAD LLM 分组切断几何续写碎片，整区域回退几何重建：%s(%r) | %s(%r)",
+                    first.handle, (first.text or "")[:20],
+                    second.handle, (second.text or "")[:20],
+                )
+                return False
+    return True
+
+
 def _groups_respect_geometry(
     groups: Sequence[Sequence[str]],
     entities: Sequence[TextEntity],
     barrier_index: Optional["BarrierIndex"],
 ) -> bool:
+    if not _groups_keep_glued_rows(groups, entities, barrier_index):
+        return False
     by_id = {entity.handle: entity for entity in entities}
     for group in groups:
         members = [by_id[item] for item in group]

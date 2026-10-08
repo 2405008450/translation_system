@@ -149,6 +149,9 @@ class Settings(BaseSettings):
     arq_segment_sync_max_jobs: int | None = None
     arq_pretranslation_max_jobs: int | None = None
     arq_ai_max_jobs: int | None = 1
+    # 导入队列单个任务的超时上限。arq 默认仅 300 秒，DWG/大 DOCX 的
+    # ODA 转换 + 实体解析 + LLM 语义合并经常超过该值，会被误判为失败。
+    import_worker_job_timeout_seconds: int = Field(default=3600, ge=60)
     # 单个项目预翻译批次内，同时处理的文件任务数。仍会叠加 LLM_MAX_CONCURRENCY 的限制。
     pretranslation_run_file_concurrency: int = 2
     auto_tm_outbox_max_batches_per_run: int = 5

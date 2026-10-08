@@ -80,6 +80,7 @@ nginx 的 `client_max_body_size` 在 `docker/nginx/default.conf`，默认 **500m
 |------|----------|------|
 | `ARQ_IMPORT_MAX_JOBS` | 2 | 上传文件、记忆库、术语库、词汇表等导入队列并发，独立于 QA、自动 TM 等维护任务 |
 | `ARQ_MAINTENANCE_MAX_JOBS` | 2 | 普通维护队列并发，主要处理手动 QA 和旧版遗留任务 |
+| `IMPORT_WORKER_JOB_TIMEOUT_SECONDS` | 3600 | 导入任务开始执行后的超时上限（秒，最小 60），也适用于维护队列中的旧版导入任务；维护队列其他任务仍为 300 秒 |
 | `ARQ_AUTO_TM_MAX_JOBS` | 1 | auto-TM outbox 与自动重匹配队列并发，建议保持 1，避免多文件重匹配同时压数据库 |
 | `ARQ_SEGMENT_SYNC_MAX_JOBS` | 1 | 项目重复句段同步队列并发，建议先保持 1 |
 | `ARQ_PRETRANSLATION_MAX_JOBS` | 2 | 项目预翻译 run 队列并发 |
@@ -91,6 +92,12 @@ nginx 的 `client_max_body_size` 在 `docker/nginx/default.conf`，默认 **500m
 | `ARQ_MAX_JOBS` | 5 | 导入/维护队列未单独设置时的全局兜底值 |
 
 LLM 预翻译的理论请求上限约为 `ARQ_PRETRANSLATION_MAX_JOBS × PRETRANSLATION_RUN_FILE_CONCURRENCY × LLM_MAX_CONCURRENCY`。若模型服务出现 429、超时或错误率升高，优先下调 `LLM_MAX_CONCURRENCY` 或 `PRETRANSLATION_RUN_FILE_CONCURRENCY`。
+
+导入超时从 300 秒放宽到 3600 秒，可以减少大 DWG、大 DOCX 被误判失败的情况；它不会主动延长正常任务耗时，也不包含排队等待时间。长任务或卡住的任务会更久地占用导入并发槽位；代码默认并发为 1，生产示例为 2，全部槽位被占用时后续导入仍会积压。导入、维护、自动 TM、句段同步、预翻译和 AI 使用独立队列，但数据库、Redis、模型服务和宿主机资源仍会相互影响。调整前应观察导入任务运行时长、最老待处理任务的等待时长、CPU/内存、数据库连接和模型错误率。
+
+普通导入通过 `asyncio.to_thread` 执行，arq 超时只取消等待协程，无法强制停止解析线程。因此超过一小时的任务仍可能出现队列判失败、后台继续执行并更新业务状态的情况；这项调整缓解误超时，并未解决硬终止问题。arq 将普通执行超时记为失败，不会仅因超时自动重试；worker 重启或协程被取消则可能重跑，应避免在长导入运行期间随意重启或重复提交。需要硬终止时应采用独立子进程及事务/幂等保护（AI 队列已有子进程隔离）。修改环境变量后需重建 `import-worker` 和 `worker`，运行中的进程不会自动读取新值。
+
+arq 0.28 按 worker 内最长函数超时设置执行锁有效期（超时值 + 10 秒），所以导入和兼容旧版导入的维护 worker 默认锁有效期均为 3610 秒。正常结束会清锁；若进程被 OOM、强制杀死等方式异常终止，已领取任务可能需要等锁过期才能由其他 worker 接管，最坏接近一小时。函数级超时能保持普通维护任务的 300 秒执行限制，但不能缩短该 worker 的统一执行锁有效期。
 
 拼写/语法 QA 默认手动生成：`SPELLING_GRAMMAR_QA_AUTO_SCHEDULE=false`。不要轻易开启自动调度，否则保存/确认句段会持续产生 QA 任务并增加维护队列与数据库压力。
 
