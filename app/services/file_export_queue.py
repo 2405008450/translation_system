@@ -60,6 +60,7 @@ PROOFREADING_EXPORT_TYPES = {
     "proofreading_docx_ordered",
     "proofreading_audit_xlsx",
     "proofreading_xlsx_original",
+    "proofreading_xlsx_target",
 }
 
 # 导出完成消息的固定前缀。附加提示（如部分画板已转位图）直接拼在其后，
@@ -604,6 +605,7 @@ def build_file_record_exported_file(
             export_layout_bilingual_docx,
             export_ordered_bilingual_docx,
             export_target_docx_with_revisions,
+            export_target_xlsx,
         )
         from app.services.proofreading import export_batch_xlsx
 
@@ -649,6 +651,8 @@ def build_file_record_exported_file(
             if batch.batch_kind != "document_pair":
                 raise ValueError("审计 Excel 仅用于双文档校对批次。")
             content, filename = export_document_pair_xlsx(db, batch)
+        elif export_type == "proofreading_xlsx_target":
+            content, filename = export_target_xlsx(db, batch)
         else:
             content, filename = export_batch_xlsx(db, batch)
         return _GenericExportedFile(

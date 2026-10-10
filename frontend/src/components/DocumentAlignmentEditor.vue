@@ -45,7 +45,7 @@ const message = ref('')
 const error = ref('')
 const draggingSide = ref<'source' | 'target' | null>(null)
 const dragDepth = { source: 0, target: 0 }
-const acceptedExtensions = new Set(['doc', 'docx', 'txt', 'html', 'htm'])
+const acceptedExtensions = new Set(['doc', 'docx', 'txt', 'html', 'htm', 'xlsx'])
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 function stopPolling() {
@@ -64,7 +64,7 @@ function setFile(side: 'source' | 'target', file: File | null) {
   if (file) {
     const extension = file.name.split('.').pop()?.toLowerCase() || ''
     if (!acceptedExtensions.has(extension)) {
-      error.value = `不支持“${file.name}”的文件格式，请上传 DOC、DOCX、TXT、HTML 或 HTM 文件。`
+      error.value = `不支持“${file.name}”的文件格式，请上传 DOC、DOCX、TXT、HTML、HTM 或 XLSX 文件。`
       return
     }
   }
@@ -103,6 +103,11 @@ async function makePreview() {
   if (!sourceFile.value || !targetFile.value) return
   busy.value = true
   error.value = ''
+  if ((sourceFile.value.name.toLowerCase().endsWith('.xlsx')) !== (targetFile.value.name.toLowerCase().endsWith('.xlsx'))) {
+    error.value = 'Excel 对齐需要原文和译文均为 .xlsx 文件。'
+    busy.value = false
+    return
+  }
   try {
     preview.value = await previewDocumentAlignment(props.projectId, sourceFile.value, targetFile.value)
   } catch (value) {
@@ -123,9 +128,9 @@ async function createBatch() {
       preview_token: preview.value.preview_token,
       source_language: sourceLanguage.value,
       target_language: targetLanguage.value,
-      granularity: granularity.value,
+      granularity: preview.value.pair_format === 'xlsx' ? 'paragraph' : granularity.value,
       use_llm_for_hard_blocks: false,
-      full_review: fullReview.value,
+      full_review: preview.value.pair_format === 'xlsx' ? false : fullReview.value,
       alignment_strategy: alignmentStrategy.value,
     })
     batchId.value = batch.id
@@ -263,7 +268,7 @@ onBeforeUnmount(stopPolling)
         <span class="alignment-upload__head-icon"><Upload :size="20" /></span>
         <div>
           <strong>上传需要校对的两个文档</strong>
-          <p>可点击选择或将文件分别拖放到下方区域。系统会识别段落、表格、重复页眉页脚和页码。</p>
+          <p>分别上传原文和译文。Excel 按工作表和单元格位置对齐，支持合并单元格与可编辑图形文字。</p>
         </div>
       </div>
 
@@ -277,7 +282,7 @@ onBeforeUnmount(stopPolling)
           @dragleave.prevent="leaveDropZone('source')"
           @drop.prevent="dropFile('source', $event)"
         >
-          <input type="file" accept=".doc,.docx,.txt,.html,.htm" @change="selectFile('source', $event)">
+          <input type="file" accept=".doc,.docx,.txt,.html,.htm,.xlsx" @change="selectFile('source', $event)">
           <span class="file-pick__step">1</span>
           <span class="file-pick__icon"><Check v-if="sourceFile" :size="22" /><FileText v-else :size="22" /></span>
           <span class="file-pick__copy">
@@ -298,7 +303,7 @@ onBeforeUnmount(stopPolling)
           @dragleave.prevent="leaveDropZone('target')"
           @drop.prevent="dropFile('target', $event)"
         >
-          <input type="file" accept=".doc,.docx,.txt,.html,.htm" @change="selectFile('target', $event)">
+          <input type="file" accept=".doc,.docx,.txt,.html,.htm,.xlsx" @change="selectFile('target', $event)">
           <span class="file-pick__step">2</span>
           <span class="file-pick__icon"><Check v-if="targetFile" :size="22" /><FileText v-else :size="22" /></span>
           <span class="file-pick__copy">
@@ -310,7 +315,7 @@ onBeforeUnmount(stopPolling)
       </div>
 
       <div class="alignment-upload__actions">
-        <span>支持 DOC、DOCX、TXT、HTML、HTM</span>
+        <span>支持 DOC、DOCX、TXT、HTML、HTM、XLSX；Excel 需上传两个 XLSX 文件</span>
         <button class="button button--primary alignment-upload__preview-button" :disabled="busy || !sourceFile || !targetFile" @click="makePreview">
           解析并预览 <ArrowRight :size="16" />
         </button>
@@ -318,7 +323,13 @@ onBeforeUnmount(stopPolling)
 
       <div v-if="preview" class="alignment-preview-config">
         <strong>{{ preview.source.unit_count }} 个原文单元 → {{ preview.target.unit_count }} 个译文单元</strong>
-        <span>
+        <span v-if="preview.pair_format === 'xlsx'">
+          {{ preview.source.sheet_count }} / {{ preview.target.sheet_count }} 个工作表，位置配对 {{ preview.coordinate_pairs }} 个，
+          结构差异 {{ preview.structure_warnings }} 处，缺口 {{ preview.unmatched_units }} 处；
+          图形文字 {{ preview.source.drawing_texts }} / {{ preview.target.drawing_texts }} 段。
+          公式与数字保持原样。
+        </span>
+        <span v-else>
           原文 {{ preview.source.paragraph_count }} 个段落块 / {{ preview.source.table_count }} 张表，
           译文 {{ preview.target.paragraph_count }} 个段落块 / {{ preview.target.table_count }} 张表
         </span>
@@ -328,16 +339,17 @@ onBeforeUnmount(stopPolling)
         <select v-model="targetLanguage" class="field__control" aria-label="译文语言">
           <option v-for="item in languageOptions" :key="item.code" :value="item.code">{{ item.label }}</option>
         </select>
-        <select v-model="granularity" class="field__control" aria-label="对齐粒度">
+        <p v-for="warning in preview.warnings || []" :key="warning" class="form-message">{{ warning }}</p>
+        <select v-if="preview.pair_format !== 'xlsx'" v-model="granularity" class="field__control" aria-label="对齐粒度">
           <option value="sentence">句子粒度（默认）</option>
           <option value="paragraph">段落粒度</option>
         </select>
-        <select v-model="alignmentStrategy" class="field__control" aria-label="对齐策略">
+        <select v-if="preview.pair_format !== 'xlsx'" v-model="alignmentStrategy" class="field__control" aria-label="对齐策略">
           <option value="order_first">全文顺序优先（当前稳定版）</option>
           <option value="hierarchical_llm">分块 + LLM（实验版）</option>
           <option value="structure_aware">结构辅助（旧方式）</option>
         </select>
-        <label><input v-model="fullReview" type="checkbox"> 启用 Gemini 块内拆分与配对</label>
+        <label v-if="preview.pair_format !== 'xlsx'"><input v-model="fullReview" type="checkbox"> 启用 Gemini 块内拆分与配对</label>
         <button class="button button--primary" :disabled="busy || sourceLanguage === targetLanguage" @click="createBatch">生成完整对齐草稿</button>
       </div>
 

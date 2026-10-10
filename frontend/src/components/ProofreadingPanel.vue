@@ -323,6 +323,7 @@ async function downloadBatch(batch: ProofreadingBatch) {
 function documentPairExportChoice(batch: ProofreadingBatch): { format: ProofreadingExportFormat; name: string } | null {
   if (batch.batch_kind !== 'document_pair' || !batch.bindings[0]?.file_record_id) return null
   if (batch.workflow_stage === 'proofreading') {
+    if (batch.pair_format === 'xlsx') return { format: 'proofreading_audit_xlsx', name: '导出 Excel 校对报告' }
     return batch.target_revision_export_available
       ? { format: 'proofreading_docx_target_revisions', name: '导出目标原格式（含修订）' }
       : { format: 'proofreading_docx_layout', name: '导出源格式双语 Word' }
@@ -494,8 +495,8 @@ defineExpose({ refreshBatches })
           <span class="proofreading-import-mode__icon"><FileText :size="22" /></span>
           <span class="proofreading-import-mode__copy">
             <strong>原文 + 译文两个文档</strong>
-            <small>分别上传两个文档，自动解析并对齐句段。</small>
-            <em>支持 DOC、DOCX、TXT</em>
+            <small>分别上传两个文档；复杂 Excel 按工作表和单元格位置对齐。</small>
+            <em>支持 DOC、DOCX、TXT、HTML、XLSX</em>
           </span>
           <ExternalLink class="proofreading-import-mode__arrow" :size="16" />
         </button>
@@ -549,7 +550,11 @@ defineExpose({ refreshBatches })
             <label><input v-model="sheetDrafts[sheet.sheet_index].enabled" type="checkbox" :disabled="!sheet.supported"> {{ sheet.name }}</label>
             <span>{{ sheet.max_row }} 行 × {{ sheet.max_column }} 列</span>
           </div>
-          <p v-if="!sheet.supported" class="form-message is-error">暂不能安全处理：{{ sheet.blocked_reasons.join('；') }}</p>
+          <template v-if="!sheet.supported">
+            <p class="form-message">当前表暂不支持插入校对列：{{ sheet.blocked_reasons.join('；') }}</p>
+            <p class="form-message">{{ sheet.capability_message }}</p>
+            <button class="button" type="button" @click="selectImportMode('document_pair')">使用原文 + 译文双 Excel 对齐</button>
+          </template>
           <div v-else-if="sheetDrafts[sheet.sheet_index].enabled" class="proofreading-sheet__settings">
             <label class="field">
               <span class="field__label">表头行</span>

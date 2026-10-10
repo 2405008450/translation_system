@@ -10,6 +10,12 @@ export interface AlignmentPreviewSide {
   character_count: number
   paragraph_count: number
   table_count: number
+  sheet_count?: number
+  text_cells?: number
+  drawing_texts?: number
+  formula_cells?: number
+  merged_regions?: number
+  pictures?: number
 }
 
 export interface AlignmentPreview {
@@ -17,6 +23,11 @@ export interface AlignmentPreview {
   source: AlignmentPreviewSide
   target: AlignmentPreviewSide
   supported_granularities: Array<'sentence' | 'paragraph'>
+  pair_format?: 'xlsx' | 'document'
+  coordinate_pairs?: number
+  structure_warnings?: number
+  unmatched_units?: number
+  warnings?: string[]
 }
 
 export interface AlignmentPair {

@@ -44,7 +44,7 @@ from app.services.proofreading import (
 )
 from app.services.llm_service import LLMConfigurationError, validate_provider_choice
 from app.services.document_alignment.segments import ensure_document_pair_segments_complete
-from app.services.document_alignment.export import build_export_readiness, target_revision_export_available
+from app.services.document_alignment.export import build_export_readiness, is_xlsx_pair, target_revision_export_available
 from app.services.file_export_queue import queue_file_export
 from app.services.file_record_service import delete_proofreading_batch
 
@@ -83,6 +83,7 @@ class ProofreadingExportTaskRequest(BaseModel):
         "proofreading_docx_ordered",
         "proofreading_audit_xlsx",
         "proofreading_xlsx_original",
+        "proofreading_xlsx_target",
     ]
     acknowledge_warnings: bool = False
 
@@ -482,6 +483,7 @@ def get_file_proofreading_baselines(
             else latest_report.model if latest_report else ""
         )
         proofreading_context = {
+            "pair_format": "xlsx" if batch and is_xlsx_pair(batch) else "document",
             "batch_id": str(binding.batch_id),
             "batch_kind": getattr(batch, "batch_kind", "xlsx_columns") if batch else "xlsx_columns",
             "workflow_stage": getattr(batch, "workflow_stage", "not_applicable") if batch else "not_applicable",

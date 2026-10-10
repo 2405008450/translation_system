@@ -140,7 +140,7 @@ import { useRichTextEditor, type TextFormat, type CaseType } from '../composable
 import { useToast } from '../composables/useToast'
 import { useWorkbenchShortcuts } from '../composables/useWorkbenchShortcuts'
 import { getTaskExportFormatLabel } from '../constants/taskFiles'
-import { llmModelOptions, llmProviderOptions, llmScopeOptions } from '../constants/llm'
+import { llmModelOptions, llmProviderOptions, llmScenarioOptions, llmScopeOptions } from '../constants/llm'
 import { formatLanguagePair } from '../constants/languages'
 import {
   calculateOverallWorkflowProgress,
@@ -166,6 +166,7 @@ import type {
   LLMMergeTarget,
   LLMProvider,
   LLMTranslateScope,
+  LLMTranslationScenario,
   RevisionDisplaySettings,
   SaveToTMResult,
   Segment,
@@ -332,6 +333,7 @@ type ProofreadingBaselineResponse = {
     actual_model: string
     failed_segments: number
     target_revision_export_available: boolean
+    pair_format?: 'xlsx' | 'document'
   } | null
   items: Array<{
     segment_id: string
@@ -757,7 +759,18 @@ const proofreadingExportChoices = computed<Array<{
   format: ProofreadingExportFormat
   name: string
   description: string
-}>>(() => (
+}>>(() => proofreadingContext.value?.pair_format === 'xlsx' ? [
+  {
+    format: 'proofreading_audit_xlsx',
+    name: proofreadingContext.value?.workflow_stage === 'proofreading' ? 'Excel 校对报告' : 'Excel 对齐报告',
+    description: '保留原文和译文位置；校对阶段包含修改后的译文与理由。',
+  },
+  ...(proofreadingContext.value?.workflow_stage === 'proofreading' ? [{
+    format: 'proofreading_xlsx_target' as const,
+    name: '目标原格式 Excel',
+    description: '以译文副本为底稿，只回写修改的文字，保留合并、公式和图片。',
+  }] : []),
+] : (
   proofreadingContext.value?.batch_kind === 'document_pair'
     ? proofreadingContext.value?.workflow_stage === 'proofreading'
       ? [
@@ -1064,6 +1077,7 @@ function handleBottomDrawerResizeKeydown(event: KeyboardEvent) {
 
 const pageError = ref('')
 const llmScope = ref<LLMTranslateScope>('current_segment')
+const llmTranslationScenario = ref<LLMTranslationScenario>('standard')
 const llmMergeTarget = ref<LLMMergeTarget>('current_file')
 const llmProvider = ref<LLMProvider>('deepseek')
 const llmModel = ref('')
@@ -8473,6 +8487,7 @@ async function replaceSegmentPageQueryIfNeeded() {
 }
 
 async function loadTask() {
+  llmTranslationScenario.value = 'standard'
   if (!props.id) {
     pageError.value = t('workbench.errors.taskLoad')
     return
@@ -8559,6 +8574,7 @@ async function loadTask() {
 }
 
 async function loadMergeViewTask() {
+  llmTranslationScenario.value = 'standard'
   if (!props.mergeViewId) {
     return
   }
@@ -8734,6 +8750,7 @@ async function runLLMTranslation() {
     await segmentStore.startLLMTranslation(llmScope.value, llmProvider.value, {
       guidelineTemplateId: selectedGuidelineTemplateId.value || undefined,
       temporaryPrompt: workbenchGuidelines.value,
+      translationScenario: llmTranslationScenario.value,
       model: llmModel.value || undefined,
       sentenceId: llmScope.value === 'current_segment' ? currentSentenceId : undefined,
       mergeTarget: segmentStore.mergeViewId ? llmMergeTarget.value : undefined,
@@ -10068,6 +10085,12 @@ onBeforeRouteLeave(async () => {
 
       <div v-if="!authStore.isExternalTranslator && !workbenchRibbonCollapsed" class="workbench-ribbon__ai-strip" aria-label="AI">
         <label class="ai-strip__field">
+          <span>{{ t('llm.scenario.label') }}</span>
+          <select v-model="llmTranslationScenario" class="field__control" :disabled="segmentStore.llmRunning" data-testid="llm-translation-scenario" :title="t('llm.scenario.mixedDescription')">
+            <option v-for="option in llmScenarioOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+          </select>
+        </label>
+        <label class="ai-strip__field">
           <span>{{ t('workbench.aiScopeShort') }}</span>
           <select v-model="llmScope" class="field__control" :title="activeMergeFileContextTitle || t('workbench.aiScope')">
             <option v-for="option in workbenchLLMScopeOptions" :key="option.value" :value="option.value">
@@ -10135,6 +10158,10 @@ onBeforeRouteLeave(async () => {
           <span>{{ t('workbench.ribbon.autoTagging') }}</span>
         </button>
       </div>
+
+      <p v-if="!authStore.isExternalTranslator && !workbenchRibbonCollapsed && llmTranslationScenario === 'mixed'" class="llm-scenario-note" role="note">
+        {{ t('llm.scenario.mixedDescription') }} {{ t('llm.scenario.mixedHint') }}
+      </p>
 
       <div v-if="!workbenchRibbonCollapsed" class="workbench-ribbon__container container">
         <div class="tool-group tool-group--confirm workbench-confirm-menu">
@@ -10774,6 +10801,14 @@ onBeforeRouteLeave(async () => {
         >
           <ArrowLeft :size="16" />
         </button>
+
+        <label class="field field--compact workbench-toolbar__field">
+          <span class="field__label">{{ t('llm.scenario.label') }}</span>
+          <select v-model="llmTranslationScenario" class="field__control" :disabled="segmentStore.llmRunning" data-testid="llm-translation-scenario" :title="t('llm.scenario.mixedDescription')">
+            <option v-for="option in llmScenarioOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+          </select>
+          <span v-if="llmTranslationScenario === 'mixed'" class="field__note" role="note">{{ t('llm.scenario.mixedHint') }}</span>
+        </label>
 
         <label class="field field--compact workbench-toolbar__field">
           <span class="field__label">{{ t('workbench.aiScopeShort') }}</span>
@@ -14804,6 +14839,14 @@ onBeforeRouteLeave(async () => {
   color: #245d5b;
   font-size: 11px;
   line-height: 1.2;
+}
+
+.llm-scenario-note {
+  margin: 0;
+  padding: 6px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #52616f;
 }
 
 .ai-strip__button {

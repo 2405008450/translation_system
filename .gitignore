@@ -45,7 +45,8 @@ frontend/.env.*.local
 frontend/.DS_Store
 .claude
 *.xlsx
-tests/
+tests/*
+!tests/test_mixed_translation.py
 记忆库下载/
 术语库下载/
 tools/yicat_cookies.json
@@ -53,6 +54,7 @@ TMX下载/
 /tools/
 /.playwright-mcp/
 
+.server-diagnostics/
 # Local translation export/probe artifacts
 /tm_*.json
 /tm_*.jsonl
@@ -63,3 +65,5 @@ outputs/
 
 # Local translation-rule sample; production rules are uploaded per project
 /广东地方志翻译规则_230620.docx
+
+docs/

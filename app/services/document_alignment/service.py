@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -107,13 +107,40 @@ def _calibrate_pair_confidence(
 
 
 def preview_document_pair(source_bytes: bytes, source_filename: str, target_bytes: bytes, target_filename: str) -> dict:
+    xlsx_pair = _is_xlsx_pair(source_filename, target_filename)
+    if xlsx_pair:
+        from .xlsx import build_xlsx_pairs, read_xlsx_content
+        source_content = read_xlsx_content(source_bytes)
+        target_content = read_xlsx_content(target_bytes)
+        source, target = source_content.units(), target_content.units()
+        pairs = build_xlsx_pairs(source, target, {"xlsx_manifest": {
+            "source": source_content.items, "target": target_content.items,
+        }})
+        return {
+            "source": {**_structure_summary(source, source_filename), **source_content.summary},
+            "target": {**_structure_summary(target, target_filename), **target_content.summary},
+            "pair_format": "xlsx", "supported_granularities": ["paragraph"],
+            "coordinate_pairs": sum(bool(p.src_indices and p.tgt_indices) for p in pairs),
+            "structure_warnings": sum(bool(p.features.get("structure_warning")) for p in pairs),
+            "unmatched_units": sum(not p.src_indices or not p.tgt_indices for p in pairs),
+            "warnings": list(dict.fromkeys(source_content.summary["warnings"] + target_content.summary["warnings"])),
+        }
     source = parse_side(source_bytes, source_filename, "sentence")
     target = parse_side(target_bytes, target_filename, "sentence")
     return {
         "source": _structure_summary(source, source_filename),
         "target": _structure_summary(target, target_filename),
         "supported_granularities": ["sentence", "paragraph"],
+        "pair_format": "document",
     }
+
+
+def _is_xlsx_pair(source_filename: str, target_filename: str) -> bool:
+    source_xlsx = Path(source_filename).suffix.lower() == ".xlsx"
+    target_xlsx = Path(target_filename).suffix.lower() == ".xlsx"
+    if source_xlsx != target_xlsx:
+        raise ValueError("Excel 对齐需要原文和译文均为 .xlsx 文件。")
+    return source_xlsx
 
 
 def _structure_summary(units: list[AlignUnit], filename: str) -> dict:
@@ -170,8 +197,20 @@ def create_alignment_batch(
     require_language_pair(source_language, target_language)
     if alignment_strategy not in {"hierarchical_llm", "order_first", "structure_aware"}:
         raise ValueError("不支持的对齐策略。")
-    src_units = parse_side(source_bytes, source_filename, granularity)
-    tgt_units = parse_side(target_bytes, target_filename, granularity)
+    xlsx_config = {}
+    if _is_xlsx_pair(source_filename, target_filename):
+        from .xlsx import read_xlsx_content
+        source_content, target_content = read_xlsx_content(source_bytes), read_xlsx_content(target_bytes)
+        src_units, tgt_units = source_content.units(), target_content.units()
+        granularity, alignment_strategy, full_review, use_llm_for_hard_blocks = "paragraph", "xlsx_coordinate", False, False
+        xlsx_config = {
+            "pair_format": "xlsx",
+            "xlsx_manifest": {"source": source_content.items, "target": target_content.items},
+            "xlsx_summary": {"source": source_content.summary, "target": target_content.summary},
+        }
+    else:
+        src_units = parse_side(source_bytes, source_filename, granularity)
+        tgt_units = parse_side(target_bytes, target_filename, granularity)
     if not src_units and not tgt_units:
         raise ValueError("两份文档均未解析出可对齐内容。")
     batch = ProofreadingBatch(
@@ -188,6 +227,7 @@ def create_alignment_batch(
             # 这是批次级快照，避免部署环境的全局开关改变历史批次行为。
             "full_review": full_review,
             "full_review_model": get_settings().alignment_llm_full_review_model,
+            **xlsx_config,
         }, ensure_ascii=False),
     )
     db.add(batch)
@@ -224,7 +264,17 @@ def _orm_units(db: Session, batch_id: UUID, side: str) -> list[AlignUnit]:
             numbering=row.numbering, char_len=max(1, len(normalize_text(row.text))),
             numbers=tuple(extract_numbers(row.text)), is_heading=inferred_heading,
         ))
-    return assign_table_boundary_keys(units)
+    units = assign_table_boundary_keys(units)
+    config = json.loads(db.get(ProofreadingBatch, batch_id).config_json or "{}")
+    manifest = config.get("xlsx_manifest", {}).get(side)
+    if manifest is not None:
+        # 工作表重排时，名称键仍能保证人工拆分和合并不串到另一张表。
+        from .xlsx import item_key
+        units = [replace(
+            unit, cell_key=str(item_key(manifest[unit.index])),
+            row_key=str((manifest[unit.index]["sheet_name"], unit.row_index)),
+        ) for unit in units]
+    return units
 
 
 AlignmentProgress = Callable[[int, int, str], None]
@@ -305,6 +355,12 @@ async def _compute_pairs(
     progress_callback: AlignmentProgress | None = None,
 ) -> list[AlignPair]:
     config = json.loads(batch.config_json or "{}")
+    if config.get("pair_format") == "xlsx":
+        from .xlsx import build_xlsx_pairs
+        pairs = build_xlsx_pairs(src, tgt, config)
+        if progress_callback is not None:
+            progress_callback(1, 1, "Excel 单元格位置对齐")
+        return pairs
     ratio = _language_ratio(batch.source_language, batch.target_language)
     settings = get_settings()
     # 历史批次没有该字段时继续走原有顺序策略；新建批次由 API 明确写入新默认值。
@@ -969,14 +1025,28 @@ def _store_pairs(
 ) -> None:
     src = {unit.index: unit for unit in _orm_units(db, batch.id, "source")}
     tgt = {unit.index: unit for unit in _orm_units(db, batch.id, "target")}
+    config = json.loads(batch.config_json or "{}")
+    manual_features = {}
+    if config.get("pair_format") == "xlsx":
+        from .xlsx import pair_locations
+        for row in db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id, locked=True).all():
+            key = (tuple(json.loads(row.src_indices)), tuple(json.loads(row.tgt_indices)))
+            previous = json.loads(row.features or "{}")
+            manual_features[key] = {name: previous[name] for name in ("manual_source_text", "manual_target_text") if name in previous}
     db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).delete(synchronize_session=False)
     for order, pair in enumerate(pairs):
         first = src.get(pair.src_indices[0]) if pair.src_indices else tgt.get(pair.tgt_indices[0])
         signature = (tuple(pair.src_indices), tuple(pair.tgt_indices))
         _set_pair_cell_features(pair.features, pair.src_indices, pair.tgt_indices, src, tgt)
+        if config.get("pair_format") == "xlsx":
+            if signature in (locked_signatures or set()):
+                pair.features.update(manual_features.get(signature, {}))
+            pair.features["source_location"] = pair_locations(config, pair.src_indices, "source")
+            pair.features["target_location"] = pair_locations(config, pair.tgt_indices, "target")
         db.add(DocumentAlignmentPair(
             batch_id=batch.id, pair_order=order, src_indices=json.dumps(pair.src_indices), tgt_indices=json.dumps(pair.tgt_indices),
-            source_text=_join_text(pair.src_indices, src), target_text=_join_text(pair.tgt_indices, tgt),
+            source_text=pair.features.get("manual_source_text", _join_text(pair.src_indices, src)),
+            target_text=pair.features.get("manual_target_text", _join_text(pair.tgt_indices, tgt)),
             confidence=pair.confidence, confidence_level=pair.confidence_level, method=pair.method,
             features=json.dumps(pair.features, ensure_ascii=False), block_type=first.block_type if first else "paragraph",
             block_index=first.block_index if first else 0, row_index=first.row_index if first else None,
@@ -1008,9 +1078,15 @@ def _store_pairs(
             f" LLM 分块：接受 {accepted_chunks}，未调整 {unchanged_chunks}，"
             f"失败或拒绝 {failed_chunks}。"
         )
-    config = json.loads(batch.config_json or "{}")
     hierarchical = config.get("alignment_strategy") == "hierarchical_llm"
-    if hierarchical:
+    if config.get("pair_format") == "xlsx":
+        batch.message = (
+            f"Excel 位置对齐完成：{len(pairs)} 个配对，"
+            f"结构差异 {sum(bool(p.features.get('structure_warning')) for p in pairs)} 处，"
+            f"缺口 {sum(not p.src_indices or not p.tgt_indices for p in pairs)} 处。"
+            "可编辑图形文字已纳入，图片内部文字请人工检查。"
+        )
+    elif hierarchical:
         batch.message = (
             f"分块对齐完成：隔离页眉页脚/页码 "
             f"{sum(pair.method == 'ignored_running_matter' for pair in pairs)} 组，"
@@ -1150,7 +1226,11 @@ def run_alignment_batch(batch_id: UUID) -> None:
 
         # 从这里到最终落库之间不持有数据库会话。全量 LLM 复核即使运行数小时，
         # 也不会触发 PostgreSQL idle-in-transaction 超时。
-        if not locked_anchors:
+        if locked_anchors and json.loads(batch.config_json or "{}").get("pair_format") == "xlsx":
+            from .xlsx import build_xlsx_pairs
+            # Excel 按位置匹配，工作表重排后的锁定关系无需满足全文单调顺序。
+            pairs = build_xlsx_pairs(src, tgt, json.loads(batch.config_json), locked_anchors)
+        elif not locked_anchors:
             pairs = asyncio.run(_compute_pairs(
                 batch, src, tgt,
                 progress_callback=lambda completed, total, phase: _write_alignment_progress(
@@ -1249,6 +1329,12 @@ def refresh_pair_text(db: Session, pair: DocumentAlignmentPair) -> None:
         else _join_text(tgt_indices, tgt)
     )
     _set_pair_cell_features(features, src_indices, tgt_indices, src, tgt)
+    batch = db.get(ProofreadingBatch, pair.batch_id)
+    config = json.loads(batch.config_json or "{}")
+    if config.get("pair_format") == "xlsx":
+        from .xlsx import pair_locations
+        features["source_location"] = pair_locations(config, src_indices, "source")
+        features["target_location"] = pair_locations(config, tgt_indices, "target")
     pair.features = json.dumps(features, ensure_ascii=False)
     pair.method = "manual"
     pair.confidence = 1.0 if pair.locked else 0.8

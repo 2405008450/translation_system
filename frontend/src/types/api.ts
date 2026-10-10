@@ -1788,9 +1788,11 @@ export interface CommentReplyPayload {
 
 export type LLMTranslateScope = 'current_segment' | 'fuzzy_only' | 'none_only' | 'empty_target_only' | 'all' | 'all_with_exact'
 export type LLMProvider = 'auto' | 'deepseek' | 'openrouter'
+export type LLMTranslationScenario = 'standard' | 'mixed'
 export type LLMMergeTarget = 'current_file' | 'merge_view'
 
 export interface LLMGuidelineOptions {
+  translationScenario?: LLMTranslationScenario
   guidelineTemplateId?: string
   temporaryPrompt?: string
   model?: string

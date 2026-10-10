@@ -5,7 +5,7 @@ import { useI18n } from 'vue-i18n'
 
 import { http } from '../api/http'
 import { canonicalizeLanguagePair, formatLanguagePair } from '../constants/languages'
-import { defaultLLMModelId, llmModelOptions as baseLLMModelOptions } from '../constants/llm'
+import { defaultLLMModelId, llmModelOptions as baseLLMModelOptions, llmScenarioOptions } from '../constants/llm'
 import { pushToast } from '../composables/useToast'
 import type {
   DocumentMatchAnalysisRow,
@@ -13,6 +13,7 @@ import type {
   GuidelineTemplateSummary,
   LLMProvider,
   LLMTranslateScope,
+  LLMTranslationScenario,
   PretranslationMatchAnalysisPreviewResponse,
   TermBase,
   TMCollection,
@@ -87,6 +88,7 @@ interface PretranslationRunStatus {
   completed_files: number
   failed_files: number
   canceled_files: number
+  llm_translation_scenario?: LLMTranslationScenario
   tasks: PretranslationTaskStatus[]
 }
 
@@ -154,6 +156,7 @@ const llmScope = ref<LLMTranslateScope>('all')
 const llmProvider = ref<LLMProvider>('openrouter')
 const llmModel = ref(defaultLLMModelId)
 const llmTranslationUnit = ref<LLMTranslationUnit>('sentence')
+const llmTranslationScenario = ref<LLMTranslationScenario>('standard')
 const llmGuidelines = ref('')
 const selectedGuidelineTemplateId = ref('')
 const importingGuidelineTemplate = ref(false)
@@ -546,6 +549,7 @@ watch(() => props.open, (open) => {
   if (open) {
     void loadResources()
     if (!running.value) {
+      llmTranslationScenario.value = 'standard'
       resetProgress()
       applyTMThresholdDefaultFromFiles()
       applyResourceDefaultsFromFiles(true)
@@ -683,6 +687,7 @@ function buildTaskStatusText(task: PretranslationTaskStatus) {
 
 function applyPretranslationRun(run: PretranslationRunStatus) {
   activeRunId.value = run.id
+  llmTranslationScenario.value = run.llm_translation_scenario || 'standard'
   const nextTaskIdsByFileId = { ...activeTaskIdsByFileId.value }
   let activeCount = 0
   let terminalCount = 0
@@ -1212,6 +1217,8 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
         model: llmModel.value || null,
         guideline_template_id: selectedGuidelineTemplateId.value || null,
         temporary_prompt: llmGuidelines.value,
+        translation_unit: llmTranslationUnit.value,
+        translation_scenario: llmTranslationScenario.value,
         glossary_base_ids: useGlossary.value ? selectedGlossaryBaseIds.value : [],
       }),
       signal: controller.signal,
@@ -1537,6 +1544,7 @@ async function startPreTranslateTaskRun() {
       llm_provider: llmProvider.value,
       llm_model: llmModel.value || null,
       llm_translation_unit: llmTranslationUnit.value,
+      llm_translation_scenario: llmTranslationScenario.value,
       guideline_template_id: selectedGuidelineTemplateId.value || null,
       temporary_prompt: llmGuidelines.value,
     })
@@ -2074,6 +2082,13 @@ onBeforeUnmount(() => {
         </div>
         <div class="ptd-grid ptd-grid--llm">
           <label class="field">
+            <span class="field__label">{{ t('llm.scenario.label') }}</span>
+            <select v-model="llmTranslationScenario" class="field__control" :disabled="running || !useLlm" data-testid="pretranslate-translation-scenario">
+              <option v-for="option in llmScenarioOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+            </select>
+            <span v-if="llmTranslationScenario === 'mixed'" class="field__note">{{ t('llm.scenario.mixedDescription') }}</span>
+          </label>
+          <label class="field">
             <span class="field__label">{{ t('projectDetail.preTranslate.llm.provider') }}</span>
             <select v-model="llmProvider" class="field__control" :disabled="running || !useLlm">
               <option v-for="option in llmProviderOptions" :key="option.value" :value="option.value">
@@ -2099,6 +2114,7 @@ onBeforeUnmount(() => {
             <span class="field__note">{{ t('projectDetail.preTranslate.llm.scopeHint') }}</span>
           </label>
         </div>
+        <p v-if="llmTranslationScenario === 'mixed'" class="hint-text" role="note">{{ t('llm.scenario.mixedHint') }}</p>
         <label class="field field--full">
           <span class="field__label">{{ t('projectDetail.preTranslate.llm.guidelineTemplate') }}</span>
           <div class="ptd-guideline-tools">

@@ -283,6 +283,10 @@ def preview_workbook(raw_bytes: bytes, filename: str) -> dict[str, Any]:
                 ],
                 "supported": not blocked_reasons,
                 "blocked_reasons": blocked_reasons,
+                "capability_message": (
+                    "可通过双 Excel 位置对齐校对文字并导出独立报告；当前列映射模式暂不支持在此表插入校对列。"
+                    if blocked_reasons else "支持同表原文列与译文列校对。"
+                ),
             })
     finally:
         workbook.close()
@@ -1373,6 +1377,7 @@ def serialize_batch(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
     )
     return {
         "id": str(batch.id),
+        "pair_format": "xlsx" if config.get("pair_format") == "xlsx" else "document",
         "project_id": str(batch.project_id),
         "filename": batch.filename,
         "source_language": batch.source_language,

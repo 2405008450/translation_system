@@ -1,4 +1,4 @@
-import type { LLMProvider, LLMTranslateScope } from '../types/api'
+import type { LLMProvider, LLMTranslateScope, LLMTranslationScenario } from '../types/api'
 import { translate } from '../i18n'
 
 export interface LLMOption<T extends string> {
@@ -15,6 +15,19 @@ export interface LLMModelOption {
 }
 
 export const defaultLLMModelId = 'google/gemini-3.7-flash'
+
+export const llmScenarioOptions: LLMOption<LLMTranslationScenario>[] = [
+  {
+    value: 'standard',
+    get label() { return translate('llm.scenario.standard') },
+    get description() { return translate('llm.scenario.standardDescription') },
+  },
+  {
+    value: 'mixed',
+    get label() { return translate('llm.scenario.mixed') },
+    get description() { return translate('llm.scenario.mixedDescription') },
+  },
+]
 
 export const llmModelShortLabelMap: Record<string, string> = {
   'google/gemini-3.7-flash': 'Gemini 3.7 Flash',

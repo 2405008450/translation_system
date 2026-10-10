@@ -803,6 +803,14 @@ const overrides = {
     },
   },
   llm: {
+    scenario: {
+      label: 'Translation scenario',
+      standard: 'Standard translation',
+      standardDescription: 'Translate from the source language selected for the file.',
+      mixed: 'Mixed-language source',
+      mixedDescription: 'Translate Korean, English and other natural-language descriptions into the target language, preserving tags, variables, model numbers, abbreviations and protocol literals.',
+      mixedHint: 'To repair existing TM translations, select a scope that includes 100% matches. Rerunning may overwrite old translations; confirmed segments still follow the existing scope rules.',
+    },
     scope: {
       currentSegment: {
         label: 'Current segment',

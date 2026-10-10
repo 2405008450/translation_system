@@ -2970,6 +2970,7 @@ export const useSegmentStore = defineStore('segment', () => {
             sentence_id: realSentenceId,
             guideline_template_id: guidelineOptions.guidelineTemplateId || null,
             temporary_prompt: guidelineOptions.temporaryPrompt || '',
+            translation_scenario: guidelineOptions.translationScenario || 'standard',
           }),
           signal: llmAbortController?.signal,
         })

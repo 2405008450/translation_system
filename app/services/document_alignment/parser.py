@@ -353,7 +353,10 @@ def parse_side(raw_bytes: bytes, filename: str, granularity: str = "sentence") -
         result = _parse_txt(raw_bytes, granularity)
     elif suffix in {".html", ".htm"}:
         result = _parse_html(raw_bytes, filename, granularity)
+    elif suffix == ".xlsx":
+        from .xlsx import read_xlsx_content
+        result = read_xlsx_content(raw_bytes).units()
     else:
-        raise ValueError("仅支持 docx、doc、txt、html 和 htm 文档。")
+        raise ValueError("仅支持 docx、doc、txt、html、htm 和 xlsx 文档。")
     indexed = [replace(unit, index=index) for index, unit in enumerate(result)]
     return assign_table_boundary_keys(indexed)

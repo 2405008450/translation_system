@@ -19,6 +19,7 @@ export interface ProofreadingSheetPreview {
   header_candidates: Array<{ row_index: number; values: string[] }>
   supported: boolean
   blocked_reasons: string[]
+  capability_message?: string
 }
 
 export interface ProofreadingPreview {
@@ -61,6 +62,7 @@ export interface ProofreadingBatch {
   source_language: string
   target_language?: string
   batch_kind?: 'xlsx_columns' | 'document_pair'
+  pair_format?: 'xlsx' | 'document'
   alignment_status?: 'not_applicable' | 'aligning' | 'canceling' | 'canceled' | 'draft' | 'confirmed' | 'failed'
   workflow_stage?: 'not_applicable' | 'import' | 'alignment' | 'proofreading'
   target_revision_export_available?: boolean
@@ -95,6 +97,7 @@ export type ProofreadingExportFormat =
   | 'proofreading_docx_ordered'
   | 'proofreading_audit_xlsx'
   | 'proofreading_xlsx_original'
+  | 'proofreading_xlsx_target'
 
 export interface ProofreadingExportReadiness {
   batch_id: string

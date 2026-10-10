@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.models import (
     DocumentAlignmentPair, FileRecord, ProofreadingBatch, ProofreadingColumnBinding,
     ProofreadingSegmentBaseline, Segment,
+    TranslationReviewReportItem,
 )
 from app.services.normalizer import compact_match_core
 
@@ -162,12 +163,21 @@ def target_revision_export_available(batch: ProofreadingBatch) -> bool:
     )
 
 
+def is_xlsx_pair(batch: ProofreadingBatch) -> bool:
+    return batch.batch_kind == "document_pair" and _batch_config(batch).get("pair_format") == "xlsx"
+
+
 def build_export_readiness(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
     rows, file_record = build_proofreading_export_rows(db, batch)
     stage = getattr(batch, "workflow_stage", "not_applicable")
     if batch.batch_kind == "document_pair":
         available_formats = ["proofreading_audit_xlsx"]
-        if stage == "proofreading":
+        if stage == "proofreading" and is_xlsx_pair(batch):
+            available_formats = ["proofreading_audit_xlsx"]
+            target_filename = str(_batch_config(batch).get("target_filename") or "")
+            if target_cache_path(batch.id, target_filename, create_parent=False).is_file():
+                available_formats.append("proofreading_xlsx_target")
+        elif stage == "proofreading":
             available_formats = [
                 "proofreading_docx_layout",
                 "proofreading_docx_ordered",
@@ -585,6 +595,8 @@ def export_alignment_csv(pairs: list[DocumentAlignmentPair]) -> bytes:
 
 def export_document_pair_xlsx(db: Session, batch: ProofreadingBatch) -> tuple[bytes, str]:
     """导出纯对齐结果，不读取或生成校对后译文。"""
+    if is_xlsx_pair(batch):
+        return export_xlsx_pair_audit(db, batch)
     pairs = db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(
         DocumentAlignmentPair.pair_order,
     ).all()
@@ -628,6 +640,107 @@ def export_document_pair_xlsx(db: Session, batch: ProofreadingBatch) -> tuple[by
     workbook.save(output)
     workbook.close()
     return output.getvalue(), f"{Path(batch.filename).stem}_原文译文对齐表.xlsx"
+
+
+def export_xlsx_pair_audit(db: Session, batch: ProofreadingBatch) -> tuple[bytes, str]:
+    """独立报告保留两侧位置；对齐阶段只报告原译文，校对阶段包含修订。"""
+    from .xlsx import pair_locations
+
+    config = _batch_config(batch)
+    proofreading = getattr(batch, "workflow_stage", "") == "proofreading"
+    rows, file_record = build_proofreading_export_rows(db, batch)
+    pairs = db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(DocumentAlignmentPair.pair_order).all()
+    reasons: dict[str, str] = {}
+    if proofreading and file_record is not None:
+        segments = {s.id: s for s in db.query(Segment).filter_by(file_record_id=file_record.id).all()}
+        for item in db.query(TranslationReviewReportItem).filter_by(file_record_id=file_record.id).order_by(
+            TranslationReviewReportItem.created_at, TranslationReviewReportItem.id,
+        ).all():
+            segment = segments.get(item.segment_id)
+            if segment is not None and item.suggested_target_text == segment.target_text and item.reason:
+                reasons[str(_segment_metadata(segment).get("alignment_pair_id", ""))] = item.reason
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Excel校对报告" if proofreading else "Excel对齐报告"
+    headers = ["序号", "状态", "原文位置", "译文位置", "原文", "原译文"]
+    if proofreading:
+        headers += ["校对译文", "是否修改", "确认状态", "修改理由"]
+    headers += ["结构提示"]
+    sheet.append(headers)
+    for row, pair in zip(rows, pairs):
+        features = json.loads(pair.features or "{}")
+        values = [row.order + 1, row.kind,
+                  pair_locations(config, json.loads(pair.src_indices or "[]"), "source"),
+                  pair_locations(config, json.loads(pair.tgt_indices or "[]"), "target"),
+                  pair.source_text, row.original_target_text if proofreading else pair.target_text]
+        if proofreading:
+            values += [row.reviewed_target_text, "是" if row.changed else "否", row.confirmation_status,
+                       reasons.get(row.pair_id, "人工修改" if row.changed else "")]
+        values += [features.get("structure_warning", "")]
+        sheet.append(values)
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(fill_type="solid", fgColor="FFD9EAF7")
+    # 报告文本始终按字符串写入，避免把以等号开头的译文当成公式。
+    for cells in sheet.iter_rows(min_row=2):
+        for cell in cells:
+            if isinstance(cell.value, str):
+                cell.data_type = "s"
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    from openpyxl.utils import get_column_letter
+    for index, title in enumerate(headers, 1):
+        sheet.column_dimensions[get_column_letter(index)].width = 48 if "文" in title else 32 if "位置" in title or "理由" in title or "提示" in title else 14
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    sheet.sheet_view.showGridLines = False
+    coverage = workbook.create_sheet("覆盖说明")
+    coverage.append(["项目", "说明"])
+    coverage.append(["处理范围", "文字单元格及可编辑图形文字；公式、数字、协议标签保持原样。"])
+    coverage.append(["配对方式", "按工作表名称和单元格位置；图形按对象标识及段落位置。"])
+    coverage.append(["图片文字", "图片内部文字未自动校对，请人工检查。"])
+    for side, label in (("source", "原文"), ("target", "译文")):
+        summary = config.get("xlsx_summary", {}).get(side, {})
+        coverage.append([label + "文字单元格", summary.get("text_cells", 0)])
+        coverage.append([label + "图形文字段落", summary.get("drawing_texts", 0)])
+        coverage.append([label + "公式单元格", summary.get("formula_cells", 0)])
+    coverage.column_dimensions["A"].width = 25
+    coverage.column_dimensions["B"].width = 95
+    output = BytesIO()
+    workbook.save(output)
+    workbook.close()
+    suffix = "校对报告" if proofreading else "对齐报告"
+    return output.getvalue(), f"{Path(batch.filename).stem}_{suffix}.xlsx"
+
+
+def export_target_xlsx(db: Session, batch: ProofreadingBatch) -> tuple[bytes, str]:
+    """以译文副本为母版，只回写有明确目标位置的已修改文字。"""
+    from .xlsx import patch_xlsx_text
+
+    if not is_xlsx_pair(batch) or getattr(batch, "workflow_stage", "") != "proofreading":
+        raise ValueError("仅在双 Excel 校对阶段允许导出目标原格式。")
+    config = _batch_config(batch)
+    filename = str(config.get("target_filename") or "")
+    path = target_cache_path(batch.id, filename, create_parent=False)
+    if not path.is_file():
+        raise ValueError("译文 Excel 原件缺失，请重新导入。")
+    rows, _ = build_proofreading_export_rows(db, batch)
+    rows_by_pair = {row.pair_id: row for row in rows}
+    manifest = config["xlsx_manifest"]["target"]
+    replacements = []
+    for pair in db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(DocumentAlignmentPair.pair_order).all():
+        row = rows_by_pair[str(pair.id)]
+        indices = json.loads(pair.tgt_indices or "[]")
+        if len(indices) != 1:
+            original_parts = "\n".join(manifest[index]["text"] for index in indices)
+            if row.reviewed_target_text != original_parts:
+                raise ValueError("修改内容没有唯一的目标单元格或图形段落，请先拆分配对；也可导出独立校对报告。")
+            continue
+        item = manifest[indices[0]]
+        # 包含对齐阶段的人工文本修订，不能只比较校对阶段基线。
+        if row.reviewed_target_text != item["text"]:
+            replacements.append((item, row.reviewed_target_text))
+    raw_bytes = path.read_bytes()
+    return patch_xlsx_text(raw_bytes, replacements), f"{Path(filename).stem}_校对版.xlsx"
 
 
 def export_ordered_bilingual_docx(

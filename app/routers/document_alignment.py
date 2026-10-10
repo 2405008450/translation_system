@@ -133,9 +133,11 @@ async def preview_alignment(
     # 避免在 asyncio.to_thread 期间触发 idle-in-transaction 超时。
     db.rollback()
     source_name, target_name = source_file.filename or "source.txt", target_file.filename or "target.txt"
-    allowed = {".docx", ".doc", ".txt", ".html", ".htm"}
+    allowed = {".docx", ".doc", ".txt", ".html", ".htm", ".xlsx"}
     if Path(source_name).suffix.lower() not in allowed or Path(target_name).suffix.lower() not in allowed:
-        raise HTTPException(400, "仅支持 docx、doc、txt、html 和 htm 文档。")
+        raise HTTPException(400, "仅支持 docx、doc、txt、html、htm 和 xlsx 文档。")
+    if (Path(source_name).suffix.lower() == ".xlsx") != (Path(target_name).suffix.lower() == ".xlsx"):
+        raise HTTPException(400, "Excel 对齐需要原文和译文均为 .xlsx 文件。")
     token = str(uuid4())
     try:
         staged = await asyncio.to_thread(

@@ -256,6 +256,7 @@ interface ProjectFileItem {
     alignment_status: string
     batch_status: string
     target_revision_export_available: boolean
+    pair_format?: 'xlsx' | 'document'
   } | null
 }
 
@@ -1918,6 +1919,20 @@ function getProofreadingExportChoices(row: ProjectRow): ProofreadingExportChoice
   const info = row.proofreading
   if (!info?.batch_id) return []
   const stage = info.workflow_stage
+  if (info.pair_format === 'xlsx') {
+    return [
+      {
+        format: 'proofreading_audit_xlsx',
+        name: stage === 'proofreading' ? 'Excel 校对报告' : 'Excel 对齐报告',
+        description: '原文与译文按位置对照；校对阶段包含修改后的译文与理由。',
+      },
+      ...(stage === 'proofreading' ? [{
+        format: 'proofreading_xlsx_target' as const,
+        name: '目标原格式 Excel',
+        description: '以译文副本为底稿，只回写修改的文字，保留合并、公式和图片。',
+      }] : []),
+    ]
+  }
   if (info.batch_kind === 'document_pair') {
     const alignmentTable: ProofreadingExportChoice = {
       format: 'proofreading_audit_xlsx',

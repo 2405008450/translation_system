@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
@@ -45,6 +46,8 @@ def _pair_segment_metadata(batch: ProofreadingBatch, pair: DocumentAlignmentPair
         "confidence": pair.confidence,
         "method": pair.method,
         "cross_cell": bool(features.get("cross_cell")) if isinstance(features, dict) else False,
+        "source_location": features.get("source_location", "") if isinstance(features, dict) else "",
+        "target_location": features.get("target_location", "") if isinstance(features, dict) else "",
     }
 
 
@@ -63,6 +66,7 @@ def _create_pair_segment(
     source_text = TRANSLATION_ONLY_SOURCE_LABEL if translation_only else pair.source_text
     source_hash_text = f"translation-only:{pair.id}" if translation_only else pair.source_text
     segment = Segment(
+        id=uuid4(),
         file_record_id=file_record.id, workflow_step_id=workflow_step_id,
         sentence_id=f"align-{pair.id}", source_text=source_text,
         source_hash=build_source_hash(source_hash_text), display_text=source_text,
@@ -75,7 +79,9 @@ def _create_pair_segment(
         segment_metadata=json.dumps(metadata, ensure_ascii=False),
     )
     db.add(segment)
-    db.flush()
+    # UUID 已在内存生成，Excel 大批次无需为每个单元格单独往返数据库。
+    if not metadata.get("source_location") and not metadata.get("target_location"):
+        db.flush()
     baseline = ProofreadingSegmentBaseline(
         batch_id=batch.id, binding_id=binding.id, segment_id=segment.id, sheet_index=0,
         row_index=pair.pair_order, source_cell_ref=f"S{pair.pair_order}",

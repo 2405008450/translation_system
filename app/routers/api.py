@@ -244,6 +244,7 @@ from app.services.llm_service import (
     LLMRequestError,
     LLMResponseValidationError,
     LLMTranslationFailure,
+    LLMTranslationScenario,
     LLMTranslationTask,
     iter_batch_translate,
     translate_filename as llm_translate_filename,
@@ -1964,6 +1965,7 @@ class LLMTranslateRequest(BaseModel):
     model: str | None = Field(default=None, max_length=120)
     sentence_id: str | None = None
     translation_unit: Literal["paragraph", "sentence"] = "paragraph"
+    translation_scenario: LLMTranslationScenario = "standard"
     translation_guidelines: str = ""
     guideline_template_id: str | None = None
     temporary_prompt: str = ""
@@ -2031,6 +2033,7 @@ class PretranslationRunRequest(BaseModel):
     llm_provider: Literal["auto", "deepseek", "openrouter"] = "openrouter"
     llm_model: str | None = Field(default=None, max_length=120)
     llm_translation_unit: Literal["paragraph", "sentence"] = "paragraph"
+    llm_translation_scenario: LLMTranslationScenario = "standard"
     guideline_template_id: str | None = None
     temporary_prompt: str = Field(default="", max_length=8000)
 
@@ -2180,6 +2183,7 @@ def _serialize_pretranslation_run(
         "completed_files": int(run.completed_files or 0),
         "failed_files": int(run.failed_files or 0),
         "canceled_files": int(run.canceled_files or 0),
+        "llm_translation_scenario": _load_pretranslation_options(run).get("llm_translation_scenario") or "standard",
         "created_by_id": str(run.created_by_id) if run.created_by_id else None,
         "created_by": serialize_user(run.created_by) if run.created_by else None,
         "created_at": run.created_at.isoformat() if run.created_at else None,
@@ -2412,6 +2416,7 @@ async def _run_pretranslation_llm_stage(task_id: UUID, options: dict[str, Any]) 
         provider=options.get("llm_provider") or "openrouter",
         model=requested_model,
         translation_unit=options.get("llm_translation_unit") or "paragraph",
+        translation_scenario=options.get("llm_translation_scenario") or "standard",
         guideline_template_id=options.get("guideline_template_id") or None,
         temporary_prompt=options.get("temporary_prompt") or "",
         glossary_base_ids=[
@@ -5785,6 +5790,7 @@ def _build_llm_translation_tasks(
     include_context: bool = False,
     sentence_id: str | None = None,
     source_filename: str | None = None,
+    translation_scenario: LLMTranslationScenario = "standard",
 ) -> list[LLMTranslationTask]:
     statuses_by_scope = LLM_STATUSES_BY_SCOPE
     target_statuses: set[str] | None = None
@@ -5885,6 +5891,7 @@ def _build_llm_translation_tasks(
                 base_status=getattr(segment, "status", None),
                 base_source=getattr(segment, "source", None),
                 base_target_text=getattr(segment, "target_text", "") or "",
+                translation_scenario=translation_scenario,
             )
         )
 
@@ -7396,7 +7403,7 @@ def _build_project_file_payload(
 
 
 def _serialize_file_proofreading_summary(batch: ProofreadingBatch) -> dict[str, Any]:
-    from app.services.document_alignment.export import target_revision_export_available
+    from app.services.document_alignment.export import is_xlsx_pair, target_revision_export_available
 
     return {
         "batch_id": str(batch.id),
@@ -7405,6 +7412,7 @@ def _serialize_file_proofreading_summary(batch: ProofreadingBatch) -> dict[str, 
         "alignment_status": getattr(batch, "alignment_status", "not_applicable"),
         "batch_status": batch.status,
         "target_revision_export_available": target_revision_export_available(batch),
+        "pair_format": "xlsx" if is_xlsx_pair(batch) else "document",
     }
 
 
@@ -17819,6 +17827,7 @@ async def llm_translate_file_record(
         include_context=body.translation_unit == "paragraph",
         sentence_id=body.sentence_id,
         source_filename=get_file_record_source_filename(file_record),
+        translation_scenario=body.translation_scenario,
     )
     deduplication = _deduplicate_llm_translation_tasks(translation_tasks)
     target_task_by_sentence_id = {
@@ -18042,6 +18051,7 @@ async def llm_translate_file_record(
                 "provider": body.provider,
                 "model": requested_model,
                 "translation_unit": body.translation_unit,
+                "translation_scenario": body.translation_scenario,
                 "source_language": source_language,
                 "target_language": target_language,
                 "glossary_base_ids": [str(glossary_base_id) for glossary_base_id in glossary_base_ids],
