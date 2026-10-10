@@ -1723,7 +1723,7 @@ export default {
       standard: '标准翻译',
       standardDescription: '按照文件所选源语言翻译。',
       mixed: '多语言混合原文',
-      mixedDescription: '将韩文、英文及其他语言的描述统一译成目标语言，保留 Tag、变量、型号、缩写和协议字面值。',
+      mixedDescription: '将原文中不同语言的描述统一译成目标语言，保留已有目标语言文本及 Tag、变量、型号、缩写和协议字面值。',
       mixedHint: '如需修复旧 TM 译文，请选择包含 100% 匹配的处理范围；重译可能覆盖旧译文，已确认句段仍按原有范围规则处理。',
     },
     scope: {
