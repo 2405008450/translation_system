@@ -139,7 +139,7 @@ from app.services.document_statistics import (
     normalize_document_statistics_scope,
     serialize_document_statistics,
 )
-from app.services.document_alignment.service import merge_alignment_pair_range
+from app.services.document_alignment.service import merge_alignment_pair_range, lock_alignment_batch
 from app.services.document_alignment.segments import (
     TRANSLATION_ONLY_SOURCE_LABEL,
     ensure_document_pair_segments_complete,
@@ -12715,6 +12715,10 @@ def _load_segments_for_structure_change(
     file_record: FileRecord,
 ) -> list[Segment]:
     """锁定并按文档权威顺序读取句段，供拆分、合并等结构操作使用。"""
+    parse_options = _get_file_record_document_parse_options(file_record)
+    if parse_options.get("alignment_mode") == "document_pair" and parse_options.get("proofreading_batch_id"):
+        # 所有结构入口统一先锁批次、再锁句段，避免与对齐物化形成反向锁顺序。
+        lock_alignment_batch(db, UUID(str(parse_options["proofreading_batch_id"])))
     return (
         db.query(Segment)
         .filter(Segment.file_record_id == file_record.id)

@@ -86,11 +86,13 @@ import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { http } from '../api/http'
 import {
   deleteAlignmentPair,
+  listAlignmentPairs,
   replaceAlignmentPairRange,
   splitAlignmentPairsByCell,
   updateAlignmentPairText,
   type AlignmentPairReplacement,
 } from '../api/documentAlignment'
+import { useAlignmentStructureOperations, type AlignmentFocusTarget } from '../composables/useAlignmentStructureOperations'
 import { queryOnlineTerms, type OnlineTermSource } from '../api/onlineTerms'
 import {
   completeAlignment,
@@ -503,6 +505,7 @@ const proofreadingGenerationButtonLabel = computed(() => {
 })
 
 const PROOFREADING_OPENROUTER_MODELS = [
+  { value: 'google/gemini-4-argon', label: 'Gemini 4 Argon' },
   { value: 'google/gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
   { value: 'google/gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
   { value: 'google/gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
@@ -4365,6 +4368,11 @@ function updateSegmentTarget(
   targetHtml?: string,
   options: UpdateSegmentTargetOptions = {},
 ) {
+  if (isAlignmentWorkbench.value) {
+    if (alignmentStructureBusy.value) return
+    handleSegmentTargetUpdate(sentenceId, targetText, targetHtml, options)
+    return
+  }
   // sentenceId 在合并模式下是复合键；按 key 查找句段
   const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
   if (segment && !segment.can_write) {
@@ -4415,6 +4423,11 @@ async function syncPendingWorkbenchEdits(): Promise<boolean> {
 }
 
 async function updateSegmentSource(sentenceId: string, sourceText: string) {
+  if (isAlignmentWorkbench.value) {
+    if (alignmentStructureBusy.value) return
+    await handleSegmentSourceUpdate(sentenceId, sourceText)
+    return
+  }
   const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
   if (segment && !segment.can_write) {
     toast.warn('当前流程阶段无编辑权限')
@@ -7149,6 +7162,10 @@ function recordActiveSegmentEditorUndoBoundary(inputType: string, preserveNextTa
 }
 
 function undoActiveSegmentEdit() {
+  if (isAlignmentWorkbench.value) {
+    void undoAlignmentWorkbench()
+    return
+  }
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
@@ -7161,6 +7178,10 @@ function undoActiveSegmentEdit() {
 }
 
 function redoActiveSegmentEdit() {
+  if (isAlignmentWorkbench.value) {
+    void redoAlignmentWorkbench()
+    return
+  }
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
@@ -7209,30 +7230,69 @@ const reopenAlignmentDisabledReason = computed(() => {
   return '已开始校对生成，不能退回对齐，以免覆盖已有校对成果。'
 })
 
-interface AlignmentWorkbenchCommand {
-  startOrder: number
-  before: AlignmentPairReplacement[]
-  after: AlignmentPairReplacement[]
-  label: string
-}
-const alignmentUndoStack = ref<AlignmentWorkbenchCommand[]>([])
-const alignmentRedoStack = ref<AlignmentWorkbenchCommand[]>([])
 const alignmentAdvancing = ref(false)
+const alignmentOperations = useAlignmentStructureOperations({
+  flush: flushAlignmentTextPatches,
+  expectedIds: async (order, before) => {
+    const local = segmentStore.segments.filter(item => typeof item.alignment_pair_order === 'number'
+      && item.alignment_pair_order >= order && item.alignment_pair_order < order + before.length)
+      .sort((left, right) => left.alignment_pair_order! - right.alignment_pair_order!)
+    let rows = local.map(item => ({ id: item.alignment_pair_id!, ...alignmentReplacement(item) }))
+    if (rows.length !== before.length) {
+      const pageSize = 100
+      rows = []
+      for (let page = Math.floor(order / pageSize) + 1; rows.length < before.length; page++) {
+        const data = await listAlignmentPairs(proofreadingContext.value!.batch_id, { page, page_size: pageSize })
+        const window = data.items.filter(item => item.pair_order >= order && item.pair_order < order + before.length)
+        rows.push(...window)
+        if (!data.items.length || page * pageSize >= order + before.length) break
+      }
+    }
+    if (rows.length !== before.length || rows.some((item, index) => (
+      JSON.stringify(item.src_indices) !== JSON.stringify(before[index].src_indices)
+      || JSON.stringify(item.tgt_indices) !== JSON.stringify(before[index].tgt_indices)
+      || item.source_text !== before[index].source_text || item.target_text !== before[index].target_text
+    ))) throw new Error('对齐配对已变化，请刷新后重试。')
+    return rows.map(item => item.id)
+  },
+  replace: async (order, before, after, ids) => {
+    const result = await replaceAlignmentPairRange(proofreadingContext.value!.batch_id, {
+      start_order: order, delete_count: before.length, replacements: after, expected_pair_ids: ids,
+      expected_texts: before.map(item => ({ source_text: item.source_text || '', target_text: item.target_text || '' })),
+    })
+    selectedSentenceIds.value = new Set()
+    return result.items
+  },
+  refresh: refreshAlignmentOperation,
+  success: message => toast.success({ message }),
+  error: (error, fallback) => toast.error({ message: getErrorMessage(error, fallback) }),
+})
+const alignmentUndoStack = alignmentOperations.undoStack
+const alignmentRedoStack = alignmentOperations.redoStack
+const alignmentRefreshPending = alignmentOperations.pendingRefresh
+const alignmentStructureBusy = computed(() => alignmentAdvancing.value || alignmentOperations.busy.value || Boolean(alignmentRefreshPending.value))
 type AlignmentTextPatch = { source_text?: string; target_text?: string }
 const pendingAlignmentTextPatches = new Map<string, AlignmentTextPatch>()
 const alignmentTextSaveTimers = new Map<string, number>()
 const alignmentTextSavePromises = new Set<Promise<void>>()
+const alignmentTextRequestsByPair = new Map<string, Promise<void>>()
 
 function alignmentSegmentByKey(sentenceId: string) {
   return segmentStore.segments.find(item => segmentKeyOf(item) === sentenceId)
 }
 
 async function persistAlignmentTextPatch(pairId: string) {
+  const inFlight = alignmentTextRequestsByPair.get(pairId)
+  if (inFlight) {
+    await inFlight
+    return persistAlignmentTextPatch(pairId)
+  }
   const payload = pendingAlignmentTextPatches.get(pairId)
   if (!payload) return
   pendingAlignmentTextPatches.delete(pairId)
   const request = updateAlignmentPairText(pairId, payload).then(() => undefined)
   alignmentTextSavePromises.add(request)
+  alignmentTextRequestsByPair.set(pairId, request)
   try {
     await request
   } catch (error) {
@@ -7243,6 +7303,7 @@ async function persistAlignmentTextPatch(pairId: string) {
     throw error
   } finally {
     alignmentTextSavePromises.delete(request)
+    alignmentTextRequestsByPair.delete(pairId)
   }
 }
 
@@ -7262,6 +7323,10 @@ function queueAlignmentTextPatch(pairId: string, payload: AlignmentTextPatch) {
 }
 
 async function flushAlignmentTextPatches() {
+  if (isAlignmentWorkbench.value) {
+    commitActiveSegmentEditorContent()
+    await nextTick()
+  }
   for (const timer of alignmentTextSaveTimers.values()) window.clearTimeout(timer)
   alignmentTextSaveTimers.clear()
   let succeeded = true
@@ -7308,7 +7373,7 @@ async function handleSegmentSourceUpdate(sentenceId: string, sourceText: string)
 }
 
 async function enterProofreadingFromAlignment() {
-  if (alignmentAdvancing.value) return
+  if (alignmentStructureBusy.value) return
   const batchId = proofreadingContext.value?.batch_id
   if (!batchId) {
     toast.error({ message: '缺少对齐批次，无法进入校对。' })
@@ -7376,11 +7441,14 @@ function alignmentReplacement(segment: Segment): AlignmentPairReplacement {
     src_indices: [...(segment.alignment_src_indices || [])],
     tgt_indices: [...(segment.alignment_tgt_indices || [])],
     locked: true,
+    source_text: segment.alignment_src_indices?.length ? segment.source_text : '',
+    target_text: segment.target_text || '',
   }
 }
 
 function cloneAlignmentReplacements(items: AlignmentPairReplacement[]) {
   return items.map(item => ({
+    ...item,
     src_indices: [...item.src_indices],
     tgt_indices: [...item.tgt_indices],
     locked: item.locked,
@@ -7392,28 +7460,41 @@ async function applyAlignmentReplacement(
   before: AlignmentPairReplacement[],
   after: AlignmentPairReplacement[],
   label: string,
-  recordHistory = true,
 ) {
   const batchId = proofreadingContext.value?.batch_id
-  if (!batchId) return
-  await replaceAlignmentPairRange(batchId, {
-    start_order: startOrder,
-    delete_count: before.length,
-    replacements: after,
-  })
-  if (recordHistory) {
-    alignmentUndoStack.value.push({
-      startOrder,
-      before: cloneAlignmentReplacements(before),
-      after: cloneAlignmentReplacements(after),
-      label,
-    })
-    if (alignmentUndoStack.value.length > 50) alignmentUndoStack.value.shift()
-    alignmentRedoStack.value = []
+  if (!batchId || alignmentStructureBusy.value) return
+  await alignmentOperations.run(startOrder, before, after, label)
+}
+
+async function refreshAlignmentOperation(target: AlignmentFocusTarget) {
+  const batchId = proofreadingContext.value?.batch_id
+  const fileId = segmentStore.fileRecord?.id
+  if (!batchId || !fileId) throw new Error('缺少对齐批次或文件。')
+  let pairId = target.pairId
+  if (!pairId) {
+    // 删除后优先定位后继，删除末行则定位前一行；批量拆分也按原顺序定位。
+    const probe = await listAlignmentPairs(batchId, { page: 1, page_size: 1 })
+    if (!probe.total) {
+      await refreshSegmentPage(1, segmentStore.pageSize, { includeStats: true, preservePosition: true, throwOnError: true, skipEditSync: true })
+      return
+    }
+    const order = Math.min(target.order, probe.total - 1)
+    const pageSize = 100
+    const data = await listAlignmentPairs(batchId, { page: Math.floor(order / pageSize) + 1, page_size: pageSize })
+    pairId = data.items.find(item => item.pair_order === order)?.id
   }
-  selectedSentenceIds.value = new Set()
-  await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize, { includeStats: false })
-  toast.success({ message: `${label}完成，已自动保存。` })
+  if (!pairId) throw new Error('无法定位调整后的配对，请重试刷新。')
+  const sentenceId = `align-${pairId}`
+  const position = (await http.get<SegmentPositionResponse>(
+    `/file-records/${fileId}/segments/${encodeURIComponent(sentenceId)}/position`,
+    { params: { page_size: segmentStore.pageSize } },
+  )).data
+  // 结果可能移出当前筛选范围，复用既有跳转逻辑切换到全部句段。
+  await clearSegmentFiltersForTermQANavigation()
+  await refreshSegmentPage(position.page, position.page_size, { includeStats: true, preservePosition: true, throwOnError: true, skipEditSync: true })
+  const index = editorSegments.value.findIndex(item => item.alignment_pair_id === pairId)
+  if (index < 0) throw new Error('调整已保存，但结果尚未加载，请重试刷新。')
+  await focusEditorSegmentAtIndex(index)
 }
 
 function nextAlignmentSegment(current: Segment) {
@@ -7426,6 +7507,7 @@ async function shiftAlignmentBoundaryInWorkbench(
   side: 'source' | 'target',
   direction: 'next_into_current' | 'current_into_next',
 ) {
+  if (alignmentStructureBusy.value) return
   const current = activeSegment.value
   if (!current || typeof current.alignment_pair_order !== 'number') return
   const next = nextAlignmentSegment(current)
@@ -7443,6 +7525,9 @@ async function shiftAlignmentBoundaryInWorkbench(
   }
   if (direction === 'next_into_current') after[0][field].push(moved)
   else after[1][field].unshift(moved)
+  const textField = side === 'source' ? 'source_text' : 'target_text'
+  delete after[0][textField]
+  delete after[1][textField]
   await applyAlignmentReplacement(
     current.alignment_pair_order,
     before,
@@ -7452,6 +7537,7 @@ async function shiftAlignmentBoundaryInWorkbench(
 }
 
 async function splitAlignmentPairInWorkbench() {
+  if (alignmentStructureBusy.value) return
   const current = activeSegment.value
   if (!current || typeof current.alignment_pair_order !== 'number') return
   const before = [alignmentReplacement(current)]
@@ -7470,18 +7556,20 @@ async function splitAlignmentPairInWorkbench() {
 
 async function splitAlignmentPairsByCellInWorkbench() {
   const batchId = proofreadingContext.value?.batch_id
-  if (!batchId || alignmentAdvancing.value) return
+  if (!batchId || alignmentStructureBusy.value) return
+  const order = activeSegment.value?.alignment_pair_order ?? 0
   const pairIds = [...selectedSentenceIds.value]
     .map(sentenceId => alignmentSegmentByKey(sentenceId)?.alignment_pair_id)
     .filter((value): value is string => Boolean(value))
   alignmentAdvancing.value = true
   try {
+    if (!await flushAlignmentTextPatches()) throw new Error('仍有对齐文本未保存，请检查后重试。')
     const result = await splitAlignmentPairsByCell(batchId, [...new Set(pairIds)])
     selectedSentenceIds.value = new Set()
     // 批量单元格修复可能跨越多个分页，旧的局部撤回命令不再对应当前 pair_order。
     alignmentUndoStack.value = []
     alignmentRedoStack.value = []
-    await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize, { includeStats: false })
+    await alignmentOperations.refreshCommitted({ order })
     if (result.changed_pairs) {
       toast.success({
         message: `已拆分 ${result.changed_pairs} 个跨单元格配对，并回收 ${result.merged_gaps} 组相邻错位。`,
@@ -7497,6 +7585,7 @@ async function splitAlignmentPairsByCellInWorkbench() {
 }
 
 async function insertAlignmentPairInWorkbench() {
+  if (alignmentStructureBusy.value) return
   const current = activeSegment.value
   if (!current || typeof current.alignment_pair_order !== 'number') return
   await applyAlignmentReplacement(
@@ -7508,6 +7597,7 @@ async function insertAlignmentPairInWorkbench() {
 }
 
 async function deleteAlignmentPairInWorkbench() {
+  if (alignmentStructureBusy.value) return
   const current = activeSegment.value
   if (!current || typeof current.alignment_pair_order !== 'number') return
   const before = alignmentReplacement(current)
@@ -7526,20 +7616,17 @@ async function deleteAlignmentPairInWorkbench() {
       })
       if (!confirmed) return
     }
-    const saved = await flushAlignmentTextPatches()
-    if (!saved) {
-      toast.error({ message: '仍有对齐文本未保存，暂未删除。' })
-      return
-    }
+    if (alignmentStructureBusy.value) return
     if (!current.alignment_pair_id) return
     alignmentAdvancing.value = true
     try {
+      if (!await flushAlignmentTextPatches()) throw new Error('仍有对齐文本未保存，暂未删除。')
       await deleteAlignmentPair(current.alignment_pair_id)
       // 此删除会把目标解析单元吸收到相邻配对，不能用普通区间替换安全撤回。
       alignmentUndoStack.value = []
       alignmentRedoStack.value = []
       selectedSentenceIds.value = new Set()
-      await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize, { includeStats: true })
+      await alignmentOperations.refreshCommitted({ order: current.alignment_pair_order })
       toast.success({ message: '增译行已删除，后续句段顺序已自动更新。' })
     } catch (error) {
       toast.error({ message: getErrorMessage(error, '删除增译行失败。') })
@@ -7556,27 +7643,11 @@ function handleSegmentTargetBlurCommit(sentenceId: string) {
 }
 
 async function undoAlignmentWorkbench() {
-  const command = alignmentUndoStack.value.pop()
-  if (!command) return
-  try {
-    await applyAlignmentReplacement(command.startOrder, command.after, command.before, `撤回：${command.label}`, false)
-    alignmentRedoStack.value.push(command)
-  } catch (error) {
-    alignmentUndoStack.value.push(command)
-    toast.error({ message: getErrorMessage(error, '撤回失败。') })
-  }
+  if (!alignmentStructureBusy.value) await alignmentOperations.undo()
 }
 
 async function redoAlignmentWorkbench() {
-  const command = alignmentRedoStack.value.pop()
-  if (!command) return
-  try {
-    await applyAlignmentReplacement(command.startOrder, command.before, command.after, `重做：${command.label}`, false)
-    alignmentUndoStack.value.push(command)
-  } catch (error) {
-    alignmentRedoStack.value.push(command)
-    toast.error({ message: getErrorMessage(error, '重做失败。') })
-  }
+  if (!alignmentStructureBusy.value) await alignmentOperations.redo()
 }
 
 // 切换激活句段时清除光标缓存
@@ -7656,6 +7727,7 @@ function handleSourceCaretChange(sentenceId: string, offset: number) {
 }
 
 const canSplitSegment = computed(() => {
+  if (isAlignmentWorkbench.value && alignmentStructureBusy.value) return false
   if (!activeSegment.value) return false
   const displayText = getSegmentCopyableSourceText(activeSegment.value)
   return activeSegmentCanWrite.value && displayText.length >= 2
@@ -7713,6 +7785,7 @@ const selectedMergeSegmentsAreAdjacent = computed(() => {
 })
 
 const canMergeSegment = computed(() => {
+  if (isAlignmentWorkbench.value && alignmentStructureBusy.value) return false
   return (
     orderedSelectedMergeSegments.value.length >= 2
     && selectedMergeSegmentsCanWrite.value
@@ -7779,6 +7852,7 @@ async function handleSplitSegment() {
 }
 
 async function handleMergeSegment() {
+  if (isAlignmentWorkbench.value && alignmentStructureBusy.value) return
   if (!canMergeSegment.value) {
     toast.warn({ message: mergeSegmentButtonTitle.value })
     return
@@ -8618,10 +8692,11 @@ async function loadMergeViewTask() {
 async function refreshSegmentPage(
   page = segmentStore.currentPage,
   size = segmentStore.pageSize,
-  options: { includeStats?: boolean } = {},
+  options: { includeStats?: boolean; preservePosition?: boolean; throwOnError?: boolean; skipEditSync?: boolean } = {},
 ) {
   const isMergeMode = Boolean(segmentStore.mergeViewId || props.mergeViewId)
   if (!isMergeMode && !segmentStore.fileRecord) {
+    if (options.throwOnError) throw new Error('文件尚未加载。')
     return
   }
 
@@ -8632,11 +8707,12 @@ async function refreshSegmentPage(
 
   pageError.value = ''
   try {
-    const synced = await syncPendingWorkbenchEdits()
+    const synced = options.skipEditSync ? true : await syncPendingWorkbenchEdits()
     if (!synced) {
       const reason = segmentStore.syncMessage || t('workbench.errors.loadMore')
       pageError.value = reason
       toast.warn(reason)
+      if (options.throwOnError) throw new Error(reason)
       return
     }
     const nextQuery = getSegmentWindowQuery(page, size, includeStats || hadPendingEdits)
@@ -8663,7 +8739,7 @@ async function refreshSegmentPage(
       }
     }
     await nextTick()
-    await virtualListRef.value?.scrollToIndex(0, 'start')
+    if (!options.preservePosition) await virtualListRef.value?.scrollToIndex(0, 'start')
     observeSegmentEditorResults()
     scheduleSegmentEditorScrollbarGutterUpdate()
     await router.replace({
@@ -8675,6 +8751,7 @@ async function refreshSegmentPage(
     })
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.loadMore'))
+    if (options.throwOnError) throw error
   }
 }
 
@@ -9704,43 +9781,43 @@ onBeforeRouteLeave(async () => {
         </div>
         <div class="workbench-ribbon__top-actions" :aria-label="isAlignmentWorkbench ? '对齐编辑操作' : '校对编辑操作'">
           <template v-if="isAlignmentWorkbench">
-            <button class="workbench-ribbon__top-action" type="button" :disabled="!alignmentUndoStack.length" @click="void undoAlignmentWorkbench()">
+            <button class="workbench-ribbon__top-action" type="button" :disabled="alignmentStructureBusy || !alignmentUndoStack.length" @click="void undoAlignmentWorkbench()">
               <Undo2 :size="15" /><span>撤回</span>
             </button>
-            <button class="workbench-ribbon__top-action" type="button" :disabled="!alignmentRedoStack.length" @click="void redoAlignmentWorkbench()">
+            <button class="workbench-ribbon__top-action" type="button" :disabled="alignmentStructureBusy || !alignmentRedoStack.length" @click="void redoAlignmentWorkbench()">
               <Redo2 :size="15" /><span>前进</span>
             </button>
-            <button class="workbench-ribbon__top-action" type="button" :disabled="!canMergeSegment" :title="mergeSegmentButtonTitle" @click="handleMergeSegment">
+            <button class="workbench-ribbon__top-action" type="button" :disabled="alignmentStructureBusy || !canMergeSegment" :title="mergeSegmentButtonTitle" @click="handleMergeSegment">
               <Combine :size="15" /><span>合并</span>
             </button>
-            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" @click="void splitAlignmentPairInWorkbench()">
+            <button class="workbench-ribbon__top-action" type="button" :disabled="alignmentStructureBusy || !activeSegment" @click="void splitAlignmentPairInWorkbench()">
               <Split :size="15" /><span>拆分</span>
             </button>
             <button
               class="workbench-ribbon__top-action"
               type="button"
-              :disabled="alignmentAdvancing"
+              :disabled="alignmentStructureBusy"
               :title="selectedSentenceIds.size ? '按单元格拆分选中行' : '扫描整批并按单元格拆分'"
               @click="void splitAlignmentPairsByCellInWorkbench()"
             >
               <TableCellsSplit :size="15" /><span>按单元格拆分</span>
             </button>
-            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" title="下一项开头的译文移入当前项" @click="void shiftAlignmentBoundaryInWorkbench('target', 'next_into_current')">
+            <button class="workbench-ribbon__top-action" type="button" :disabled="alignmentStructureBusy || !activeSegment" title="下一项开头的译文移入当前项" @click="void shiftAlignmentBoundaryInWorkbench('target', 'next_into_current')">
               <ChevronUp :size="15" /><span>上移</span>
             </button>
-            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" title="当前项末尾的译文移入下一项" @click="void shiftAlignmentBoundaryInWorkbench('target', 'current_into_next')">
+            <button class="workbench-ribbon__top-action" type="button" :disabled="alignmentStructureBusy || !activeSegment" title="当前项末尾的译文移入下一项" @click="void shiftAlignmentBoundaryInWorkbench('target', 'current_into_next')">
               <ChevronDown :size="15" /><span>下移</span>
             </button>
-            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" title="下一项开头的原文移入当前项" @click="void shiftAlignmentBoundaryInWorkbench('source', 'next_into_current')">
+            <button class="workbench-ribbon__top-action" type="button" :disabled="alignmentStructureBusy || !activeSegment" title="下一项开头的原文移入当前项" @click="void shiftAlignmentBoundaryInWorkbench('source', 'next_into_current')">
               <ChevronUp :size="15" /><span>原文上移</span>
             </button>
-            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" title="当前项末尾的原文移入下一项" @click="void shiftAlignmentBoundaryInWorkbench('source', 'current_into_next')">
+            <button class="workbench-ribbon__top-action" type="button" :disabled="alignmentStructureBusy || !activeSegment" title="当前项末尾的原文移入下一项" @click="void shiftAlignmentBoundaryInWorkbench('source', 'current_into_next')">
               <ChevronDown :size="15" /><span>原文下移</span>
             </button>
-            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" @click="void insertAlignmentPairInWorkbench()">
+            <button class="workbench-ribbon__top-action" type="button" :disabled="alignmentStructureBusy || !activeSegment" @click="void insertAlignmentPairInWorkbench()">
               <Plus :size="15" /><span>插入</span>
             </button>
-            <button class="workbench-ribbon__top-action" type="button" :disabled="!activeSegment" @click="void deleteAlignmentPairInWorkbench()">
+            <button class="workbench-ribbon__top-action" type="button" :disabled="alignmentStructureBusy || !activeSegment" @click="void deleteAlignmentPairInWorkbench()">
               <Trash2 :size="15" /><span>删除</span>
             </button>
             <button class="workbench-ribbon__top-action" type="button" @click="segmentSearchOpen = !segmentSearchOpen">
@@ -9750,7 +9827,7 @@ onBeforeRouteLeave(async () => {
               class="workbench-ribbon__top-action"
               data-testid="proofreading-export-alignment-button"
               type="button"
-              :disabled="proofreadingExporting || !proofreadingContext?.batch_id || alignmentAdvancing"
+              :disabled="proofreadingExporting || !proofreadingContext?.batch_id || alignmentStructureBusy"
               title="导出原文与译文一一对照的 Excel 表格"
               @click="void exportProofreadingWithFormat('proofreading_audit_xlsx')"
             >
@@ -9762,7 +9839,7 @@ onBeforeRouteLeave(async () => {
               class="workbench-ribbon__top-action proofreading-workbench-toolbar__primary"
               data-testid="proofreading-complete-alignment-button"
               type="button"
-              :disabled="alignmentAdvancing"
+              :disabled="alignmentStructureBusy"
               @click="void enterProofreadingFromAlignment()"
             >
               <Loader2 v-if="alignmentAdvancing" class="lucide-spin" :size="15" />
@@ -11191,6 +11268,11 @@ onBeforeRouteLeave(async () => {
             </span>
           </div>
           <div class="segment-editor-toolbar__actions">
+            <button v-if="isAlignmentWorkbench && alignmentRefreshPending" class="button button--ghost" type="button"
+              data-testid="alignment-retry-refresh" title="操作已保存，列表尚未刷新；点击只重新读取结果。"
+              :disabled="alignmentOperations.busy.value || alignmentAdvancing" @click="void alignmentOperations.retryRefresh()">
+              已保存 · 重试刷新
+            </button>
             <div class="segment-editor-toolbar__font-zoom" role="group" aria-label="句段编辑字体缩放">
               <button
                 class="segment-editor-toolbar__font-button"
@@ -11821,7 +11903,7 @@ onBeforeRouteLeave(async () => {
                       :segment-key="segmentKeyOf(item)"
                       :index="getEditorSegmentDisplayIndex(segmentKeyOf(item), index)"
                       :active="segmentStore.activeSentenceId === segmentKeyOf(item)"
-                      :disabled="!item.can_write"
+                      :disabled="!item.can_write || (isAlignmentWorkbench && alignmentStructureBusy)"
                       :source-editing="sourceEditing || (isAlignmentWorkbench && !item.alignment_translation_only)"
                       :selected="selectedSentenceIds.has(segmentKeyOf(item))"
                       :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(segmentKeyOf(item)) : null"

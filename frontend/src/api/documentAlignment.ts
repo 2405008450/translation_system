@@ -152,12 +152,16 @@ export interface AlignmentPairReplacement {
   src_indices: number[]
   tgt_indices: number[]
   locked: boolean
+  source_text?: string
+  target_text?: string
 }
 
 export async function replaceAlignmentPairRange(batchId: string, payload: {
   start_order: number
   delete_count: number
   replacements: AlignmentPairReplacement[]
+  expected_pair_ids?: string[]
+  expected_texts?: Array<{ source_text: string; target_text: string }>
 }) {
   const { data } = await http.post<{ items: AlignmentPair[] }>(
     `/proofreading-batches/${batchId}/alignment-pairs/replace-range`,

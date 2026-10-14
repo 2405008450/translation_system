@@ -16,7 +16,7 @@ from app.services.normalizer import build_source_hash
 from app.services.proofreading import IMPORTED_TRANSLATION_SOURCE
 from app.services.reference_sync_service import attach_project_reference_bases_to_file
 
-from .service import _source_cache_path, validate_pair_integrity
+from .service import _source_cache_path, validate_pair_integrity, lock_alignment_batch
 
 TRANSLATION_ONLY_SOURCE_LABEL = "（增译，无对应原文）"
 
@@ -100,6 +100,7 @@ def ensure_document_pair_segments_complete(
     """幂等补齐历史双文档批次中曾被跳过的增译，并恢复 pair_order 顺序。"""
     if batch.batch_kind != "document_pair" or batch.alignment_status != "confirmed":
         return 0
+    lock_alignment_batch(db, batch.id)
     binding = db.query(ProofreadingColumnBinding).filter_by(batch_id=batch.id).first()
     if binding is None:
         return 0
@@ -117,6 +118,8 @@ def ensure_document_pair_segments_complete(
             metadata = {}
         pair_id = str(metadata.get("alignment_pair_id") or "")
         if pair_id:
+            if pair_id in segments_by_pair_id:
+                raise ValueError("同一对齐配对存在多个历史句段，请核查配对归属后修复，不能按文本自动删除。")
             segments_by_pair_id[pair_id] = segment
 
     pairs = db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(

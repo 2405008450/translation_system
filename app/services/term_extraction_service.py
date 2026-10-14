@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 TERM_EXTRACTION_MODEL = "google/gemini-3.5-flash"
 TERM_EXTRACTION_MODEL_OPTIONS = (
+    "google/gemini-4-argon",
     "google/gemini-3.5-flash",
     "google/gemini-3.1-pro-preview",
     "google/gemini-3.1-flash-lite",

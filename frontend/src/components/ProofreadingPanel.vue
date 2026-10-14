@@ -752,6 +752,7 @@ defineExpose({ refreshBatches })
                   <option v-if="generationDraft(batch).provider === 'auto'" value="">自动选择默认模型</option>
                   <option v-if="generationDraft(batch).provider === 'deepseek'" value="deepseek-chat">DeepSeek Chat</option>
                   <option v-if="generationDraft(batch).provider === 'openrouter'" value="google/gemini-3-flash-preview">Gemini 3 Flash Preview</option>
+                  <option v-if="generationDraft(batch).provider === 'openrouter'" value="google/gemini-4-argon">Gemini 4 Argon</option>
                 </select>
               </label>
             </div>

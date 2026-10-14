@@ -1349,6 +1349,7 @@ def merge_alignment_pair_range(
     lock_merged_pair: bool = True,
 ) -> DocumentAlignmentPair:
     """将同一批次中连续的多个配对原子合并，并压紧 pair_order。"""
+    lock_alignment_batch(db, batch_id)
     unique_ids = list(dict.fromkeys(pair_ids))
     if len(unique_ids) < 2:
         raise ValueError("请至少选择两个配对进行合并。")
@@ -1383,6 +1384,8 @@ def merge_alignment_pair_range(
         else:
             merged_pair_ids.append(str(row.id))
 
+    merged_spec = [{"src_indices": merged_src, "tgt_indices": merged_tgt}]
+    _preserve_replacement_texts(db, batch_id, rows, merged_spec)
     first.src_indices = json.dumps(merged_src)
     first.tgt_indices = json.dumps(merged_tgt)
     first.locked = lock_merged_pair or all(row.locked for row in rows)
@@ -1390,6 +1393,7 @@ def merge_alignment_pair_range(
         "manual_merge": True,
         "merged_pair_ids": list(dict.fromkeys(merged_pair_ids)),
         "merged_pair_count": len(rows),
+        **{f"manual_{field}": merged_spec[0][field] for field in ("source_text", "target_text") if field in merged_spec[0]},
     }, ensure_ascii=False)
 
     # 合并后若存在原文，以首个原文单元作为版式锚点；纯增译则使用首个译文单元。
@@ -1416,15 +1420,69 @@ def merge_alignment_pair_range(
     return first
 
 
+class AlignmentConflictError(ValueError):
+    """操作快照已过期，调用方应刷新而不是重复提交。"""
+
+
+def lock_alignment_batch(db: Session, batch_id: UUID) -> ProofreadingBatch | None:
+    # 补齐句段与结构编辑使用同一把锁，避免两个请求同时物化同一配对。
+    return db.query(ProofreadingBatch).filter_by(id=batch_id).populate_existing().with_for_update().first()
+
+
+def _preserve_replacement_texts(db: Session, batch_id: UUID, removed, replacements) -> None:
+    """只按完整解析单元组搬运人工文本；无法无损拆开时拒绝操作。"""
+    for side, field in (("source", "src_indices"), ("target", "tgt_indices")):
+        text_field = f"{side}_text"
+        units = {unit.index: unit for unit in _orm_units(db, batch_id, side)}
+        for old in removed:
+            indices = json.loads(getattr(old, field) or "[]")
+            text = getattr(old, text_field) or ""
+            if text == _join_text(indices, units):
+                continue
+            destinations = [item for item in replacements if set(indices).intersection(item[field])]
+            if not indices:
+                destinations = [item for item in replacements if not item[field]]
+            if len(destinations) != 1 or not set(indices).issubset(destinations[0][field]):
+                # 撤回/重做携带明确文本快照，普通拆分不携带猜测的文本。
+                if destinations and all(text_field in item for item in destinations):
+                    continue
+                raise ValueError("人工编辑的文本无法无损分配到调整后的行，请先明确文本边界。")
+        for item in replacements:
+            if text_field in item:
+                continue
+            indices = item[field]
+            contributors = [old for old in removed if set(json.loads(getattr(old, field) or "[]")).intersection(indices)]
+            if not indices:
+                contributors = [old for old in removed if not json.loads(getattr(old, field) or "[]")]
+            if contributors and any((getattr(old, text_field) or "") != _join_text(json.loads(getattr(old, field) or "[]"), units) for old in contributors):
+                pieces = []
+                remaining = list(indices)
+                for old in contributors:
+                    old_indices = json.loads(getattr(old, field) or "[]")
+                    overlap = [index for index in old_indices if index in indices]
+                    if overlap == old_indices:
+                        pieces.append(getattr(old, text_field) or "")
+                    else:
+                        pieces.append(_join_text(overlap, units))
+                    remaining = [index for index in remaining if index not in overlap]
+                if remaining:
+                    raise ValueError("人工文本调整范围不完整，请刷新后重试。")
+                item[text_field] = "\n".join(piece for piece in pieces if piece)
+
+
 def replace_alignment_pair_range(
     db: Session,
     batch_id: UUID,
     start_order: int,
     delete_count: int,
     replacements: list[dict[str, Any]],
+    *,
+    expected_pair_ids: list[UUID] | None = None,
+    expected_texts: list[dict[str, str]] | None = None,
 ) -> list[DocumentAlignmentPair]:
     """原子替换一段连续配对，供人工调整以及撤回/重做复用。"""
-    rows = db.query(DocumentAlignmentPair).filter_by(batch_id=batch_id).order_by(
+    lock_alignment_batch(db, batch_id)
+    rows = db.query(DocumentAlignmentPair).populate_existing().filter_by(batch_id=batch_id).order_by(
         DocumentAlignmentPair.pair_order,
     ).all()
     if start_order < 0 or start_order > len(rows):
@@ -1433,6 +1491,14 @@ def replace_alignment_pair_range(
         raise ValueError("待替换的配对范围无效。")
     if delete_count > 100 or len(replacements) > 100:
         raise ValueError("单次最多调整 100 个连续配对。")
+    if expected_pair_ids is not None and [str(row.id) for row in rows[start_order:start_order + delete_count]] != [str(value) for value in expected_pair_ids]:
+        raise AlignmentConflictError("对齐配对已变化，请刷新后重试。")
+    if expected_texts is not None:
+        if len(expected_texts) != delete_count:
+            raise ValueError("待替换的文本快照数量无效。")
+        for row, snapshot in zip(rows[start_order:start_order + delete_count], expected_texts):
+            if any((getattr(row, field) or "") != value for field, value in snapshot.items() if field in {"source_text", "target_text"}):
+                raise AlignmentConflictError("对齐文本已被其他操作修改，请刷新后重试。")
 
     normalized: list[dict[str, Any]] = []
     for item in replacements:
@@ -1448,11 +1514,13 @@ def replace_alignment_pair_range(
             "src_indices": src,
             "tgt_indices": tgt,
             "locked": bool(item.get("locked", True)),
+            **{field: item[field] for field in ("source_text", "target_text") if isinstance(item.get(field), str)},
         })
 
     before = rows[:start_order]
     removed = rows[start_order:start_order + delete_count]
     after = rows[start_order + delete_count:]
+    _preserve_replacement_texts(db, batch_id, removed, normalized)
 
     # 先把保留行迁入负数序号空间，避免 PostgreSQL 唯一约束逐行检查时发生瞬时冲突。
     for temporary, row in enumerate([*before, *after], start=1):
@@ -1473,7 +1541,10 @@ def replace_alignment_pair_range(
             confidence=1.0 if item["locked"] else 0.8,
             confidence_level="high",
             method="manual",
-            features=json.dumps({"manual_adjustment": True}, ensure_ascii=False),
+            features=json.dumps({
+                "manual_adjustment": True,
+                **{f"manual_{field}": item[field] for field in ("source_text", "target_text") if field in item},
+            }, ensure_ascii=False),
             locked=item["locked"],
         )
         db.add(pair)
@@ -1640,6 +1711,7 @@ def split_alignment_pairs_by_cell(
     db: Session, batch_id: UUID, pair_ids: Iterable[UUID] | None = None,
 ) -> dict[str, int]:
     """把已落库的同侧跨单元格配对原地拆开，无需数据库迁移。"""
+    lock_alignment_batch(db, batch_id)
     source_units = {unit.index: unit for unit in _orm_units(db, batch_id, "source")}
     target_units = {unit.index: unit for unit in _orm_units(db, batch_id, "target")}
     requested = list(dict.fromkeys(pair_ids or []))
@@ -1709,6 +1781,12 @@ def split_alignment_pairs_by_cell(
     if not changed_pairs:
         return {"changed_pairs": 0, "created_pairs": 0, "merged_gaps": 0}
 
+    changed_specs = [spec for spec in specs if spec["changed"]]
+    changed_indices = {index for spec in changed_specs for index in spec["src_indices"]}
+    changed_targets = {index for spec in changed_specs for index in spec["tgt_indices"]}
+    affected = [row for row in rows if set(json.loads(row.src_indices or "[]")).intersection(changed_indices) or set(json.loads(row.tgt_indices or "[]")).intersection(changed_targets)]
+    _preserve_replacement_texts(db, batch_id, affected, changed_specs)
+
     # PostgreSQL 会逐行检查唯一序号：先整体搬到负数空间，再一次性写回最终顺序。
     for temporary, row in enumerate(rows, start=1):
         row.pair_order = -temporary
@@ -1736,11 +1814,12 @@ def split_alignment_pairs_by_cell(
         src_indices = spec["src_indices"]
         tgt_indices = spec["tgt_indices"]
         features: dict[str, Any] = {"manual_adjustment": True, "split_by_cell": True}
+        features.update({f"manual_{field}": spec[field] for field in ("source_text", "target_text") if field in spec})
         _set_pair_cell_features(features, src_indices, tgt_indices, source_units, target_units)
         row.src_indices = json.dumps(src_indices)
         row.tgt_indices = json.dumps(tgt_indices)
-        row.source_text = _join_text(src_indices, source_units)
-        row.target_text = _join_text(tgt_indices, target_units)
+        row.source_text = spec.get("source_text", _join_text(src_indices, source_units))
+        row.target_text = spec.get("target_text", _join_text(tgt_indices, target_units))
         row.features = json.dumps(features, ensure_ascii=False)
         row.locked = bool(spec["locked"])
         row.method = "manual"

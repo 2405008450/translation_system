@@ -26,6 +26,7 @@ from app.services.document_alignment.service import (
     delete_alignment_pair, merge_alignment_pair_range, replace_alignment_pair_range,
     run_alignment_batch, serialize_pair, split_alignment_pairs_by_cell,
     validate_pair_integrity,
+    AlignmentConflictError, lock_alignment_batch,
 )
 from app.services.import_task_storage import (
     cleanup_import_task_staging, get_import_task_staging_dir, stage_import_file_streams,
@@ -78,12 +79,16 @@ class PairReplacement(BaseModel):
     src_indices: list[int] = Field(default_factory=list)
     tgt_indices: list[int] = Field(default_factory=list)
     locked: bool = True
+    source_text: str | None = None
+    target_text: str | None = None
 
 
 class PairRangeReplace(BaseModel):
     start_order: int = Field(ge=0)
     delete_count: int = Field(ge=0, le=100)
     replacements: list[PairReplacement] = Field(default_factory=list, max_length=100)
+    expected_pair_ids: list[UUID] | None = Field(default=None, max_length=100)
+    expected_texts: list[PairTextPatch] | None = Field(default=None, max_length=100)
 
 
 class PairCellSplit(BaseModel):
@@ -100,7 +105,7 @@ def _project(db: Session, project_id: UUID) -> Project:
 
 
 def _batch(db: Session, batch_id: UUID, project_id: UUID | None = None) -> ProofreadingBatch:
-    batch = db.get(ProofreadingBatch, batch_id)
+    batch = lock_alignment_batch(db, batch_id)
     if not batch or batch.batch_kind != "document_pair" or project_id is not None and batch.project_id != project_id:
         raise HTTPException(404, "双文档对齐批次不存在。")
     return batch
@@ -244,6 +249,7 @@ def patch_pair_text(
     if not pair:
         raise HTTPException(404, "配对不存在。")
     batch = _batch(db, pair.batch_id)
+    db.refresh(pair)
     if batch.alignment_status not in {"draft", "confirmed"}:
         raise HTTPException(409, "当前对齐结果不可编辑。")
     _require_alignment_stage(batch)
@@ -285,6 +291,7 @@ def remove_pair(
     if not pair:
         raise HTTPException(404, "配对不存在。")
     batch = _batch(db, pair.batch_id)
+    db.refresh(pair)
     if batch.alignment_status not in {"draft", "confirmed"}:
         raise HTTPException(409, "当前对齐结果不可删除。")
     _require_alignment_stage(batch)
@@ -316,27 +323,18 @@ def split_pair(batch_id: UUID, payload: PairSplit, db: Session = Depends(get_db)
         or (payload.src_at == len(src) and payload.tgt_at == len(tgt))
     ):
         raise HTTPException(400, "拆分位置无效。")
-    # 先转为负序号再平移，避免唯一约束在逐行更新时发生瞬时冲突。
-    db.query(DocumentAlignmentPair).filter(
-        DocumentAlignmentPair.batch_id == batch_id, DocumentAlignmentPair.pair_order > pair.pair_order,
-    ).update({DocumentAlignmentPair.pair_order: -DocumentAlignmentPair.pair_order - 1}, synchronize_session=False)
-    db.flush()
-    db.query(DocumentAlignmentPair).filter(
-        DocumentAlignmentPair.batch_id == batch_id, DocumentAlignmentPair.pair_order < 0,
-    ).update({DocumentAlignmentPair.pair_order: -DocumentAlignmentPair.pair_order}, synchronize_session=False)
-    second = DocumentAlignmentPair(
-        batch_id=batch_id, pair_order=pair.pair_order + 1,
-        src_indices=json.dumps(src[payload.src_at:]), tgt_indices=json.dumps(tgt[payload.tgt_at:]),
-        source_text="", target_text="", confidence=0.8, confidence_level="high", method="manual", features="{}",
-        block_type=pair.block_type, block_index=pair.block_index, row_index=pair.row_index, cell_index=pair.cell_index,
-    )
-    pair.src_indices, pair.tgt_indices = json.dumps(src[:payload.src_at]), json.dumps(tgt[:payload.tgt_at])
-    db.add(second)
-    db.flush()
-    refresh_pair_text(db, pair); refresh_pair_text(db, second)
-    validate_pair_integrity(db, batch_id)
-    db.commit()
-    return {"items": [serialize_pair(pair), serialize_pair(second)]}
+    try:
+        items = replace_alignment_pair_range(db, batch_id, pair.pair_order, 1, [
+            {"src_indices": src[:payload.src_at], "tgt_indices": tgt[:payload.tgt_at], "locked": True},
+            {"src_indices": src[payload.src_at:], "tgt_indices": tgt[payload.tgt_at:], "locked": True},
+        ], expected_pair_ids=[pair.id])
+        if batch.alignment_status == "confirmed":
+            ensure_document_pair_segments_complete(db, batch, refresh_existing=True)
+        db.commit()
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    return {"items": [serialize_pair(item) for item in items]}
 
 
 @router.post("/proofreading-batches/{batch_id}/alignment-pairs/merge")
@@ -348,6 +346,8 @@ def merge_pairs(batch_id: UUID, payload: PairMerge, db: Session = Depends(get_db
         pair_ids = [payload.first_pair_id, payload.second_pair_id]
     try:
         merged = merge_alignment_pair_range(db, batch_id, pair_ids)
+        if batch.alignment_status == "confirmed":
+            ensure_document_pair_segments_complete(db, batch, refresh_existing=True)
         db.commit()
     except ValueError as exc:
         db.rollback()
@@ -374,13 +374,21 @@ def shift_boundary(batch_id: UUID, payload: BoundaryShift, db: Session = Depends
     else:
         if not left: raise HTTPException(400, "当前配对没有可移动单元。")
         right.insert(0, left.pop())
-    setattr(current, field, json.dumps(left)); setattr(nxt, field, json.dumps(right))
-    refresh_pair_text(db, current); refresh_pair_text(db, nxt)
-    validate_pair_integrity(db, batch_id)
-    if batch.alignment_status == "confirmed":
-        ensure_document_pair_segments_complete(db, batch, refresh_existing=True)
-    db.commit()
-    return {"items": [serialize_pair(current), serialize_pair(nxt)]}
+    replacements = [
+        {"src_indices": json.loads(row.src_indices), "tgt_indices": json.loads(row.tgt_indices), "locked": True}
+        for row in (current, nxt)
+    ]
+    replacements[0][field], replacements[1][field] = left, right
+    try:
+        items = replace_alignment_pair_range(db, batch_id, current.pair_order, 2, replacements,
+                                             expected_pair_ids=[current.id, nxt.id])
+        if batch.alignment_status == "confirmed":
+            ensure_document_pair_segments_complete(db, batch, refresh_existing=True)
+        db.commit()
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    return {"items": [serialize_pair(item) for item in items]}
 
 
 @router.post("/proofreading-batches/{batch_id}/alignment-pairs/replace-range")
@@ -401,11 +409,16 @@ def replace_pair_range(
             batch_id,
             payload.start_order,
             payload.delete_count,
-            [item.model_dump() for item in payload.replacements],
+            [item.model_dump(exclude_none=True) for item in payload.replacements],
+            expected_pair_ids=payload.expected_pair_ids,
+            expected_texts=[item.model_dump(exclude_none=True) for item in payload.expected_texts] if payload.expected_texts is not None else None,
         )
         if batch.alignment_status == "confirmed":
             ensure_document_pair_segments_complete(db, batch, refresh_existing=True)
         db.commit()
+    except AlignmentConflictError as exc:
+        db.rollback()
+        raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
         db.rollback()
         raise HTTPException(400, str(exc)) from exc

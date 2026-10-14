@@ -30,6 +30,7 @@ export const llmScenarioOptions: LLMOption<LLMTranslationScenario>[] = [
 ]
 
 export const llmModelShortLabelMap: Record<string, string> = {
+  'google/gemini-4-argon': 'Gemini 4 Argon',
   'google/gemini-3.7-flash': 'Gemini 3.7 Flash',
   'google/gemini-3.5-flash': 'Gemini 3.5',
   'google/gemini-3.1-pro-preview': 'Gemini 3.1 Pro',
@@ -46,6 +47,12 @@ export const llmModelShortLabelMap: Record<string, string> = {
 }
 
 export const llmModelOptions: LLMModelOption[] = [
+  {
+    id: 'google/gemini-4-argon',
+    name: 'Gemini 4 Argon',
+    family: 'gemini',
+    provider: 'openrouter',
+  },
   {
     id: defaultLLMModelId,
     name: 'Gemini 3.7 Flash',
