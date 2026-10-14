@@ -20,8 +20,6 @@ RUN npm ci --omit=dev --ignore-scripts
 FROM python:3.11-slim-bookworm AS runtime
 
 ARG APP_VERSION=
-ARG ODA_FILE_CONVERTER_VERSION=27.1
-ARG ODA_FILE_CONVERTER_SHA256=c71363cd54758177af47a365154f180dc50a1e2b52a131994fda541c13a36766
 ENV TZ=Asia/Shanghai \
     APP_VERSION=${APP_VERSION} \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -78,8 +76,16 @@ RUN apt-get update \
         unrar-free \
         xauth \
         xvfb \
-    && curl -fL --retry 3 \
-        "https://www.opendesign.com/guestfiles/get?filename=ODAFileConverter_QT6_lnxX64_8.3dll_${ODA_FILE_CONVERTER_VERSION}.deb" \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/*
+
+# 独立下载层：上游安装包不可用时，不必重新安装整套系统依赖。
+# 固定版本并校验内容，避免官网默认下载升级后构建结果发生变化。
+ARG ODA_FILE_CONVERTER_VERSION=27.9
+ARG ODA_FILE_CONVERTER_SHA256=12f5e14c55c35176062f63e242d5390f732722213dd685fa3cd44a6555384cd0
+RUN curl -fL --retry 3 --connect-timeout 30 --max-time 600 \
+        "https://www.opendesign.com/guestfiles/get?filename=ODAFileConverter_QT6_lnxX64_11dll_${ODA_FILE_CONVERTER_VERSION}.deb" \
         -o /tmp/oda-file-converter.deb \
     && echo "${ODA_FILE_CONVERTER_SHA256}  /tmp/oda-file-converter.deb" | sha256sum -c - \
     && dpkg -i /tmp/oda-file-converter.deb \
@@ -87,10 +93,7 @@ RUN apt-get update \
         && [ ! -e /usr/lib/x86_64-linux-gnu/libxcb-util.so.0 ]; then \
         ln -s libxcb-util.so.1 /usr/lib/x86_64-linux-gnu/libxcb-util.so.0; \
        fi \
-    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
-    && echo $TZ > /etc/timezone \
-    && rm -f /tmp/oda-file-converter.deb \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -f /tmp/oda-file-converter.deb
 
 COPY scripts/oda_file_converter_headless.sh /usr/local/bin/oda-file-converter-headless
 RUN chmod 0755 /usr/local/bin/oda-file-converter-headless
