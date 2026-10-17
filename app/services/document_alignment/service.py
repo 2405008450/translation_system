@@ -12,7 +12,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.config import get_settings
+from app.config import DEFAULT_ALIGNMENT_REVIEW_MODEL, get_settings
 from app.database import SessionLocal
 from app.models import DocumentAlignmentPair, DocumentAlignmentUnit, ProofreadingBatch, Project, User
 from app.services.language_pairs import normalize_language_code, require_language_pair
@@ -319,7 +319,7 @@ async def _compute_hierarchical_pairs(
             pairs, src, tgt, ratio,
             model=str(config.get("full_review_model") or getattr(
                 settings, "alignment_llm_full_review_model",
-                "google/gemini-3.7-flash",
+                DEFAULT_ALIGNMENT_REVIEW_MODEL,
             )),
             max_pairs=max(1, int(getattr(settings, "alignment_llm_full_review_max_pairs", 28))),
             max_chars=max(1000, int(getattr(settings, "alignment_llm_full_review_max_chars", 18000))),
@@ -503,7 +503,7 @@ async def _compute_pairs(
                 result, src, tgt, ratio,
                 model=str(config.get("full_review_model") or getattr(
                     settings, "alignment_llm_full_review_model",
-                    "google/gemini-3.7-flash",
+                    DEFAULT_ALIGNMENT_REVIEW_MODEL,
                 )),
                 max_pairs=max(1, int(getattr(settings, "alignment_llm_full_review_max_pairs", 28))),
                 max_chars=max(1000, int(getattr(settings, "alignment_llm_full_review_max_chars", 18000))),

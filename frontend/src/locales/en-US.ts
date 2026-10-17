@@ -4,6 +4,13 @@ type LocaleNode = string | number | boolean | null | LocaleTree | LocaleNode[]
 type LocaleTree = { [key: string]: LocaleNode }
 
 const overrides = {
+  resourceImport: {
+    result: {
+      completed: 'Import completed: {created} added, {updated} overwritten; skipped {duplicates} duplicates, {empty} empty rows and {headers} headers.',
+      noChanges: 'No data was written: {created} added, {updated} overwritten; skipped {duplicates} duplicates, {empty} empty rows and {headers} headers.',
+      noValidRows: ' No valid entries were found. Check the file contents and language pair.',
+    },
+  },
   common: {
     brand: 'Translation Workbench',
     comingSoon: 'Coming soon',

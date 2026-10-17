@@ -14,6 +14,7 @@ import {
 import { formatLanguagePair, languageOptions } from '../constants/languages'
 import { refreshGlobalNotifications } from '../utils/notifications'
 import { isProgressComplete } from '../utils/progress'
+import { formatResourceImportResult, type ResourceImportResult } from '../utils/resourceImport'
 import type {
   TMCollection,
   GlossaryBase,
@@ -64,7 +65,7 @@ const props = withDefaults(defineProps<{
 })
 
 const emit = defineEmits<{
-  imported: [payload: { tab: ImportTab, resourceId?: string }]
+  imported: [payload: ResourceImportResult]
 }>()
 const { t } = useI18n()
 
@@ -994,7 +995,7 @@ async function uploadTMWorkbook() {
 
     tmImportSummary.value = summary
     tmImportPreview.value = null
-    tmImportMessage.value = t('resourceImport.tm.success.imported', { filename: summary.filename })
+    tmImportMessage.value = formatResourceImportResult(summary)
     refreshGlobalNotifications()
     selectedTMFile.value = null
     if (tmFileInput.value) {
@@ -1002,7 +1003,7 @@ async function uploadTMWorkbook() {
     }
     newTMCollectionName.value = ''
     newTMCollectionDescription.value = ''
-    emit('imported', { tab: 'tm', resourceId: summary.collection_id || collectionId })
+    emit('imported', { tab: 'tm', resourceId: summary.collection_id || collectionId, summary })
     await loadTMCollections()
   } catch (error) {
     tmImportMessage.value = isAbortError(error)
@@ -1067,7 +1068,7 @@ async function uploadGlossaryWorkbook() {
 
     glossaryImportSummary.value = summary
     glossaryImportPreview.value = null
-    glossaryImportMessage.value = `导入完成：${summary.filename}`
+    glossaryImportMessage.value = formatResourceImportResult(summary)
     refreshGlobalNotifications()
     selectedGlossaryFile.value = null
     if (glossaryFileInput.value) {
@@ -1075,7 +1076,7 @@ async function uploadGlossaryWorkbook() {
     }
     newGlossaryBaseName.value = ''
     newGlossaryBaseDescription.value = ''
-    emit('imported', { tab: 'glossary', resourceId: summary.glossary_base_id || glossaryBaseId })
+    emit('imported', { tab: 'glossary', resourceId: summary.glossary_base_id || glossaryBaseId, summary })
     await loadGlossaryBases()
   } catch (error) {
     glossaryImportMessage.value = isAbortError(error)
@@ -1140,7 +1141,7 @@ async function uploadTermWorkbook() {
 
     termImportSummary.value = summary
     termImportPreview.value = null
-    termImportMessage.value = t('resourceImport.term.success.imported', { filename: summary.filename })
+    termImportMessage.value = formatResourceImportResult(summary)
     refreshGlobalNotifications()
     selectedTermFile.value = null
     if (termFileInput.value) {
@@ -1148,7 +1149,7 @@ async function uploadTermWorkbook() {
     }
     newTermBaseName.value = ''
     newTermBaseDescription.value = ''
-    emit('imported', { tab: 'term', resourceId: summary.term_base_id || termBaseId })
+    emit('imported', { tab: 'term', resourceId: summary.term_base_id || termBaseId, summary })
     await loadTermBases()
   } catch (error) {
     termImportMessage.value = isAbortError(error)

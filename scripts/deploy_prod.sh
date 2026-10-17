@@ -14,8 +14,26 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
-if [[ "${USE_PROXY:-0}" == "1" ]]; then
+# 未显式指定时沿用现有应用容器的代理配置，避免重建容器后丢失网络出口。
+USE_PROXY="${USE_PROXY:-auto}"
+if [[ "$USE_PROXY" == "auto" ]]; then
+  previous_compose_files="$(docker inspect ai-translation-app \
+    --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' 2>/dev/null || true)"
+  if [[ "$previous_compose_files" == *docker-compose.proxy.yml* ]]; then
+    USE_PROXY=1
+  else
+    USE_PROXY=0
+  fi
+fi
+
+if [[ "$USE_PROXY" != "0" && "$USE_PROXY" != "1" ]]; then
+  echo "USE_PROXY 只支持 auto、0 或 1。" >&2
+  exit 1
+fi
+
+if [[ "$USE_PROXY" == "1" ]]; then
   COMPOSE_FILES+=(-f docker-compose.proxy.yml)
+  echo "网络代理：启用 Mihomo（保留或显式指定的代理配置）。"
 fi
 
 if [[ "$USE_NGINX" == "1" ]]; then
@@ -46,7 +64,9 @@ usage() {
 
 环境变量:
   ENV_FILE=.env.prod   Compose 环境文件
-  USE_PROXY=1          叠加 docker-compose.proxy.yml（Mihomo 代理）
+  USE_PROXY=auto       默认沿用现有应用容器的代理配置；首次部署不启用
+  USE_PROXY=1          显式启用 docker-compose.proxy.yml（Mihomo 代理）
+  USE_PROXY=0          显式关闭代理
   USE_NGINX=0          不启 nginx，改用 docker-compose.app-port.yml 直连 app
   NGINX_HTTP_PORT=80   nginx 对外 HTTP 端口
   APP_PUBLISH_PORT=80  USE_NGINX=0 时 app 直连发布端口
@@ -74,6 +94,9 @@ case "$cmd" in
     ;;
   restart)
     compose build app
+    if [[ "$USE_PROXY" == "1" ]]; then
+      compose up -d --no-deps mihomo
+    fi
     compose up --force-recreate db-migrate
     if [[ "$USE_NGINX" == "1" ]]; then
       compose up -d --force-recreate --no-deps app import-worker worker auto-tm-worker segment-sync-worker pretranslation-worker nginx

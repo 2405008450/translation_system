@@ -1479,6 +1479,11 @@ export default {
   },
   resourceImport: {
     title: '导入语言资产',
+    result: {
+      completed: '导入完成：新增 {created} 条，覆盖 {updated} 条；跳过重复 {duplicates} 条、空内容 {empty} 条、表头 {headers} 条。',
+      noChanges: '本次导入未写入任何数据：新增 {created} 条，覆盖 {updated} 条；跳过重复 {duplicates} 条、空内容 {empty} 条、表头 {headers} 条。',
+      noValidRows: '未发现可导入的有效条目，请检查文件内容及语言对。',
+    },
     description: '在当前上下文里继续导入记忆库、词汇表或术语库，不必跳到独立管理页。',
     contextFallback: '当前上下文',
     contextPair: '默认语言对：{pair}',

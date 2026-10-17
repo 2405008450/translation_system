@@ -44,7 +44,7 @@ from app.services.proofreading import (
 )
 from app.services.llm_service import LLMConfigurationError, validate_provider_choice
 from app.services.document_alignment.segments import ensure_document_pair_segments_complete
-from app.services.document_alignment.export import build_export_readiness, is_xlsx_pair, target_revision_export_available
+from app.services.document_alignment.export import build_export_readiness, export_batch_is_busy, is_xlsx_pair, target_revision_export_available
 from app.services.file_export_queue import queue_file_export
 from app.services.file_record_service import delete_proofreading_batch
 
@@ -338,8 +338,8 @@ def create_proofreading_export_task(
     current_user: User = Depends(require_business_manager),
 ):
     batch = _get_batch_or_404(db, batch_id)
-    if batch.status in {"queued", "running", "canceling"}:
-        raise HTTPException(status_code=409, detail="请先结束当前 LLM 校对任务再导出。")
+    if export_batch_is_busy(batch):
+        raise HTTPException(status_code=409, detail="请先完成或结束当前解析、对齐或校对任务再导出。")
     readiness = build_export_readiness(db, batch)
     if payload.format not in readiness["available_formats"]:
         if payload.format == "proofreading_docx_target_revisions":

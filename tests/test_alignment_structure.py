@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import unittest
+from io import BytesIO
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
+from docx import Document
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -12,9 +16,11 @@ from app.models import (
     ProofreadingBatch, ProofreadingColumnBinding, ProofreadingSegmentBaseline,
     Segment, SegmentComment, SegmentQAIssue, SegmentRevision, User,
 )
-from app.routers.document_alignment import PairRangeReplace, PairSplit, replace_pair_range, split_pair
+from app.routers.document_alignment import PairRangeReplace, PairSplit, replace_pair_range, split_pair, rerun
 from app.services.document_alignment.service import replace_alignment_pair_range, validate_pair_integrity
 from app.services.document_alignment.segments import ensure_document_pair_segments_complete
+from app.services.document_alignment.export import build_export_readiness, export_ordered_bilingual_docx
+from app.routers.proofreading import create_proofreading_export_task, ProofreadingExportTaskRequest
 
 
 class AlignmentStructureTests(unittest.IsolatedAsyncioTestCase):
@@ -188,6 +194,116 @@ class AlignmentStructureTests(unittest.IsolatedAsyncioTestCase):
         ensure_document_pair_segments_complete(self.db, batch, refresh_existing=True)
         self.assertEqual([row.target_text for row in self.db.query(Segment)], ["合法重复的文档内容"] * 2)
         self.assertEqual(self.db.query(ProofreadingSegmentBaseline).count(), 2)
+
+    async def test_explicit_rerun_uses_current_alignment_model(self):
+        batch, _ = self._structure_fixture()
+        batch.config_json = json.dumps({"full_review": True, "full_review_model": "google/gemini-3.7-flash",
+                                        "alignment_strategy": "order_first"})
+        self.db.commit()
+        tasks = BackgroundTasks()
+        with patch("app.routers.document_alignment.get_settings", return_value=SimpleNamespace(
+            alignment_llm_full_review_model="google/gemini-4-argon",
+        )):
+            rerun(batch.id, tasks, self.db, self.user)
+        config = json.loads(batch.config_json)
+        self.assertEqual(config["full_review_model"], "google/gemini-4-argon")
+        self.assertEqual(config["alignment_strategy"], "order_first")
+        self.assertEqual(len(tasks.tasks), 1)
+
+    async def test_rerun_preserves_disabled_review_and_xlsx_settings(self):
+        for options in ({"full_review": False}, {"pair_format": "xlsx", "full_review": False}):
+            batch, _ = self._structure_fixture()
+            original = {**options, "full_review_model": "historical-model"}
+            batch.config_json = json.dumps(original)
+            self.db.commit()
+            rerun(batch.id, BackgroundTasks(), self.db, self.user)
+            self.assertEqual(json.loads(batch.config_json), original)
+
+    async def test_ordered_word_available_in_both_document_pair_stages_and_formats(self):
+        batch, _ = self._structure_fixture(confirmed=True)
+        for stage in ("alignment", "proofreading"):
+            for pair_format in ("document", "xlsx"):
+                with self.subTest(stage=stage, pair_format=pair_format):
+                    batch.workflow_stage = stage
+                    batch.config_json = json.dumps({"pair_format": pair_format})
+                    readiness = build_export_readiness(self.db, batch)
+                    self.assertIn("proofreading_docx_ordered", readiness["available_formats"])
+                    self.assertIn("proofreading_audit_xlsx", readiness["available_formats"])
+                    if stage == "alignment":
+                        self.assertNotIn("proofreading_docx_layout", readiness["available_formats"])
+
+    async def test_ordered_word_keeps_current_text_gap_markers_and_paragraph_order(self):
+        batch, pairs = self._structure_fixture(groups=[([0], [0]), ([], [1]), ([1], [])], confirmed=True)
+        segment = self.db.query(Segment).filter_by(sentence_id=f"align-{pairs[0].id}").one()
+        segment.source_text = "当前人工原文\n保留原文换行"
+        segment.target_text = "Current reviewed translation\nKeep this line break"
+        pairs[0].block_type = "heading"
+        self.db.flush()
+        for stage in ("alignment", "proofreading"):
+            batch.workflow_stage = stage
+            content, filename = export_ordered_bilingual_docx(self.db, batch)
+            document = Document(BytesIO(content))
+            self.assertEqual(filename, "structure_上下对照.docx")
+            self.assertEqual([p.text for p in document.paragraphs], [
+                "双语校对文档", "当前人工原文\n保留原文换行", "Current reviewed translation\nKeep this line break",
+                "（增译，无对应原文）", "Target 1", "原文1", "【译文缺失】",
+            ])
+            self.assertEqual(len(document.tables), 0)
+            self.assertTrue(document.paragraphs[1].paragraph_format.keep_with_next)
+            self.assertTrue(document.paragraphs[1].runs[0].bold)
+            self.assertGreater(document.paragraphs[2].paragraph_format.space_after.pt, 0)
+
+    async def test_ordered_word_exports_entire_batch_without_source_document(self):
+        batch, _ = self._structure_fixture(groups=[([i], [i]) for i in range(105)], confirmed=True)
+        content, _ = export_ordered_bilingual_docx(self.db, batch)
+        paragraphs = Document(BytesIO(content)).paragraphs
+        self.assertEqual(len(paragraphs), 211)
+        for index in range(105):
+            self.assertEqual(paragraphs[index * 2 + 1].text, f"原文{index}")
+            self.assertEqual(paragraphs[index * 2 + 2].text, f"Target {index}")
+
+    async def test_ordered_word_reflects_split_merge_and_manual_edit(self):
+        from app.routers.document_alignment import patch_pair_text, PairTextPatch
+        batch, pairs = self._structure_fixture(confirmed=True)
+        result = replace_pair_range(batch.id, PairRangeReplace(start_order=0, delete_count=1,
+            expected_pair_ids=[pairs[0].id], replacements=[{"src_indices": [0], "tgt_indices": [0]},
+            {"src_indices": [1], "tgt_indices": [1]}]), self.db, self.user)
+        from uuid import UUID
+        patch_pair_text(UUID(result["items"][1]["id"]), PairTextPatch(target_text="人工修订的第二条"), self.db, self.user)
+        content, _ = export_ordered_bilingual_docx(self.db, batch)
+        self.assertEqual([p.text for p in Document(BytesIO(content)).paragraphs][1:],
+                         ["原文0", "Target 0", "原文1", "人工修订的第二条", "原文2", "Target 2"])
+        merged = replace_alignment_pair_range(self.db, batch.id, 0, 2,
+            [{"src_indices": [0, 1], "tgt_indices": [0, 1], "locked": True}])
+        ensure_document_pair_segments_complete(self.db, batch, refresh_existing=True)
+        content, _ = export_ordered_bilingual_docx(self.db, batch)
+        self.assertEqual([p.text for p in Document(BytesIO(content)).paragraphs][1:],
+                         ["原文0\n原文1", "Target 0\n人工修订的第二条", "原文2", "Target 2"])
+        self.assertEqual(len(merged), 1)
+
+    async def test_ordered_word_export_queues_before_llm_proofreading(self):
+        batch, _ = self._structure_fixture(confirmed=True)
+        with patch("app.routers.proofreading.queue_file_export", return_value={"task_id": "task1", "status": "queued"}) as enqueue:
+            response = create_proofreading_export_task(batch.id, ProofreadingExportTaskRequest(
+                format="proofreading_docx_ordered", acknowledge_warnings=True), self.db, self.user)
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(enqueue.call_args.kwargs["export_type"], "proofreading_docx_ordered")
+        self.assertEqual(batch.status, "ready")
+
+    async def test_ordered_word_rejects_active_generation(self):
+        batch, _ = self._structure_fixture(confirmed=True)
+        for status, alignment_status, stage in (
+            ("aligning", "aligning", "import"), ("ready", "canceling", "alignment"),
+            ("running", "confirmed", "proofreading"), ("queued", "confirmed", "proofreading"),
+            ("canceling", "confirmed", "proofreading"),
+        ):
+            batch.status, batch.alignment_status, batch.workflow_stage = status, alignment_status, stage
+            self.db.commit()
+            self.assertEqual(build_export_readiness(self.db, batch)["available_formats"], [])
+            with self.assertRaises(HTTPException) as failure:
+                create_proofreading_export_task(batch.id, ProofreadingExportTaskRequest(
+                    format="proofreading_docx_ordered", acknowledge_warnings=True), self.db, self.user)
+            self.assertEqual(failure.exception.status_code, 409)
 
     async def test_invalid_duplicate_indices_roll_back_structure_and_materialization(self):
         batch, pairs = self._structure_fixture(confirmed=True)

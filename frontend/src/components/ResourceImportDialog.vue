@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 
 import ResourceImportPanel from './ResourceImportPanel.vue'
 import Modal from './base/Modal.vue'
+import type { ResourceImportResult } from '../utils/resourceImport'
 
 type ImportTab = 'tm' | 'glossary' | 'term'
 type ImportMode = 'all' | ImportTab
@@ -43,7 +44,7 @@ const modalDescription = computed(() => t('resourceImport.description'))
 
 const emit = defineEmits<{
   close: []
-  imported: [payload: { tab: ImportTab, resourceId?: string }]
+  imported: [payload: ResourceImportResult]
 }>()
 </script>
 

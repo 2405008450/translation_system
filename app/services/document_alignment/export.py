@@ -167,6 +167,16 @@ def is_xlsx_pair(batch: ProofreadingBatch) -> bool:
     return batch.batch_kind == "document_pair" and _batch_config(batch).get("pair_format") == "xlsx"
 
 
+def export_batch_is_busy(batch: ProofreadingBatch) -> bool:
+    """解析、对齐或校对仍在生成时，不导出中间状态。"""
+    return getattr(batch, "status", None) in {"aligning", "queued", "running", "canceling"} or (
+        batch.batch_kind == "document_pair" and (
+            getattr(batch, "alignment_status", None) in {"aligning", "canceling"}
+            or getattr(batch, "workflow_stage", "not_applicable") == "import"
+        )
+    )
+
+
 def build_export_readiness(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
     rows, file_record = build_proofreading_export_rows(db, batch)
     stage = getattr(batch, "workflow_stage", "not_applicable")
@@ -187,6 +197,11 @@ def build_export_readiness(db: Session, batch: ProofreadingBatch) -> dict[str, A
                 available_formats.insert(0, "proofreading_docx_target_revisions")
     else:
         available_formats = ["proofreading_xlsx_original"]
+    if batch.batch_kind == "document_pair" and stage in {"alignment", "proofreading"}:
+        if "proofreading_docx_ordered" not in available_formats:
+            available_formats.append("proofreading_docx_ordered")
+    if export_batch_is_busy(batch):
+        available_formats = []
     return {
         "batch_id": str(batch.id),
         "total": len(rows),
@@ -770,7 +785,7 @@ def export_ordered_bilingual_docx(
             target_run.font.color.rgb = RGBColor(156, 0, 6)
     output = BytesIO()
     document.save(output)
-    return output.getvalue(), f"{Path(batch.filename).stem}_双语校对版_顺序优先.docx"
+    return output.getvalue(), f"{Path(batch.filename).stem}_上下对照.docx"
 
 
 def _normalize_export_text(value: str) -> str:

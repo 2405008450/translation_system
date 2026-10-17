@@ -14,6 +14,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.auth import require_business_manager
+from app.config import get_settings
 from app.database import get_db
 from app.models import DocumentAlignmentPair, ProofreadingBatch, Project, User
 from app.services.document_alignment.export import export_alignment_csv as build_alignment_csv
@@ -453,6 +454,11 @@ def rerun(batch_id: UUID, background_tasks: BackgroundTasks, db: Session = Depen
     batch = _batch(db, batch_id)
     if batch.alignment_status in {"aligning", "canceling"}:
         raise HTTPException(409, "当前双文档对齐任务仍在运行。")
+    config = json.loads(batch.config_json or "{}")
+    if config.get("pair_format") != "xlsx" and config.get("full_review", True):
+        # 用户明确发起重跑时使用当前对齐模型；已完成批次不会被后台自动改写。
+        config["full_review_model"] = get_settings().alignment_llm_full_review_model
+        batch.config_json = json.dumps(config, ensure_ascii=False)
     batch.alignment_status = "aligning"; batch.status = "aligning"; batch.progress = 0
     batch.message = "正在准备文档对齐窗口…"
     batch.error_message = ""

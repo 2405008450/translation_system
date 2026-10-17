@@ -224,7 +224,7 @@ class XlsxPairWorkflowTests(unittest.TestCase):
         self.assertFalse(config["full_review"])
         self.assertEqual(config["alignment_strategy"], "xlsx_coordinate")
         readiness = build_export_readiness(self.db, self.batch)
-        self.assertEqual(readiness["available_formats"], ["proofreading_audit_xlsx"])
+        self.assertEqual(readiness["available_formats"], ["proofreading_audit_xlsx", "proofreading_docx_ordered"])
         report, _ = export_document_pair_xlsx(self.db, self.batch)
         workbook = load_workbook(BytesIO(report))
         self.assertNotIn("校对译文", [c.value for c in workbook.active[1]])
@@ -236,7 +236,7 @@ class XlsxPairWorkflowTests(unittest.TestCase):
         segment.status = "confirmed"
         self.db.commit()
         readiness = build_export_readiness(self.db, self.batch)
-        self.assertEqual(readiness["available_formats"], ["proofreading_audit_xlsx", "proofreading_xlsx_target"])
+        self.assertEqual(readiness["available_formats"], ["proofreading_audit_xlsx", "proofreading_xlsx_target", "proofreading_docx_ordered"])
         report, _ = export_document_pair_xlsx(self.db, self.batch)
         workbook = load_workbook(BytesIO(report))
         self.assertEqual(workbook.active["G2"].value, "=这是文字而不是公式")

@@ -334,9 +334,19 @@ function documentPairExportChoice(batch: ProofreadingBatch): { format: Proofread
   return null
 }
 
-async function exportDocumentPairBatch(batch: ProofreadingBatch) {
-  const choice = documentPairExportChoice(batch)
-  if (!choice) return
+function canExportOrderedWord(batch: ProofreadingBatch) {
+  return batch.batch_kind === 'document_pair' && Boolean(batch.bindings[0]?.file_record_id)
+    && ['alignment', 'proofreading'].includes(batch.workflow_stage || '')
+}
+
+function batchExportBusy(batch: ProofreadingBatch) {
+  return ['aligning', 'queued', 'running', 'canceling'].includes(batch.status)
+    || ['aligning', 'canceling'].includes(batch.alignment_status || '')
+}
+
+async function exportDocumentPairBatch(batch: ProofreadingBatch, orderedWord = false) {
+  const choice = orderedWord ? { format: 'proofreading_docx_ordered' as const, name: '上下对照 Word' } : documentPairExportChoice(batch)
+  if (!choice || actionBatchId.value || batchExportBusy(batch)) return
   actionBatchId.value = batch.id
   errorMessage.value = ''
   try {
@@ -696,12 +706,19 @@ defineExpose({ refreshBatches })
                 v-if="documentPairExportChoice(batch)"
                 class="button"
                 type="button"
-                :disabled="Boolean(actionBatchId)"
+                :disabled="Boolean(actionBatchId) || batchExportBusy(batch)"
                 @click="exportDocumentPairBatch(batch)"
               >
                 <Loader2 v-if="actionBatchId === batch.id" class="lucide-spin" :size="14" />
                 <Download v-else :size="14" />
                 {{ documentPairExportChoice(batch)?.name }}
+              </button>
+              <button v-if="canExportOrderedWord(batch)" class="button" type="button"
+                data-testid="batch-export-ordered-word"
+                :disabled="Boolean(actionBatchId) || batchExportBusy(batch)"
+                @click="exportDocumentPairBatch(batch, true)">
+                <Loader2 v-if="actionBatchId === batch.id" class="lucide-spin" :size="14" />
+                <Download v-else :size="14" />上下对照 Word
               </button>
               <button
                 v-if="batch.batch_kind !== 'document_pair'"

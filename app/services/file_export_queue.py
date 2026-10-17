@@ -604,6 +604,7 @@ def build_file_record_exported_file(
             export_document_pair_xlsx,
             export_layout_bilingual_docx,
             export_ordered_bilingual_docx,
+            export_batch_is_busy,
             export_target_docx_with_revisions,
             export_target_xlsx,
         )
@@ -625,6 +626,8 @@ def build_file_record_exported_file(
             ).first()
         if batch is None:
             raise ValueError("当前文件没有可导出的校对批次。")
+        if export_batch_is_busy(batch):
+            raise ValueError("请先完成或结束当前解析、对齐或校对任务再导出。")
 
         if export_type == "proofreading_docx_target_revisions":
             content, filename = export_target_docx_with_revisions(db, batch)

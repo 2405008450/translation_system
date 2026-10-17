@@ -30,6 +30,7 @@ import { getLanguageLabel, languageOptions } from '../constants/languages'
 import { useAuthStore } from '../stores/auth'
 import type { PaginatedResponse, TermBase, TermEntryRecord, TMCollection, TMEntryRecord } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import { formatResourceImportResult, type ResourceImportResult } from '../utils/resourceImport'
 
 type ResourceMode = 'tm' | 'term'
 type ExportFormat = 'xlsx' | 'tmx' | 'tbx'
@@ -643,14 +644,15 @@ async function exportEntries(format: ExportFormat) {
   }
 }
 
-async function handleImported(payload: { tab: 'tm' | 'glossary' | 'term' }) {
+async function handleImported(payload: ResourceImportResult) {
   if (payload.tab !== copy.value.importTab) {
     return
   }
   showImportDialog.value = false
   currentPage.value = 1
   await reloadPage()
-  entryMessage.value = '导入完成，列表已刷新。'
+  const resultMessage = formatResourceImportResult(payload.summary)
+  entryMessage.value = entryMessage.value ? `${resultMessage} ${entryMessage.value}` : resultMessage
 }
 
 function scheduleEntriesReload() {

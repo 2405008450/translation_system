@@ -758,14 +758,21 @@ async function exportProofreadingWorkbook() {
   }
 }
 
+const orderedWordExportChoice = {
+  format: 'proofreading_docx_ordered' as const,
+  name: '上下对照 Word',
+  description: '按当前对齐顺序逐条导出，每条先原文、后译文，上下分段显示。',
+}
+
 const proofreadingExportChoices = computed<Array<{
   format: ProofreadingExportFormat
   name: string
   description: string
 }>>(() => proofreadingContext.value?.pair_format === 'xlsx' ? [
+  orderedWordExportChoice,
   {
     format: 'proofreading_audit_xlsx',
-    name: proofreadingContext.value?.workflow_stage === 'proofreading' ? 'Excel 校对报告' : 'Excel 对齐报告',
+    name: proofreadingContext.value?.workflow_stage === 'proofreading' ? 'Excel 校对报告' : 'Excel 对照表',
     description: '保留原文和译文位置；校对阶段包含修改后的译文与理由。',
   },
   ...(proofreadingContext.value?.workflow_stage === 'proofreading' ? [{
@@ -787,11 +794,7 @@ const proofreadingExportChoices = computed<Array<{
             name: '源格式双语 Word',
             description: '沿用原文排版，按原文在前导出原文与校对后译文。',
           },
-          {
-            format: 'proofreading_docx_ordered',
-            name: '顺序优先 Word',
-            description: '按对齐顺序导出原文与校对后译文。',
-          },
+          orderedWordExportChoice,
           {
             format: 'proofreading_audit_xlsx',
             name: '一一对照表',
@@ -799,9 +802,10 @@ const proofreadingExportChoices = computed<Array<{
           },
         ]
       : [
+          orderedWordExportChoice,
           {
             format: 'proofreading_audit_xlsx',
-            name: '一一对照表',
+            name: 'Excel 对照表',
             description: '原文与原始译文逐条对照，不生成校对后译文。',
           },
         ]
@@ -816,7 +820,7 @@ const proofreadingExportChoices = computed<Array<{
 
 async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
   const batchId = proofreadingContext.value?.batch_id
-  if (!batchId || proofreadingExporting.value) return
+  if (proofreadingExportBlocked.value || !batchId) return
   showProofreadingExportMenu.value = false
   proofreadingExporting.value = true
   proofreadingExportProgress.value = 0
@@ -834,7 +838,7 @@ async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
     let acknowledgeWarnings = false
     if (readiness.has_warnings && format !== 'proofreading_audit_xlsx') {
       acknowledgeWarnings = await confirm({
-        title: '校对版仍有待处理内容',
+        title: isAlignmentWorkbench.value ? '对齐结果仍有待处理内容' : '校对版仍有待处理内容',
         message: [
           `总计 ${readiness.total} 条，未确认 ${readiness.unconfirmed} 条。`,
           `缺译 ${readiness.missing_translation} 条，增译 ${readiness.translation_only} 条，`,
@@ -866,11 +870,11 @@ async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
     const successMessage = format === 'proofreading_docx_target_revisions'
       ? '已导出目标原格式 Word（含修订）'
       : format === 'proofreading_docx_layout'
-      ? filename.includes('顺序优先')
-        ? '原排版校验未通过，已自动导出顺序优先 Word'
+      ? filename.includes('顺序优先') || filename.endsWith('_上下对照.docx')
+        ? '原排版校验未通过，已自动导出上下对照 Word'
         : '已导出双语 Word（保留源排版）'
       : format === 'proofreading_docx_ordered'
-        ? '已导出双语 Word（顺序优先）'
+        ? '已导出上下对照 Word'
         : format === 'proofreading_audit_xlsx'
           ? '已导出原文译文对齐表'
           : '已导出校对版 Excel（保留原工作簿）'
@@ -7270,7 +7274,12 @@ const alignmentOperations = useAlignmentStructureOperations({
 const alignmentUndoStack = alignmentOperations.undoStack
 const alignmentRedoStack = alignmentOperations.redoStack
 const alignmentRefreshPending = alignmentOperations.pendingRefresh
-const alignmentStructureBusy = computed(() => alignmentAdvancing.value || alignmentOperations.busy.value || Boolean(alignmentRefreshPending.value))
+const alignmentStructureBusy = computed(() => alignmentAdvancing.value || alignmentOperations.busy.value || Boolean(alignmentRefreshPending.value) || proofreadingExporting.value)
+const proofreadingExportBlocked = computed(() => (
+  proofreadingExporting.value || manualSaving.value || !proofreadingContext.value?.batch_id
+  || ['aligning', 'queued', 'running', 'canceling'].includes(proofreadingContext.value?.batch_status || '')
+  || (isAlignmentWorkbench.value && alignmentStructureBusy.value)
+))
 type AlignmentTextPatch = { source_text?: string; target_text?: string }
 const pendingAlignmentTextPatches = new Map<string, AlignmentTextPatch>()
 const alignmentTextSaveTimers = new Map<string, number>()
@@ -8982,6 +8991,10 @@ async function saveNow() {
     if (!synced) {
       return false
     }
+    if (isAlignmentWorkbench.value && !await flushAlignmentTextPatches()) {
+      pageError.value = '仍有对齐文本未保存，已取消当前操作。'
+      return false
+    }
     toast.success(t('workbench.messages.synced'))
     return true
   } catch (error) {
@@ -9823,18 +9836,32 @@ onBeforeRouteLeave(async () => {
             <button class="workbench-ribbon__top-action" type="button" @click="segmentSearchOpen = !segmentSearchOpen">
               <Search :size="15" /><span>查找</span>
             </button>
-            <button
-              class="workbench-ribbon__top-action"
-              data-testid="proofreading-export-alignment-button"
-              type="button"
-              :disabled="proofreadingExporting || !proofreadingContext?.batch_id || alignmentStructureBusy"
-              title="导出原文与译文一一对照的 Excel 表格"
-              @click="void exportProofreadingWithFormat('proofreading_audit_xlsx')"
-            >
-              <Loader2 v-if="proofreadingExporting" class="lucide-spin" :size="15" />
-              <Download v-else :size="15" />
-              <span>{{ proofreadingExporting ? '导出中' : '导出对照表' }}</span>
-            </button>
+            <div class="export-dropdown">
+              <button
+                class="workbench-ribbon__top-action"
+                data-testid="proofreading-export-alignment-button"
+                type="button"
+                :disabled="proofreadingExportBlocked"
+                title="保存当前编辑并导出 Excel 对照表或上下对照 Word"
+                @click.stop="showProofreadingExportMenu = !showProofreadingExportMenu"
+              >
+                <Loader2 v-if="proofreadingExporting" class="lucide-spin" :size="15" />
+                <Download v-else :size="15" />
+                <span>{{ proofreadingExporting ? '导出中' : '导出对照文档' }}</span>
+                <ChevronDown :size="12" />
+              </button>
+              <div v-if="showProofreadingExportMenu" class="export-dropdown__menu">
+                <div class="export-dropdown__group">
+                  <div class="export-dropdown__group-title">选择导出格式</div>
+                  <button v-for="choice in proofreadingExportChoices" :key="choice.format"
+                    class="export-dropdown__item" type="button" :disabled="proofreadingExportBlocked"
+                    @click="void exportProofreadingWithFormat(choice.format)">
+                    <span class="export-dropdown__item-name">{{ choice.name }}</span>
+                    <span class="export-dropdown__item-desc">{{ choice.description }}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
             <button
               class="workbench-ribbon__top-action proofreading-workbench-toolbar__primary"
               data-testid="proofreading-complete-alignment-button"
@@ -9858,7 +9885,7 @@ onBeforeRouteLeave(async () => {
               class="workbench-ribbon__top-action"
               data-testid="proofreading-export-button"
               type="button"
-              :disabled="manualSaving || proofreadingExporting || !proofreadingContext?.batch_id"
+              :disabled="proofreadingExportBlocked"
               title="保存当前编辑并选择校对版导出格式"
               @click.stop="showProofreadingExportMenu = !showProofreadingExportMenu"
             >
@@ -9875,7 +9902,7 @@ onBeforeRouteLeave(async () => {
                   :key="choice.format"
                   class="export-dropdown__item"
                   type="button"
-                  :disabled="proofreadingExporting"
+                  :disabled="proofreadingExportBlocked"
                   @click="void exportProofreadingWithFormat(choice.format)"
                 >
                   <span class="export-dropdown__item-name">{{ choice.name }}</span>
