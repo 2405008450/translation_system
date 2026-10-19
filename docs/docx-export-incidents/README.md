@@ -23,5 +23,9 @@
 
 ## 当前记录
 
+- [2026-10-19 导出自动句序与文本块位置检查（已发布）](2026-10-19-automatic-segment-order-guard.md)
+- [2026-10-19 图二错位：实际导出文件复核与换行位置修复（已发布）](2026-10-19-multiline-target-position.md)
+- [2026-10-19 分页漏句、同 run 富文本错位及完整性防护（已发布）](2026-10-19-export-integrity-and-run-order.md)
+- [2026-09-22 分页标记导致句段错位与缺失（初检记录，10-19 已完成修复）](2026-09-22-rendered-page-break-segment-loss.md)
 - [2026-09-22 稳定版导出字体与字号保留](2026-09-22-preserve-source-fonts.md)
 - [2026-09-04 连续富文本标记泄漏与句段丢失](2026-09-04-consecutive-format-marker-leak.md)

@@ -28,6 +28,7 @@ from app.services.automatic_numbering import (
 from app.services.document_workspace import (
     CELL_PARAGRAPH_BREAK_SENTINEL,
     DOCUMENT_PARSE_MODE_FULL,
+    PAGE_BREAK_FRAGMENT,
     DocxPackage,
     MATH_PLACEHOLDER_TEMPLATE,
     NS,
@@ -180,9 +181,12 @@ REVISION_MARKER_PREFIX = "\ue000DOCX_REVISION_"
 REVISION_MARKER_SUFFIX = "\ue001"
 FORMAT_MARKER_PREFIX = "\ue002DOCX_FORMAT_"
 FORMAT_MARKER_SUFFIX = "\ue003"
+TEXT_MARKER_PREFIX = "\ue004DOCX_TEXT_"
+TEXT_MARKER_SUFFIX = "\ue005"
 INTERNAL_EXPORT_MARKERS = (
     (FORMAT_MARKER_PREFIX, "format"),
     (REVISION_MARKER_PREFIX, "revision"),
+    (TEXT_MARKER_PREFIX, "text"),
 )
 # 仅清理编辑器负责的基础格式；字体、字号、颜色等仍继承源 run。
 EXPLICIT_FORMAT_RUN_PROPERTIES = {
@@ -570,6 +574,23 @@ def _wrap_html_with_formats(content: str, formats: tuple[str, ...]) -> str:
     return content
 
 
+@dataclass
+class ExportOrderCheck:
+    """保留预期句序和最终 XML 的定位范围，不能用写入调用次序替代成品检查。"""
+    roots: list[ET.Element]
+    expected: list[tuple[str, str]]
+    math_atoms: dict[int, str]
+    full_scope: bool = False
+
+
+@dataclass
+class ExportConsumption:
+    """译文及双语副本共享消费凭据，检查漏写和重复写入。"""
+    count: int = 0
+    order_check: ExportOrderCheck | None = None
+    order_exempt_reason: str | None = None
+
+
 @dataclass(frozen=True)
 class ExportSegment:
     sentence_id: str
@@ -585,6 +606,7 @@ class ExportSegment:
     sequence_index: int | None = None
     source_structure_changed: bool = False
     revision: "ExportRevisionInfo | None" = None
+    consumption: ExportConsumption = field(default_factory=ExportConsumption, compare=False)
 
 
 @dataclass(frozen=True)
@@ -622,6 +644,8 @@ class TextToken:
     field_instruction_extra_elements: list[ET.Element] = field(default_factory=list)
     checkbox_marker: str | None = None
     preserved_word_symbol: str | None = None
+    structural_replacements: list[tuple[str, str, ET.Element]] = field(default_factory=list)
+    order_root: ET.Element | None = None
 
 
 @dataclass(frozen=True)
@@ -691,12 +715,15 @@ def export_bilingual_docx_with_layout(
             order=order,
         )
 
+    _assert_all_segments_consumed(segments_by_block)
+
     # 双语版必须保持源文编号定义不变；目标副本会移除 numPr，并直接使用句段中的目标编号文本。
     if document_parse_options.get("clean_format"):
         _clean_story_formatting(stories)
     if not document_parse_options.get("preserve_hyperlinks", True):
         _strip_story_hyperlinks(stories)
 
+    _assert_export_segment_order(stories, segments_by_block)
     _assert_no_internal_export_markers(stories)
 
     return _build_modified_docx(
@@ -763,6 +790,8 @@ def export_translated_docx(
             segments_by_block=segments_by_block,
         )
 
+    _assert_all_segments_consumed(segments_by_block)
+
     _localize_numbering_definitions(
         package,
         target_language=target_language,
@@ -783,6 +812,7 @@ def export_translated_docx(
     if revisions_by_sentence_id and _enable_word_revision_tracking(package):
         modified_part_names.add("word/settings.xml")
 
+    _assert_export_segment_order(stories, segments_by_block)
     _assert_no_internal_export_markers(stories)
 
     return _build_modified_docx(
@@ -1641,15 +1671,213 @@ def _should_merge_table_cell_paragraphs(
     )
 
 
+def _split_token_sentence_spans(tokens: list[TextToken]) -> list[SentenceSpan]:
+    """与解析器共用显示文字及断句规则，包括分页和软换行。"""
+    display_text = "".join(token.display_text for token in tokens)
+    spans = split_sentence_spans(display_text)
+    if not spans and normalize_text(display_text):
+        spans = [_build_trimmed_span(display_text)]
+    return spans
+
+
+def _align_persisted_segment_spans(
+    tokens: list[TextToken], segments: list[ExportSegment],
+) -> list[SentenceSpan] | None:
+    """源文完整相符时按持久化句段定位，避免重新断句导致历史任务漂移。"""
+    characters: list[str] = []
+    positions: list[int] = []
+    for token in tokens:
+        for offset, character in enumerate(token.source_text):
+            key = _structure_text_key(character)
+            characters.extend(key)
+            positions.extend([token.start + offset] * len(key))
+    keys = [_structure_text_key(segment.source_text) for segment in segments]
+    if not all(keys) or "".join(keys) != "".join(characters):
+        return None
+    cursor = 0
+    spans = []
+    for key in keys:
+        spans.append(SentenceSpan(positions[cursor], positions[cursor + len(key) - 1] + 1))
+        cursor += len(key)
+    return spans
+
+
+def _mark_segments_consumed(segments: Iterable[ExportSegment]) -> None:
+    for segment in segments:
+        segment.consumption.count += 1
+
+
+def _assert_all_segments_consumed(groups: dict[BlockKey, list[ExportSegment]]) -> None:
+    invalid = [segment for group in groups.values() for segment in group if segment.consumption.count != 1]
+    if invalid:
+        # 仅给出句段标识，不在异常或日志中泄漏客户正文。
+        identifiers = ", ".join(segment.sentence_id for segment in invalid[:8])
+        raise ValueError(f"DOCX 导出失败：{len(invalid)} 个句段未完整写入或重复写入（{identifiers}），请联系管理员检查文档定位。")
+
+
+def _register_export_order_check(
+    tokens: list[TextToken], segments: list[ExportSegment], keep_source_when_empty: bool,
+    roots: list[ET.Element] | None = None,
+) -> None:
+    if roots is None:
+        candidates = [token.order_root if token.order_root is not None else
+                      token.container_element if token.container_element is not None else token.element
+                      for token in tokens]
+        roots = list({id(root): root for root in candidates if root is not None}.values())
+        roots = [root for root in roots if not any(
+            root is node for other in roots if other is not root for node in other.iter()
+        )]
+    math_atoms = {id(token.anchor_element): f"DOCX_MATH_{id(token.anchor_element):x}_"
+                  for token in tokens if token.is_math and token.anchor_element is not None}
+    math_by_placeholder = {token.source_text: math_atoms[id(token.anchor_element)]
+                           for token in tokens if token.is_math and token.anchor_element is not None}
+    expected = []
+    source_keys = []
+    for segment in segments:
+        replacement = _resolve_segment_replacement_text(segment)
+        if not replacement and keep_source_when_empty:
+            replacement = segment.source_text
+        replacement = MATH_PLACEHOLDER_RE.sub(
+            lambda match: math_by_placeholder.get(_canonical_math_placeholder(match.group(0)), match.group(0)),
+            replacement,
+        )
+        expected.append((segment.sentence_id, _structure_text_key(_sanitize_xml_text(replacement))))
+        source = MATH_PLACEHOLDER_RE.sub(
+            lambda match: math_by_placeholder.get(_canonical_math_placeholder(match.group(0)), match.group(0)),
+            segment.source_text,
+        )
+        source_keys.append(_structure_text_key(_sanitize_xml_text(source)))
+    original_contents = "".join(_export_order_visible_text(root, math_atoms) for root in roots)
+    # 完整覆盖的原文块还要整体相等，避免通过在别的句子里找到同文子串蒙混过关。
+    full_scope = original_contents == "".join(source_keys)
+    if not tokens:  # 表格逐行分配在写入后登记，范围只含这一目标句段的全部行。
+        full_scope = original_contents == "".join(wanted for _, wanted in expected)
+    check = ExportOrderCheck(roots=roots, expected=expected, math_atoms=math_atoms, full_scope=full_scope)
+    for segment in segments:
+        segment.consumption.order_check = check
+
+
+def _export_order_visible_text(root: ET.Element, math_atoms: dict[int, str]) -> str:
+    """只读取最终可见结果；公式用原 XML 节点身份定位，删除侧修订不参与匹配。"""
+    pieces: list[str] = []
+    fields: list[ExportTrackedField] = []
+
+    def visit(node: ET.Element) -> None:
+        if node.tag in {_qn("w", "del"), _qn("w", "moveFrom"), _qn("w", "drawing"), _qn("w", "pict")}:
+            return
+        if node.tag in OMML_ATOMIC_TAGS:
+            pieces.append(math_atoms.get(id(node), ""))
+            return
+        if node.tag in {_qn("w", "t"), _qn("a", "t"), _qn("c", "v")}:
+            pieces.append(node.text or "")
+            return
+        if node.tag == _qn("w", "sym"):
+            pieces.append(_decode_symbol(node) or "")
+            return
+        if node.tag == _qn("w", "instrText"):
+            if fields and fields[-1].collecting_instruction:
+                fields[-1].instruction_parts.append(node.text or "")
+            return
+        if node.tag == _qn("w", "fldChar"):
+            completed = _update_export_field_state(node, fields)
+            checkbox = _parse_checkbox_macro_field("".join(completed.instruction_parts)) if completed else None
+            if checkbox:
+                pieces.append(" ".join(checkbox))
+            return
+        for child in node:
+            visit(child)
+    visit(root)
+    return _structure_text_key("".join(pieces))
+
+
+def _assert_export_segment_order(stories: Iterable[StoryPart], groups: dict[BlockKey, list[ExportSegment]]) -> None:
+    positions: dict[int, tuple[int, int]] = {}
+    parents: dict[int, ET.Element] = {}
+    part_roots = []
+    seen_parts = set()
+    for story in stories:
+        part_root = story.package.read_xml(story.part_name)
+        if part_root is None:
+            part_root = story.root
+        # 一个 notes/comments part 中会有多个 story，必须检查整份最终 XML。
+        for name, root in [(story.part_name, part_root), *_iter_related_chart_parts(story.root, story)]:
+            if name in seen_parts:
+                continue
+            seen_parts.add(name)
+            part_roots.append(root)
+    for part_index, root in enumerate(part_roots):
+        positions.update({id(node): (part_index, index) for index, node in enumerate(root.iter())})
+        parents.update({id(child): parent for parent in root.iter() for child in parent})
+
+    checked: set[int] = set()
+    scope_order: dict[tuple, list[tuple[tuple, tuple[int, int], str]]] = defaultdict(list)
+    story_blocks: dict[tuple[int, int], tuple[tuple[int, int], str]] = {}
+    for block_key, segments in groups.items():
+        for segment_index, segment in enumerate(segments):
+            check = segment.consumption.order_check
+            if check is None:
+                if segment.consumption.order_exempt_reason == "bilingual_numeric_cell":
+                    continue
+                raise ValueError(f"DOCX 导出失败：句段缺少顺序核验记录（{segment.sentence_id}）。")
+            if id(check) in checked:
+                continue
+            checked.add(id(check))
+            if not check.roots or any(id(root) not in positions for root in check.roots):
+                raise ValueError(f"DOCX 导出失败：句段输出范围已脱离文档（{segment.sentence_id}）。")
+            roots = sorted(check.roots, key=lambda root: positions[id(root)])
+            contents = "".join(_export_order_visible_text(root, check.math_atoms) for root in roots)
+            cursor = 0
+            for sentence_id, wanted in check.expected:
+                if not wanted:
+                    continue
+                found = contents.find(wanted, cursor)
+                if found < 0:
+                    raise ValueError(f"DOCX 导出失败：句段顺序或位置核验未通过（{sentence_id}），已停止导出以避免内容错位。")
+                cursor = found + len(wanted)
+            if check.full_scope and contents != "".join(wanted for _, wanted in check.expected):
+                raise ValueError(f"DOCX 导出失败：句段顺序或位置核验未通过（{segment.sentence_id}），输出块与预期内容不一致。")
+            first_position = positions[id(roots[0])]
+            kind, block_index, row_index, cell_index = block_key
+            # 表格内按同一张表核对单元格；嵌套表格与外层跨段不强行线性比较。
+            scope = (first_position[0], kind, block_index if kind.endswith("table_cell") else None)
+            expected_position = (block_index, row_index if row_index is not None else -1,
+                                 cell_index if cell_index is not None else -1, segment_index)
+            # 图表标签按解析器的类别顺序枚举，不把其 XML 布局当作正文阅读顺序。
+            if not kind.endswith("chart_text"):
+                scope_order[scope].append((expected_position, first_position, segment.sentence_id))
+            if kind.endswith("paragraph") or kind.endswith("table_cell"):
+                unit = roots[0] if kind.endswith("paragraph") else None
+                ancestor = roots[0]
+                embedded = False
+                while ancestor is not None:
+                    if ancestor.tag in {_qn("w", "txbxContent"), _qn("w", "drawing"), _qn("w", "pict")}:
+                        embedded = True
+                    if unit is None and ancestor.tag == _qn("w", "tbl"):
+                        unit = ancestor
+                    ancestor = parents.get(id(ancestor))
+                # 文本框有自己的阅读域；正文中的整张表作为一个块比较，兼容嵌套表格。
+                if unit is not None and not embedded:
+                    story_blocks[(first_position[0], block_index)] = (positions[id(unit)], segment.sentence_id)
+    for items in scope_order.values():
+        previous_position = None
+        for _, actual_position, sentence_id in sorted(items, key=lambda item: item[0]):
+            if previous_position is not None and actual_position < previous_position:
+                raise ValueError(f"DOCX 导出失败：文本块顺序核验未通过（{sentence_id}），已停止导出以避免内容错位。")
+            previous_position = actual_position
+    previous_by_part: dict[int, tuple[int, int]] = {}
+    for (part, _), (actual_position, sentence_id) in sorted(story_blocks.items()):
+        if part in previous_by_part and actual_position < previous_by_part[part]:
+            raise ValueError(f"DOCX 导出失败：文本块顺序核验未通过（{sentence_id}），段落与表格位置不一致。")
+        previous_by_part[part] = actual_position
+
+
 def _count_token_sentence_spans(tokens: list[TextToken]) -> int:
     _assign_token_offsets(tokens)
     display_text = "".join(token.display_text for token in tokens)
     if not display_text:
         return 0
 
-    spans = split_sentence_spans(display_text)
-    if not spans and normalize_text(display_text):
-        spans = [_build_trimmed_span(display_text)]
+    spans = _split_token_sentence_spans(tokens)
 
     count = 0
     for span in spans:
@@ -1793,6 +2021,7 @@ def _try_distribute_table_cell_paragraph_lines(
         _replace_entire_paragraph_tokens_with_text(item.tokens, line)
 
     if len(lines) <= len(paragraph_group):
+        _register_export_order_check([], group_segments, True, roots=[item.paragraph for item in paragraph_group])
         return True
 
     parent = paragraph_group[-1].parent or cell
@@ -1803,6 +2032,7 @@ def _try_distribute_table_cell_paragraph_lines(
         parent = cell
         insert_index = list(parent).index(anchor) + 1 if anchor in list(parent) else len(parent)
 
+    order_roots = [item.paragraph for item in paragraph_group]
     for line in lines[len(paragraph_group):]:
         clone = _clone_bilingual_paragraph(extra_paragraph_template)
         parent.insert(insert_index, clone)
@@ -1817,7 +2047,9 @@ def _try_distribute_table_cell_paragraph_lines(
             process_embedded_textboxes=False,
         )
         _replace_entire_paragraph_tokens_with_text(clone_tokens, line)
+        order_roots.append(clone)
 
+    _register_export_order_check([], group_segments, True, roots=order_roots)
     return True
 
 
@@ -1858,6 +2090,11 @@ def _export_bilingual_table_cell(
         if _table_cell_has_only_numeric_or_math_content(cell_segments)
         else cell_segments
     )
+    if not exportable_cell_segments:
+        # 双语版有意省略纯数字/公式的重复目标行，原文单元格已完整保留。
+        _mark_segments_consumed(cell_segments)
+        for segment in cell_segments:
+            segment.consumption.order_exempt_reason = "bilingual_numeric_cell"
     segment_cursor = 0
     paragraph_buffer: list[CellParagraphTokens] = []
 
@@ -2114,6 +2351,7 @@ def _export_table_cell(
                 numbering_schema=numbering_schema,
                 segments_by_block=segments_by_block,
             ):
+                _mark_segments_consumed(group_segments)
                 segment_cursor += consumed_count
                 continue
             _replace_block_tokens(
@@ -2395,7 +2633,16 @@ def _collect_inline_tokens(
     if node.tag == _qn("w", "tab"):
         return [TextToken(display_text="\t", source_text="\t")]
 
+    if node.tag == _qn("w", "lastRenderedPageBreak"):
+        if story.parse_options.get("segmentation_profile") == "en_docx_v1":
+            return []
+        return [TextToken(display_text=PAGE_BREAK_FRAGMENT.display_text,
+                          source_text=PAGE_BREAK_FRAGMENT.source_text)]
+
     if node.tag in {_qn("w", "br"), _qn("w", "cr")}:
+        if node.get(_qn("w", "type")) == "page":
+            return [TextToken(display_text=PAGE_BREAK_FRAGMENT.display_text,
+                              source_text=PAGE_BREAK_FRAGMENT.source_text)]
         return [
             TextToken(
                 display_text="\n",
@@ -2473,6 +2720,9 @@ def _collect_inline_tokens(
             )
         )
 
+    if node.tag == _qn("w", "p"):
+        for token in tokens:
+            token.order_root = node
     return tokens
 
 
@@ -2768,9 +3018,10 @@ def _replace_block_tokens(
     if not display_text:
         return
 
-    spans = split_sentence_spans(display_text)
-    if not spans and normalize_text(display_text):
-        spans = [_build_trimmed_span(display_text)]
+    _register_export_order_check(tokens, segments, keep_source_when_empty)
+    spans = _align_persisted_segment_spans(tokens, segments)
+    if spans is None:
+        spans = _split_token_sentence_spans(tokens)
 
     source_spans = [
         (span, _normalize_segment_source_text(_collect_span_text(tokens, span, use_source=True)))
@@ -2786,6 +3037,7 @@ def _replace_block_tokens(
             segments=segments,
             keep_source_when_empty=keep_source_when_empty,
         )
+        _mark_segments_consumed(segments)
         return
 
     used_segment_indexes: set[int] = set()
@@ -2839,6 +3091,11 @@ def _replace_block_tokens(
                 boundary_text=boundary_text,
             )
         if _can_queue_word_revision_marker(tokens, span, segment):
+            if not replacement:
+                # 可导出的真实删除修订接受后为空，不应按普通空译文保留源文。
+                check = segment.consumption.order_check
+                if check is not None:
+                    check.expected[match_index] = (segment.sentence_id, "")
             marker = _build_revision_marker(
                 segment.revision.revision_key,
                 len(pending_revision_markers),
@@ -2870,6 +3127,12 @@ def _replace_block_tokens(
             segment.target_html is not None
             and not _span_contains_preserved_word_symbols(tokens, span)
         )
+        if has_custom_target_html:
+            html_text = "".join(fragment.text for fragment in _parse_formatted_html(segment.target_html))
+            if _structure_text_key(html_text) != _structure_text_key(replacement):
+                # 过期或空白富文本不能覆盖已保存的完整译文；降级只影响格式。
+                logger.warning("DOCX rich text differs from target; using plain text: sentence_id=%s", segment.sentence_id)
+                has_custom_target_html = False
 
         if expected_math_placeholders:
             _queue_math_sentence_replacement(
@@ -2898,9 +3161,13 @@ def _replace_block_tokens(
         previous_replacement = replacement
         previous_span = span
 
+    if len(used_segment_indexes) != len(segments):
+        raise ValueError("DOCX 导出失败：源文句界与译文数量不一致，已停止导出以避免内容缺失。")
+
     _apply_token_edits(tokens)
     _expand_formatted_markers(tokens, pending_format_markers, format_reference_runs)
     _expand_word_revision_markers(tokens, pending_revision_markers)
+    _mark_segments_consumed(segments)
 
 
 def _can_queue_word_revision_marker(
@@ -3016,12 +3283,7 @@ def _expand_word_revision_markers(
 
         parent, run_element, text_element = marker_context
 
-        current_text = text_element.text or ""
-        prefix, suffix = current_text.split(marker, 1)
-        text_element.text = prefix
-        _sync_word_text_space_attribute(text_element)
-
-        insert_index = list(parent).index(run_element) + 1
+        insert_index, suffix_run = _split_word_run_at_marker(parent, run_element, text_element, marker)
         if not _word_run_has_visible_content(run_element):
             parent.remove(run_element)
             insert_index -= 1
@@ -3039,10 +3301,8 @@ def _expand_word_revision_markers(
             parent.insert(insert_index, node)
             insert_index += 1
 
-        if suffix:
-            for suffix_run in _build_inserted_word_runs(suffix, run_element):
-                parent.insert(insert_index, suffix_run)
-                insert_index += 1
+        if suffix_run is not None:
+            parent.insert(insert_index, suffix_run)
 
 
 def _resolve_word_revision_baseline(
@@ -3228,9 +3488,7 @@ def _tokens_have_structural_segment_change(
         return False
     _assign_token_offsets(tokens)
     display_text = "".join(token.display_text for token in tokens)
-    spans = split_sentence_spans(display_text)
-    if not spans and normalize_text(display_text):
-        spans = [_build_trimmed_span(display_text)]
+    spans = _split_token_sentence_spans(tokens)
     source_spans = [
         (span, _normalize_segment_source_text(_collect_span_text(tokens, span, use_source=True)))
         for span in spans
@@ -3506,6 +3764,7 @@ def _build_inline_bilingual_segments(
                 math_placeholders=segment.math_placeholders,
                 sequence_index=segment.sequence_index,
                 source_structure_changed=segment.source_structure_changed,
+                consumption=segment.consumption,
             )
         )
     return bilingual_segments
@@ -3769,7 +4028,9 @@ def _queue_structural_word_text_range_edit(
     replacement_token: TextToken | None = None
     for token, _, _ in writable_overlaps:
         if (
-            token.run_element is not None
+            token.element is not None
+            and token.element.tag == _qn("w", "t")
+            and token.run_element is not None
             and token.container_element is not None
             and token.anchor_element is not None
             and _namespace_uri(token.run_element.tag) == NS["w"]
@@ -3784,17 +4045,15 @@ def _queue_structural_word_text_range_edit(
     if parent is None or anchor is None:
         return False
 
-    try:
-        insert_index = list(parent).index(anchor)
-    except ValueError:
+    if anchor not in list(parent):
         return False
 
-    for run in _build_inserted_word_runs(replacement_text, replacement_token.run_element):
-        parent.insert(insert_index, run)
-        insert_index += 1
-
+    # 目标换行和源软换行都必须先按字符偏移排队。此时直接在 anchor 前插 run，
+    # 会把同一 run 后半句提前到前半句之前，即使全部文字仍在同一个段落。
+    marker = f"{TEXT_MARKER_PREFIX}{id(replacement_token):x}_{len(replacement_token.structural_replacements)}{TEXT_MARKER_SUFFIX}"
+    replacement_token.structural_replacements.append((marker, replacement_text, deepcopy(replacement_token.run_element)))
     for token, local_start, local_end in writable_overlaps:
-        token.edits.append((local_start, local_end, ""))
+        token.edits.append((local_start, local_end, marker if token is replacement_token else ""))
 
     _remove_structural_line_break_tokens(structural_line_break_tokens)
     return True
@@ -4019,10 +4278,9 @@ def _queue_formatted_sentence_replacement(
     # 清空所有重叠 token 的文本
     first_token, first_start, first_end = writable_overlaps[0]
 
-    # 多个句段可能共享同一个 w:t。若当前句段从 token 中间开始，直接把
-    # 格式化 run 插到原 run 前会把后面的译文移动到整段最前面。此时改用
-    # 字符偏移替换；超链接范围仍由普通替换逻辑保留，顺序和内容优先。
-    if first_start > 0 and inline_marker:
+    # 同一个 run 也可能有多个 w:t 和分页节点。所有富文本都按字符偏移
+    # 延迟展开，不能根据当前 w:t 的起点决定是否插到整个 run 前面。
+    if inline_marker:
         _queue_sentence_replacement(
             tokens,
             span,
@@ -4074,8 +4332,6 @@ def _expand_formatted_markers(
 
         parent, run, element = context
         text_value = element.text or ""
-        before_text, after_text = text_value.split(marker, 1)
-
         if (
             run is None
             or parent is None
@@ -4095,9 +4351,7 @@ def _expand_formatted_markers(
             )
             continue
 
-        element.text = before_text
-        _sync_word_text_space_attribute(element)
-        insert_index = list(parent).index(run) + 1
+        insert_index, suffix_run = _split_word_run_at_marker(parent, run, element, marker)
         inserted_count = 0
         references = (reference_runs_by_marker or {}).get(marker)
         for fragment_index, fragment in enumerate(fragments):
@@ -4111,11 +4365,33 @@ def _expand_formatted_markers(
             )
             inserted_count += 1
 
-        if after_text:
+        if suffix_run is not None:
             parent.insert(
                 insert_index + inserted_count,
-                _build_inserted_word_run(after_text, run),
+                suffix_run,
             )
+
+
+def _split_word_run_at_marker(
+    parent: ET.Element, run: ET.Element, element: ET.Element, marker: str,
+) -> tuple[int, ET.Element | None]:
+    """在真实文本节点处拆 run，保留后续文字、分页、图片和原生样式。"""
+    if element not in list(run):
+        raise ValueError("DOCX 导出失败：格式标记所在文本节点不能安全拆分。")
+    before, after = (element.text or "").split(marker, 1)
+    element.text = before
+    _sync_word_text_space_attribute(element)
+    suffix = _build_word_run_shell(run)
+    if after:
+        tail_text = ET.SubElement(suffix, _qn("w", "t"))
+        tail_text.text = after
+        _sync_word_text_space_attribute(tail_text)
+    children = list(run)
+    for child in children[children.index(element) + 1:]:
+        run.remove(child)
+        suffix.append(child)
+    has_suffix = any(child.tag != _qn("w", "rPr") for child in suffix)
+    return list(parent).index(run) + 1, suffix if has_suffix else None
 
 
 def _collect_live_marker_roots(tokens: list[TextToken]) -> list[ET.Element]:
@@ -4601,6 +4877,25 @@ def _apply_token_edits(tokens: list[TextToken]) -> None:
             token.element.set(XML_SPACE_ATTR, "preserve")
         else:
             token.element.attrib.pop(XML_SPACE_ATTR, None)
+
+    pending = [item for token in tokens for item in token.structural_replacements]
+    if pending:
+        roots = _collect_live_marker_roots(tokens)
+        for marker, replacement, reference_run in pending:
+            context = _find_live_marker_context(roots, marker)
+            if context is None:
+                raise ValueError("DOCX 导出失败：换行替换标记无法定位，已停止导出以避免句段错位。")
+            parent, run, element = context
+            if parent is None or run is None or run.tag != _qn("w", "r"):
+                raise ValueError("DOCX 导出失败：换行替换节点不能安全拆分。")
+            insert_index, suffix_run = _split_word_run_at_marker(parent, run, element, marker)
+            for inserted_run in _build_inserted_word_runs(replacement, reference_run):
+                parent.insert(insert_index, inserted_run)
+                insert_index += 1
+            if suffix_run is not None:
+                parent.insert(insert_index, suffix_run)
+        for token in tokens:
+            token.structural_replacements.clear()
 
 
 def _needs_space_preserve(text: str) -> bool:
