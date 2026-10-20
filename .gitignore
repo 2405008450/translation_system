@@ -48,6 +48,7 @@ frontend/.DS_Store
 tests/*
 !tests/test_mixed_translation.py
 !tests/test_alignment_structure.py
+!tests/test_workflow_proofreading.py
 !tests/test_deploy_proxy.py
 记忆库下载/
 术语库下载/

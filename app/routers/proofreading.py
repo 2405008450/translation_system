@@ -13,6 +13,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.services.workflow_capabilities import is_standalone_proofreading
+from app.services.workflow_proofreading import (
+    batch_config, can_read_workflow_file, eligible_workflow_segments,
+    prepare_workflow_proofreading,
+)
 from app.auth import can_access_all_projects, get_current_user, require_business_manager
 from app.database import get_db
 from app.models import (
@@ -102,6 +107,28 @@ def _get_batch_or_404(db: Session, batch_id: UUID) -> ProofreadingBatch:
     return batch
 
 
+def _require_batch_access(db: Session, batch: ProofreadingBatch, user: User) -> None:
+    if can_access_all_projects(user):
+        return
+    files = db.query(FileRecord).join(ProofreadingColumnBinding).filter(ProofreadingColumnBinding.batch_id == batch.id).all()
+    if not any(can_read_workflow_file(db, file, user) for file in files):
+        raise HTTPException(404, "校对任务不存在或未分配给当前用户。")
+
+
+@router.post("/file-records/{file_record_id}/workflow/proofreading/prepare")
+def prepare_file_workflow_proofreading(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file = db.get(FileRecord, file_record_id)
+    if file is None or not can_read_workflow_file(db, file, current_user):
+        raise HTTPException(404, "任务不存在或未分配给当前用户。")
+    batch = prepare_workflow_proofreading(db, file, current_user)
+    db.commit()
+    return {"batch_id": str(batch.id) if batch else None}
+
+
 def _load_preview_file(preview_token: str) -> tuple[str, bytes]:
     token = (preview_token or "").strip()
     if not token or any(char not in "0123456789abcdef-" for char in token.lower()):
@@ -123,7 +150,7 @@ async def preview_proofreading_workbook(
     _: User = Depends(require_business_manager),
 ):
     project = _get_project_or_404(db, project_id)
-    if getattr(project, "workflow_template_id", "") != "proofread":
+    if not is_standalone_proofreading(project):
         raise HTTPException(status_code=400, detail="当前项目不是“校对”工作流。")
     filename = file.filename or "proofreading.xlsx"
     if Path(filename).suffix.lower() != ".xlsx":
@@ -193,9 +220,15 @@ def list_proofreading_batches(
 def get_proofreading_batch(
     batch_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_business_manager),
+    current_user: User = Depends(get_current_user),
 ):
-    return serialize_batch(db, _get_batch_or_404(db, batch_id))
+    batch = _get_batch_or_404(db, batch_id)
+    _require_batch_access(db, batch, current_user)
+    payload = serialize_batch(db, batch)
+    if not can_access_all_projects(current_user):
+        payload["bindings"] = [binding for binding in payload["bindings"]
+                               if can_read_workflow_file(db, db.get(FileRecord, UUID(binding["file_record_id"])), current_user)]
+    return payload
 
 
 @router.delete("/proofreading-batches/{batch_id}")
@@ -220,12 +253,22 @@ def generate_proofreading_batch(
     payload: ProofreadingGenerateRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_business_manager),
+    current_user: User = Depends(get_current_user),
 ):
-    batch = _get_batch_or_404(db, batch_id)
+    batch = db.query(ProofreadingBatch).filter_by(id=batch_id).with_for_update().populate_existing().first()
+    if batch is None:
+        raise HTTPException(404, "校对任务不存在。")
+    _require_batch_access(db, batch, current_user)
+    workflow_ids = None
+    if batch.batch_kind == "workflow_segments" or not can_access_all_projects(current_user):
+        workflow_ids = [str(segment.id) for segment in eligible_workflow_segments(db, batch, current_user)]
+        if not workflow_ids:
+            raise HTTPException(403, "当前没有有权校对的未确认非空句段。")
     if batch.status in {"queued", "running", "canceling"}:
         raise HTTPException(status_code=409, detail="当前校对批次正在运行。")
-    if batch.status not in {"ready", "partial_failed", "failed", "canceled"}:
+    if batch.status not in {"ready", "partial_failed", "failed", "canceled"} and not (
+        batch.status == "completed" and eligible_workflow_segments(db, batch, current_user)
+    ):
         raise HTTPException(status_code=409, detail=f"当前状态（{batch.status}）不可启动校对。")
     if getattr(batch, "batch_kind", "xlsx_columns") == "document_pair" and getattr(batch, "workflow_stage", "not_applicable") != "proofreading":
         raise HTTPException(status_code=409, detail="请先完成对齐再开始校对。")
@@ -234,6 +277,11 @@ def generate_proofreading_batch(
     model = (payload.model or "").strip() or None
     user_instructions = payload.user_instructions.strip()
     retry_scope = payload.retry_scope
+    if workflow_ids is not None and retry_scope == "failed_only":
+        failed_ids = get_latest_generation_error_segment_ids(db, batch.id)
+        workflow_ids = [value for value in workflow_ids if UUID(value) in failed_ids]
+        if not workflow_ids:
+            raise HTTPException(409, "当前分配范围内没有可重试的失败项。")
     if retry_scope == "failed_only" and not get_latest_generation_error_segment_ids(db, batch.id):
         raise HTTPException(status_code=409, detail="当前批次没有可重试的生成失败项。")
     try:
@@ -251,6 +299,9 @@ def generate_proofreading_batch(
         "model": model or "",
         "user_instructions": user_instructions,
         "retry_scope": retry_scope,
+        "started_by_id": str(current_user.id),
+        "run_id": str(uuid4()),
+        **({"segment_ids": workflow_ids} if workflow_ids is not None else {}),
     }
     batch.config_json = json.dumps(batch_config, ensure_ascii=False)
     batch.cancel_requested = False
@@ -273,6 +324,7 @@ def generate_proofreading_batch(
         model,
         user_instructions,
         retry_scope,
+        batch_config["generation"]["run_id"],
     )
     return {"batch_id": str(batch.id), "status": "queued"}
 
@@ -281,9 +333,15 @@ def generate_proofreading_batch(
 def cancel_proofreading_batch(
     batch_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_business_manager),
+    current_user: User = Depends(get_current_user),
 ):
-    batch = _get_batch_or_404(db, batch_id)
+    batch = db.query(ProofreadingBatch).filter_by(id=batch_id).with_for_update().populate_existing().first()
+    if batch is None:
+        raise HTTPException(404, "校对任务不存在。")
+    _require_batch_access(db, batch, current_user)
+    generation = batch_config(batch).get("generation", {})
+    if not can_access_all_projects(current_user) and generation.get("started_by_id") != str(current_user.id):
+        raise HTTPException(403, "只有启动者或管理人员可以取消校对。")
     if batch.status not in {"queued", "running", "canceling"}:
         raise HTTPException(status_code=409, detail="当前校对批次不在运行中，无法取消。")
     batch.cancel_requested = True
@@ -322,9 +380,10 @@ def export_proofreading_batch(
 def get_proofreading_export_readiness(
     batch_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_business_manager),
+    current_user: User = Depends(get_current_user),
 ):
     batch = _get_batch_or_404(db, batch_id)
+    _require_batch_access(db, batch, current_user)
     readiness = build_export_readiness(db, batch)
     db.commit()
     return readiness
@@ -335,9 +394,10 @@ def create_proofreading_export_task(
     batch_id: UUID,
     payload: ProofreadingExportTaskRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_business_manager),
+    current_user: User = Depends(get_current_user),
 ):
     batch = _get_batch_or_404(db, batch_id)
+    _require_batch_access(db, batch, current_user)
     if export_batch_is_busy(batch):
         raise HTTPException(status_code=409, detail="请先完成或结束当前解析、对齐或校对任务再导出。")
     readiness = build_export_readiness(db, batch)
@@ -425,16 +485,23 @@ def get_file_proofreading_baselines(
         .order_by(Segment.display_index)
         .all()
     )
-    is_proofreading = binding is not None
+    batch = db.get(ProofreadingBatch, binding.batch_id) if binding else None
+    workflow_mode = batch is not None and batch.batch_kind == "workflow_segments"
+    if workflow_mode:
+        step_id = batch_config(batch).get("workflow_step_id")
+        rows = [(baseline, segment) for baseline, segment in rows if str(segment.workflow_step_id) == step_id]
+        if not rows:
+            binding = None
+    is_proofreading = binding is not None and not workflow_mode
     proofreading_context = None
     review_items_by_segment: dict[UUID, TranslationReviewReportItem] = {}
     if binding is not None:
         batch = db.get(ProofreadingBatch, binding.batch_id)
         try:
-            batch_config = json.loads(batch.config_json or "{}") if batch else {}
+            config = json.loads(batch.config_json or "{}") if batch else {}
         except (TypeError, ValueError, json.JSONDecodeError):
-            batch_config = {}
-        generation = batch_config.get("generation") if isinstance(batch_config, dict) else {}
+            config = {}
+        generation = config.get("generation") if isinstance(config, dict) else {}
         if not isinstance(generation, dict):
             generation = {}
         latest_report = (
@@ -460,7 +527,11 @@ def get_file_proofreading_baselines(
             )
             .all()
         )
+        baseline_by_segment = {baseline.segment_id: baseline for baseline, _ in rows}
         for review_item in review_items:
+            baseline = baseline_by_segment.get(review_item.segment_id)
+            if workflow_mode and baseline and review_item.created_at and baseline.created_at and review_item.created_at < baseline.created_at:
+                continue
             if review_item.segment_id is not None:
                 review_items_by_segment.setdefault(review_item.segment_id, review_item)
         latest_llm_segment = (
@@ -468,6 +539,7 @@ def get_file_proofreading_baselines(
             .filter(
                 Segment.file_record_id == file_record_id,
                 Segment.llm_provider.is_not(None),
+                Segment.source == "llm_review",
             )
             .order_by(Segment.updated_at.desc())
             .first()
@@ -482,13 +554,19 @@ def get_file_proofreading_baselines(
             if latest_llm_segment and latest_llm_segment.llm_model
             else latest_report.model if latest_report else ""
         )
+        eligible = eligible_workflow_segments(db, batch, current_user)
         proofreading_context = {
+            "can_generate": bool(eligible),
+            "can_cancel": can_access_all_projects(current_user) or generation.get("started_by_id") == str(current_user.id),
+            "eligible_segments": len(eligible),
+            "workflow_step_id": str(config.get("workflow_step_id") or ""),
             "pair_format": "xlsx" if batch and is_xlsx_pair(batch) else "document",
             "batch_id": str(binding.batch_id),
             "batch_kind": getattr(batch, "batch_kind", "xlsx_columns") if batch else "xlsx_columns",
             "workflow_stage": getattr(batch, "workflow_stage", "not_applicable") if batch else "not_applicable",
             "alignment_status": getattr(batch, "alignment_status", "not_applicable") if batch else "not_applicable",
             "batch_status": batch.status if batch else "",
+            "batch_progress": int(batch.progress or 0) if batch else 0,
             "sheet_name": binding.sheet_name,
             "target_language": binding.target_language,
             "provider": str(generation.get("provider") or "auto"),
@@ -509,6 +587,7 @@ def get_file_proofreading_baselines(
                 "segment_id": str(segment.id),
                 "sentence_id": segment.sentence_id,
                 "original_target_text": baseline.original_target_text,
+                "llm_reviewed": segment.source == "llm_review" and bool(segment.llm_provider),
                 "review_suggestion": (
                     review_items_by_segment[segment.id].reason
                     if segment.id in review_items_by_segment

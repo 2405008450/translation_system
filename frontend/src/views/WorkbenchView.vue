@@ -101,6 +101,7 @@ import {
   downloadProofreadingExportTask,
   exportProofreadingBatch,
   generateProofreadingBatch,
+  cancelProofreadingBatch,
   getProofreadingBatch,
   getProofreadingExportReadiness,
   getProofreadingExportTask,
@@ -322,10 +323,15 @@ type ProofreadingBaselineResponse = {
   is_proofreading: boolean
   proofreading_context: {
     batch_id: string
-    batch_kind: 'xlsx_columns' | 'document_pair'
+    can_generate?: boolean
+    can_cancel?: boolean
+    eligible_segments?: number
+    workflow_step_id?: string
+    batch_kind: 'xlsx_columns' | 'document_pair' | 'workflow_segments'
     workflow_stage?: 'not_applicable' | 'import' | 'alignment' | 'proofreading'
     alignment_status?: string
     batch_status: string
+    batch_progress?: number
     sheet_name: string
     target_language: string
     provider: string
@@ -341,6 +347,7 @@ type ProofreadingBaselineResponse = {
     segment_id: string
     sentence_id: string
     original_target_text: string
+    llm_reviewed?: boolean
     review_suggestion: string
     review_category: string
     review_confidence: string
@@ -430,6 +437,7 @@ const segmentEditorResultsRef = ref<HTMLElement | null>(null)
 const segmentEditorRowRefs = new Map<string, SegmentEditorRowPublic>()
 const matchPanelRef = ref<WorkbenchMatchPanelPublic | null>(null)
 const proofreadingBaselines = ref<Record<string, string>>({})
+const proofreadingReviewedIds = ref<Set<string>>(new Set())
 const proofreadingReviewItems = ref<Record<string, {
   reason: string
   category: string
@@ -461,6 +469,10 @@ const proofreadingGenerationDraft = reactive<{
   retryScope: 'all',
 })
 let proofreadingGenerationPollTimer: number | null = null
+const hasWorkflowProofreading = computed(() => proofreadingContext.value?.batch_kind === 'workflow_segments')
+const proofreadingPhaseLabel = computed(() => isDocumentPairProofreading.value
+  ? (isAlignmentWorkbench.value ? '阶段 2/3 · 对齐' : '阶段 3/3 · 校对')
+  : '阶段 2/2 · 校对（无需对齐）')
 const hasProofreadingBaselines = computed(() => Object.keys(proofreadingBaselines.value).length > 0)
 const proofreadingChangedCount = computed(() => segmentStore.segments.filter((segment) => {
   const original = proofreadingBaselines.value[segment.id]
@@ -494,7 +506,8 @@ const proofreadingExportButtonLabel = computed(() => {
   return proofreadingContext.value?.batch_kind === 'document_pair' ? '导出译文' : '导出校对版'
 })
 const canStartProofreadingGeneration = computed(() => (
-  ['ready', 'partial_failed', 'failed', 'canceled'].includes(proofreadingContext.value?.batch_status || '')
+  proofreadingContext.value?.can_generate !== false
+  && ['ready', 'partial_failed', 'failed', 'canceled', 'completed'].includes(proofreadingContext.value?.batch_status || '')
 ))
 const proofreadingGenerationButtonLabel = computed(() => {
   const status = proofreadingContext.value?.batch_status || ''
@@ -564,6 +577,7 @@ async function pollProofreadingGeneration(batchId: string) {
     const batch = await getProofreadingBatch(batchId)
     if (proofreadingContext.value?.batch_id === batchId) {
       proofreadingContext.value.batch_status = batch.status
+      proofreadingContext.value.batch_progress = batch.progress
       proofreadingContext.value.failed_segments = batch.failed_segments
     }
     if (['queued', 'running', 'canceling'].includes(batch.status)) {
@@ -574,6 +588,7 @@ async function pollProofreadingGeneration(batchId: string) {
     }
     const fileRecordId = activeWorkbenchFileId.value || props.id
     if (fileRecordId) {
+      await segmentStore.refreshCurrentSegmentPage()
       await loadProofreadingBaselines(fileRecordId)
     }
     if (batch.status === 'completed') {
@@ -622,7 +637,20 @@ async function submitProofreadingGeneration() {
   }
 }
 
+async function cancelCurrentProofreading() {
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId) return
+  try {
+    const batch = await cancelProofreadingBatch(batchId)
+    if (proofreadingContext.value) proofreadingContext.value.batch_status = batch.status
+    void pollProofreadingGeneration(batchId)
+  } catch (error) {
+    toast.error(getErrorMessage(error, '取消校对失败。'))
+  }
+}
+
 function proofreadingOriginalTarget(segment: Segment) {
+  if (hasWorkflowProofreading.value && segment.workflow_step_id !== proofreadingContext.value?.workflow_step_id) return null
   return proofreadingBaselines.value[segment.id] ?? null
 }
 
@@ -664,6 +692,9 @@ function proofreadingSuggestionFor(segment: Segment): ProofreadingSuggestion {
 
   const originalTarget = proofreadingBaselines.value[segment.id]
   const batchStatus = proofreadingContext.value?.batch_status || ''
+  if (hasWorkflowProofreading.value && !proofreadingReviewedIds.value.has(segment.id)) {
+    return { text: '此句段尚未完成 LLM 校对，可由有权操作的校对人员启动。', label: '待校对', tone: 'pending' }
+  }
   if (['ready', 'queued', 'running'].includes(batchStatus)) {
     return {
       text: batchStatus === 'ready' ? '尚未开始生成校对建议。' : '正在生成校对建议。',
@@ -768,7 +799,11 @@ const proofreadingExportChoices = computed<Array<{
   format: ProofreadingExportFormat
   name: string
   description: string
-}>>(() => proofreadingContext.value?.pair_format === 'xlsx' ? [
+}>>(() => hasWorkflowProofreading.value ? [{
+  format: 'proofreading_audit_xlsx',
+  name: 'Excel 校对报告',
+  description: '导出当前校对阶段句段的原译文、校对后译文和修改理由。',
+}] : proofreadingContext.value?.pair_format === 'xlsx' ? [
   orderedWordExportChoice,
   {
     format: 'proofreading_audit_xlsx',
@@ -893,6 +928,7 @@ async function loadProofreadingBaselines(fileRecordId: string) {
   proofreadingContext.value = null
   segmentStore.setLiveSpellingEnabled(true)
   try {
+    await http.post(`/file-records/${fileRecordId}/workflow/proofreading/prepare`)
     const { data } = await http.get<ProofreadingBaselineResponse>(`/file-records/${fileRecordId}/proofreading-baselines`)
     isProofreadingWorkbench.value = data.is_proofreading
     segmentStore.setLiveSpellingEnabled(!data.is_proofreading)
@@ -900,6 +936,7 @@ async function loadProofreadingBaselines(fileRecordId: string) {
     proofreadingBaselines.value = Object.fromEntries(
       data.items.map((item) => [item.segment_id, item.original_target_text]),
     )
+    proofreadingReviewedIds.value = new Set(data.items.filter((item) => item.llm_reviewed).map((item) => item.segment_id))
     proofreadingReviewItems.value = Object.fromEntries(
       data.items
         .filter((item) => item.review_suggestion || item.review_category)
@@ -909,6 +946,10 @@ async function loadProofreadingBaselines(fileRecordId: string) {
           confidence: item.review_confidence,
         }]),
     )
+    if (data.proofreading_context && ['queued', 'running', 'canceling'].includes(data.proofreading_context.batch_status)) {
+      clearProofreadingGenerationPollTimer()
+      proofreadingGenerationPollTimer = window.setTimeout(() => void pollProofreadingGeneration(data.proofreading_context!.batch_id), 2000)
+    }
     if (data.is_proofreading) {
       activeBottomTool.value = null
       setSegmentDisplayScope(
@@ -922,11 +963,27 @@ async function loadProofreadingBaselines(fileRecordId: string) {
     if (segmentDisplayScope.value === 'proofreading_changed') {
       setSegmentDisplayScope('all')
     }
-    // 普通翻译任务没有校对基线，保持原有两列工作台。
+    // 请求失败时保留普通工作台，避免影响原有编辑能力。
   } finally {
     workbenchModeResolved.value = true
   }
 }
+
+// 其他窗口推进阶段时，句段增量同步也要刷新校对入口与比较基线。
+watch(
+  () => segmentStore.segments.map((segment) => `${segment.id}:${segment.workflow_step_id || ''}`),
+  (next, previous) => {
+    if (!workbenchModeResolved.value || workflowTransitionLoading.value) return
+    const previousSteps = new Map(previous.map((value) => value.split(':') as [string, string]))
+    if (next.some((value) => {
+      const [id, step] = value.split(':')
+      return id && previousSteps.has(id) && previousSteps.get(id) !== step
+    })) {
+      const fileId = activeWorkbenchFileId.value || props.id
+      if (fileId) void loadProofreadingBaselines(fileId)
+    }
+  },
+)
 
 const bottomPanelRef = ref<HTMLElement | null>(null)
 const bottomDrawerRef = ref<HTMLElement | null>(null)
@@ -5104,6 +5161,7 @@ async function submitWorkflowTransition() {
       buildWorkflowTransitionPayload(),
     )
     await segmentStore.refreshCurrentSegmentPage()
+    await loadProofreadingBaselines(segmentStore.fileRecord.id)
     showWorkflowTransitionDialog.value = false
     toast.success(`已流转 ${data.updated_count} 个句段`)
   } catch (error) {
@@ -9768,6 +9826,7 @@ onBeforeRouteLeave(async () => {
       'is-ribbon-collapsed': isStandaloneWorkbench && workbenchRibbonCollapsed,
       'is-fullscreen': isWorkbenchFullscreen,
       'has-proofreading-baseline': hasProofreadingBaselines,
+      'has-workflow-proofreading': hasWorkflowProofreading,
       'is-proofreading-workbench': isProofreadingWorkbench,
       'is-alignment-workbench': isAlignmentWorkbench,
       'is-workbench-mode-pending': !workbenchModeResolved,
@@ -9786,7 +9845,7 @@ onBeforeRouteLeave(async () => {
       <div class="workbench-ribbon__tabs proofreading-workbench-toolbar__main">
         <button class="workbench-ribbon__tab is-active proofreading-workbench-toolbar__back" type="button" title="返回项目" @click="goBack">
           <ArrowLeft :size="14" />
-          <span>{{ isAlignmentWorkbench ? '阶段 2/3 · 对齐' : '阶段 3/3 · 校对' }}</span>
+          <span>{{ proofreadingPhaseLabel }}</span>
         </button>
         <div class="workbench-ribbon__task">
           <strong>{{ workbenchHeaderTitle }}</strong>
@@ -9923,6 +9982,10 @@ onBeforeRouteLeave(async () => {
             <Bot v-else :size="15" />
             <span>{{ proofreadingGenerationButtonLabel }}</span>
           </button>
+          <button
+            v-if="proofreadingContext?.can_cancel && ['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')"
+            class="workbench-ribbon__top-action" type="button" @click="void cancelCurrentProofreading()"
+          >取消校对</button>
           <button
             v-if="isDocumentPairProofreading"
             class="workbench-ribbon__top-action"
@@ -11260,6 +11323,15 @@ onBeforeRouteLeave(async () => {
         :class="{ 'has-search-open': segmentSearchOpen }"
         :style="segmentEditorFontStyle"
       >
+        <div v-if="hasWorkflowProofreading" class="workflow-proofreading-actions" data-testid="workflow-proofreading-actions">
+          <span>校对阶段 · 当前可处理 {{ proofreadingContext?.eligible_segments || 0 }} 个句段<span v-if="['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')"> · {{ proofreadingContext?.batch_progress || 0 }}%</span></span>
+          <button class="button" type="button" :disabled="!canStartProofreadingGeneration || proofreadingGenerating" @click="openProofreadingGenerateDialog">
+            <Bot :size="14" />{{ proofreadingGenerationButtonLabel }}
+          </button>
+          <button v-if="proofreadingContext?.can_cancel && ['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')" class="button" type="button" @click="void cancelCurrentProofreading()">取消校对</button>
+          <button class="button" type="button" :disabled="proofreadingExportBlocked" @click="void exportProofreadingWithFormat('proofreading_audit_xlsx')">导出校对报告</button>
+          <button class="button" type="button" @click="toggleProofreadingRevisionVisible">{{ proofreadingDiffVisible ? '隐藏修订' : '显示修订' }}</button>
+        </div>
         <div class="panel-header panel-header--compact segment-editor-toolbar">
           <div class="segment-editor-toolbar__title">
             <div class="section-title section-title--tight">{{ isAlignmentWorkbench ? '对齐条目' : isProofreadingWorkbench ? '校对条目' : t('workbench.editorTitle') }}</div>
@@ -11948,9 +12020,11 @@ onBeforeRouteLeave(async () => {
                       :source-language="getSegmentLanguageContext(item)?.source_language || null"
                       :target-language="getSegmentLanguageContext(item)?.target_language || null"
                       :original-target-text="isAlignmentWorkbench ? null : proofreadingOriginalTarget(item)"
+                      :show-proofreading-baseline-column="hasProofreadingBaselines && !isAlignmentWorkbench"
+                      :preserve-workflow-columns="hasWorkflowProofreading"
                       :alignment-mode="isAlignmentWorkbench"
                       :show-proofreading-diff="proofreadingDiffVisible"
-                      :proofreading-suggestion="isProofreadingWorkbench && !isAlignmentWorkbench ? proofreadingSuggestionFor(item) : null"
+                      :proofreading-suggestion="!isAlignmentWorkbench && (isProofreadingWorkbench || (hasWorkflowProofreading && proofreadingOriginalTarget(item) !== null)) ? proofreadingSuggestionFor(item) : null"
                       @focus="segmentStore.setActiveSentence"
                       @blur-commit="handleSegmentTargetBlurCommit"
                       @activate-target="handleSegmentTargetActivate"
@@ -14276,6 +14350,9 @@ onBeforeRouteLeave(async () => {
 </template>
 
 <style scoped>
+.workflow-proofreading-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border-color, #dbe3ed); }
+.workflow-proofreading-actions > span { margin-right: auto; font-size: 13px; }
+
 .workbench-page.is-workbench-mode-pending > :not(.workbench-mode-loading) {
   display: none !important;
 }
@@ -17085,6 +17162,10 @@ onBeforeRouteLeave(async () => {
   --segment-editor-grid-template: 64px minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(210px, 0.78fr);
 }
 
+.workbench-page.has-workflow-proofreading .segment-editor-results {
+  --segment-editor-grid-template: 64px minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) 76px 76px;
+}
+
 .workbench-page.has-proofreading-baseline.is-alignment-workbench .segment-editor-results {
   --segment-editor-grid-template: 64px minmax(0, 1fr) minmax(0, 1fr);
 }
@@ -18072,6 +18153,10 @@ onBeforeRouteLeave(async () => {
 
   .workbench-page.has-proofreading-baseline .segment-editor-results {
     --segment-editor-grid-template: 56px minmax(150px, 1fr) minmax(150px, 1fr) minmax(170px, 1.1fr) minmax(170px, 0.9fr);
+  }
+
+  .workbench-page.has-workflow-proofreading .segment-editor-results {
+    --segment-editor-grid-template: 56px minmax(130px, 1fr) minmax(130px, 1fr) minmax(160px, 1.1fr) 64px 56px;
   }
 
   .workbench-page.has-proofreading-baseline.is-alignment-workbench .segment-editor-results,

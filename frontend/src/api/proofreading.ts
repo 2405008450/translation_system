@@ -61,7 +61,7 @@ export interface ProofreadingBatch {
   filename: string
   source_language: string
   target_language?: string
-  batch_kind?: 'xlsx_columns' | 'document_pair'
+  batch_kind?: 'xlsx_columns' | 'document_pair' | 'workflow_segments'
   pair_format?: 'xlsx' | 'document'
   alignment_status?: 'not_applicable' | 'aligning' | 'canceling' | 'canceled' | 'draft' | 'confirmed' | 'failed'
   workflow_stage?: 'not_applicable' | 'import' | 'alignment' | 'proofreading'

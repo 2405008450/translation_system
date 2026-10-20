@@ -1772,8 +1772,9 @@ def delete_proofreading_batch(db: Session, batch: ProofreadingBatch) -> None:
             stale.unlink()
         except OSError:
             logger.warning("无法删除对齐原文缓存：%s", stale)
-    for file_record_id in file_record_ids:
-        delete_file_record(db, file_record_id)
+    if batch.batch_kind != "workflow_segments":
+        for file_record_id in file_record_ids:
+            delete_file_record(db, file_record_id)
 
 
 def _is_docx_filename(filename: str) -> bool:

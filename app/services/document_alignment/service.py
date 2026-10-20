@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.workflow_capabilities import supports_alignment
+
 import asyncio
 import hashlib
 import json
@@ -190,8 +192,8 @@ def create_alignment_batch(
     use_llm_for_hard_blocks: bool = False, full_review: bool = True,
     alignment_strategy: str = "order_first",
 ) -> ProofreadingBatch:
-    if project.workflow_template_id != "proofread":
-        raise ValueError("只有“校对”工作流项目可以创建双文档对齐批次。")
+    if not supports_alignment(project):
+        raise ValueError("请在“对齐-校对”工作流中导入原文和译文文档。")
     source_language = normalize_language_code(source_language, field_label="源语言") or ""
     target_language = normalize_language_code(target_language, field_label="目标语言") or ""
     require_language_pair(source_language, target_language)

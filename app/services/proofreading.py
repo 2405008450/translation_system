@@ -23,7 +23,10 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import range_boundaries
 from sqlalchemy.orm import Session
+from app.auth import can_access_all_projects
 
+from app.services.workflow_capabilities import is_standalone_proofreading, proofreading_step_id
+from app.services.workflow_proofreading import batch_config, eligible_workflow_segments
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models import (
@@ -104,6 +107,9 @@ def _refresh_batch_change_stats(db: Session, batch: ProofreadingBatch) -> None:
         .filter(ProofreadingSegmentBaseline.batch_id == batch.id)
         .all()
     )
+    if batch.batch_kind == "workflow_segments":
+        step_id = batch_config(batch).get("workflow_step_id")
+        current_rows = [(baseline, segment) for baseline, segment in current_rows if str(segment.workflow_step_id) == step_id]
     batch.changed_segments = sum(
         1
         for baseline, segment in current_rows
@@ -367,7 +373,7 @@ def create_batch_from_workbook(
     source_language = normalize_language_code(source_language, field_label="源语言") or ""
     if not source_language:
         raise ValueError("请选择源语言。")
-    if getattr(project, "workflow_template_id", "") != "proofread":
+    if not is_standalone_proofreading(project):
         raise ValueError("只有“校对”工作流项目可以创建多语种校对批次。")
     workbook = load_workbook(BytesIO(raw_bytes), read_only=False, data_only=False)
     try:
@@ -418,11 +424,7 @@ def create_batch_from_workbook(
 
         total_segments = 0
         skipped_segments = 0
-        first_step = (
-            project.workflow_steps[0].id
-            if getattr(project, "workflow_steps", None)
-            else None
-        )
+        first_step = proofreading_step_id(project)
         for mapping in normalized_mappings:
             worksheet = workbook.worksheets[mapping["sheet_index"]]
             header_row = mapping["header_row"]
@@ -922,6 +924,15 @@ async def generate_batch(
         else set()
     )
 
+    workflow_mode = batch.batch_kind == "workflow_segments"
+    restricted_mode = workflow_mode or not can_access_all_projects(current_user)
+    generation = batch_config(batch).get("generation", {})
+    requested_ids = generation.get("segment_ids")
+    allowed_ids = {UUID(value) for value in requested_ids} if requested_ids is not None else None
+    if restricted_mode:
+        eligible_ids = {segment.id for segment in eligible_workflow_segments(db, batch, current_user)}
+        allowed_ids = eligible_ids if allowed_ids is None else allowed_ids & eligible_ids
+
     bindings = (
         db.query(ProofreadingColumnBinding)
         .filter(ProofreadingColumnBinding.batch_id == batch.id)
@@ -987,9 +998,12 @@ async def generate_batch(
         )
         groups_by_hash: dict[str, dict[str, Any]] = {}
         for baseline, segment in rows:
+            if allowed_ids is not None and segment.id not in allowed_ids:
+                continue
             if retry_scope == "failed_only" and segment.id not in failed_segment_ids:
                 continue
-            if not normalize_text(baseline.original_target_text) or segment.status == "confirmed":
+            candidate_text = segment.target_text or ""
+            if not normalize_text(candidate_text) or segment.status == "confirmed":
                 continue
             loaded_versions[segment.id] = int(segment.version or 1)
             source_hash = segment.source_hash or build_source_hash(segment.source_text)
@@ -1004,8 +1018,8 @@ async def generate_batch(
                 "segments": [],
                 "translation_only": bool(segment_metadata.get("translation_only")),
             })
-            if baseline.original_target_text not in group["variants"]:
-                group["variants"].append(baseline.original_target_text)
+            if candidate_text not in group["variants"]:
+                group["variants"].append(candidate_text)
             group["segments"].append((baseline, segment))
         groups = list(groups_by_hash.values())
         file_record = db.get(FileRecord, language_bindings[0].file_record_id)
@@ -1062,7 +1076,20 @@ async def generate_batch(
 
             # 模型调用期间用户可能已编辑或确认句段：重新读取最新状态，避免覆盖人工修改。
             packed_segment_ids = [segment.id for group in packed for _, segment in group["segments"]]
-            db.query(Segment).filter(Segment.id.in_(packed_segment_ids)).populate_existing().all()
+            db.query(Segment).filter(Segment.id.in_(packed_segment_ids)).with_for_update().populate_existing().all()
+
+            if restricted_mode:
+                if current_user is not None:
+                    db.refresh(current_user)
+                live_ids = {segment.id for segment in eligible_workflow_segments(db, batch, current_user)}
+                for group in packed:
+                    group["segments"] = [(baseline, segment) for baseline, segment in group["segments"]
+                                         if segment.id in live_ids and int(segment.version or 1) == loaded_versions.get(segment.id)]
+            if _batch_cancel_requested(db, batch.id):
+                _finalize_canceled_batch(db, batch, report=report, file_ids=file_ids,
+                                         failed_count=failed_count, checked_count=checked_count,
+                                         changed_count=changed_count, category_counts=category_counts)
+                return
 
             failed_groups = [group for group in packed if "error" in (results.get(group["sid"]) or {"error": ""})]
             for group in failed_groups:
@@ -1186,10 +1213,19 @@ def run_generate_batch(
     model: str | None,
     user_instructions: str = "",
     retry_scope: str = "all",
+    run_id: str | None = None,
 ) -> None:
     with SessionLocal() as db:
-        batch = db.query(ProofreadingBatch).filter(ProofreadingBatch.id == batch_id).first()
+        query = db.query(ProofreadingBatch).filter(ProofreadingBatch.id == batch_id)
+        if run_id is not None:
+            query = query.with_for_update().populate_existing()
+        batch = query.first()
         if not batch:
+            return
+        # 排队取消后可能立即启动新一轮；旧后台回调不得认领新一轮任务。
+        if run_id is not None and (
+            batch_config(batch).get("generation", {}).get("run_id") != run_id or batch.status != "queued"
+        ):
             return
         if _batch_cancel_requested(db, batch.id):
             _finalize_canceled_batch(db, batch)
@@ -1361,6 +1397,7 @@ def serialize_batch(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
         .filter(
             ProofreadingSegmentBaseline.batch_id == batch.id,
             Segment.llm_provider.is_not(None),
+            Segment.source == PROOFREADING_SOURCE,
         )
         .order_by(Segment.updated_at.desc())
         .first()

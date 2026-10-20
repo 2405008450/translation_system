@@ -2,6 +2,7 @@
 import { Bot, CheckCircle2, ChevronDown, Download, ExternalLink, FileSpreadsheet, FileText, Loader2, MessageSquareText, Pause, Play, Settings2, Trash2, Upload } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { supportsAlignment } from '../utils/workflowCapabilities'
 
 import {
   cancelProofreadingBatch,
@@ -27,7 +28,7 @@ import { getLanguageLabel, languageOptions } from '../constants/languages'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import { getApiErrorMessage } from '../utils/apiError'
 
-const props = defineProps<{ projectId: string }>()
+const props = defineProps<{ projectId: string; templateId?: string }>()
 const emit = defineEmits<{ refreshProject: [] }>()
 const router = useRouter()
 const confirm = useConfirm()
@@ -62,7 +63,7 @@ const batches = ref<ProofreadingBatch[]>([])
 const busy = ref(false)
 const actionBatchId = ref('')
 const errorMessage = ref('')
-const selectedImportMode = ref<'document_pair' | 'xlsx_columns' | null>(null)
+const selectedImportMode = ref<'document_pair' | 'xlsx_columns' | null>(props.templateId === 'proofread_only' ? 'xlsx_columns' : null)
 const expandedBatchIds = ref(new Set<string>())
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
@@ -425,7 +426,7 @@ function statusTone(status: ProofreadingBatch['status']) {
 }
 
 function batchKindLabel(batch: ProofreadingBatch) {
-  return batch.batch_kind === 'document_pair' ? '双文档' : '表格列'
+  return batch.batch_kind === 'document_pair' ? '双文档 · 先对齐后校对' : '表格列 · 无需对齐'
 }
 
 function selectImportMode(mode: 'document_pair' | 'xlsx_columns') {
@@ -489,8 +490,8 @@ defineExpose({ refreshBatches })
       <div class="proofreading-import__head">
         <div class="proofreading-import__intro">
           <span class="proofreading-import__eyebrow"><Upload :size="14" />新增资料</span>
-          <div class="section-title section-title--tight">导入校对资料</div>
-          <p class="panel-subtitle">选择资料结构，导入后统一进入语言任务。</p>
+          <div class="section-title section-title--tight">{{ supportsAlignment(templateId) ? '导入对齐资料' : '导入校对资料' }}</div>
+          <p class="panel-subtitle">{{ supportsAlignment(templateId) ? '分别上传原文与译文，完成对齐后再校对。' : '原文与译文按行对应，映射列后直接校对，无需对齐。' }}</p>
         </div>
       </div>
 
@@ -499,6 +500,7 @@ defineExpose({ refreshBatches })
           class="proofreading-import-mode"
           :class="{ 'is-active': selectedImportMode === 'document_pair' }"
           type="button"
+          v-if="supportsAlignment(templateId)"
           data-testid="proofreading-import-document-pair"
           @click="selectImportMode('document_pair')"
         >
@@ -514,6 +516,7 @@ defineExpose({ refreshBatches })
           class="proofreading-import-mode"
           :class="{ 'is-active': selectedImportMode === 'xlsx_columns' }"
           type="button"
+          v-if="!supportsAlignment(templateId)"
           data-testid="proofreading-import-spreadsheet"
           @click="selectImportMode('xlsx_columns')"
         >
@@ -563,7 +566,7 @@ defineExpose({ refreshBatches })
           <template v-if="!sheet.supported">
             <p class="form-message">当前表暂不支持插入校对列：{{ sheet.blocked_reasons.join('；') }}</p>
             <p class="form-message">{{ sheet.capability_message }}</p>
-            <button class="button" type="button" @click="selectImportMode('document_pair')">使用原文 + 译文双 Excel 对齐</button>
+            <p class="form-message">如需双文档对齐，请新建“对齐-校对”工作流项目。</p>
           </template>
           <div v-else-if="sheetDrafts[sheet.sheet_index].enabled" class="proofreading-sheet__settings">
             <label class="field">

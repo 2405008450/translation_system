@@ -14,6 +14,7 @@ from app.services.analytics_service import count_source_words
 from app.services.document_storage import save_source_file
 from app.services.normalizer import build_source_hash
 from app.services.proofreading import IMPORTED_TRANSLATION_SOURCE
+from app.services.workflow_capabilities import proofreading_step_id
 from app.services.reference_sync_service import attach_project_reference_bases_to_file
 
 from .service import _source_cache_path, validate_pair_integrity, lock_alignment_batch
@@ -140,7 +141,7 @@ def ensure_document_pair_segments_complete(
                 db.delete(segment)
                 segments_by_pair_id.pop(pair_id, None)
         db.flush()
-    workflow_step_id = batch.project.workflow_steps[0].id if batch.project.workflow_steps else None
+    workflow_step_id = proofreading_step_id(batch.project)
     added = 0
     ordered_segments: list[Segment] = []
     for pair in pairs:
@@ -153,6 +154,7 @@ def ensure_document_pair_segments_complete(
             added += 1
             baselines_by_segment[segment.id] = baseline
         else:
+            segment.workflow_step_id = workflow_step_id
             existing_baseline = baselines_by_segment.get(segment.id)
             try:
                 previous_metadata = json.loads(segment.segment_metadata or "{}")
@@ -282,7 +284,7 @@ def materialize_alignment(db: Session, batch: ProofreadingBatch, *, current_user
     )
     db.add(binding)
     db.flush()
-    first_step = project.workflow_steps[0].id if project.workflow_steps else None
+    first_step = proofreading_step_id(project)
     pairs = db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(DocumentAlignmentPair.pair_order).all()
     sequence = 0
     for pair in pairs:

@@ -123,6 +123,10 @@ def build_proofreading_export_rows(
         items = db.query(ProofreadingSegmentBaseline, Segment).join(
             Segment, Segment.id == ProofreadingSegmentBaseline.segment_id,
         ).filter(ProofreadingSegmentBaseline.binding_id == binding.id).all()
+        if batch.batch_kind == "workflow_segments":
+            from app.services.workflow_proofreading import batch_config
+            step_id = batch_config(batch).get("workflow_step_id")
+            items = [(baseline, segment) for baseline, segment in items if str(segment.workflow_step_id) == step_id]
         for baseline, segment in items:
             ordered_items.append((
                 baseline.sheet_index,
@@ -195,6 +199,8 @@ def build_export_readiness(db: Session, batch: ProofreadingBatch) -> dict[str, A
             ]
             if target_revision_export_available(batch):
                 available_formats.insert(0, "proofreading_docx_target_revisions")
+    elif batch.batch_kind == "workflow_segments":
+        available_formats = ["proofreading_audit_xlsx"]
     else:
         available_formats = ["proofreading_xlsx_original"]
     if batch.batch_kind == "document_pair" and stage in {"alignment", "proofreading"}:
@@ -608,8 +614,62 @@ def export_alignment_csv(pairs: list[DocumentAlignmentPair]) -> bytes:
     return ("\ufeff" + output.getvalue()).encode("utf-8")
 
 
+def export_workflow_proofreading_xlsx(db: Session, batch: ProofreadingBatch) -> tuple[bytes, str]:
+    """普通工作流的校对报告，使用原句段顺序及当前有效校对基线。"""
+    from app.models import TranslationReviewReport
+
+    rows, file = build_proofreading_export_rows(db, batch)
+    baselines = db.query(ProofreadingSegmentBaseline, Segment).join(
+        Segment, Segment.id == ProofreadingSegmentBaseline.segment_id,
+    ).filter(ProofreadingSegmentBaseline.batch_id == batch.id).all()
+    baseline_by_id = {baseline.segment_id: baseline for baseline, _ in baselines}
+    reason_by_id: dict = {}
+    items = db.query(TranslationReviewReportItem).join(
+        TranslationReviewReport, TranslationReviewReport.id == TranslationReviewReportItem.report_id,
+    ).filter(
+        TranslationReviewReport.proofreading_batch_id == batch.id,
+        TranslationReviewReportItem.status != "resolved",
+    ).order_by(TranslationReviewReport.created_at.desc(), TranslationReviewReportItem.created_at.desc()).all()
+    for item in items:
+        baseline = baseline_by_id.get(item.segment_id)
+        if baseline is not None and item.created_at >= baseline.created_at:
+            reason_by_id.setdefault(item.segment_id, item.reason)
+    reason_by_position = {
+        baseline.row_index: reason_by_id.get(segment.id, "") for baseline, segment in baselines
+    }
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "校对报告"
+    sheet.append(["序号", "原文", "进入校对时译文", "当前译文", "是否修改", "确认状态", "修改建议或失败原因"])
+    for row in rows:
+        sheet.append([
+            row.order + 1, row.source_text, row.original_target_text, row.reviewed_target_text,
+            "是" if row.changed else "否", row.confirmation_status,
+            reason_by_position.get(row.row_index, ""),
+        ])
+    # 所有内容按文本输出，避免原文以等号开头时被 Excel 当成公式。
+    for cells in sheet:
+        for cell in cells:
+            if isinstance(cell.value, str):
+                cell.data_type = "s"
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(fill_type="solid", fgColor="FFD9EAF7")
+    for column in ("B", "C", "D", "G"):
+        sheet.column_dimensions[column].width = 48
+    sheet.freeze_panes = "B2"
+    sheet.auto_filter.ref = sheet.dimensions
+    output = BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue(), f"{Path(file.filename if file else batch.filename).stem}_校对报告.xlsx"
+
+
 def export_document_pair_xlsx(db: Session, batch: ProofreadingBatch) -> tuple[bytes, str]:
     """导出纯对齐结果，不读取或生成校对后译文。"""
+    if batch.batch_kind == "workflow_segments":
+        return export_workflow_proofreading_xlsx(db, batch)
     if is_xlsx_pair(batch):
         return export_xlsx_pair_audit(db, batch)
     pairs = db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(

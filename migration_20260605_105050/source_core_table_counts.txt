@@ -1,0 +1,14 @@
+﻿源库核心表行数 - 2026-06-05 10:51:32
++----------------+-----------+
+|   table_name   | row_count |
++----------------+-----------+
+| file_records   |       161 |
+| memory_bases   |        22 |
+| memory_entries |    163304 |
+| projects       |        69 |
+| segments       |    679652 |
+| term_bases     |         9 |
+| term_entries   |      2179 |
+| users          |        17 |
++----------------+-----------+
+

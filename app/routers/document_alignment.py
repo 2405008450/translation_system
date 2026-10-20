@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.workflow_capabilities import supports_alignment
+
 import asyncio
 import json
 from pathlib import Path
@@ -100,7 +102,7 @@ def _project(db: Session, project_id: UUID) -> Project:
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "项目不存在。")
-    if project.workflow_template_id != "proofread":
+    if not supports_alignment(project):
         raise HTTPException(400, "当前项目不是“校对”工作流。")
     return project
 

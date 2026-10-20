@@ -49,6 +49,8 @@ const props = withDefaults(defineProps<{
   showProofreadingDiff?: boolean
   /** 校对工作台专用的 LLM 修改建议；非校对任务为 null。 */
   proofreadingSuggestion?: ProofreadingSuggestion | null
+  showProofreadingBaselineColumn?: boolean
+  preserveWorkflowColumns?: boolean
   alignmentMode?: boolean
 }>(), {
   disabled: false,
@@ -80,6 +82,8 @@ const props = withDefaults(defineProps<{
   originalTargetText: null,
   showProofreadingDiff: true,
   proofreadingSuggestion: null,
+  showProofreadingBaselineColumn: false,
+  preserveWorkflowColumns: false,
   alignmentMode: false,
 })
 
@@ -3112,12 +3116,12 @@ watch(
       </div>
     </div>
 
-    <div v-if="originalTargetText !== null" class="segment-row__cell segment-row__cell--original-target">
+    <div v-if="originalTargetText !== null || showProofreadingBaselineColumn" class="segment-row__cell segment-row__cell--original-target">
       <div v-if="isProofreadingChanged" class="segment-row__original-target-label">
         <strong>已修订</strong>
       </div>
       <div class="segment-row__original-target-text" :dir="targetDirection" :lang="targetLanguage || undefined">
-        {{ originalTargetText || '（空）' }}
+        {{ originalTargetText === null ? '—' : originalTargetText || '（空）' }}
       </div>
     </div>
 
@@ -3235,6 +3239,9 @@ watch(
         ></div>
       </div>
       </div>
+      <div v-if="preserveWorkflowColumns && proofreadingSuggestion" class="segment-row__workflow-suggestion" :title="proofreadingSuggestion.text">
+        <strong>{{ proofreadingSuggestion.label }}</strong> {{ proofreadingSuggestion.text }}
+      </div>
     </div>
 
     <Teleport to="body">
@@ -3278,7 +3285,7 @@ watch(
     </Teleport>
 
     <div
-      v-if="proofreadingSuggestion !== null"
+      v-if="proofreadingSuggestion !== null && !preserveWorkflowColumns"
       class="segment-row__cell segment-row__cell--suggestion"
       :class="`is-${proofreadingSuggestion.tone}`"
       :title="proofreadingSuggestion.text"
@@ -3320,13 +3327,15 @@ watch(
       </span>
     </div>
 
-    <div v-if="proofreadingSuggestion === null && !alignmentMode" class="segment-row__cell segment-row__cell--workflow">
+    <div v-if="(proofreadingSuggestion === null || preserveWorkflowColumns) && !alignmentMode" class="segment-row__cell segment-row__cell--workflow">
       <span class="segment-row__workflow-label">{{ workflowLabel }}</span>
     </div>
   </article>
 </template>
 
 <style scoped>
+.segment-row__workflow-suggestion { font-size: 12px; color: var(--text-secondary, #526277); padding: 6px 8px; border-top: 1px solid #e2e8f0; white-space: pre-wrap; }
+
 .segment-row.is-alignment-mode.is-alignment-translation-only {
   --segment-row-bg: linear-gradient(90deg, #fff5d6 0%, #fffaf0 48%, #fffdf7 100%);
   --segment-row-border: #e1b955;

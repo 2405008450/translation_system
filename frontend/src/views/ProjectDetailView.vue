@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import axios from 'axios'
+import { isStandaloneProofreading, supportsAlignment } from '../utils/workflowCapabilities'
 import {
   ArrowDown,
   ArrowLeft,
@@ -1023,7 +1024,7 @@ function setFilePageSize(size: number) {
   currentPage.value = 1
 }
 
-const isProofreadingProject = computed(() => project.value?.workflow_template_id === 'proofread')
+const isProofreadingProject = computed(() => isStandaloneProofreading(project.value?.workflow_template_id))
 const tabs = computed(() => {
   const items = [
     { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
@@ -1044,13 +1045,13 @@ const tabs = computed(() => {
     : items
 })
 const tableRows = computed<ProjectFileItem[]>(() => project.value?.files ?? [])
-const proofreadingStageSteps = [
+const proofreadingStageSteps = computed(() => [
   { key: 'import', label: '导入' },
-  { key: 'alignment', label: '对齐' },
+  ...(supportsAlignment(project.value?.workflow_template_id) ? [{ key: 'alignment', label: '对齐' } as const] : []),
   { key: 'proofreading', label: '校对' },
   { key: 'export', label: '导出' },
-] as const
-type ProofreadingProjectStage = (typeof proofreadingStageSteps)[number]['key']
+] as const)
+type ProofreadingProjectStage = 'import' | 'alignment' | 'proofreading' | 'export'
 const projectProofreadingStage = computed<ProofreadingProjectStage>(() => {
   const stages = tableRows.value
     .map((row) => row.proofreading?.workflow_stage)
@@ -7820,7 +7821,8 @@ onBeforeUnmount(() => {
         </div>
 
         <ProofreadingPanel
-          v-if="project.workflow_template_id === 'proofread' && project.can_manage"
+          v-if="isStandaloneProofreading(project.workflow_template_id) && project.can_manage"
+          :template-id="project.workflow_template_id"
           ref="proofreadingPanelRef"
           :project-id="project.id"
           @refresh-project="loadProject"
@@ -7829,7 +7831,7 @@ onBeforeUnmount(() => {
         <div class="table-toolbar pd-toolbar">
           <div class="table-toolbar__left pd-toolbar__left">
             <button
-              v-if="canUploadProjectFiles && project.workflow_template_id !== 'proofread'"
+              v-if="canUploadProjectFiles && !isStandaloneProofreading(project.workflow_template_id)"
               class="button button--primary pd-toolbar-primary"
               data-testid="project-upload-open"
               type="button"

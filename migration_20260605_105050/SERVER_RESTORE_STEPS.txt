@@ -1,0 +1,40 @@
+﻿AI Translation System 服务器恢复步骤
+
+1. 安装 PostgreSQL 17.x。
+   本机导出工具版本为 PostgreSQL 17.7，服务器建议使用 PostgreSQL 17 同主版本。
+
+2. 创建用户和数据库，使用 postgres 超级用户执行：
+
+CREATE USER tm_user WITH PASSWORD '服务器强密码';
+CREATE DATABASE tm_demo OWNER tm_user TEMPLATE template0;
+GRANT ALL PRIVILEGES ON DATABASE tm_demo TO tm_user;
+
+3. 检查服务器扩展：
+
+psql -U postgres -d tm_demo -c "SELECT name, default_version FROM pg_available_extensions WHERE name IN ('pg_trgm', 'vector', 'pgcrypto');"
+
+4. 恢复数据库：
+
+pg_restore --exit-on-error --verbose --no-owner --no-acl -U postgres -d tm_demo tm_demo.dump
+
+5. 解压文件存储到项目根目录：
+
+Expand-Archive file_storage.zip -DestinationPath . -Force
+
+解压后应存在：
+- data/file_records
+- data/export_tasks
+
+6. 配置服务器 .env：
+
+DATABASE_URL=postgresql+psycopg://tm_user:服务器强密码@localhost:5432/tm_demo
+FILE_STORAGE_DIR=data/file_records
+TM_VECTOR_ENABLED=false
+
+7. 恢复后校验：
+
+SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_trgm', 'vector', 'pgcrypto');
+
+并对照 source_core_table_counts.txt 检查核心表行数。
+
+注意：本机源库当前未安装 pgvector，dump 中没有 vector 扩展和 source_embedding 向量列。服务器若后续安装 pgvector，可再执行 scripts/add_tm_pgvector_support.sql，并运行 scripts/rebuild_tm_embeddings.py 回填 embedding，然后把 TM_VECTOR_ENABLED 改为 true。

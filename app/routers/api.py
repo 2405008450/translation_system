@@ -83,6 +83,7 @@ from app.models import (
     TranslationReviewReportItem,
     User,
 )
+from app.services.workflow_capabilities import is_standalone_proofreading, standalone_steps
 from app.services.adapters import (
     DocumentAST,
     ExportService,
@@ -3716,10 +3717,13 @@ def _can_manage_workflow(current_user: User | None) -> bool:
 WORKFLOW_TEMPLATE_DEFINITIONS: list[dict[str, Any]] = [
     {
         "id": "proofread",
+        "name": "对齐-校对",
+        "steps": standalone_steps("proofread"),
+    },
+    {
+        "id": "proofread_only",
         "name": "校对",
-        "steps": [
-            {"step_key": "proofread", "name": "校对", "step_type": "proofread"},
-        ],
+        "steps": standalone_steps("proofread_only"),
     },
     {
         "id": "translate",
@@ -3830,9 +3834,10 @@ def _create_project_workflow_steps(
     if len(source_steps) > 8:
         raise HTTPException(status_code=400, detail="工作流阶段最多支持 8 个。")
 
-    is_proofread_template = str(template["id"]) == "proofread"
-    if is_proofread_template and len(source_steps) != 1:
-        raise HTTPException(status_code=400, detail="校对工作流只能包含一个“校对”阶段。")
+    is_proofread_template = is_standalone_proofreading(str(template["id"]))
+    if is_proofread_template:
+        # 独立流程阶段由模板定义，兼容旧客户端只提交一个“校对”阶段。
+        source_steps = [WorkflowStepRequest(**step) for step in standalone_steps(str(template["id"]))]
 
     normalized: list[ProjectWorkflowStep] = []
     used_keys: set[str] = set()
@@ -3842,8 +3847,6 @@ def _create_project_workflow_steps(
             raise HTTPException(status_code=400, detail="工作流阶段名称不能为空。")
         if index == 0 and not is_proofread_template and name != "翻译":
             raise HTTPException(status_code=400, detail="工作流第一个阶段必须是“翻译”。")
-        if index == 0 and is_proofread_template and name != "校对":
-            raise HTTPException(status_code=400, detail="校对工作流阶段名称必须是“校对”。")
 
         raw_key = (item.step_key or "").strip().lower()
         step_key = raw_key or (
@@ -3854,8 +3857,8 @@ def _create_project_workflow_steps(
         step_key = re.sub(r"[^a-z0-9_]+", "_", step_key).strip("_") or f"step_{index + 1}"
         if index == 0 and not is_proofread_template:
             step_key = "translate"
-        elif index == 0:
-            step_key = "proofread"
+        elif is_proofread_template:
+            step_key = item.step_key
         base_key = step_key
         suffix = 2
         while step_key in used_keys:
@@ -3870,8 +3873,8 @@ def _create_project_workflow_steps(
         )).strip().lower()
         if index == 0 and not is_proofread_template:
             step_type = "translation"
-        elif index == 0:
-            step_type = "proofread"
+        elif is_proofread_template:
+            step_type = item.step_type
 
         normalized.append(
             ProjectWorkflowStep(
@@ -5073,6 +5076,7 @@ def _advance_assignment_workflow_transitions(
 ) -> int:
     updated_count = 0
     changed_file_ids: set[UUID] = set()
+    transitioned_ids: set[UUID] = set()
     for item in preview:
         file_record_id = UUID(str(item["file_record_id"]))
         from_step_id = UUID(str(item["from_step"]["id"]))
@@ -5089,13 +5093,18 @@ def _advance_assignment_workflow_transitions(
         if range_condition is not None:
             query = query.filter(range_condition)
         for segment in query.all():
+            transitioned_ids.add(segment.id)
             segment.workflow_step_id = target_step_id
             apply_segment_status(segment, _resolve_unconfirmed_segment_status(segment))
             segment.last_modified_by_id = current_user.id
             segment.version = int(segment.version or 1) + 1
             updated_count += 1
             changed_file_ids.add(file_record_id)
+    db.flush()
+    from app.services.workflow_proofreading import prepare_workflow_proofreading
     for file_record_id in changed_file_ids:
+        file = db.get(FileRecord, file_record_id)
+        prepare_workflow_proofreading(db, file, current_user, refresh_segment_ids=transitioned_ids)
         sync_file_record_status(db, file_record_id)
     return updated_count
 
@@ -13032,6 +13041,9 @@ def transition_file_record_workflow(
         if segment.status == "confirmed" and normalize_text(segment.target_text):
             confirmed_segments.append(segment)
 
+    db.flush()
+    from app.services.workflow_proofreading import prepare_workflow_proofreading
+    prepare_workflow_proofreading(db, file_record, current_user, refresh_segment_ids={seg.id for seg in segments})
     auto_tm_summary = _empty_auto_tm_summary()
     if confirmed_segments:
         auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import axios from 'axios'
+import { isStandaloneProofreading, workflowDescriptions } from '../utils/workflowCapabilities'
 import {
   Copy,
   Database,
@@ -170,10 +171,10 @@ const duplicateTemplates = ref<ProjectItem[]>([])
 const duplicateTemplateProjectId = ref('')
 const duplicateTemplateDetail = ref<ProjectDetailResponse | null>(null)
 const workflowTemplates = ref<WorkflowTemplate[]>([])
-const orderedWorkflowTemplates = computed(() => [
-  ...workflowTemplates.value.filter((template) => template.id !== 'proofread'),
-  ...workflowTemplates.value.filter((template) => template.id === 'proofread'),
-])
+const orderedWorkflowTemplates = computed(() => {
+  const order = ['translate', 'translate_review', 'translate_review_proofread', 'proofread_only', 'proofread']
+  return [...workflowTemplates.value].sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id))
+})
 const loadingWorkflowTemplates = ref(false)
 const showFilterDialog = ref(false)
 const loadingFilterOptions = ref(false)
@@ -322,11 +323,11 @@ const canManageProjects = computed(() => authStore.isBusinessManager)
 const canCreateProjects = computed(() => authStore.isBusinessManager)
 const canAssignProjects = computed(() => authStore.isBusinessManager)
 const isCreateLanguagePairPartiallySelected = computed(() => (
-  form.workflow_template_id !== 'proofread'
+  !isStandaloneProofreading(form.workflow_template_id)
   && Boolean(form.source_language) !== Boolean(form.target_language)
 ))
 const isCreateLanguagePairDuplicated = computed(() => (
-  form.workflow_template_id !== 'proofread'
+  !isStandaloneProofreading(form.workflow_template_id)
   && Boolean(form.source_language)
   && Boolean(form.target_language)
   && form.source_language === form.target_language
@@ -600,8 +601,8 @@ function normalizeWorkflowStepKey(value: string, index: number) {
 }
 
 function cloneWorkflowSteps(template: WorkflowTemplate): EditableWorkflowStep[] {
-  if (template.id === 'proofread') {
-    return [{ step_key: 'proofread', name: '校对', step_type: 'proofread' }]
+  if (isStandaloneProofreading(template.id)) {
+    return template.steps.map((step) => ({ step_key: step.step_key, name: step.name, step_type: step.step_type }))
   }
   return template.steps.map((step, index) => ({
     step_key: index === 0 ? 'translate' : normalizeWorkflowStepKey(step.step_key || '', index),
@@ -628,7 +629,7 @@ async function loadWorkflowTemplates() {
 function handleWorkflowTemplateChange() {
   const template = workflowTemplates.value.find((item) => item.id === form.workflow_template_id)
   form.workflow_steps = template ? cloneWorkflowSteps(template) : []
-  if (template?.id === 'proofread') {
+  if (isStandaloneProofreading(template?.id)) {
     form.source_language = ''
     form.target_language = ''
   }
@@ -781,8 +782,8 @@ async function createProject() {
     formError.value = t('projectList.errors.sameLanguage')
     return
   }
-  const workflowSteps = form.workflow_template_id === 'proofread'
-    ? [{ step_key: 'proofread', name: '校对', step_type: 'proofread' }]
+  const workflowSteps = isStandaloneProofreading(form.workflow_template_id)
+    ? form.workflow_steps.map((step) => ({ step_key: step.step_key, name: step.name, step_type: step.step_type }))
     : form.workflow_steps.map((step, index) => ({
         step_key: index === 0 ? 'translate' : normalizeWorkflowStepKey(step.step_key, index),
         name: index === 0 ? '翻译' : step.name.trim(),
@@ -1568,7 +1569,7 @@ onBeforeUnmount(() => {
           </select>
         </label>
 
-        <div v-if="form.workflow_template_id !== 'proofread'" class="field field--full project-language-binding">
+        <div v-if="!isStandaloneProofreading(form.workflow_template_id)" class="field field--full project-language-binding">
           <span class="field__label">{{ t('projectList.form.languagePairBinding') }}</span>
           <p class="project-language-binding__hint">
             {{ t('projectList.form.languagePairBindingHint') }}
@@ -1625,11 +1626,12 @@ onBeforeUnmount(() => {
           >
             <option value="" disabled>{{ loadingWorkflowTemplates ? '模板加载中...' : '请选择工作流模板' }}</option>
             <option v-for="template in orderedWorkflowTemplates" :key="template.id" :value="template.id">
-              {{ template.name }}{{ template.id === 'proofread' ? '（最新）' : '' }}
+              {{ template.name }}
             </option>
           </select>
         </label>
 
+        <p v-if="form.workflow_template_id" class="form-hint field--full">{{ workflowDescriptions[form.workflow_template_id] }}</p>
         <div v-if="form.workflow_steps.length > 0" class="workflow-editor field--full">
           <div
             v-for="(step, index) in form.workflow_steps"
@@ -1641,11 +1643,11 @@ onBeforeUnmount(() => {
               v-model="step.name"
               class="field__control"
               type="text"
-              :disabled="index === 0"
+              :disabled="index === 0 || isStandaloneProofreading(form.workflow_template_id)"
               maxlength="80"
             />
             <button
-              v-if="index > 0"
+              v-if="index > 0 && !isStandaloneProofreading(form.workflow_template_id)"
               class="button button--ghost workflow-editor__remove"
               type="button"
               @click="removeWorkflowStep(index)"
@@ -1653,7 +1655,7 @@ onBeforeUnmount(() => {
               删除
             </button>
           </div>
-          <button v-if="form.workflow_template_id !== 'proofread'" class="button button--ghost workflow-editor__add" type="button" @click="addWorkflowStep">
+          <button v-if="!isStandaloneProofreading(form.workflow_template_id)" class="button button--ghost workflow-editor__add" type="button" @click="addWorkflowStep">
             <Plus :size="14" />
             添加阶段
           </button>

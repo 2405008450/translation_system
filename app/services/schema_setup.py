@@ -892,6 +892,25 @@ def _is_insufficient_privilege_error(exc: ProgrammingError) -> bool:
     return "InsufficientPrivilege" in message or "必须是表" in message or "must be owner" in message.lower()
 
 
+def _alignment_stage_upgrade_needed(connection, inspector, missing_items: list[str]) -> bool:
+    # 此升级仅修改数据，结构完整的旧库也需要检查。
+    stage_columns = {"projects.workflow_template_id", "project_workflow_steps.step_type", "project_workflow_steps.sort_order"}
+    if not inspector.has_table("project_workflow_steps") or stage_columns.intersection(missing_items):
+        return False
+    return bool(connection.execute(text("""
+        SELECT EXISTS (
+            SELECT 1 FROM projects AS project
+            WHERE project.workflow_template_id = 'proofread' AND (
+                NOT EXISTS (SELECT 1 FROM project_workflow_steps AS step
+                            WHERE step.project_id = project.id AND step.step_type = 'alignment')
+                OR EXISTS (SELECT 1 FROM project_workflow_steps AS step
+                           WHERE step.project_id = project.id AND step.step_type = 'proofread'
+                           AND step.sort_order <> 1)
+            )
+        )
+    """)).scalar())
+
+
 def _ensure_runtime_schema_once() -> None:
     with engine.connect() as connection:
         inspector = inspect(connection)
@@ -925,6 +944,10 @@ def _ensure_runtime_schema_once() -> None:
         if default_needs_upgrade(inspector):
             length_items.append("projects.review_sync_enabled_default")
             length_statements.append(DEFAULT_ENABLED_MIGRATION)
+        if _alignment_stage_upgrade_needed(connection, inspector, missing_items):
+            from app.services.workflow_capabilities import ALIGNMENT_STAGE_MIGRATIONS
+            length_items.append("projects.alignment_proofreading_stages")
+            length_statements.extend(ALIGNMENT_STAGE_MIGRATIONS)
         all_missing_items = [*missing_items, *length_items]
         if not all_missing_items:
             return
@@ -970,6 +993,8 @@ def _ensure_runtime_schema_once() -> None:
         ]
         if default_needs_upgrade(inspector):
             remaining_items.append("projects.review_sync_enabled_default")
+        if _alignment_stage_upgrade_needed(connection, inspector, remaining_items):
+            remaining_items.append("projects.alignment_proofreading_stages")
     if remaining_items:
         remaining_text = ", ".join(remaining_items)
         raise RuntimeError(
@@ -1057,6 +1082,7 @@ def _update_trigger_function_exists(connection) -> bool:
 
 
 def _build_schema_statements(*, create_update_function: bool) -> list[str]:
+    from app.services.workflow_capabilities import ALIGNMENT_STAGE_MIGRATIONS
     statements: list[str] = []
     if create_update_function:
         statements.append(
@@ -4151,4 +4177,5 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
     )
     from app.services.review_sync_schema import schema_statements
     statements.extend(schema_statements())
+    statements.extend(ALIGNMENT_STAGE_MIGRATIONS)
     return statements

@@ -651,8 +651,8 @@ def build_file_record_exported_file(
                 filename=filename,
             )
         if export_type == "proofreading_audit_xlsx":
-            if batch.batch_kind != "document_pair":
-                raise ValueError("审计 Excel 仅用于双文档校对批次。")
+            if batch.batch_kind not in {"document_pair", "workflow_segments"}:
+                raise ValueError("当前批次不支持校对报告导出。")
             content, filename = export_document_pair_xlsx(db, batch)
         elif export_type == "proofreading_xlsx_target":
             content, filename = export_target_xlsx(db, batch)
