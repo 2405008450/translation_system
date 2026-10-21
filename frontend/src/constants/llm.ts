@@ -14,7 +14,7 @@ export interface LLMModelOption {
   provider: 'openrouter' | 'deepseek'
 }
 
-export const defaultLLMModelId = 'google/gemini-3.7-flash'
+export const defaultLLMModelId = 'google/gemini-3.8-flash'
 
 export const llmScenarioOptions: LLMOption<LLMTranslationScenario>[] = [
   {
@@ -31,11 +31,17 @@ export const llmScenarioOptions: LLMOption<LLMTranslationScenario>[] = [
 
 export const llmModelShortLabelMap: Record<string, string> = {
   'google/gemini-4-argon': 'Gemini 4 Argon',
+  'google/gemini-3.8-flash': 'Gemini 3.8 Flash',
   'google/gemini-3.7-flash': 'Gemini 3.7 Flash',
+  'google/gemini-3.6-flash': 'Gemini 3.6 Flash',
   'google/gemini-3.5-flash': 'Gemini 3.5',
   'google/gemini-3.1-pro-preview': 'Gemini 3.1 Pro',
   'google/gemini-3.1-flash-lite': 'Gemini 3.1 Lite',
   'google/gemini-3-flash-preview': 'Gemini 3 Flash',
+  'openai/gpt-6.1-sol': 'GPT-6.1 Sol',
+  'openai/gpt-6-luna': 'GPT-6 Luna',
+  'openai/gpt-6-sol': 'GPT-6 Sol',
+  'openai/gpt-6-astra': 'GPT-6 Astra',
   'openai/gpt-5.6-luna': 'GPT-5.6 Luna',
   'openai/gpt-5.6-terra': 'GPT-5.6 Terra',
   'openai/gpt-5.5': 'GPT-5.5',
@@ -54,7 +60,37 @@ export const llmModelOptions: LLMModelOption[] = [
     provider: 'openrouter',
   },
   {
+    id: 'openai/gpt-6.1-sol',
+    name: 'GPT-6.1 Sol',
+    family: 'gpt',
+    provider: 'openrouter',
+  },
+  {
     id: defaultLLMModelId,
+    name: 'Gemini 3.8 Flash',
+    family: 'gemini',
+    provider: 'openrouter',
+  },
+  {
+    id: 'openai/gpt-6-luna',
+    name: 'GPT-6 Luna',
+    family: 'gpt',
+    provider: 'openrouter',
+  },
+  {
+    id: 'openai/gpt-6-astra',
+    name: 'GPT-6 Astra',
+    family: 'gpt',
+    provider: 'openrouter',
+  },
+  {
+    id: 'openai/gpt-6-sol',
+    name: 'GPT-6 Sol',
+    family: 'gpt',
+    provider: 'openrouter',
+  },
+  {
+    id: 'google/gemini-3.7-flash',
     name: 'Gemini 3.7 Flash',
     family: 'gemini',
     provider: 'openrouter',
@@ -93,6 +129,12 @@ export const llmModelOptions: LLMModelOption[] = [
     id: 'openai/gpt-5.6-terra',
     name: 'GPT-5.6 Terra',
     family: 'gpt',
+    provider: 'openrouter',
+  },
+  {
+    id: 'google/gemini-3.6-flash',
+    name: 'Gemini 3.6 Flash',
+    family: 'gemini',
     provider: 'openrouter',
   },
   {
