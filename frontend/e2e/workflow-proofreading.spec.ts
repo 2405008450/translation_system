@@ -297,7 +297,7 @@ async function mockBatchPanel(page: Page, options: {
     total_segments: 1820, changed_segments: 11, skipped_segments: 0, failed_segments: options.failedSegments || 0,
     export_status: 'idle', export_progress: 0, export_error_message: '', export_filename: '',
     created_at: null, finished_at: null,
-    generation_settings: { provider: 'openrouter', model: options.savedModel || 'google/gemini-4-argon',
+    generation_settings: { provider: 'openrouter', model: options.savedModel ?? 'google/gemini-4-argon',
       user_instructions: '保留原文缩写，统一术语。', actual_provider: 'openrouter', actual_model: 'google/gemini-4-argon' },
     bindings: [{ id: 'binding-1', file_record_id: 'file-1', sheet_index: 0, sheet_name: 'Sheet1',
       header_row: 1, source_column: 1, target_column: 2, output_column: 3, source_header: '原文', target_header: '译文', target_language: 'fr-FR' }],
@@ -395,6 +395,28 @@ test('取消完成后批量入口恢复重新配置且不会自动启动', async
   const dialog = page.getByRole('dialog', { name: 'LLM 校对设置' })
   await expect(dialog).toBeVisible()
   await expect(dialog.getByLabel('仅重试生成失败项（0 条）')).toBeDisabled()
+  expect(starts).toEqual([])
+  expect(errors).toEqual([])
+})
+
+test('翻译校对和独立校对默认选择 Argon，模型选项保持唯一且名称正确', async ({ page }) => {
+  await mockApi(page)
+  await page.goto('/e2e/workflow-proofreading-harness.html?mode=workbench')
+  await page.getByTestId('workflow-proofreading-actions').getByRole('button', { name: '开始 LLM 校对' }).click()
+  let dialog = page.getByRole('dialog', { name: 'LLM 校对设置' })
+  await dialog.getByLabel('模型提供方').selectOption('openrouter')
+  await expect(dialog.getByLabel('校对模型')).toHaveValue('google/gemini-4-argon')
+  await expect(dialog.getByLabel('校对模型').locator('option[value="google/gemini-4-argon"]')).toHaveText('Gemini 4 Argon')
+  await expect(dialog.getByLabel('校对模型').locator('option[value="google/gemini-3.8-flash"]')).toHaveText('Gemini 3.8 Flash')
+  await dialog.getByRole('button', { name: '取消', exact: true }).click()
+  const { starts, errors } = await mockBatchPanel(page, { savedModel: '' })
+  await page.goto('/e2e/workflow-proofreading-harness.html?mode=pure')
+  await page.getByRole('button', { name: '开始 LLM 校对', exact: true }).click()
+  dialog = page.getByRole('dialog', { name: 'LLM 校对设置' })
+  await expect(dialog.getByLabel('校对模型')).toHaveValue('google/gemini-4-argon')
+  await dialog.getByLabel('模型提供方').selectOption('deepseek')
+  await dialog.getByLabel('模型提供方').selectOption('openrouter')
+  await expect(dialog.getByLabel('校对模型')).toHaveValue('google/gemini-4-argon')
   expect(starts).toEqual([])
   expect(errors).toEqual([])
 })

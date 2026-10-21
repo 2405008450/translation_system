@@ -14,7 +14,7 @@ export interface LLMModelOption {
   provider: 'openrouter' | 'deepseek'
 }
 
-export const defaultLLMModelId = 'google/gemini-3.8-flash'
+export const defaultLLMModelId = 'google/gemini-4-argon'
 
 export const llmScenarioOptions: LLMOption<LLMTranslationScenario>[] = [
   {
@@ -66,7 +66,7 @@ export const llmModelOptions: LLMModelOption[] = [
     provider: 'openrouter',
   },
   {
-    id: defaultLLMModelId,
+    id: 'google/gemini-3.8-flash',
     name: 'Gemini 3.8 Flash',
     family: 'gemini',
     provider: 'openrouter',
