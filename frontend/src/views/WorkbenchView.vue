@@ -62,6 +62,7 @@ import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 
 import Modal from '../components/base/Modal.vue'
+import { PROOFREADING_DEFAULT_OPENROUTER_MODEL, proofreadingOpenRouterModels } from '../utils/proofreadingGeneration'
 import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import NotesPanel from '../components/NotesPanel.vue'
 import Pagination from '../components/Pagination.vue'
@@ -522,24 +523,7 @@ const proofreadingGenerationButtonLabel = computed(() => {
   return '开始 LLM 校对'
 })
 
-const PROOFREADING_OPENROUTER_MODELS = [
-  { value: 'google/gemini-4-argon', label: 'Gemini 4 Argon' },
-  { value: 'google/gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
-  { value: 'google/gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
-  { value: 'google/gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
-  { value: 'google/gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
-  { value: 'google/gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro Preview' },
-  { value: 'google/gemini-3-flash-preview', label: 'Gemini 3 Flash Preview' },
-]
-const PROOFREADING_DEFAULT_OPENROUTER_MODEL = 'google/gemini-3.7-flash'
-
-// 批次里保存过的历史模型若不在预置列表中，也要保留为可选项，避免下拉框显示空白。
-const proofreadingOpenRouterModelOptions = computed(() => {
-  const current = proofreadingGenerationDraft.model
-  return current && !PROOFREADING_OPENROUTER_MODELS.some((option) => option.value === current)
-    ? [...PROOFREADING_OPENROUTER_MODELS, { value: current, label: current }]
-    : PROOFREADING_OPENROUTER_MODELS
-})
+const proofreadingOpenRouterModelOptions = computed(() => proofreadingOpenRouterModels(proofreadingGenerationDraft.model))
 
 function handleProofreadingProviderChange() {
   proofreadingGenerationDraft.model = proofreadingGenerationDraft.provider === 'deepseek'
@@ -797,7 +781,7 @@ async function exportProofreadingWorkbook() {
 const orderedWordExportChoice = {
   format: 'proofreading_docx_ordered' as const,
   name: '上下对照 Word',
-  description: '按当前对齐顺序逐条导出，每条先原文、后译文，上下分段显示。',
+  description: '按句段顺序导出原文与译文；校对阶段在译文中包含修改建议整句批注。',
 }
 
 const workflowProofreadingExportChoices = computed(() => ([
@@ -866,12 +850,12 @@ const proofreadingExportChoices = computed<Array<{
           ...(proofreadingContext.value?.target_revision_export_available ? [{
             format: 'proofreading_docx_target_revisions' as const,
             name: '目标原格式（含修订）',
-            description: '以导入的译文 DOCX 为母版，保留其排版并写入可接受或拒绝的 Word 修订。',
+            description: '以导入的译文 DOCX 为母版，保留排版，包含真实修订及修改建议整句批注。',
           }] : []),
           {
             format: 'proofreading_docx_layout',
             name: '源格式双语 Word',
-            description: '沿用原文排版，按原文在前导出原文与校对后译文。',
+            description: '沿用原文排版，导出原文与校对后译文，并在译文中包含修改建议整句批注。',
           },
           orderedWordExportChoice,
           {
@@ -889,6 +873,7 @@ const proofreadingExportChoices = computed<Array<{
           },
         ]
     : [
+        orderedWordExportChoice,
         {
           format: 'proofreading_xlsx_original',
           name: '校对版 Excel',

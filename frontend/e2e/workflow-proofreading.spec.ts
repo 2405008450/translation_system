@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import type { ProofreadingBatch } from '../src/api/proofreading'
 
 const templates = [
   { id: 'proofread', name: '对齐-校对', steps: [{ step_key: 'alignment', name: '对齐', step_type: 'alignment' }, { step_key: 'proofread', name: '校对', step_type: 'proofread' }] },
@@ -16,7 +17,7 @@ const segments = [0, 1].map((index) => ({
   sequence_index: index, score: 0, block_type: 'paragraph', block_index: index, qa_issues: [],
 }))
 
-async function mockApi(page: Page, standalone = false, options: { batchStatus?: string; wordUnavailable?: boolean; normalWorkflow?: boolean } = {}) {
+async function mockApi(page: Page, standalone = false, options: { batchStatus?: string; wordUnavailable?: boolean; normalWorkflow?: boolean; documentPair?: boolean } = {}) {
   const errors: string[] = []
   page.on('pageerror', (error) => { errors.push(error.message); console.error('Browser error:', error.message) })
   await page.route('http://127.0.0.1:5182/api/**', async (route) => {
@@ -29,7 +30,9 @@ async function mockApi(page: Page, standalone = false, options: { batchStatus?: 
     else if (path.endsWith('/export-readiness')) data = {
       batch_id: 'batch-1', total: 1, confirmed: 0, unconfirmed: 1, missing_translation: 0,
       translation_only: 0, translation_only_unreviewed: 0, llm_failed: 0, has_warnings: false,
-      available_formats: options.wordUnavailable ? ['proofreading_audit_xlsx'] : ['proofreading_audit_xlsx', 'proofreading_docx_revisions'],
+      available_formats: standalone
+        ? ['proofreading_docx_ordered', 'proofreading_xlsx_original', 'proofreading_docx_layout', 'proofreading_docx_target_revisions', 'proofreading_audit_xlsx']
+        : options.wordUnavailable ? ['proofreading_audit_xlsx'] : ['proofreading_audit_xlsx', 'proofreading_docx_revisions'],
       unavailable_formats: options.wordUnavailable ? { proofreading_docx_revisions: 'Word 源文件缺失，无法生成保留排版的校对修订版。' } : {},
     }
     else if (path.endsWith('/export-options')) data = { export_options: [
@@ -45,7 +48,8 @@ async function mockApi(page: Page, standalone = false, options: { batchStatus?: 
     })
     else if (path.endsWith('/proofreading-baselines')) data = {
       is_proofreading: standalone,
-      proofreading_context: options.normalWorkflow ? null : { batch_id: 'batch-1', batch_kind: standalone ? 'xlsx_columns' : 'workflow_segments',
+      proofreading_context: options.normalWorkflow ? null : { batch_id: 'batch-1', batch_kind: options.documentPair ? 'document_pair' : standalone ? 'xlsx_columns' : 'workflow_segments',
+        target_revision_export_available: Boolean(options.documentPair),
         workflow_step_id: 'step-2',
         workflow_stage: 'proofreading', batch_status: options.batchStatus || 'ready', sheet_name: '测试资料', provider: 'auto', model: '',
         user_instructions: '', can_generate: true, eligible_segments: 1, failed_segments: 0 },
@@ -130,6 +134,34 @@ test('纯校对工作台阶段编号不包含对齐', async ({ page }) => {
   await expect(page.getByTestId('proofreading-workbench-toolbar')).toBeVisible()
   await expect(page.getByText('阶段 2/2 · 校对（无需对齐）')).toBeVisible()
   await expect(page.getByTestId('proofreading-reopen-alignment-button')).toHaveCount(0)
+})
+
+test('独立纯校对提供带整句批注的 Word 并使用导出队列', async ({ page }) => {
+  const errors = await mockApi(page, true)
+  const formats: string[] = []
+  page.on('request', request => {
+    if (request.method() === 'POST' && request.url().endsWith('/export-tasks')) formats.push(request.postDataJSON().format)
+  })
+  await page.goto('/e2e/workflow-proofreading-harness.html?mode=standalone')
+  await page.getByTestId('proofreading-export-button').click()
+  const word = page.getByRole('button', { name: /上下对照 Word/ })
+  await expect(word).toContainText('修改建议整句批注')
+  await expect(page.getByRole('button', { name: /校对版 Excel/ })).toBeVisible()
+  const download = page.waitForEvent('download')
+  await word.click()
+  await download
+  expect(formats).toEqual(['proofreading_docx_ordered'])
+  expect(errors).toEqual([])
+})
+
+test('独立对齐校对的三种 Word 导出均说明包含整句批注', async ({ page }) => {
+  const errors = await mockApi(page, true, { documentPair: true })
+  await page.goto('/e2e/workflow-proofreading-harness.html?mode=standalone')
+  await page.getByTestId('proofreading-export-button').click()
+  for (const name of [/目标原格式（含修订）/, /源格式双语 Word/, /上下对照 Word/]) {
+    await expect(page.getByRole('button', { name })).toContainText('修改建议整句批注')
+  }
+  expect(errors).toEqual([])
 })
 
 test('校对顶部与操作栏提供相同交付格式，普通导出收起保留', async ({ page }) => {
@@ -251,4 +283,118 @@ test('人工编辑保存失败时不创建校对导出任务', async ({ page }) 
   await page.getByTestId('export-proofreading_audit_xlsx').click()
   await expect(page.getByText('当前编辑尚未保存，已取消导出。', { exact: true })).toBeVisible()
   expect(exports).toEqual([])
+})
+
+async function mockBatchPanel(page: Page, options: {
+  status?: ProofreadingBatch['status']; failedSegments?: number; documentPair?: boolean; savedModel?: string
+} = {}) {
+  const errors = await mockApi(page, true)
+  const batch: ProofreadingBatch = {
+    id: 'batch-1', project_id: 'project-1', filename: '批量校对.xlsx', source_language: 'zh-CN',
+    batch_kind: options.documentPair ? 'document_pair' : 'xlsx_columns', workflow_stage: 'proofreading',
+    alignment_status: options.documentPair ? 'confirmed' : 'not_applicable',
+    status: options.status || 'ready', progress: 0, message: '', error_message: '',
+    total_segments: 1820, changed_segments: 11, skipped_segments: 0, failed_segments: options.failedSegments || 0,
+    export_status: 'idle', export_progress: 0, export_error_message: '', export_filename: '',
+    created_at: null, finished_at: null,
+    generation_settings: { provider: 'openrouter', model: options.savedModel || 'google/gemini-4-argon',
+      user_instructions: '保留原文缩写，统一术语。', actual_provider: 'openrouter', actual_model: 'google/gemini-4-argon' },
+    bindings: [{ id: 'binding-1', file_record_id: 'file-1', sheet_index: 0, sheet_name: 'Sheet1',
+      header_row: 1, source_column: 1, target_column: 2, output_column: 3, source_header: '原文', target_header: '译文', target_language: 'fr-FR' }],
+  }
+  const starts: Record<string, unknown>[] = []
+  await page.route('**/projects/project-1/proofreading-batches', route => route.fulfill({ json: { items: [batch] } }))
+  await page.route('**/proofreading-batches/batch-1/generate', async route => {
+    const payload = route.request().postDataJSON()
+    starts.push(payload)
+    batch.status = 'queued'
+    batch.generation_settings = { ...batch.generation_settings, ...payload }
+    await route.fulfill({ json: { batch_id: batch.id, status: 'queued' } })
+  })
+  return { batch, starts, errors }
+}
+
+for (const status of ['ready', 'canceled', 'partial_failed'] as const) {
+  test(`批量校对 ${status} 必须先配置再确认启动`, async ({ page }) => {
+    const { starts, errors } = await mockBatchPanel(page, { status, failedSegments: status === 'partial_failed' ? 3 : 0 })
+    await page.goto('/e2e/workflow-proofreading-harness.html?mode=pure')
+    const name = status === 'ready' ? '开始 LLM 校对' : status === 'canceled' ? '重新开始校对' : '重试失败项'
+    await page.getByRole('button', { name, exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: 'LLM 校对设置' })
+    await expect(dialog).toBeVisible()
+    await expect(dialog.getByLabel('模型提供方')).toHaveValue('openrouter')
+    await expect(dialog.getByLabel('校对模型')).toHaveValue('google/gemini-4-argon')
+    await expect(dialog.getByLabel('本批次校对提示词')).toHaveValue('保留原文缩写，统一术语。')
+    expect(starts).toEqual([])
+    await dialog.getByLabel('模型提供方').selectOption('deepseek')
+    await expect(dialog.getByLabel('校对模型')).toHaveValue('deepseek-chat')
+    await dialog.getByLabel('本批次校对提示词').fill('  本轮保留缩写，校正法语术语。  ')
+    await dialog.getByLabel('全部可校对句段').check()
+    await page.getByTestId('batch-confirm-generation').click()
+    await expect(dialog).toBeHidden()
+    expect(starts).toEqual([{ provider: 'deepseek', model: 'deepseek-chat',
+      user_instructions: '本轮保留缩写，校正法语术语。', retry_scope: 'all' }])
+    expect(errors).toEqual([])
+  })
+}
+
+test('双文档批量重试保留历史模型，关闭设置不会调用 LLM', async ({ page }) => {
+  const { starts, errors } = await mockBatchPanel(page, {
+    documentPair: true, status: 'partial_failed', failedSegments: 7, savedModel: 'saved/custom-model',
+  })
+  await page.goto('/e2e/workflow-proofreading-harness.html?mode=combined')
+  await page.getByRole('button', { name: '校对设置', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'LLM 校对设置' })
+  await expect(dialog.getByLabel('校对模型')).toHaveValue('saved/custom-model')
+  await expect(dialog.getByLabel('仅重试生成失败项（7 条）')).toBeChecked()
+  await dialog.getByRole('button', { name: '取消', exact: true }).click()
+  await expect(dialog).toBeHidden()
+  expect(starts).toEqual([])
+  await page.getByRole('button', { name: '重试失败项', exact: true }).click()
+  await page.getByTestId('batch-confirm-generation').click()
+  await expect(dialog).toBeHidden()
+  expect(starts[0]).toMatchObject({ model: 'saved/custom-model', retry_scope: 'failed_only' })
+  expect(errors).toEqual([])
+})
+
+test('批量校对提交失败保留弹窗和配置，提交期间阻止重复启动', async ({ page }) => {
+  const { starts, errors } = await mockBatchPanel(page)
+  let finishRequest: (() => void) | undefined
+  const pending = new Promise<void>(resolve => { finishRequest = resolve })
+  await page.route('**/proofreading-batches/batch-1/generate', async route => {
+    starts.push(route.request().postDataJSON())
+    await pending
+    await route.fulfill({ status: 409, json: { detail: '已有校对任务正在运行。' } })
+  })
+  await page.goto('/e2e/workflow-proofreading-harness.html?mode=pure')
+  await page.getByRole('button', { name: '开始 LLM 校对', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'LLM 校对设置' })
+  await dialog.getByLabel('本批次校对提示词').fill('保留输入的提示词')
+  await page.getByTestId('batch-confirm-generation').click()
+  await expect(page.getByTestId('batch-confirm-generation')).toBeDisabled()
+  await expect(dialog.getByLabel('本批次校对提示词')).toBeDisabled()
+  await dialog.getByRole('button', { name: '关闭', exact: true }).click()
+  await expect(dialog).toBeVisible()
+  expect(starts).toHaveLength(1)
+  finishRequest!()
+  await expect(dialog.getByRole('alert')).toHaveText('已有校对任务正在运行。')
+  await expect(page.getByTestId('batch-confirm-generation')).toBeEnabled()
+  await expect(dialog.getByLabel('本批次校对提示词')).toHaveValue('保留输入的提示词')
+  expect(errors).toEqual([])
+})
+
+test('取消完成后批量入口恢复重新配置且不会自动启动', async ({ page }) => {
+  const { batch, starts, errors } = await mockBatchPanel(page, { status: 'canceling' })
+  await page.clock.install()
+  await page.goto('/e2e/workflow-proofreading-harness.html?mode=pure')
+  await expect(page.getByRole('button', { name: '取消中…', exact: true })).toBeDisabled()
+  await expect(page.getByRole('button', { name: '重新开始校对', exact: true })).toHaveCount(0)
+  batch.status = 'canceled'
+  await page.clock.fastForward(2100)
+  await page.getByRole('button', { name: '重新开始校对', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'LLM 校对设置' })
+  await expect(dialog).toBeVisible()
+  await expect(dialog.getByLabel('仅重试生成失败项（0 条）')).toBeDisabled()
+  expect(starts).toEqual([])
+  expect(errors).toEqual([])
 })

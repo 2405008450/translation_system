@@ -22,6 +22,7 @@ from app.models import (
     TranslationReviewReportItem,
 )
 from app.services.normalizer import compact_match_core
+from app.services.proofreading_export_comments import collect_proofreading_comments
 
 from .parser import AlignUnit, parse_side
 from .segments import TRANSLATION_ONLY_SOURCE_LABEL, ensure_document_pair_segments_complete
@@ -50,6 +51,8 @@ class ProofreadingExportRow:
     block_index: int = 0
     row_index: int | None = None
     cell_index: int | None = None
+    segment_id: str = ""
+    comment_text: str = ""
 
 
 def _segment_metadata(segment: Segment) -> dict[str, Any]:
@@ -61,7 +64,7 @@ def _segment_metadata(segment: Segment) -> dict[str, Any]:
 
 
 def build_proofreading_export_rows(
-    db: Session, batch: ProofreadingBatch,
+    db: Session, batch: ProofreadingBatch, *, include_comments: bool = False,
 ) -> tuple[list[ProofreadingExportRow], FileRecord | None]:
     """建立导出的唯一顺序清单，不依赖 sentence_id 或数据库自然顺序。"""
     if batch.batch_kind == "document_pair":
@@ -77,6 +80,9 @@ def build_proofreading_export_rows(
                 if pair_id:
                     segment_by_pair[pair_id] = segment
         rows: list[ProofreadingExportRow] = []
+        comments = collect_proofreading_comments(db, batch, [
+            (segment, baseline_by_segment.get(segment.id)) for segment in segment_by_pair.values()
+        ]) if include_comments else {}
         pairs = db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(
             DocumentAlignmentPair.pair_order,
         ).all()
@@ -113,6 +119,8 @@ def build_proofreading_export_rows(
                 block_index=pair.block_index,
                 row_index=pair.row_index,
                 cell_index=pair.cell_index,
+                segment_id=str(segment.id) if segment is not None else "",
+                comment_text=comments.get(str(segment.id), "") if segment is not None else "",
             ))
         return rows, file_record
 
@@ -136,6 +144,9 @@ def build_proofreading_export_rows(
                 baseline,
                 segment,
             ))
+    comments = collect_proofreading_comments(db, batch, [
+        (segment, baseline) for *_, baseline, segment in ordered_items
+    ]) if include_comments else {}
     rows = []
     for order, (_, _, _, _, baseline, segment) in enumerate(sorted(ordered_items, key=lambda item: item[:4])):
         rows.append(ProofreadingExportRow(
@@ -153,6 +164,8 @@ def build_proofreading_export_rows(
             block_index=segment.block_index,
             row_index=baseline.row_index,
             cell_index=segment.cell_index,
+            segment_id=str(segment.id),
+            comment_text=comments.get(str(segment.id), ""),
         ))
     return rows, file_record
 
@@ -211,7 +224,7 @@ def build_export_readiness(db: Session, batch: ProofreadingBatch) -> dict[str, A
         else:
             available_formats.append("proofreading_docx_revisions")
     else:
-        available_formats = ["proofreading_xlsx_original"]
+        available_formats = ["proofreading_xlsx_original", "proofreading_docx_ordered"]
     if batch.batch_kind == "document_pair" and stage in {"alignment", "proofreading"}:
         if "proofreading_docx_ordered" not in available_formats:
             available_formats.append("proofreading_docx_ordered")
@@ -490,12 +503,37 @@ def _build_target_revision_payload(
     granularity = str(config.get("granularity") or "sentence")
     target_units = parse_side(target_bytes, target_filename, granularity)
     units_by_index = {unit.index: unit for unit in target_units}
-    rows = build_proofreading_export_rows(db, batch)[0]
+    rows = build_proofreading_export_rows(db, batch, include_comments=True)[0]
     reviewed_by_pair = {row.pair_id: row.reviewed_target_text for row in rows}
     baseline_by_pair = {row.pair_id: row.original_target_text for row in rows}
     pairs = db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(
         DocumentAlignmentPair.pair_order,
     ).all()
+
+    # 按目标单元的真实位置分配理由，避免重复译文导致批注串位。
+    reason_by_pair = {row.pair_id: getattr(row, "comment_text", "") for row in rows if getattr(row, "comment_text", "")}
+    reasons_by_unit: dict[int, list[tuple[str, str]]] = {}
+    previous_target: int | None = None
+    for pair in pairs:
+        try:
+            indices = json.loads(pair.tgt_indices or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            indices = []
+        valid: list[int] = []
+        for index in indices if isinstance(indices, list) else []:
+            try:
+                normalized = int(index)
+            except (TypeError, ValueError):
+                continue
+            if normalized in units_by_index:
+                valid.append(normalized)
+        reason = reason_by_pair.get(str(pair.id), "")
+        anchors = valid or ([previous_target if previous_target is not None else target_units[0].index] if target_units else [])
+        if reason:
+            for index in anchors:
+                reasons_by_unit.setdefault(index, []).append((str(pair.id), reason))
+        if valid:
+            previous_target = valid[-1]
 
     final_replacements = _project_pair_texts_onto_units(pairs, reviewed_by_pair, units_by_index, target_units)
     baseline_replacements = _project_pair_texts_onto_units(pairs, baseline_by_pair, units_by_index, target_units)
@@ -510,6 +548,7 @@ def _build_target_revision_payload(
 
     export_segments: list[dict[str, Any]] = []
     revisions: list[dict[str, Any]] = []
+    located_comment_pairs: set[str] = set()
     for block_key, block_segments in grouped.items():
         block_type = str(block_segments[0].get("block_type") or "paragraph")
         if granularity == "sentence":
@@ -537,13 +576,22 @@ def _build_target_revision_payload(
         baseline_parts = _apply_unit_replacements_to_block(
             source_parts, joiner, block_units, baseline_replacements, batch_id=batch.id,
         )
-        for segment, before_text, after_text in zip(kept_segments, baseline_parts, final_parts):
+        spans = _part_spans(source_parts, joiner)
+        leading = len(joiner.join(source_parts)) - len(joiner.join(source_parts).lstrip())
+        for segment, before_text, after_text, (start, end) in zip(kept_segments, baseline_parts, final_parts, spans):
             payload = dict(segment)
             payload["target_text"] = after_text
             payload["target_html"] = None
             export_segments.append(payload)
             sentence_id = str(segment.get("sentence_id") or "")
             if sentence_id and before_text != after_text:
+                matched_reasons = [
+                    item for unit in block_units
+                    if max(start, unit.source_start + leading) < min(end, unit.source_end + leading)
+                    for item in reasons_by_unit.get(unit.index, [])
+                ]
+                located_comment_pairs.update(pair_id for pair_id, _ in matched_reasons)
+                reasons = list(dict.fromkeys(reason for _, reason in matched_reasons))
                 revisions.append({
                     "id": f"proofreading-{batch.id}-{sentence_id}",
                     "sentence_id": sentence_id,
@@ -552,12 +600,15 @@ def _build_target_revision_payload(
                     "status": "pending",
                     "source": "manual",
                     "author": {"name": "校对工作流"},
+                    "comment_text": "\n".join(reasons),
                 })
+    if set(reason_by_pair) - located_comment_pairs:
+        raise ValueError("无法安全定位部分校对建议的完整译文范围，请使用上下对照 Word 导出。")
     return export_segments, revisions
 
 
 def export_target_docx_with_revisions(
-    db: Session, batch: ProofreadingBatch,
+    db: Session, batch: ProofreadingBatch, *, release_transaction_before_render: bool = False,
 ) -> tuple[bytes, str]:
     """以目标 DOCX 原件为母版，导出校对后的真实 Word 修订痕迹。"""
     from app.services.document_exporter import export_translated_docx
@@ -575,10 +626,14 @@ def export_target_docx_with_revisions(
     segments, revisions = _build_target_revision_payload(
         db, batch, target_bytes, target_filename,
     )
+    target_language = batch.target_language
+    if release_transaction_before_render:
+        db.expunge_all()
+        db.rollback()
     content = export_translated_docx(
         target_bytes,
         segments,
-        target_language=batch.target_language,
+        target_language=target_language,
         revisions=revisions,
         include_revision_marks=True,
     )
@@ -837,14 +892,25 @@ def export_target_xlsx(db: Session, batch: ProofreadingBatch) -> tuple[bytes, st
 
 
 def export_ordered_bilingual_docx(
-    db: Session, batch: ProofreadingBatch,
+    db: Session, batch: ProofreadingBatch, *, release_transaction_before_render: bool = False,
 ) -> tuple[bytes, str]:
     """生成顺序优先的原文在前双语 Word，不依赖源文件版式映射。"""
-    from docx import Document
-    from docx.shared import Pt, RGBColor
+    rows, _ = build_proofreading_export_rows(db, batch, include_comments=True)
+    filename = batch.filename
+    if release_transaction_before_render:
+        db.expunge_all()
+        db.rollback()
+    return _render_ordered_bilingual_docx(rows, filename)
 
-    rows, _ = build_proofreading_export_rows(db, batch)
+
+def _render_ordered_bilingual_docx(rows: list[ProofreadingExportRow], filename: str) -> tuple[bytes, str]:
+    from docx import Document
+    from docx.oxml import parse_xml
+    from docx.shared import Pt, RGBColor
+    from app.services.docx_comments import SentenceComment, add_sentence_comments, wrap_sentence_comment
+
     document = Document()
+    comments: list[SentenceComment] = []
     title = document.add_heading("双语校对文档", level=1)
     title.paragraph_format.keep_with_next = True
     for row in rows:
@@ -861,9 +927,16 @@ def export_ordered_bilingual_docx(
         if row.kind == "缺译":
             target_run.bold = True
             target_run.font.color.rgb = RGBColor(156, 0, 6)
+        if row.comment_text:
+            comment_id = len(comments)
+            comments.append(SentenceComment(row.segment_id, comment_id, row.comment_text))
+            start, end, reference = wrap_sentence_comment([], comment_id)
+            target._p.insert(list(target._p).index(target_run._r), parse_xml(ET.tostring(start)))
+            target._p.append(parse_xml(ET.tostring(end)))
+            target._p.append(parse_xml(ET.tostring(reference)))
     output = BytesIO()
     document.save(output)
-    return output.getvalue(), f"{Path(batch.filename).stem}_上下对照.docx"
+    return add_sentence_comments(output.getvalue(), comments), f"{Path(filename).stem}_上下对照.docx"
 
 
 def _normalize_export_text(value: str) -> str:
@@ -1000,49 +1073,55 @@ def _build_layout_export_segments(
             "row_index": anchor.row_index,
             "cell_index": anchor.cell_index,
             "segment_metadata": metadata,
+            "comment_text": row.comment_text,
         })
     return export_segments
 
 
 def export_layout_bilingual_docx(
-    db: Session, batch: ProofreadingBatch,
+    db: Session, batch: ProofreadingBatch, *, release_transaction_before_render: bool = False,
 ) -> tuple[bytes, str, bool]:
     """优先保留源 DOCX 排版；完整性门禁失败时返回顺序优先版本。"""
     from app.services.file_record_service import load_file_record_source
     from app.services.task_file_service import export_bilingual_task_docx_with_layout
 
-    rows, file_record = build_proofreading_export_rows(db, batch)
-    if file_record is None or Path(file_record.filename).suffix.lower() != ".docx":
-        content, filename = export_ordered_bilingual_docx(db, batch)
-        return content, filename, True
-    raw_bytes = load_file_record_source(file_record)
+    rows, file_record = build_proofreading_export_rows(db, batch, include_comments=True)
+    filename = batch.filename
+    supported = file_record is not None and Path(file_record.filename).suffix.lower() == ".docx"
+    raw_bytes = load_file_record_source(file_record) if supported else None
+    export_segments = _build_layout_export_segments(db, file_record, rows) if raw_bytes is not None else []
+    file_options = dict(filename=file_record.filename, document_parse_mode=file_record.document_parse_mode,
+                        document_parse_options=file_record.document_parse_options,
+                        target_language=file_record.target_language) if supported else {}
+    if release_transaction_before_render:
+        db.expunge_all()
+        db.rollback()
     if raw_bytes is None:
-        content, filename = export_ordered_bilingual_docx(db, batch)
+        content, filename = _render_ordered_bilingual_docx(rows, filename)
         return content, filename, True
-    export_segments = _build_layout_export_segments(db, file_record, rows)
     try:
         exported = export_bilingual_task_docx_with_layout(
             raw_bytes=raw_bytes,
-            filename=file_record.filename,
+            filename=file_options["filename"],
             segments=export_segments,
             order="source_first",
-            document_parse_mode=file_record.document_parse_mode,
-            document_parse_options=file_record.document_parse_options,
-            target_language=file_record.target_language,
+            document_parse_mode=file_options["document_parse_mode"],
+            document_parse_options=file_options["document_parse_options"],
+            target_language=file_options["target_language"],
         )
         if _layout_export_is_complete(
             exported.content,
             rows,
             source_content=raw_bytes,
-            document_parse_mode=file_record.document_parse_mode,
-            document_parse_options=file_record.document_parse_options,
+            document_parse_mode=file_options["document_parse_mode"],
+            document_parse_options=file_options["document_parse_options"],
         ):
             return (
                 exported.content,
-                f"{Path(batch.filename).stem}_双语校对版_保留排版.docx",
+                f"{Path(filename).stem}_双语校对版_保留排版.docx",
                 False,
             )
     except Exception:
         pass
-    content, filename = export_ordered_bilingual_docx(db, batch)
+    content, filename = _render_ordered_bilingual_docx(rows, filename)
     return content, filename, True

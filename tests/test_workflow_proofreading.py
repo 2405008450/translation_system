@@ -857,6 +857,213 @@ class TranslationWorkflowProofreadingTests(WorkflowTestCase):
             ["Revised first sentence. Second revised sentence.", "Corrected table text", "Traduction 3"])
         self.assertEqual(path.read_bytes(), raw)
 
+    def test_standalone_excel_word_comments_follow_language_columns_and_saved_text(self):
+        from openpyxl import Workbook
+        from app.services.proofreading import create_batch_from_workbook
+        from app.services.document_alignment.export import export_ordered_bilingual_docx, build_export_readiness
+        self.project.workflow_template_id = "proofread_only"
+        self.db.commit()
+        workbook = Workbook()
+        workbook.active.append(["原文", "法语", "英语"])
+        workbook.active.append(["重复原文", "Avant FR", "Before EN"])
+        workbook.active.append(["重复原文", "Autre FR", "Other EN"])
+        stream = BytesIO()
+        workbook.save(stream)
+        workbook.close()
+        with patch("app.services.proofreading.save_source_file"), \
+             patch("app.services.proofreading.attach_project_reference_bases_to_file"):
+            batch = create_batch_from_workbook(self.db, project=self.project, current_user=self.user,
+                raw_bytes=stream.getvalue(), filename="pure.xlsx", source_language="zh-CN",
+                mappings=[{"sheet_index": 0, "header_row": 1, "source_column": 1,
+                    "targets": [{"target_column": 2, "target_language": "fr-FR"},
+                                {"target_column": 3, "target_language": "en-US"}]}])
+        bindings = self.db.query(ProofreadingColumnBinding).filter_by(batch_id=batch.id).all()
+        for binding in bindings:
+            self.file = self.db.get(FileRecord, binding.file_record_id)
+            segments = self.db.query(Segment).filter_by(file_record_id=self.file.id).order_by(Segment.sequence_index).all()
+            segments[0].target_text = f"Corrected {binding.target_language}"
+            self.add_suggestion(batch, segments[0], segments[0].target_text, f"统一{binding.target_language}表达")
+            self.add_suggestion(batch, segments[1], "LLM previous text", "人工改写后不再适用")
+            segments[1].target_text = "Manual final text"
+        self.db.commit()
+        readiness = build_export_readiness(self.db, batch)
+        self.assertIn("proofreading_docx_ordered", readiness["available_formats"])
+        content, _ = export_ordered_bilingual_docx(self.db, batch, release_transaction_before_render=True)
+        self.assertFalse(self.db.in_transaction())
+        comments = list(self.word_comments(content).values())
+        self.assertEqual([row["accepted"] for row in comments], ["Corrected fr-FR", "Corrected en-US"])
+        self.assertEqual([row["text"] for row in comments], ["语言与格式：统一fr-FR表达", "语言与格式：统一en-US表达"])
+        self.assertEqual({row["author"] for row in comments}, {"校对工作流"})
+
+    def setup_standalone_document_pair(self):
+        from docx import Document
+        from app.services.document_alignment.parser import parse_side
+        from app.services.document_alignment.segments import ensure_document_pair_segments_complete
+        document = Document()
+        document.add_paragraph("First sentence. Second sentence.")
+        document.add_table(rows=1, cols=1).cell(0, 0).text = "Table text."
+        stream = BytesIO()
+        document.save(stream)
+        raw = stream.getvalue()
+        units = parse_side(raw, "target.docx", "sentence")
+        self.assertEqual(len(units), 3)
+        batch = ProofreadingBatch(project_id=self.project.id, created_by_id=self.user.id,
+            filename="source.docx", file_hash="test", source_language="en-US", target_language="fr-FR",
+            batch_kind="document_pair", alignment_status="confirmed", workflow_stage="proofreading",
+            status="completed", config_json=json.dumps({"target_filename": "target.docx", "granularity": "sentence"}))
+        self.file = FileRecord(project_id=self.project.id, filename="source.docx", source_language="en-US",
+            target_language="fr-FR", document_parse_mode="full", document_parse_options="{}")
+        self.db.add_all([batch, self.file])
+        self.db.flush()
+        self.db.add(ProofreadingColumnBinding(batch_id=batch.id, file_record_id=self.file.id,
+            sheet_index=0, sheet_name="双文档对齐", header_row=1, source_column=1, target_column=2,
+            output_column=3, target_language="fr-FR"))
+        pairs = []
+        for unit in units:
+            pair = DocumentAlignmentPair(batch_id=batch.id, pair_order=unit.index,
+                src_indices=json.dumps([unit.index]), tgt_indices=json.dumps([unit.index]),
+                source_text=unit.text, target_text=unit.text, block_type=unit.block_type,
+                block_index=unit.block_index, row_index=unit.row_index, cell_index=unit.cell_index,
+                confidence=1, confidence_level="high", method="manual")
+            self.db.add(pair)
+            pairs.append(pair)
+        self.db.flush()
+        ensure_document_pair_segments_complete(self.db, batch)
+        self.segments = self.db.query(Segment).filter_by(file_record_id=self.file.id).order_by(Segment.sequence_index).all()
+        self.assertEqual(len(self.segments), 3)
+        for index, segment in enumerate(self.segments):
+            segment.target_text = ["First corrected sentence.", "Second corrected sentence.", "Corrected table text."][index]
+            self.add_suggestion(batch, segment, segment.target_text, f"第{index + 1}句中文理由")
+        self.db.commit()
+        return batch, raw
+
+    def test_standalone_target_word_comments_cover_sentences_table_and_revision_roundtrip(self):
+        from pathlib import Path
+        from app.services.document_alignment.export import export_target_docx_with_revisions
+        batch, raw = self.setup_standalone_document_pair()
+        path = Path(self.storage.name) / "target.docx"
+        path.write_bytes(raw)
+        with patch("app.services.document_alignment.export.target_cache_path", return_value=path):
+            content, _ = export_target_docx_with_revisions(self.db, batch, release_transaction_before_render=True)
+        self.assertFalse(self.db.in_transaction())
+        comments = list(self.word_comments(content).values())
+        self.assertEqual([row["accepted"].strip() for row in comments],
+            ["First corrected sentence.", "Second corrected sentence.", "Corrected table text."])
+        self.assertEqual([row["rejected"].strip() for row in comments], ["First sentence.", "Second sentence.", "Table text."])
+        self.assertEqual([row["text"] for row in comments], [f"语言与格式：第{index}句中文理由" for index in (1, 2, 3)])
+        self.assertEqual(self.word_texts(content)[0], ["First corrected sentence. Second corrected sentence.", "Corrected table text."])
+        self.assertEqual(self.word_texts(content, accept=False)[0], ["First sentence. Second sentence.", "Table text."])
+        self.assertEqual(path.read_bytes(), raw)
+
+    def test_standalone_layout_and_fallback_keep_comments_without_extra_revisions(self):
+        from app.services.document_alignment.export import export_layout_bilingual_docx
+        from app.services.document_workspace import NS
+        batch, raw = self.setup_standalone_document_pair()
+        with patch("app.services.file_record_service.load_file_record_source", return_value=raw):
+            content, _, fallback = export_layout_bilingual_docx(self.db, batch, release_transaction_before_render=True)
+        self.assertFalse(self.db.in_transaction())
+        self.assertFalse(fallback)
+        self.assertEqual(len(self.word_comments(content)), 3)
+        root = self.word_texts(content)[1]
+        self.assertFalse(root.findall(".//w:ins", NS))
+        self.assertFalse(root.findall(".//w:del", NS))
+        with patch("app.services.file_record_service.load_file_record_source", return_value=raw), \
+             patch("app.services.task_file_service.export_bilingual_task_docx_with_layout", side_effect=ValueError("无法定位")):
+            content, _, fallback = export_layout_bilingual_docx(self.db, self.db.get(ProofreadingBatch, batch.id))
+        self.assertTrue(fallback)
+        self.assertEqual(len(self.word_comments(content)), 3)
+
+    def test_standalone_word_queue_keeps_snapshot_and_releases_transaction_before_render(self):
+        from pathlib import Path
+        from app.services import document_exporter
+        from app.services.file_export_queue import build_file_record_exported_file
+        batch, raw = self.setup_standalone_document_pair()
+        file_id, batch_id = self.file.id, batch.id
+        path = Path(self.storage.name) / "target.docx"
+        path.write_bytes(raw)
+        renderer = document_exporter.export_translated_docx
+        def render_after_release(*args, **kwargs):
+            self.assertFalse(self.db.in_transaction())
+            return renderer(*args, **kwargs)
+        with patch("app.services.document_alignment.export.target_cache_path", return_value=path), \
+             patch("app.services.document_exporter.export_translated_docx", side_effect=render_after_release):
+            result = build_file_record_exported_file(self.db, self.file, "proofreading_docx_target_revisions",
+                release_transaction_before_render=True)
+        self.assertEqual(len(self.word_comments(result.content)), 3)
+        file_record = self.db.get(FileRecord, file_id)
+        result = build_file_record_exported_file(self.db, file_record, "proofreading_docx_ordered",
+            release_transaction_before_render=True)
+        self.assertFalse(self.db.in_transaction())
+        self.assertEqual(len(self.word_comments(result.content)), 3)
+        self.assertEqual(self.db.query(TranslationReviewReportItem).count(), 3)
+        self.assertEqual(self.db.query(ProofreadingSegmentBaseline).filter_by(batch_id=batch_id).count(), 3)
+
+    def test_standalone_target_word_whole_insert_delete_and_existing_comment_ids(self):
+        from pathlib import Path
+        from docx import Document
+        from app.services.document_alignment.export import export_target_docx_with_revisions
+        batch, raw = self.setup_standalone_document_pair()
+        first_base = self.db.query(ProofreadingSegmentBaseline).filter_by(segment_id=self.segments[0].id).one()
+        first_base.original_target_text = ""
+        self.segments[1].target_text = ""
+        self.add_suggestion(batch, self.segments[1], "", "删除整句重复内容")
+        self.db.commit()
+        document = Document(BytesIO(raw))
+        document.add_comment(document.paragraphs[0].runs[0], text="母版原有批注", author="原审阅人")
+        stream = BytesIO()
+        document.save(stream)
+        path = Path(self.storage.name) / "target.docx"
+        path.write_bytes(stream.getvalue())
+        with patch("app.services.document_alignment.export.target_cache_path", return_value=path):
+            content, _ = export_target_docx_with_revisions(self.db, batch)
+        comments = self.word_comments(content)
+        self.assertEqual(set(comments), {"0", "1", "2", "3"})
+        self.assertEqual(comments["0"]["text"], "母版原有批注")
+        self.assertEqual(comments["0"]["author"], "原审阅人")
+        self.assertEqual((comments["1"]["accepted"].strip(), comments["1"]["rejected"].strip()),
+            ("First corrected sentence.", ""))
+        self.assertEqual((comments["2"]["accepted"].strip(), comments["2"]["rejected"].strip()),
+            ("", "Second sentence."))
+        self.assertEqual(comments["2"]["text"], "语言与格式：删除整句重复内容")
+
+    def test_standalone_target_word_merged_pair_comment_maps_to_each_changed_sentence(self):
+        from app.services.document_alignment.export import _build_target_revision_payload
+        batch, raw = self.setup_standalone_document_pair()
+        pairs = self.db.query(DocumentAlignmentPair).filter_by(batch_id=batch.id).order_by(DocumentAlignmentPair.pair_order).all()
+        pairs[0].tgt_indices = '["0", "1"]'
+        pairs[0].target_text = "First sentence.\nSecond sentence."
+        pairs[1].tgt_indices = "[]"
+        pairs[1].target_text = ""
+        self.segments[0].target_text = "First corrected sentence.\nSecond corrected sentence."
+        self.segments[1].target_text = ""
+        baseline_by_id = {item.segment_id: item for item in self.db.query(ProofreadingSegmentBaseline).all()}
+        baseline_by_id[self.segments[0].id].original_target_text = pairs[0].target_text
+        baseline_by_id[self.segments[1].id].original_target_text = ""
+        self.add_suggestion(batch, self.segments[0], self.segments[0].target_text, "合并对齐对的理由")
+        self.db.commit()
+        _, revisions = _build_target_revision_payload(self.db, batch, raw, "target.docx")
+        self.assertEqual([row["comment_text"] for row in revisions],
+            ["语言与格式：合并对齐对的理由", "语言与格式：合并对齐对的理由", "语言与格式：第3句中文理由"])
+        with patch("app.services.document_alignment.export._apply_unit_replacements_to_block", side_effect=lambda parts, *args, **kwargs: list(parts)):
+            with self.assertRaisesRegex(ValueError, "无法安全定位"):
+                _build_target_revision_payload(self.db, batch, raw, "target.docx")
+
+    def test_standalone_alignment_stage_and_refreshed_baseline_exclude_old_comments(self):
+        from app.services.document_alignment.export import export_ordered_bilingual_docx
+        batch, _ = self.setup_standalone_document_pair()
+        batch.workflow_stage = "alignment"
+        self.db.commit()
+        self.assertEqual(self.word_comments(export_ordered_bilingual_docx(self.db, batch)[0]), {})
+        batch.workflow_stage = "proofreading"
+        baseline = self.db.query(ProofreadingSegmentBaseline).filter_by(segment_id=self.segments[0].id).one()
+        baseline.created_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=5)
+        self.segments[1].target_text = "Manual text invalidates old suggestion"
+        self.add_suggestion(batch, self.segments[2], "", "异常信息", category="generation_error", status="open")
+        batch.status = "canceled"
+        self.db.commit()
+        comments = list(self.word_comments(export_ordered_bilingual_docx(self.db, batch)[0]).values())
+        self.assertEqual([row["text"] for row in comments], ["语言与格式：第3句中文理由"])
+
     def test_comment_export_rejects_unlocatable_range_and_preserves_comment_free_exports(self):
         from docx import Document
         from app.services.docx_comments import SentenceComment, add_sentence_comments

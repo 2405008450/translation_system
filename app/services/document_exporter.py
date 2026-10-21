@@ -704,10 +704,22 @@ def export_bilingual_docx_with_layout(
         for segment in source_segments
         if segment.get("sentence_id")
     }
+    segments = list(segments)
+    # 同文的前后快照只复用整句定位及批注包装，不生成增删修订。
+    comment_revisions = {
+        str(_get_segment_value(segment, "sentence_id")): ExportRevisionInfo(
+            revision_key=f"comment-{_get_segment_value(segment, 'sentence_id')}",
+            before_text=str(_get_segment_value(segment, "target_text", "") or ""),
+            after_text=str(_get_segment_value(segment, "target_text", "") or ""),
+            author="校对工作流", comment_text=str(_get_segment_value(segment, "comment_text")),
+        ) for segment in segments if _get_segment_value(segment, "comment_text")
+    }
+    comment_revisions, sentence_comments = _prepare_revision_comments(raw_bytes, comment_revisions)
     segments_by_block = _group_segments_by_block(
         segments,
         math_placeholders_by_sentence_id,
         source_segments=source_segments,
+        revisions_by_sentence_id=comment_revisions,
     )
     block_counter = count(0)
 
@@ -732,13 +744,14 @@ def export_bilingual_docx_with_layout(
     _assert_export_segment_order(stories, segments_by_block)
     _assert_no_internal_export_markers(stories)
 
-    return _build_modified_docx(
+    content = _build_modified_docx(
         raw_bytes=raw_bytes,
         package=package,
         part_names={story.part_name for story in stories}
         | _collect_related_chart_part_names(stories)
         | {"word/numbering.xml"},
     )
+    return add_sentence_comments(content, sentence_comments)
 
 
 @segmentation_scope

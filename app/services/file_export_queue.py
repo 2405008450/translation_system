@@ -643,21 +643,27 @@ def build_file_record_exported_file(
                 filename=filename,
             )
         if export_type == "proofreading_docx_target_revisions":
-            content, filename = export_target_docx_with_revisions(db, batch)
+            content, filename = export_target_docx_with_revisions(
+                db, batch, **({"release_transaction_before_render": True} if release_transaction_before_render else {}),
+            )
             return _GenericExportedFile(
                 content=content,
                 media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 filename=filename,
             )
         if export_type == "proofreading_docx_layout":
-            content, filename, _ = export_layout_bilingual_docx(db, batch)
+            content, filename, _ = export_layout_bilingual_docx(
+                db, batch, **({"release_transaction_before_render": True} if release_transaction_before_render else {}),
+            )
             return _GenericExportedFile(
                 content=content,
                 media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 filename=filename,
             )
         if export_type == "proofreading_docx_ordered":
-            content, filename = export_ordered_bilingual_docx(db, batch)
+            content, filename = export_ordered_bilingual_docx(
+                db, batch, **({"release_transaction_before_render": True} if release_transaction_before_render else {}),
+            )
             return _GenericExportedFile(
                 content=content,
                 media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.models import (
     DocumentAlignmentPair, DocumentAlignmentUnit, FileRecord, Project, ProjectWorkflowStep,
     ProofreadingBatch, ProofreadingColumnBinding, ProofreadingSegmentBaseline,
-    Segment, SegmentComment, SegmentQAIssue, SegmentRevision, User,
+    Segment, SegmentComment, SegmentQAIssue, SegmentRevision, TranslationReviewReport, TranslationReviewReportItem, User,
 )
 from app.routers.document_alignment import PairRangeReplace, PairSplit, replace_pair_range, split_pair, rerun
 from app.services.document_alignment.service import replace_alignment_pair_range, validate_pair_integrity
@@ -29,7 +29,8 @@ class AlignmentStructureTests(unittest.IsolatedAsyncioTestCase):
         tables = [User.__table__, Project.__table__, ProjectWorkflowStep.__table__, FileRecord.__table__,
                   Segment.__table__, SegmentRevision.__table__, SegmentComment.__table__, SegmentQAIssue.__table__,
                   ProofreadingBatch.__table__, DocumentAlignmentPair.__table__, DocumentAlignmentUnit.__table__,
-                  ProofreadingColumnBinding.__table__, ProofreadingSegmentBaseline.__table__]
+                  ProofreadingColumnBinding.__table__, ProofreadingSegmentBaseline.__table__,
+                  TranslationReviewReport.__table__, TranslationReviewReportItem.__table__]
         # 测试库由 ORM 生成 UUID，临时移除 PostgreSQL 专用的默认表达式。
         defaults = [(column, column.server_default) for table in tables for column in table.columns
                     if column.server_default is not None and "::uuid" in str(column.server_default.arg)]

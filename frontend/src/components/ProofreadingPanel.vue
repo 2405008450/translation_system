@@ -3,6 +3,10 @@ import { Bot, CheckCircle2, ChevronDown, Download, ExternalLink, FileSpreadsheet
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { supportsAlignment } from '../utils/workflowCapabilities'
+import Modal from './base/Modal.vue'
+import {
+  PROOFREADING_DEFAULT_OPENROUTER_MODEL, proofreadingOpenRouterModels, type ProofreadingProvider,
+} from '../utils/proofreadingGeneration'
 
 import {
   cancelProofreadingBatch,
@@ -13,7 +17,6 @@ import {
   downloadProofreadingExportTask,
   exportProofreadingBatch,
   generateProofreadingBatch,
-  getProofreadingBatch,
   getProofreadingExportReadiness,
   getProofreadingExportTask,
   listProofreadingBatches,
@@ -45,12 +48,11 @@ interface SheetDraft {
   targets: Record<number, TargetDraft>
 }
 
-type ProofreadingProvider = 'auto' | 'deepseek' | 'openrouter'
-
 interface GenerationDraft {
   provider: ProofreadingProvider
   model: string
   userInstructions: string
+  retryScope: 'all' | 'failed_only'
 }
 
 const fileInput = ref<HTMLInputElement | null>(null)
@@ -64,7 +66,9 @@ const busy = ref(false)
 const actionBatchId = ref('')
 const errorMessage = ref('')
 const selectedImportMode = ref<'document_pair' | 'xlsx_columns' | null>(props.templateId === 'proofread_only' ? 'xlsx_columns' : null)
-const expandedBatchIds = ref(new Set<string>())
+const generationBatchId = ref('')
+const generationError = ref('')
+const generationBatch = computed(() => batches.value.find(batch => batch.id === generationBatchId.value))
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 const ACTIVE_GENERATE_STATUSES = new Set(['aligning', 'queued', 'running', 'canceling'])
@@ -86,15 +90,17 @@ function canConfigureBatch(batch: ProofreadingBatch) {
   return true
 }
 
-function isBatchExpanded(batchId: string) {
-  return expandedBatchIds.value.has(batchId)
+function openGenerationSettings(batch: ProofreadingBatch) {
+  if (actionBatchId.value || !canConfigureBatch(batch)) return
+  generationDraft(batch).retryScope = batch.failed_segments > 0 ? 'failed_only' : 'all'
+  generationBatchId.value = batch.id
+  generationError.value = ''
 }
 
-function toggleBatchSettings(batchId: string) {
-  const next = new Set(expandedBatchIds.value)
-  if (next.has(batchId)) next.delete(batchId)
-  else next.add(batchId)
-  expandedBatchIds.value = next
+function closeGenerationSettings() {
+  if (actionBatchId.value) return
+  generationBatchId.value = ''
+  generationError.value = ''
 }
 
 function isBatchGenerating(batch: ProofreadingBatch) {
@@ -104,15 +110,18 @@ function isBatchGenerating(batch: ProofreadingBatch) {
 function startButtonLabel(batch: ProofreadingBatch) {
   if (batch.status === 'canceled') return '重新开始校对'
   if (batch.status === 'ready') return '开始 LLM 校对'
-  return '重试失败项'
+  return batch.failed_segments > 0 ? '重试失败项' : '重新开始校对'
 }
 
 function generationDraft(batch: ProofreadingBatch) {
   if (!generationDrafts[batch.id]) {
+    const provider = batch.generation_settings?.provider || 'auto'
     generationDrafts[batch.id] = {
-      provider: batch.generation_settings?.provider || 'auto',
-      model: batch.generation_settings?.model || '',
+      provider,
+      model: batch.generation_settings?.model || (provider === 'openrouter'
+        ? PROOFREADING_DEFAULT_OPENROUTER_MODEL : provider === 'deepseek' ? 'deepseek-chat' : ''),
       userInstructions: batch.generation_settings?.user_instructions || '',
+      retryScope: batch.failed_segments > 0 ? 'failed_only' : 'all',
     }
   }
   return generationDrafts[batch.id]
@@ -123,7 +132,7 @@ function handleProviderChange(batch: ProofreadingBatch) {
   draft.model = draft.provider === 'deepseek'
     ? 'deepseek-chat'
     : draft.provider === 'openrouter'
-      ? 'google/gemini-3-flash-preview'
+      ? PROOFREADING_DEFAULT_OPENROUTER_MODEL
       : ''
 }
 
@@ -242,20 +251,30 @@ async function refreshBatches() {
 }
 
 async function startGeneration(batch: ProofreadingBatch) {
+  if (actionBatchId.value || generationBatchId.value !== batch.id || !canConfigureBatch(batch)) return
+  const draft = generationDraft(batch)
+  if (draft.retryScope === 'failed_only' && !batch.failed_segments) {
+    generationError.value = '当前没有可重试的生成失败项，请选择全部可校对句段。'
+    return
+  }
   actionBatchId.value = batch.id
   errorMessage.value = ''
+  generationError.value = ''
   try {
-    const draft = generationDraft(batch)
     await generateProofreadingBatch(batch.id, {
       provider: draft.provider,
       model: draft.model || undefined,
       user_instructions: draft.userInstructions.trim(),
+      retry_scope: draft.retryScope,
     })
-    const latest = await getProofreadingBatch(batch.id)
-    batches.value = batches.value.map((item) => item.id === latest.id ? latest : item)
+    batch.status = 'queued'
+    batch.generation_settings = { ...batch.generation_settings, provider: draft.provider,
+      model: draft.model, user_instructions: draft.userInstructions.trim() }
+    generationBatchId.value = ''
     startPolling()
+    await refreshBatches()
   } catch (error) {
-    errorMessage.value = errorText(error, '启动 LLM 校对失败。')
+    generationError.value = errorText(error, '启动 LLM 校对失败。')
   } finally {
     actionBatchId.value = ''
   }
@@ -336,8 +355,10 @@ function documentPairExportChoice(batch: ProofreadingBatch): { format: Proofread
 }
 
 function canExportOrderedWord(batch: ProofreadingBatch) {
-  return batch.batch_kind === 'document_pair' && Boolean(batch.bindings[0]?.file_record_id)
-    && ['alignment', 'proofreading'].includes(batch.workflow_stage || '')
+  return Boolean(batch.bindings[0]?.file_record_id) && (
+    batch.batch_kind === 'xlsx_columns'
+    || (batch.batch_kind === 'document_pair' && ['alignment', 'proofreading'].includes(batch.workflow_stage || ''))
+  )
 }
 
 function batchExportBusy(batch: ProofreadingBatch) {
@@ -667,12 +688,11 @@ defineExpose({ refreshBatches })
                 v-if="canConfigureBatch(batch)"
                 class="button proofreading-batch__settings-toggle"
                 type="button"
-                :aria-expanded="isBatchExpanded(batch.id)"
-                @click="toggleBatchSettings(batch.id)"
+                :disabled="Boolean(actionBatchId)"
+                @click="openGenerationSettings(batch)"
               >
                 <Settings2 :size="14" />
                 校对设置
-                <ChevronDown :size="14" :class="{ 'is-rotated': isBatchExpanded(batch.id) }" />
               </button>
               <button
                 v-if="batch.batch_kind === 'document_pair' && ['aligning', 'canceling', 'draft', 'confirmed'].includes(batch.alignment_status || '')"
@@ -688,7 +708,7 @@ defineExpose({ refreshBatches })
                 class="button button--primary"
                 type="button"
                 :disabled="Boolean(actionBatchId)"
-                @click="startGeneration(batch)"
+                @click="openGenerationSettings(batch)"
               >
                 <Loader2 v-if="actionBatchId === batch.id" class="lucide-spin" :size="14" />
                 <Play v-else :size="14" />
@@ -718,6 +738,7 @@ defineExpose({ refreshBatches })
               </button>
               <button v-if="canExportOrderedWord(batch)" class="button" type="button"
                 data-testid="batch-export-ordered-word"
+                title="导出原文与译文；校对阶段在译文中包含修改建议整句批注"
                 :disabled="Boolean(actionBatchId) || batchExportBusy(batch)"
                 @click="exportDocumentPairBatch(batch, true)">
                 <Loader2 v-if="actionBatchId === batch.id" class="lucide-spin" :size="14" />
@@ -739,23 +760,40 @@ defineExpose({ refreshBatches })
 
           <small v-if="batch.error_message" class="is-error proofreading-batch__error">{{ batch.error_message }}</small>
           <small v-if="batch.export_error_message" class="is-error proofreading-batch__error">导出失败：{{ batch.export_error_message }}</small>
-
+        </article>
+      </div>
+      <div v-else class="proofreading-task-empty">
+        <FileText :size="24" />
+        <strong>还没有校对语言任务</strong>
+        <span>请从上方选择一种导入方式开始。</span>
+      </div>
+    </div>
+    <Modal
+      :open="Boolean(generationBatch)"
+      title="LLM 校对设置"
+      :description="generationBatch ? `为「${generationBatch.filename}」选择本次模型、校对范围和提示词。` : ''"
+      width="min(680px, calc(100vw - 32px))"
+      :close-on-overlay="!actionBatchId"
+      :close-on-esc="!actionBatchId"
+      @close="closeGenerationSettings"
+    >
+      <template v-if="generationBatch">
+        <fieldset class="proofreading-generation-form" :disabled="Boolean(actionBatchId) || !canConfigureBatch(generationBatch)">
           <section
-            v-if="canConfigureBatch(batch) && isBatchExpanded(batch.id)"
             class="proofreading-generation-config"
             aria-label="LLM 校对设置"
           >
             <div class="proofreading-generation-config__head">
               <strong><Bot :size="16" />LLM 校对设置</strong>
-              <small v-if="batchActualModel(batch)">上次实际使用：{{ batchActualModel(batch) }}</small>
+              <small v-if="batchActualModel(generationBatch)">上次实际使用：{{ batchActualModel(generationBatch) }}</small>
             </div>
             <div class="proofreading-generation-config__fields">
               <label class="field">
                 <span class="field__label">模型提供方</span>
                 <select
-                  v-model="generationDraft(batch).provider"
+                  v-model="generationDraft(generationBatch).provider"
                   class="field__control"
-                  @change="handleProviderChange(batch)"
+                  @change="handleProviderChange(generationBatch)"
                 >
                   <option value="auto">自动（优先 DeepSeek，失败回退）</option>
                   <option value="deepseek">DeepSeek</option>
@@ -765,24 +803,39 @@ defineExpose({ refreshBatches })
               <label class="field">
                 <span class="field__label">校对模型</span>
                 <select
-                  v-model="generationDraft(batch).model"
+                  v-model="generationDraft(generationBatch).model"
                   class="field__control"
-                  :disabled="generationDraft(batch).provider === 'auto'"
+                  :disabled="generationDraft(generationBatch).provider === 'auto'"
                 >
-                  <option v-if="generationDraft(batch).provider === 'auto'" value="">自动选择默认模型</option>
-                  <option v-if="generationDraft(batch).provider === 'deepseek'" value="deepseek-chat">DeepSeek Chat</option>
-                  <option v-if="generationDraft(batch).provider === 'openrouter'" value="google/gemini-3-flash-preview">Gemini 3 Flash Preview</option>
-                  <option v-if="generationDraft(batch).provider === 'openrouter'" value="google/gemini-4-argon">Gemini 4 Argon</option>
+                  <option v-if="generationDraft(generationBatch).provider === 'auto'" value="">自动选择默认模型</option>
+                  <option v-if="generationDraft(generationBatch).provider === 'deepseek'" value="deepseek-chat">DeepSeek Chat</option>
+                  <template v-if="generationDraft(generationBatch).provider === 'openrouter'">
+                    <option v-for="option in proofreadingOpenRouterModels(generationDraft(generationBatch).model)"
+                      :key="option.value" :value="option.value">{{ option.label }}</option>
+                  </template>
                 </select>
               </label>
             </div>
             <p class="proofreading-generation-config__hint">
-              {{ providerDescription(generationDraft(batch).provider) }}
+              {{ providerDescription(generationDraft(generationBatch).provider) }}
             </p>
+            <fieldset class="proofreading-generation-config__scope">
+              <legend>校对范围</legend>
+              <label>
+                <input v-model="generationDraft(generationBatch).retryScope" type="radio" value="all">
+                <span>全部可校对句段</span>
+              </label>
+              <small>重新处理尚未确认的句段；已人工修改但未确认的内容也会重新校对，确认后可避免覆盖。</small>
+              <label>
+                <input v-model="generationDraft(generationBatch).retryScope" type="radio" value="failed_only"
+                  :disabled="!generationBatch.failed_segments">
+                <span>仅重试生成失败项（{{ generationBatch.failed_segments }} 条）</span>
+              </label>
+            </fieldset>
             <label class="field proofreading-generation-config__prompt">
               <span class="field__label"><MessageSquareText :size="14" />本批次校对提示词</span>
               <textarea
-                v-model="generationDraft(batch).userInstructions"
+                v-model="generationDraft(generationBatch).userInstructions"
                 class="field__control"
                 rows="4"
                 maxlength="12000"
@@ -791,16 +844,22 @@ defineExpose({ refreshBatches })
               <small>直接调用 LLM 校对，不使用 TM / 词汇表。留空时使用系统默认规则和项目翻译规则。</small>
             </label>
           </section>
-
-        </article>
-      </div>
-      <div v-else class="proofreading-task-empty">
-        <FileText :size="24" />
-        <strong>还没有校对语言任务</strong>
-        <span>请从上方选择一种导入方式开始。</span>
-      </div>
-    </div>
-
+        </fieldset>
+        <p v-if="!canConfigureBatch(generationBatch)" class="form-message is-error" role="alert">任务状态已变化，请关闭设置并刷新后重试。</p>
+        <p v-if="generationError" class="form-message is-error" role="alert">{{ generationError }}</p>
+      </template>
+      <template #footer>
+        <button class="button" type="button" :disabled="Boolean(actionBatchId)" @click="closeGenerationSettings">取消</button>
+        <button v-if="generationBatch" class="button button--primary" type="button"
+          data-testid="batch-confirm-generation"
+          :disabled="Boolean(actionBatchId) || !canConfigureBatch(generationBatch)"
+          @click="void startGeneration(generationBatch)">
+          <Loader2 v-if="actionBatchId" class="lucide-spin" :size="14" />
+          <Bot v-else :size="14" />
+          {{ actionBatchId ? '正在启动' : '确认并开始校对' }}
+        </button>
+      </template>
+    </Modal>
   </section>
 </template>
 
@@ -961,9 +1020,11 @@ defineExpose({ refreshBatches })
 .proofreading-batch__language-sheet { color: var(--ink-500); }
 .proofreading-batch__actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .proofreading-batch__actions .button { min-height: 30px; padding: 5px 9px; }
-.proofreading-batch__settings-toggle svg:last-child { transition: transform .16s ease; }
-.proofreading-batch__settings-toggle .is-rotated { transform: rotate(180deg); }
 .proofreading-batch__error { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proofreading-generation-form { min-width: 0; margin: 0; padding: 0; border: 0; }
+.proofreading-generation-config__scope { display: grid; gap: 8px; margin: 0; border: 1px solid var(--line-soft); border-radius: 8px; padding: 10px; }
+.proofreading-generation-config__scope label { display: flex; align-items: center; gap: 8px; }
+.proofreading-generation-config__scope small { color: var(--ink-500); }
 .proofreading-generation-config {
   display: grid;
   gap: 10px;
