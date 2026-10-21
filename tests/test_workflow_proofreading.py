@@ -239,6 +239,86 @@ class TranslationWorkflowProofreadingTests(WorkflowTestCase):
         payload = get_file_proofreading_baselines(self.file.id, self.db, self.user)
         self.assertNotIn(str(self.segments[0].id), {item["segment_id"] for item in payload["items"]})
 
+    async def test_every_llm_request_runs_without_transaction_or_orm_payload(self):
+        from sqlalchemy import inspect
+        from app.services.proofreading import _build_prompt
+        batch = self.setup_workflow()
+        calls = []
+        async def review(groups, **kwargs):
+            self.assertFalse(self.db.in_transaction())
+            for group in groups:
+                for baseline, segment in group["segments"]:
+                    self.assertIsNone(inspect(baseline, raiseerr=False))
+                    self.assertIsNone(inspect(segment, raiseerr=False))
+                    self.assertIsNotNone(segment.id)
+            _build_prompt(groups, kwargs["source_language"], kwargs["target_language"], kwargs["rules_text"])
+            self.assertFalse(self.db.in_transaction())
+            calls.append(groups[0]["sid"])
+            return ({group["sid"]: {"reviewed_target_text": "Texte corrigé", "category": "accuracy",
+                                     "reason": "统一术语", "confidence": "high"} for group in groups}, "test", "model")
+        with patch("app.services.proofreading.PROOFREADING_BATCH_SIZE", 1), \
+             patch("app.services.proofreading._review_group_batch", side_effect=review), \
+             patch("app.services.proofreading._attach_reference_context"), \
+             patch("app.services.proofreading.record_translation_metric_event"), \
+             patch("app.services.proofreading.sync_file_record_status"):
+            await generate_batch(self.db, batch, current_user=self.user)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.db.query(SegmentRevision).count(), 3)
+        self.assertEqual(batch.status, "completed")
+
+    def test_start_endpoint_releases_request_session_before_background_execution(self):
+        from fastapi import BackgroundTasks
+        from app.routers.proofreading import ProofreadingGenerateRequest, generate_proofreading_batch
+        batch = self.setup_workflow()
+        batch_id = batch.id
+        tasks = BackgroundTasks()
+        with patch("app.routers.proofreading.validate_provider_choice"):
+            response = generate_proofreading_batch(batch_id, ProofreadingGenerateRequest(), tasks, self.db, self.user)
+        self.assertFalse(self.db.in_transaction())
+        self.assertEqual(response["batch_id"], str(batch_id))
+        self.assertEqual(tasks.tasks[0].args[0], batch_id)
+
+    async def test_database_details_are_hidden_for_new_and_historical_errors(self):
+        from app.services.proofreading import DATABASE_RETRY_MESSAGE, serialize_batch
+        batch = self.setup_workflow()
+        raw_error = "(psycopg.errors.IdleInTransactionSessionTimeout) idle-in-transaction timeout [SQL: SELECT secret FROM segments]"
+        with patch("app.services.proofreading._review_group_batch", side_effect=RuntimeError(raw_error)), \
+             patch("app.services.proofreading._attach_reference_context"), \
+             patch("app.services.proofreading.sync_file_record_status"):
+            await generate_batch(self.db, batch, current_user=self.user)
+        self.assertEqual(batch.failed_segments, 3)
+        self.assertEqual({item.reason for item in self.db.query(TranslationReviewReportItem)}, {DATABASE_RETRY_MESSAGE})
+        item = self.db.query(TranslationReviewReportItem).first()
+        item.reason = raw_error
+        batch.error_message = raw_error
+        self.db.commit()
+        self.assertEqual(serialize_batch(self.db, batch)["error_message"], DATABASE_RETRY_MESSAGE)
+        payload = get_file_proofreading_baselines(self.file.id, self.db, self.user)
+        self.assertNotIn("[SQL:", json.dumps(payload, ensure_ascii=False))
+
+    def test_terminal_database_error_finalizes_report_and_keeps_safe_message(self):
+        from contextlib import contextmanager
+        from unittest.mock import AsyncMock
+        from sqlalchemy.exc import SQLAlchemyError
+        from app.services.proofreading import DATABASE_RETRY_MESSAGE, run_generate_batch
+        batch = self.setup_workflow()
+        batch_id, user_id = batch.id, self.user.id
+        report = TranslationReviewReport(project_id=self.project.id, proofreading_batch_id=batch.id,
+                                         report_mode="proofread_generate", scope="proofreading_batch", status="running")
+        self.db.add(report)
+        self.db.commit()
+        @contextmanager
+        def session():
+            yield self.db
+        with patch("app.services.proofreading.SessionLocal", side_effect=session), \
+             patch("app.services.proofreading.generate_batch", new_callable=AsyncMock,
+                   side_effect=SQLAlchemyError("connection interrupted [SQL: SELECT ...]")):
+            run_generate_batch(batch_id, user_id, "auto", None)
+        self.assertEqual(batch.status, "failed")
+        self.assertEqual(batch.error_message, DATABASE_RETRY_MESSAGE)
+        self.assertEqual(report.status, "failed")
+        self.assertIsNotNone(report.finished_at)
+
     def test_start_is_scoped_busy_is_rejected_and_only_starter_can_cancel(self):
         from fastapi import BackgroundTasks, HTTPException
         from app.routers.proofreading import ProofreadingGenerateRequest, generate_proofreading_batch, cancel_proofreading_batch

@@ -46,6 +46,7 @@ from app.services.proofreading import (
     run_generate_batch,
     run_export_batch,
     serialize_batch,
+    proofreading_error_message,
 )
 from app.services.llm_service import LLMConfigurationError, validate_provider_choice
 from app.services.document_alignment.segments import ensure_document_pair_segments_complete
@@ -315,18 +316,20 @@ def generate_proofreading_batch(
     batch.export_filename = ""
     batch.export_path = ""
     batch.finished_at = None
+    queued_batch_id = batch.id
+    queued_user_id = current_user.id
     db.commit()
     background_tasks.add_task(
         run_generate_batch,
-        batch.id,
-        current_user.id,
+        queued_batch_id,
+        queued_user_id,
         provider,
         model,
         user_instructions,
         retry_scope,
         batch_config["generation"]["run_id"],
     )
-    return {"batch_id": str(batch.id), "status": "queued"}
+    return {"batch_id": str(queued_batch_id), "status": "queued"}
 
 
 @router.post("/proofreading-batches/{batch_id}/cancel")
@@ -589,7 +592,10 @@ def get_file_proofreading_baselines(
                 "original_target_text": baseline.original_target_text,
                 "llm_reviewed": segment.source == "llm_review" and bool(segment.llm_provider),
                 "review_suggestion": (
-                    review_items_by_segment[segment.id].reason
+                    proofreading_error_message(review_items_by_segment[segment.id].reason)
+                    if segment.id in review_items_by_segment
+                    and review_items_by_segment[segment.id].category_key == "generation_error"
+                    else review_items_by_segment[segment.id].reason
                     if segment.id in review_items_by_segment
                     else ""
                 ),

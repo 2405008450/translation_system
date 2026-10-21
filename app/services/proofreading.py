@@ -12,6 +12,7 @@ import logging
 import re
 from collections import defaultdict
 from copy import copy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -23,6 +24,7 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import range_boundaries
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 from app.auth import can_access_all_projects
 
 from app.services.workflow_capabilities import is_standalone_proofreading, proofreading_step_id
@@ -70,6 +72,28 @@ GENERATION_ERROR_CATEGORY = "generation_error"
 GENERATION_ERROR_RESOLVED_STATUS = "resolved"
 PROOFREADING_SOURCE = "llm_review"
 IMPORTED_TRANSLATION_SOURCE = "imported_translation"
+
+DATABASE_RETRY_MESSAGE = "校对时数据库连接中断，请稍后重试。已保存的校对结果会保留。"
+
+
+def proofreading_error_message(error: Exception | str) -> str:
+    """前端只显示可操作的提示，SQL 和连接详情保留在服务端日志。"""
+    message = str(error)
+    if isinstance(error, SQLAlchemyError) or any(marker in message for marker in (
+        "[SQL:", "sqlalche.me/", "IdleInTransactionSessionTimeout", "idle-in-transaction timeout",
+    )):
+        return DATABASE_RETRY_MESSAGE
+    return message[:1000]
+
+
+@dataclass(frozen=True)
+class _BaselineSnapshot:
+    original_target_text: str
+
+
+@dataclass(frozen=True)
+class _SegmentSnapshot:
+    id: UUID
 
 
 class ProofreadingCanceled(Exception):
@@ -908,7 +932,10 @@ async def generate_batch(
     user_instructions: str = "",
     retry_scope: str = "all",
 ) -> None:
-    if _batch_cancel_requested(db, batch.id):
+    batch_id = batch.id
+    actor_id = current_user.id if current_user else None
+    source_language = batch.source_language
+    if _batch_cancel_requested(db, batch_id):
         _finalize_canceled_batch(db, batch)
         return
 
@@ -976,7 +1003,7 @@ async def generate_batch(
     loaded_versions: dict[UUID, int] = {}
     grouped_by_language: dict[str, list[dict[str, Any]]] = {}
     for target_language, language_bindings in bindings_by_language.items():
-        if _batch_cancel_requested(db, batch.id):
+        if _batch_cancel_requested(db, batch_id):
             _finalize_canceled_batch(
                 db,
                 batch,
@@ -1020,7 +1047,10 @@ async def generate_batch(
             })
             if candidate_text not in group["variants"]:
                 group["variants"].append(candidate_text)
-            group["segments"].append((baseline, segment))
+            # 跨模型调用只保留普通值，不能保留会隐式访问数据库的 ORM 对象。
+            group["segments"].append((
+                _BaselineSnapshot(baseline.original_target_text), _SegmentSnapshot(segment.id),
+            ))
         groups = list(groups_by_hash.values())
         file_record = db.get(FileRecord, language_bindings[0].file_record_id)
         if file_record and groups:
@@ -1037,7 +1067,7 @@ async def generate_batch(
     processed_groups = 0
     for target_language, groups in grouped_by_language.items():
         for packed in _pack_groups(groups):
-            if _batch_cancel_requested(db, batch.id):
+            if _batch_cancel_requested(db, batch_id):
                 _finalize_canceled_batch(
                     db,
                     batch,
@@ -1049,10 +1079,15 @@ async def generate_batch(
                     category_counts=category_counts,
                 )
                 return
+            packed_segment_ids = [segment.id for group in packed for _, segment in group["segments"]]
+            # 先持久化报告并归还连接，再等待模型；commit 后仅使用快照参数，
+            # 避免 expire_on_commit 的隐式读取重新开启一个长时间闲置的事务。
+            db.commit()
+            request_error = None
             try:
                 results, actual_provider, actual_model = await _review_group_batch(
                     packed,
-                    source_language=batch.source_language,
+                    source_language=source_language,
                     target_language=target_language,
                     rules_text=rules_text,
                     user_instructions=user_instructions,
@@ -1060,9 +1095,38 @@ async def generate_batch(
                     model=model,
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("proofreading batch=%s language=%s group failed: %s", batch.id, target_language, exc)
-                error_text = str(exc)[:1000]
-                packed_failed_count = _add_generation_error_items(db, batch, report, packed, error_text)
+                logger.warning("proofreading batch=%s language=%s group failed", batch_id, target_language, exc_info=True)
+                request_error = proofreading_error_message(exc)
+
+            # 模型调用结束后在新事务中读取并锁定当前句段，继续校验人工编辑和权限。
+            current_segments = {
+                segment.id: segment for segment in db.query(Segment).filter(
+                    Segment.id.in_(packed_segment_ids),
+                ).order_by(Segment.id).with_for_update().populate_existing().all()
+            }
+            for group in packed:
+                group["segments"] = [
+                    (baseline, current_segments[segment.id]) for baseline, segment in group["segments"]
+                    if segment.id in current_segments
+                    and int(current_segments[segment.id].version or 1) == loaded_versions.get(segment.id)
+                    and current_segments[segment.id].status != "confirmed"
+                ]
+
+            if restricted_mode:
+                if current_user is not None:
+                    db.refresh(current_user)
+                live_ids = {segment.id for segment in eligible_workflow_segments(db, batch, current_user)}
+                for group in packed:
+                    group["segments"] = [(baseline, segment) for baseline, segment in group["segments"]
+                                         if segment.id in live_ids and int(segment.version or 1) == loaded_versions.get(segment.id)]
+            if _batch_cancel_requested(db, batch_id):
+                _finalize_canceled_batch(db, batch, report=report, file_ids=file_ids,
+                                         failed_count=failed_count, checked_count=checked_count,
+                                         changed_count=changed_count, category_counts=category_counts)
+                return
+
+            if request_error is not None:
+                packed_failed_count = _add_generation_error_items(db, batch, report, packed, request_error)
                 failed_count += packed_failed_count
                 category_counts[GENERATION_ERROR_CATEGORY] += packed_failed_count
                 processed_groups += len(packed)
@@ -1073,27 +1137,9 @@ async def generate_batch(
 
             report.provider = actual_provider
             report.model = actual_model
-
-            # 模型调用期间用户可能已编辑或确认句段：重新读取最新状态，避免覆盖人工修改。
-            packed_segment_ids = [segment.id for group in packed for _, segment in group["segments"]]
-            db.query(Segment).filter(Segment.id.in_(packed_segment_ids)).with_for_update().populate_existing().all()
-
-            if restricted_mode:
-                if current_user is not None:
-                    db.refresh(current_user)
-                live_ids = {segment.id for segment in eligible_workflow_segments(db, batch, current_user)}
-                for group in packed:
-                    group["segments"] = [(baseline, segment) for baseline, segment in group["segments"]
-                                         if segment.id in live_ids and int(segment.version or 1) == loaded_versions.get(segment.id)]
-            if _batch_cancel_requested(db, batch.id):
-                _finalize_canceled_batch(db, batch, report=report, file_ids=file_ids,
-                                         failed_count=failed_count, checked_count=checked_count,
-                                         changed_count=changed_count, category_counts=category_counts)
-                return
-
             failed_groups = [group for group in packed if "error" in (results.get(group["sid"]) or {"error": ""})]
             for group in failed_groups:
-                error_text = str((results.get(group["sid"]) or {}).get("error") or "模型未返回该项的有效校对结果。")[:1000]
+                error_text = proofreading_error_message((results.get(group["sid"]) or {}).get("error") or "模型未返回该项的有效校对结果。")
                 group_failed_count = _add_generation_error_items(db, batch, report, [group], error_text)
                 failed_count += group_failed_count
                 category_counts[GENERATION_ERROR_CATEGORY] += group_failed_count
@@ -1115,13 +1161,13 @@ async def generate_batch(
                     segment.source = PROOFREADING_SOURCE
                     segment.llm_provider = actual_provider
                     segment.llm_model = actual_model
-                    segment.last_modified_by_id = current_user.id if current_user else None
+                    segment.last_modified_by_id = actor_id
                     if before_text == reviewed_text:
                         continue
                     segment.target_text = reviewed_text
                     segment.target_html = None
                     segment.version = int(segment.version or 1) + 1
-                    segment.last_modified_by_id = current_user.id if current_user else None
+                    segment.last_modified_by_id = actor_id
                     db.add(SegmentRevision(
                         file_record_id=segment.file_record_id,
                         segment_id=segment.id,
@@ -1130,7 +1176,7 @@ async def generate_batch(
                         after_text=reviewed_text,
                         source=PROOFREADING_SOURCE,
                         status="pending",
-                        author_id=current_user.id if current_user else None,
+                        author_id=actor_id,
                     ))
                     record_translation_metric_event(
                         db,
@@ -1252,10 +1298,16 @@ def run_generate_batch(
                 if getattr(batch, "cancel_requested", False) or batch.status in {"canceling", "canceled"}:
                     _finalize_canceled_batch(db, batch)
                     return
+                _refresh_batch_change_stats(db, batch)
                 batch.status = "failed"
-                batch.error_message = str(exc)
+                batch.error_message = proofreading_error_message(exc)
                 batch.message = "校对失败。"
                 batch.finished_at = _utcnow_naive()
+                db.query(TranslationReviewReport).filter(
+                    TranslationReviewReport.proofreading_batch_id == batch_id,
+                    TranslationReviewReport.status.in_(["queued", "running"]),
+                ).update({"status": "failed", "error_message": batch.error_message,
+                          "finished_at": batch.finished_at}, synchronize_session=False)
                 db.commit()
             logger.exception("proofreading generation failed batch_id=%s", batch_id)
 
@@ -1426,7 +1478,7 @@ def serialize_batch(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
         "status": batch.status,
         "progress": batch.progress,
         "message": batch.message,
-        "error_message": batch.error_message,
+        "error_message": proofreading_error_message(batch.error_message),
         "cancel_requested": bool(getattr(batch, "cancel_requested", False)),
         "total_segments": batch.total_segments,
         "changed_segments": batch.changed_segments,
