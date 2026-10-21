@@ -4,7 +4,7 @@ import json
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from hashlib import sha1
@@ -58,6 +58,9 @@ from app.services.document_workspace import (
 )
 from app.services.normalizer import compact_match_core, normalize_text
 from app.services.language_pairs import is_right_to_left_language
+from app.services.docx_comments import (
+    SentenceComment, add_sentence_comments, allocate_comment_ids, wrap_sentence_comment,
+)
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
 from app.services.docx_segmentation import segmentation_scope, prepare_package
 
@@ -617,6 +620,8 @@ class ExportRevisionInfo:
     after_text: str
     author: str
     created_at: str | None = None
+    comment_text: str = ""
+    comment_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -769,6 +774,7 @@ def export_translated_docx(
         if include_revision_marks
         else {}
     )
+    revisions_by_sentence_id, sentence_comments = _prepare_revision_comments(raw_bytes, revisions_by_sentence_id)
     math_placeholders_by_sentence_id = {
         str(segment["sentence_id"]): dict(segment.get("math_placeholders") or {})
         for segment in source_segments
@@ -828,11 +834,12 @@ def export_translated_docx(
     _assert_export_segment_order(stories, segments_by_block)
     _assert_no_internal_export_markers(stories)
 
-    return _build_modified_docx(
+    content = _build_modified_docx(
         raw_bytes=raw_bytes,
         package=package,
         part_names=modified_part_names,
     )
+    return add_sentence_comments(content, sentence_comments)
 
 
 def export_revision_paragraphs_docx(
@@ -847,7 +854,7 @@ def export_revision_paragraphs_docx(
     from docx.shared import Pt
 
     document = Document()
-    revision_map = _build_export_revision_lookup(revisions)
+    revision_map, sentence_comments = _prepare_revision_comments(None, _build_export_revision_lookup(revisions))
     for item in segments:
         sentence_id = str(item["sentence_id"])
         text = str(item.get("target_text") or "")
@@ -857,7 +864,8 @@ def export_revision_paragraphs_docx(
             sentence_id=sentence_id, source_text="", target_text=text,
             revision=revision_map.get(sentence_id),
         )
-        for node in _build_word_revision_nodes(segment, None):
+        nodes = _build_word_revision_nodes(segment, None)
+        for node in wrap_sentence_comment(nodes, segment.revision.comment_id if segment.revision else None):
             paragraph._p.append(parse_xml(ET.tostring(node, encoding="utf-8")))
         if is_right_to_left_language(target_language):
             paragraph._p.get_or_add_pPr().append(OxmlElement("w:bidi"))
@@ -870,7 +878,7 @@ def export_revision_paragraphs_docx(
         settings.insert(1, OxmlElement("w:trackRevisions"))
     output = BytesIO()
     document.save(output)
-    return output.getvalue()
+    return add_sentence_comments(output.getvalue(), sentence_comments)
 
 
 def build_translated_docx_filename(filename: str) -> str:
@@ -945,8 +953,20 @@ def _build_export_revision_lookup(
             after_text=after_text,
             author=_resolve_revision_author_name(_get_segment_value(revision, "author")),
             created_at=created_at,
+            comment_text=str(_get_segment_value(revision, "comment_text", "") or "").strip(),
         )
     return lookup
+
+
+def _prepare_revision_comments(
+    raw_bytes: bytes | None, revisions: dict[str, ExportRevisionInfo],
+) -> tuple[dict[str, ExportRevisionInfo], list[SentenceComment]]:
+    sentence_ids = [sid for sid, revision in revisions.items() if revision.comment_text]
+    if not sentence_ids:
+        return revisions, []
+    ids = allocate_comment_ids(raw_bytes, sentence_ids)
+    comments = [SentenceComment(sid, comment_id, revisions[sid].comment_text) for sid, comment_id in ids.items()]
+    return {sid: replace(revision, comment_id=ids.get(sid)) for sid, revision in revisions.items()}, comments
 
 
 def _normalize_word_revision_date(value: Any) -> str | None:
@@ -3348,7 +3368,7 @@ def _expand_word_revision_markers(
                 original_span_text,
             ),
         )
-        for node in revision_nodes:
+        for node in wrap_sentence_comment(revision_nodes, segment.revision.comment_id):
             parent.insert(insert_index, node)
             insert_index += 1
 

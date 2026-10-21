@@ -141,6 +141,7 @@ test('校对顶部与操作栏提供相同交付格式，普通导出收起保�
     /Excel 校对报告/, /Word 校对修订版/,
   ])
   await expect(choices.getByRole('button').last()).toBeEnabled()
+  await expect(choices.getByRole('button').last()).toContainText('包含修改建议批注')
   const others = page.locator('details.export-dropdown__other')
   await expect(others).not.toHaveAttribute('open', '')
   await expect(page.getByText('按原文件格式导出当前译文')).toBeHidden()

@@ -8,7 +8,10 @@ from typing import Any
 from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
-from app.models import FileRecord, ProofreadingBatch, ProofreadingSegmentBaseline, Segment
+from app.models import (
+    FileRecord, ProofreadingBatch, ProofreadingSegmentBaseline, Segment,
+    TranslationReviewReport, TranslationReviewReportItem,
+)
 from app.services.file_record_service import (
     get_file_record_source_filename, get_file_record_source_path,
     get_segment_ordering_for_file_record,
@@ -59,6 +62,20 @@ def prepare_workflow_proofreading_export(
     revisions: list[dict[str, Any]] = []
     sentence_ids: set[str] = set()
     active_count = 0
+    # 仅成功应用的最新建议可作为当前译文的理由；失败或取消的轮次不覆盖它。
+    report_items = db.query(TranslationReviewReportItem).join(
+        TranslationReviewReport, TranslationReviewReport.id == TranslationReviewReportItem.report_id,
+    ).filter(
+        TranslationReviewReport.proofreading_batch_id == batch.id,
+        TranslationReviewReportItem.file_record_id == file.id,
+        TranslationReviewReportItem.applied.is_(True),
+        TranslationReviewReportItem.status == "applied",
+        TranslationReviewReportItem.category_key != "generation_error",
+    ).order_by(TranslationReviewReport.created_at.desc(), TranslationReviewReportItem.created_at.desc(),
+               TranslationReviewReportItem.id.desc()).all()
+    latest_suggestions: dict[Any, TranslationReviewReportItem] = {}
+    for item in report_items:
+        latest_suggestions.setdefault(item.segment_id, item)
     for segment, baseline in items:
         sentence_id = str(segment.sentence_id or "")
         if not sentence_id or sentence_id in sentence_ids:
@@ -75,11 +92,17 @@ def prepare_workflow_proofreading_export(
             if before != after:
                 payload["target_text"] = after
                 payload["target_html"] = None
-                revisions.append({
+                revision = {
                     "id": f"proofreading-{batch.id}-{segment.id}", "sentence_id": sentence_id,
                     "before_text": before, "after_text": after,
                     "status": "pending", "source": "manual", "author": {"name": "校对工作流"},
-                })
+                }
+                suggestion = latest_suggestions.get(segment.id)
+                if (suggestion is not None and suggestion.created_at >= baseline.created_at
+                        and suggestion.suggested_target_text == after and (suggestion.reason or "").strip()
+                        and suggestion.category_key not in {"unchanged", "no_change", "无需修改"}):
+                    revision["comment_text"] = f"{suggestion.category_key or '校对建议'}：{suggestion.reason.strip()}"
+                revisions.append(revision)
         segments.append(payload)
     if not active_count:
         raise ValueError("当前文件没有处于校对阶段的句段。")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -654,5 +655,218 @@ class TranslationWorkflowProofreadingTests(WorkflowTestCase):
                 ["Corrected translation", "Traduction 1", "Traduction 2", "Traduction 3"])
             self.assertEqual(self.word_texts(exported.content, False)[0],
                 [f"Traduction {index}" for index in range(4)])
+
+    def add_suggestion(self, batch, segment, text, reason="统一术语，并修正语法。", *, category="语言与格式", created_at=None, status="applied"):
+        created_at = created_at or datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=1)
+        report = TranslationReviewReport(proofreading_batch_id=batch.id, file_record_id=self.file.id,
+            project_id=self.project.id, created_at=created_at, status="completed")
+        self.db.add(report)
+        self.db.flush()
+        item = TranslationReviewReportItem(report_id=report.id, file_record_id=self.file.id,
+            segment_id=segment.id, sentence_id=segment.sentence_id, category_key=category,
+            suggested_target_text=text, reason=reason, applied=status == "applied", status=status,
+            created_at=created_at)
+        self.db.add(item)
+        self.db.flush()
+        return item
+
+    def word_comments(self, content):
+        from lxml import etree
+        from app.services.docx_comments import W, COMMENTS_REL, DOCUMENT_RELS, COMMENTS_TYPE
+        import posixpath
+        with ZipFile(BytesIO(content)) as archive:
+            self.assertIsNone(archive.testzip())
+            rels = etree.fromstring(archive.read(DOCUMENT_RELS))
+            comment_rels = [node for node in rels if node.get("Type") == COMMENTS_REL]
+            if not comment_rels:
+                return {}
+            self.assertEqual(len(comment_rels), 1)
+            target = comment_rels[0].get("Target")
+            part = posixpath.normpath(posixpath.join("word", target))
+            types = etree.fromstring(archive.read("[Content_Types].xml"))
+            self.assertTrue(any(node.get("PartName") == "/" + part and node.get("ContentType") == COMMENTS_TYPE for node in types))
+            comments = etree.fromstring(archive.read(part))
+            root = etree.fromstring(archive.read("word/document.xml"))
+        def collect(node, accept=True):
+            if node.tag == W + ("del" if accept else "ins"):
+                return ""
+            if node.tag in {W + "t", W + "delText"}:
+                return node.text or ""
+            if node.tag == W + "br":
+                return "\n"
+            return "".join(collect(child, accept) for child in node)
+        result = {}
+        for comment in comments:
+            comment_id = comment.get(W + "id")
+            start = root.findall(f".//{W}commentRangeStart[@{W}id='{comment_id}']")
+            end = root.findall(f".//{W}commentRangeEnd[@{W}id='{comment_id}']")
+            reference = root.findall(f".//{W}commentReference[@{W}id='{comment_id}']")
+            self.assertEqual((len(start), len(end), len(reference)), (1, 1, 1))
+            paragraph = start[0].getparent()
+            self.assertIs(paragraph, end[0].getparent())
+            self.assertIs(paragraph, reference[0].getparent().getparent())
+            self.assertFalse(any(node.tag in {W + "ins", W + "del"} for node in start[0].iterancestors()))
+            nodes = list(paragraph)[paragraph.index(start[0]) + 1:paragraph.index(end[0])]
+            result[comment_id] = {
+                "text": collect(comment), "author": comment.get(W + "author"),
+                "accepted": "".join(collect(node) for node in nodes),
+                "rejected": "".join(collect(node, False) for node in nodes),
+            }
+        return result
+
+    async def test_llm_suggestions_become_whole_sentence_comments_in_ordered_word(self):
+        batch = self.setup_workflow()
+        await self.run_generation(batch)
+        exported = self.build_revision_export(batch, release_transaction_before_render=True)
+        self.assertFalse(self.db.in_transaction())
+        comments = self.word_comments(exported.content)
+        self.assertEqual(len(comments), 3)
+        self.assertEqual({item["text"] for item in comments.values()}, {"accuracy：统一术语"})
+        self.assertEqual({item["author"] for item in comments.values()}, {"校对工作流"})
+        self.assertEqual({item["accepted"] for item in comments.values()}, {"Texte corrigé"})
+        self.assertEqual({item["rejected"] for item in comments.values()}, {f"Traduction {index}" for index in range(3)})
+        self.assertEqual(self.word_texts(exported.content)[0][-1], "Traduction 3")
+
+    def test_comments_keep_latest_success_through_failure_cancel_and_retry(self):
+        batch = self.setup_workflow()
+        self.segments[0].target_text = "Latest successful text"
+        self.segments[1].target_text = "Still valid earlier text"
+        moment = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=1)
+        self.add_suggestion(batch, self.segments[0], "Older text", "过期理由", created_at=moment)
+        self.add_suggestion(batch, self.segments[0], "Latest successful text", "最新成功理由", created_at=moment + timedelta(seconds=1))
+        self.add_suggestion(batch, self.segments[1], "Still valid earlier text", "另一句仍有效的理由", created_at=moment)
+        self.add_suggestion(batch, self.segments[0], "", "数据库异常不进入批注", category="generation_error",
+            created_at=moment + timedelta(seconds=2), status="open")
+        self.db.commit()
+        for state in ("failed", "canceled", "partial_failed", "completed"):
+            batch.status = state
+            self.db.commit()
+            comments = self.word_comments(self.build_revision_export(batch).content)
+            self.assertEqual({comment["text"] for comment in comments.values()},
+                {"语言与格式：最新成功理由", "语言与格式：另一句仍有效的理由"})
+
+    def test_stale_manual_unchanged_empty_and_resolved_reasons_do_not_create_comments(self):
+        batch = self.setup_workflow()
+        self.segments[0].target_text = "Saved LLM result"
+        self.add_suggestion(batch, self.segments[0], "Saved LLM result")
+        self.segments[0].target_text = "Later manual edit"
+        self.add_suggestion(batch, self.segments[1], "Traduction 1", "无需修改", category="无需修改")
+        self.segments[2].target_text = "Changed without valid reason"
+        self.add_suggestion(batch, self.segments[2], self.segments[2].target_text, "", status="applied")
+        self.add_suggestion(batch, self.segments[2], self.segments[2].target_text, "已解决的建议", status="resolved")
+        self.db.commit()
+        exported = self.build_revision_export(batch)
+        self.assertEqual(self.word_comments(exported.content), {})
+        from app.services.document_workspace import NS
+        self.assertTrue(self.word_texts(exported.content)[1].findall(".//w:ins", NS))
+
+    def test_comments_exclude_previous_baseline_after_reentry(self):
+        from app.services.workflow_proofreading import prepare_workflow_proofreading
+        batch = self.setup_workflow()
+        old_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=1)
+        self.add_suggestion(batch, self.segments[0], "Final text", "旧基线的理由", created_at=old_time)
+        self.segments[0].target_text = "Reentered baseline"
+        prepare_workflow_proofreading(self.db, self.file, self.user, refresh_segment_ids={self.segments[0].id})
+        self.segments[0].target_text = "Final text"
+        self.db.commit()
+        self.assertEqual(self.word_comments(self.build_revision_export(batch).content), {})
+        self.add_suggestion(batch, self.segments[0], "Final text", "重入后的新理由")
+        self.db.commit()
+        comments = self.word_comments(self.build_revision_export(batch).content)
+        self.assertEqual(list(comments.values())[0]["text"], "语言与格式：重入后的新理由")
+        self.assertEqual(list(comments.values())[0]["rejected"], "Reentered baseline")
+
+    def test_comments_support_full_insertion_deletion_and_confirmed_segments(self):
+        batch = self.setup_workflow()
+        baseline = self.db.query(ProofreadingSegmentBaseline).filter_by(segment_id=self.segments[0].id).one()
+        baseline.original_target_text = ""
+        self.segments[0].target_text = "Inserted whole sentence"
+        self.segments[0].status = "confirmed"
+        self.segments[1].target_text = ""
+        self.add_suggestion(batch, self.segments[0], "Inserted whole sentence", "补译整句")
+        self.add_suggestion(batch, self.segments[1], "", "删除重复句")
+        self.db.commit()
+        comments = list(self.word_comments(self.build_revision_export(batch).content).values())
+        self.assertEqual([(row["accepted"], row["rejected"]) for row in comments],
+            [("Inserted whole sentence", ""), ("", "Traduction 1")])
+
+    def test_docx_whole_sentence_comments_preserve_existing_comments_table_and_revision_roundtrip(self):
+        from docx import Document
+        from lxml import etree
+        from pathlib import Path
+        from app.services.document_workspace import parse_docx_workspace
+        from app.services.docx_comments import W, COMMENTS_REL, COMMENTS_TYPE, DOCUMENT_RELS, RELS, TYPES
+        batch = self.setup_workflow()
+        document = Document()
+        document.add_paragraph("First source sentence. Second source sentence.")
+        table = document.add_table(rows=1, cols=2)
+        table.cell(0, 0).text = "Source table text"
+        table.cell(0, 1).text = "Other stage text"
+        stream = BytesIO()
+        document.save(stream)
+        # 手工建立含原有批注、非默认批注路径的母版，不依赖待验证的批注写入器。
+        raw_stream = BytesIO()
+        with ZipFile(BytesIO(stream.getvalue())) as archive, ZipFile(raw_stream, "w") as output:
+            body = etree.fromstring(archive.read("word/document.xml"))
+            paragraph = body.find(".//" + W + "body/" + W + "p")
+            paragraph.insert(0, etree.Element(W + "commentRangeStart", {W + "id": "41"}))
+            paragraph.append(etree.Element(W + "commentRangeEnd", {W + "id": "41"}))
+            reference = etree.SubElement(paragraph, W + "r")
+            etree.SubElement(reference, W + "commentReference", {W + "id": "41"})
+            old_comments = etree.Element(W + "comments", nsmap={"w": W[1:-1]})
+            old = etree.SubElement(old_comments, W + "comment", {W + "id": "41", W + "author": "原有审阅人"})
+            etree.SubElement(etree.SubElement(etree.SubElement(old, W + "p"), W + "r"), W + "t").text = "母版已有批注"
+            rels = etree.fromstring(archive.read(DOCUMENT_RELS))
+            etree.SubElement(rels, f"{{{RELS}}}Relationship", Id="rIdExistingComments", Type=COMMENTS_REL, Target="reviewer-notes.xml")
+            types = etree.fromstring(archive.read("[Content_Types].xml"))
+            etree.SubElement(types, f"{{{TYPES}}}Override", PartName="/word/reviewer-notes.xml", ContentType=COMMENTS_TYPE)
+            updates = {"word/document.xml": body, DOCUMENT_RELS: rels, "[Content_Types].xml": types}
+            for info in archive.infolist():
+                output.writestr(info, etree.tostring(updates[info.filename]) if info.filename in updates else archive.read(info.filename))
+            output.writestr("word/reviewer-notes.xml", etree.tostring(old_comments))
+        raw = raw_stream.getvalue()
+        options = {"include_comments": False}
+        parsed = parse_docx_workspace(raw, document_parse_options=options)["segments"]
+        self.assertEqual(len(parsed), 4)
+        for segment, source in zip(self.segments, parsed):
+            for name in ("sentence_id", "source_text", "display_text", "block_type", "block_index", "row_index", "cell_index"):
+                setattr(segment, name, source.get(name))
+            segment.segment_metadata = json.dumps(source.get("segment_metadata") or {})
+        self.file.filename = "source-with-comments.docx"
+        self.file.document_parse_options = json.dumps(options)
+        for index, segment in enumerate(self.segments[:3]):
+            segment.target_text = ["Revised first sentence.", "Second revised sentence.", "Corrected table text"][index]
+            self.add_suggestion(batch, segment, segment.target_text, f"第{index + 1}句的整句修改建议")
+        self.db.commit()
+        path = Path(self.storage.name) / self.file.filename
+        path.write_bytes(raw)
+        with patch("app.services.file_record_service.get_file_record_source_path", return_value=path), \
+             patch("app.services.workflow_proofreading_export.get_file_record_source_path", return_value=path):
+            exported = self.build_revision_export(batch, release_transaction_before_render=True)
+        self.assertFalse(self.db.in_transaction())
+        comments = self.word_comments(exported.content)
+        self.assertEqual(set(comments), {"41", "42", "43", "44"})
+        self.assertEqual(comments["41"]["text"], "母版已有批注")
+        self.assertEqual(comments["41"]["author"], "原有审阅人")
+        self.assertEqual([comments[str(index)]["accepted"].strip() for index in (42, 43, 44)],
+            ["Revised first sentence.", "Second revised sentence.", "Corrected table text"])
+        self.assertEqual([comments[str(index)]["rejected"].strip() for index in (42, 43, 44)],
+            ["Traduction 0", "Traduction 1", "Traduction 2"])
+        self.assertEqual(comments["44"]["text"], "语言与格式：第3句的整句修改建议")
+        self.assertEqual(self.word_texts(exported.content)[0],
+            ["Revised first sentence. Second revised sentence.", "Corrected table text", "Traduction 3"])
+        self.assertEqual(path.read_bytes(), raw)
+
+    def test_comment_export_rejects_unlocatable_range_and_preserves_comment_free_exports(self):
+        from docx import Document
+        from app.services.docx_comments import SentenceComment, add_sentence_comments
+        document = Document()
+        document.add_paragraph("A plain paragraph")
+        stream = BytesIO()
+        document.save(stream)
+        raw = stream.getvalue()
+        self.assertEqual(add_sentence_comments(raw, []), raw)
+        with self.assertRaisesRegex(ValueError, "无法安全定位"):
+            add_sentence_comments(raw, [SentenceComment("missing-segment", 0, "无法定位的理由")])
 
 

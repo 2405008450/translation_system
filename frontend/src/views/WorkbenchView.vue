@@ -809,7 +809,7 @@ const workflowProofreadingExportChoices = computed(() => ([
   {
     format: 'proofreading_docx_revisions' as const,
     name: 'Word 校对修订版',
-    description: '导出完整译文，仅本阶段修改带可接受或拒绝的真实修订；Word 来源保留排版，其他来源按句段排版。',
+    description: '导出完整译文，包含修改建议批注和可接受或拒绝的校对修订；Word 来源保留排版，其他来源按句段排版。',
   },
 ]).map(choice => ({
   ...choice,
