@@ -6,6 +6,8 @@ from io import BytesIO
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
+from xml.etree import ElementTree as ET
+from zipfile import ZipFile
 
 from openpyxl import load_workbook
 from sqlalchemy import create_engine
@@ -384,5 +386,273 @@ class TranslationWorkflowProofreadingTests(WorkflowTestCase):
         self.assertIsNotNone(self.db.get(FileRecord, self.file.id))
         self.assertEqual(self.db.query(Segment).count(), 4)
         self.assertEqual(self.db.query(ProofreadingSegmentBaseline).count(), 0)
+
+    @staticmethod
+    def word_texts(content, accept=True):
+        from app.services.document_workspace import NS, _qn
+        with ZipFile(BytesIO(content)) as archive:
+            root = ET.fromstring(archive.read("word/document.xml"))
+        def collect(node):
+            if node.tag == _qn("w", "del" if accept else "ins"):
+                return ""
+            if node.tag in {_qn("w", "t"), _qn("w", "delText")}:
+                return node.text or ""
+            if node.tag == _qn("w", "tab"):
+                return "\t"
+            if node.tag == _qn("w", "br"):
+                return "\n"
+            return "".join(collect(child) for child in node)
+        return [collect(paragraph) for paragraph in root.findall(".//w:body//w:p", NS)], root
+
+    def build_revision_export(self, batch, **kwargs):
+        from app.services.file_export_queue import build_file_record_exported_file
+        return build_file_record_exported_file(
+            self.db, self.file, "proofreading_docx_revisions", **kwargs,
+        )
+
+    def test_non_word_revision_roundtrip_includes_whole_file_and_confirmed_changes(self):
+        batch = self.setup_workflow()
+        baselines = {row.segment_id: row for row in self.db.query(ProofreadingSegmentBaseline).all()}
+        baselines[self.segments[0].id].original_target_text = "旧文 résumé\n测试\t1"
+        self.segments[0].target_text = "新文 résumé\n测试\t2🙂"
+        self.segments[0].status = "confirmed"
+        baselines[self.segments[1].id].original_target_text = ""
+        self.segments[1].target_text = "Inserted text"
+        self.segments[2].target_text = ""
+        self.segments[3].target_text = "Earlier stage stays clean"
+        # 前序修订记录不应进入校对交付文档。
+        self.db.add(SegmentRevision(file_record_id=self.file.id, segment_id=self.segments[3].id,
+            sentence_id=self.segments[3].sentence_id, before_text="Earlier revision",
+            after_text="Earlier stage stays clean", status="pending", source="manual"))
+        batch.status = "partial_failed"
+        self.db.commit()
+        before_count = self.db.query(SegmentRevision).count()
+        exported = self.build_revision_export(batch)
+        accepted, root = self.word_texts(exported.content)
+        rejected, _ = self.word_texts(exported.content, False)
+        self.assertEqual(accepted, ["新文 résumé\n测试\t2🙂", "Inserted text", "", "Earlier stage stays clean"])
+        self.assertEqual(rejected, ["旧文 résumé\n测试\t1", "", "Traduction 2", "Earlier stage stays clean"])
+        from app.services.document_workspace import NS
+        self.assertTrue(root.findall(".//w:ins", NS))
+        self.assertTrue(root.findall(".//w:del", NS))
+        self.assertEqual(exported.filename, "source_校对修订版.docx")
+        self.assertEqual(self.db.query(SegmentRevision).count(), before_count)
+        self.assertEqual(batch.status, "partial_failed")
+
+    def test_unchanged_word_has_no_revision_marks(self):
+        batch = self.setup_workflow()
+        exported = self.build_revision_export(batch)
+        from app.services.document_workspace import NS
+        accepted, root = self.word_texts(exported.content)
+        self.assertEqual(accepted, [f"Traduction {index}" for index in range(4)])
+        self.assertFalse(root.findall(".//w:ins", NS))
+        self.assertFalse(root.findall(".//w:del", NS))
+
+    def test_docx_revision_preserves_layout_table_and_both_translation_versions(self):
+        from docx import Document
+        from app.services.document_workspace import parse_docx_workspace, NS
+        from pathlib import Path
+        batch = self.setup_workflow()
+        document = Document()
+        document.add_heading("Source heading", level=1)
+        document.add_paragraph("Source paragraph")
+        table = document.add_table(rows=1, cols=2)
+        table.cell(0, 0).text = "Source cell"
+        table.cell(0, 1).text = "Other stage"
+        stream = BytesIO()
+        document.save(stream)
+        raw = stream.getvalue()
+        parsed = parse_docx_workspace(raw)["segments"]
+        self.assertEqual(len(parsed), 4)
+        for segment, source in zip(self.segments, parsed):
+            for name in ("sentence_id", "source_text", "display_text", "block_type", "block_index", "row_index", "cell_index"):
+                setattr(segment, name, source.get(name))
+            metadata = source.get("segment_metadata")
+            segment.segment_metadata = json.dumps(metadata) if isinstance(metadata, dict) else metadata
+        self.file.filename = "layout.docx"
+        self.segments[0].target_text = "Revised heading"
+        self.segments[1].target_text = ""
+        self.segments[2].target_text = "Corrected cell"
+        self.db.commit()
+        source_path = Path(self.storage.name) / "layout.docx"
+        source_path.write_bytes(raw)
+        with patch("app.services.file_record_service.get_file_record_source_path", return_value=source_path), \
+             patch("app.services.workflow_proofreading_export.get_file_record_source_path", return_value=source_path):
+            exported = self.build_revision_export(batch)
+        accepted, root = self.word_texts(exported.content)
+        rejected, _ = self.word_texts(exported.content, False)
+        self.assertEqual(accepted, ["Revised heading", "", "Corrected cell", "Traduction 3"])
+        self.assertEqual(rejected, ["Traduction 0", "Traduction 1", "Traduction 2", "Traduction 3"])
+        self.assertEqual(len(root.findall(".//w:tbl", NS)), 1)
+        self.assertEqual(root.find(".//w:p/w:pPr/w:pStyle", NS).get(f"{{{NS['w']}}}val"), "Heading1")
+        self.assertEqual(source_path.read_bytes(), raw)
+
+    def test_revision_snapshot_survives_manual_edit_and_releases_transaction_before_render(self):
+        from app.services import workflow_proofreading_export as exporter
+        batch = self.setup_workflow()
+        self.segments[0].target_text = "Snapshot text"
+        self.db.commit()
+        render = exporter.render_workflow_proofreading_docx
+        def check(snapshot):
+            self.assertFalse(self.db.in_transaction())
+            self.assertIsInstance(snapshot.segments[0], dict)
+            # 渲染使用快照，不读取后台执行过程中发生的其他修改。
+            with Session(self.engine) as other:
+                other.get(Segment, snapshot.segments[0]["id"]).target_text = "Later saved edit"
+                other.commit()
+            return render(snapshot)
+        with patch.object(exporter, "render_workflow_proofreading_docx", side_effect=check):
+            exported = self.build_revision_export(batch, release_transaction_before_render=True)
+        self.assertEqual(self.word_texts(exported.content)[0][0], "Snapshot text")
+        self.assertFalse(self.db.in_transaction())
+
+    def test_revision_export_rejects_missing_baseline_and_duplicate_mapping(self):
+        batch = self.setup_workflow()
+        baseline = self.db.query(ProofreadingSegmentBaseline).filter_by(segment_id=self.segments[0].id).one()
+        self.db.delete(baseline)
+        self.db.commit()
+        with self.assertRaisesRegex(ValueError, "缺少比较基线"):
+            self.build_revision_export(batch)
+        self.segments[0].workflow_step_id = self.review_step.id
+        self.segments[1].sentence_id = self.segments[0].sentence_id
+        self.db.commit()
+        with self.assertRaisesRegex(ValueError, "标识缺失或重复"):
+            self.build_revision_export(batch)
+
+    def test_readiness_busy_failed_cancelled_and_missing_word_source(self):
+        from app.services.document_alignment.export import build_export_readiness
+        batch = self.setup_workflow()
+        for status in ("ready", "completed", "partial_failed", "failed", "canceled"):
+            batch.status = status
+            self.assertIn("proofreading_docx_revisions", build_export_readiness(self.db, batch)["available_formats"])
+        for status in ("queued", "running", "canceling"):
+            batch.status = status
+            readiness = build_export_readiness(self.db, batch)
+            self.assertEqual(readiness["available_formats"], [])
+            self.assertIn("proofreading_docx_revisions", readiness["unavailable_formats"])
+            with self.assertRaisesRegex(ValueError, "再导出"):
+                self.build_revision_export(batch)
+        batch.status = "ready"
+        self.file.filename = "missing.docx"
+        with patch("app.services.workflow_proofreading_export.get_file_record_source_path", return_value=None):
+            readiness = build_export_readiness(self.db, batch)
+            self.assertIn("proofreading_audit_xlsx", readiness["available_formats"])
+            self.assertNotIn("proofreading_docx_revisions", readiness["available_formats"])
+            self.assertIn("源文件缺失", readiness["unavailable_formats"]["proofreading_docx_revisions"])
+            with self.assertRaisesRegex(ValueError, "源文件缺失"):
+                self.build_revision_export(batch)
+
+    def test_revision_export_uses_refreshed_baseline_after_return_and_reentry(self):
+        from app.services.workflow_proofreading import prepare_workflow_proofreading
+        batch = self.setup_workflow()
+        self.segments[0].target_text = "First proofread pass"
+        self.segments[0].workflow_step_id = self.review_step.id
+        self.db.commit()
+        exported = self.build_revision_export(batch)
+        self.assertEqual(self.word_texts(exported.content, False)[0][0], "First proofread pass")
+        self.segments[0].target_text = "New review baseline"
+        self.segments[0].workflow_step_id = self.proofread_step.id
+        prepare_workflow_proofreading(self.db, self.file, self.user, refresh_segment_ids={self.segments[0].id})
+        self.segments[0].target_text = "Second proofreading result"
+        self.db.commit()
+        exported = self.build_revision_export(batch)
+        self.assertEqual(self.word_texts(exported.content, False)[0][0], "New review baseline")
+        self.assertEqual(self.word_texts(exported.content)[0][0], "Second proofreading result")
+
+    def test_excel_report_releases_transaction_and_preserves_columns_and_order(self):
+        from app.services.file_export_queue import build_file_record_exported_file
+        batch = self.setup_workflow()
+        self.segments[0].target_text = "Saved edit"
+        self.segments[0].status = "confirmed"
+        self.db.commit()
+        exported = build_file_record_exported_file(
+            self.db, self.file, "proofreading_audit_xlsx", release_transaction_before_render=True,
+        )
+        self.assertFalse(self.db.in_transaction())
+        workbook = load_workbook(BytesIO(exported.content))
+        rows = list(workbook.active.values)
+        self.assertEqual(rows[0], ("序号", "原文", "进入校对时译文", "当前译文", "是否修改", "确认状态", "修改建议或失败原因"))
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[1][2:6], ("Traduction 0", "Saved edit", "是", "已确认"))
+        self.assertEqual([row[1] for row in rows[1:]], [f"source {index}" for index in range(3)])
+        workbook.close()
+
+    def test_revision_export_endpoint_checks_access_busy_state_and_warning_ack(self):
+        from fastapi import HTTPException
+        from app.routers.proofreading import (
+            ProofreadingExportTaskRequest, create_proofreading_export_task, get_proofreading_export_readiness,
+        )
+        batch = self.setup_workflow()
+        outsider = User(username="unassigned", hashed_password="x", role="user", translator_type="external")
+        self.db.add(outsider)
+        self.db.commit()
+        payload = ProofreadingExportTaskRequest(format="proofreading_docx_revisions", acknowledge_warnings=True)
+        with patch("app.routers.proofreading.queue_file_export", return_value={"task_id": "test"}) as queue:
+            with self.assertRaises(HTTPException) as error:
+                get_proofreading_export_readiness(batch.id, self.db, outsider)
+            self.assertEqual(error.exception.status_code, 404)
+            with self.assertRaises(HTTPException) as error:
+                create_proofreading_export_task(batch.id, payload, self.db, outsider)
+            self.assertEqual(error.exception.status_code, 404)
+            queue.assert_not_called()
+            assigned, _ = self.assign("assigned-exporter", 1, 2)
+            batch.status = "running"
+            with self.assertRaises(HTTPException) as error:
+                create_proofreading_export_task(batch.id, payload, self.db, assigned)
+            self.assertEqual(error.exception.status_code, 409)
+            batch.status = "failed"
+            with self.assertRaises(HTTPException) as error:
+                create_proofreading_export_task(batch.id,
+                    ProofreadingExportTaskRequest(format="proofreading_docx_revisions"), self.db, assigned)
+            self.assertEqual(error.exception.status_code, 409)
+            response = create_proofreading_export_task(batch.id, payload, self.db, assigned)
+            self.assertEqual(response.status_code, 202)
+            self.assertEqual(queue.call_args.kwargs["export_type"], "proofreading_docx_revisions")
+            self.assertEqual(queue.call_args.kwargs["file_record_id"], self.file.id)
+
+    def test_docx_hyperlink_changes_cannot_silently_lose_revision_marks(self):
+        from docx import Document
+        from docx.oxml import OxmlElement
+        from app.services.document_workspace import parse_docx_workspace, _qn
+        from app.services.task_file_service import export_translated_task_file
+        document = Document()
+        paragraph = document.add_paragraph()
+        hyperlink = OxmlElement("w:hyperlink")
+        hyperlink.set(_qn("w", "anchor"), "bookmark")
+        run = OxmlElement("w:r")
+        text = OxmlElement("w:t")
+        text.text = "Source hyperlink text"
+        run.append(text)
+        hyperlink.append(run)
+        paragraph._p.append(hyperlink)
+        stream = BytesIO()
+        document.save(stream)
+        raw = stream.getvalue()
+        segments = parse_docx_workspace(raw)["segments"]
+        self.assertEqual(len(segments), 1)
+        segments[0]["target_text"] = "Corrected translation"
+        revisions = [{"id": "proofreading-test", "sentence_id": segments[0]["sentence_id"],
+                      "before_text": "Review translation", "after_text": "Corrected translation",
+                      "status": "pending", "source": "manual"}]
+        with self.assertRaisesRegex(ValueError, "无法安全写入真实校对修订"):
+            export_translated_task_file(raw, "hyperlink.docx", segments, revisions=revisions,
+                include_revision_marks=True, require_revision_marks=True)
+        # 原有普通翻译导出继续保留既有降级行为。
+        self.assertTrue(export_translated_task_file(raw, "hyperlink.docx", segments,
+            revisions=revisions, include_revision_marks=True).content)
+
+    def test_excel_and_ppt_sources_export_ordered_revision_word_without_source_file(self):
+        batch = self.setup_workflow()
+        self.segments[0].target_text = "Corrected translation"
+        self.db.commit()
+        for filename in ("sheet.xlsx", "slides.pptx"):
+            self.file.filename = filename
+            self.db.commit()
+            with patch("app.services.workflow_proofreading_export.get_file_record_source_path", return_value=None):
+                exported = self.build_revision_export(batch)
+            self.assertEqual(self.word_texts(exported.content)[0],
+                ["Corrected translation", "Traduction 1", "Traduction 2", "Traduction 3"])
+            self.assertEqual(self.word_texts(exported.content, False)[0],
+                [f"Traduction {index}" for index in range(4)])
 
 

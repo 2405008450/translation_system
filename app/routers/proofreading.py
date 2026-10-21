@@ -84,6 +84,7 @@ class ProofreadingGenerateRequest(BaseModel):
 
 class ProofreadingExportTaskRequest(BaseModel):
     format: Literal[
+        "proofreading_docx_revisions",
         "proofreading_docx_target_revisions",
         "proofreading_docx_layout",
         "proofreading_docx_ordered",
@@ -405,6 +406,9 @@ def create_proofreading_export_task(
         raise HTTPException(status_code=409, detail="请先完成或结束当前解析、对齐或校对任务再导出。")
     readiness = build_export_readiness(db, batch)
     if payload.format not in readiness["available_formats"]:
+        reason = readiness.get("unavailable_formats", {}).get(payload.format)
+        if reason:
+            raise HTTPException(status_code=400, detail=reason)
         if payload.format == "proofreading_docx_target_revisions":
             raise HTTPException(
                 status_code=400,

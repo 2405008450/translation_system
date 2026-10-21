@@ -589,6 +589,7 @@ class ExportConsumption:
     count: int = 0
     order_check: ExportOrderCheck | None = None
     order_exempt_reason: str | None = None
+    revision_marks_written: bool = False
 
 
 @dataclass(frozen=True)
@@ -744,6 +745,7 @@ def export_translated_docx(
     target_language: str | None = None,
     revisions: Iterable[Any] | None = None,
     include_revision_marks: bool = False,
+    require_revision_marks: bool = False,
 ) -> bytes:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
@@ -791,6 +793,17 @@ def export_translated_docx(
         )
 
     _assert_all_segments_consumed(segments_by_block)
+    if require_revision_marks:
+        written = {
+            segment.sentence_id for group in segments_by_block.values() for segment in group
+            if segment.consumption.revision_marks_written
+        }
+        missing = set(revisions_by_sentence_id) - written
+        if missing:
+            raise ValueError(
+                "部分句段的公式、链接或结构变化无法安全写入真实校对修订，请使用 Excel 校对报告检查："
+                + "、".join(sorted(missing)[:10])
+            )
 
     _localize_numbering_definitions(
         package,
@@ -820,6 +833,44 @@ def export_translated_docx(
         package=package,
         part_names=modified_part_names,
     )
+
+
+def export_revision_paragraphs_docx(
+    segments: Iterable[Mapping[str, Any]],
+    revisions: Iterable[Any],
+    *,
+    target_language: str | None = None,
+) -> bytes:
+    """非 Word 来源按句段生成完整译文，共用真实修订的差异和 OOXML 写入逻辑。"""
+    from docx import Document
+    from docx.oxml import OxmlElement, parse_xml
+    from docx.shared import Pt
+
+    document = Document()
+    revision_map = _build_export_revision_lookup(revisions)
+    for item in segments:
+        sentence_id = str(item["sentence_id"])
+        text = str(item.get("target_text") or "")
+        paragraph = document.add_paragraph()
+        paragraph.paragraph_format.space_after = Pt(8)
+        segment = ExportSegment(
+            sentence_id=sentence_id, source_text="", target_text=text,
+            revision=revision_map.get(sentence_id),
+        )
+        for node in _build_word_revision_nodes(segment, None):
+            paragraph._p.append(parse_xml(ET.tostring(node, encoding="utf-8")))
+        if is_right_to_left_language(target_language):
+            paragraph._p.get_or_add_pPr().append(OxmlElement("w:bidi"))
+    if revision_map:
+        settings = document.settings.element
+        view = OxmlElement("w:revisionView")
+        view.set(_qn("w", "markup"), "1")
+        view.set(_qn("w", "insDel"), "1")
+        settings.insert(0, view)
+        settings.insert(1, OxmlElement("w:trackRevisions"))
+    output = BytesIO()
+    document.save(output)
+    return output.getvalue()
 
 
 def build_translated_docx_filename(filename: str) -> str:
@@ -3409,6 +3460,7 @@ def _build_word_revision_nodes(
         for run in runs:
             wrapper.append(run)
         nodes.append(wrapper)
+        segment.consumption.revision_marks_written = True
     return nodes
 
 

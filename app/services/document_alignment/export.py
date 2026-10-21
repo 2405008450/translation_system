@@ -184,6 +184,7 @@ def export_batch_is_busy(batch: ProofreadingBatch) -> bool:
 def build_export_readiness(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
     rows, file_record = build_proofreading_export_rows(db, batch)
     stage = getattr(batch, "workflow_stage", "not_applicable")
+    unavailable_formats: dict[str, str] = {}
     if batch.batch_kind == "document_pair":
         available_formats = ["proofreading_audit_xlsx"]
         if stage == "proofreading" and is_xlsx_pair(batch):
@@ -201,12 +202,22 @@ def build_export_readiness(db: Session, batch: ProofreadingBatch) -> dict[str, A
                 available_formats.insert(0, "proofreading_docx_target_revisions")
     elif batch.batch_kind == "workflow_segments":
         available_formats = ["proofreading_audit_xlsx"]
+        from app.services.workflow_proofreading_export import workflow_revision_export_unavailable_reason
+        reason = workflow_revision_export_unavailable_reason(file_record)
+        if not rows:
+            reason = "当前文件没有处于校对阶段的句段。"
+        if reason:
+            unavailable_formats["proofreading_docx_revisions"] = reason
+        else:
+            available_formats.append("proofreading_docx_revisions")
     else:
         available_formats = ["proofreading_xlsx_original"]
     if batch.batch_kind == "document_pair" and stage in {"alignment", "proofreading"}:
         if "proofreading_docx_ordered" not in available_formats:
             available_formats.append("proofreading_docx_ordered")
     if export_batch_is_busy(batch):
+        for format_name in available_formats:
+            unavailable_formats[format_name] = "请先完成或结束当前解析、对齐或校对任务再导出。"
         available_formats = []
     return {
         "batch_id": str(batch.id),
@@ -218,6 +229,7 @@ def build_export_readiness(db: Session, batch: ProofreadingBatch) -> dict[str, A
         "translation_only_unreviewed": sum(row.kind == "增译" and row.llm_status == "未校对" for row in rows),
         "llm_failed": int(batch.failed_segments or 0),
         "available_formats": available_formats,
+        "unavailable_formats": unavailable_formats,
         "has_warnings": any((
             any(row.confirmation_status != "已确认" for row in rows),
             any(row.kind == "缺译" for row in rows),
@@ -614,7 +626,9 @@ def export_alignment_csv(pairs: list[DocumentAlignmentPair]) -> bytes:
     return ("\ufeff" + output.getvalue()).encode("utf-8")
 
 
-def export_workflow_proofreading_xlsx(db: Session, batch: ProofreadingBatch) -> tuple[bytes, str]:
+def export_workflow_proofreading_xlsx(
+    db: Session, batch: ProofreadingBatch, *, release_transaction_before_render: bool = False,
+) -> tuple[bytes, str]:
     """普通工作流的校对报告，使用原句段顺序及当前有效校对基线。"""
     from app.models import TranslationReviewReport
 
@@ -637,6 +651,10 @@ def export_workflow_proofreading_xlsx(db: Session, batch: ProofreadingBatch) -> 
     reason_by_position = {
         baseline.row_index: reason_by_id.get(segment.id, "") for baseline, segment in baselines
     }
+    filename = f"{Path(file.filename if file else batch.filename).stem}_校对报告.xlsx"
+    if release_transaction_before_render:
+        db.expunge_all()
+        db.rollback()
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "校对报告"
@@ -663,7 +681,7 @@ def export_workflow_proofreading_xlsx(db: Session, batch: ProofreadingBatch) -> 
     output = BytesIO()
     workbook.save(output)
     workbook.close()
-    return output.getvalue(), f"{Path(file.filename if file else batch.filename).stem}_校对报告.xlsx"
+    return output.getvalue(), filename
 
 
 def export_document_pair_xlsx(db: Session, batch: ProofreadingBatch) -> tuple[bytes, str]:

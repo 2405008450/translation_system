@@ -55,6 +55,7 @@ FILE_EXPORT_POLL_INTERVAL_SECONDS = 0.3
 FILE_EXPORT_WAIT_TIMEOUT_SECONDS = 30 * 60
 LANGUAGE_TAGGED_EXPORT_TYPES = {"tmx", "xliff", "xliff2"}
 PROOFREADING_EXPORT_TYPES = {
+    "proofreading_docx_revisions",
     "proofreading_docx_target_revisions",
     "proofreading_docx_layout",
     "proofreading_docx_ordered",
@@ -629,6 +630,18 @@ def build_file_record_exported_file(
         if export_batch_is_busy(batch):
             raise ValueError("请先完成或结束当前解析、对齐或校对任务再导出。")
 
+        if export_type == "proofreading_docx_revisions":
+            from app.services.workflow_proofreading_export import (
+                prepare_workflow_proofreading_export, render_workflow_proofreading_docx,
+            )
+            snapshot = prepare_workflow_proofreading_export(db, batch, file_record)
+            _release_read_transaction(db, enabled=release_transaction_before_render)
+            content, filename = render_workflow_proofreading_docx(snapshot)
+            return _GenericExportedFile(
+                content=content,
+                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                filename=filename,
+            )
         if export_type == "proofreading_docx_target_revisions":
             content, filename = export_target_docx_with_revisions(db, batch)
             return _GenericExportedFile(
@@ -653,7 +666,13 @@ def build_file_record_exported_file(
         if export_type == "proofreading_audit_xlsx":
             if batch.batch_kind not in {"document_pair", "workflow_segments"}:
                 raise ValueError("当前批次不支持校对报告导出。")
-            content, filename = export_document_pair_xlsx(db, batch)
+            if batch.batch_kind == "workflow_segments":
+                from app.services.document_alignment.export import export_workflow_proofreading_xlsx
+                content, filename = export_workflow_proofreading_xlsx(
+                    db, batch, release_transaction_before_render=release_transaction_before_render,
+                )
+            else:
+                content, filename = export_document_pair_xlsx(db, batch)
         elif export_type == "proofreading_xlsx_target":
             content, filename = export_target_xlsx(db, batch)
         else:

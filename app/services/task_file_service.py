@@ -823,6 +823,7 @@ def export_translated_task_file(
     target_language: str | None = None,
     revisions: list[Any] | None = None,
     include_revision_marks: bool = False,
+    require_revision_marks: bool = False,
 ) -> ExportedTaskFile:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
@@ -846,6 +847,7 @@ def export_translated_task_file(
                 target_language=target_language,
                 revisions=revisions,
                 include_revision_marks=include_revision_marks,
+                **({"require_revision_marks": True} if require_revision_marks else {}),
             ),
             media_type=DOCX_MEDIA_TYPE,
             filename=build_translated_docx_filename(export_filename),

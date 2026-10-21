@@ -83,6 +83,7 @@ import WorkbenchTermsPanel from '../components/WorkbenchTermsPanel.vue'
 import ReferencePanel from '../components/ReferencePanel.vue'
 import TranslationReviewPanel from '../components/TranslationReviewPanel.vue'
 import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
+import WorkflowProofreadingExportOptions from '../components/WorkflowProofreadingExportOptions.vue'
 import { http } from '../api/http'
 import {
   deleteAlignmentPair,
@@ -108,6 +109,7 @@ import {
   reopenAlignment,
   type ProofreadingBatch,
   type ProofreadingExportFormat,
+  type ProofreadingExportReadiness,
 } from '../api/proofreading'
 import {
   createMergeViewQAResult,
@@ -452,6 +454,9 @@ const proofreadingExporting = ref(false)
 const proofreadingExportProgress = ref(0)
 const proofreadingExportStatus = ref<ProofreadingBatch['export_status']>('idle')
 const showProofreadingExportMenu = ref(false)
+const workflowExportReadiness = ref<ProofreadingExportReadiness | null>(null)
+const workflowExportReadinessError = ref('')
+const loadingWorkflowExportReadiness = ref(false)
 type ProofreadingProvider = 'auto' | 'deepseek' | 'openrouter'
 type ProofreadingRetryScope = 'all' | 'failed_only'
 const showProofreadingGenerateDialog = ref(false)
@@ -795,15 +800,54 @@ const orderedWordExportChoice = {
   description: '按当前对齐顺序逐条导出，每条先原文、后译文，上下分段显示。',
 }
 
+const workflowProofreadingExportChoices = computed(() => ([
+  {
+    format: 'proofreading_audit_xlsx' as const,
+    name: 'Excel 校对报告',
+    description: '导出当前校对阶段的原文、校对前后译文、确认状态和修改理由。',
+  },
+  {
+    format: 'proofreading_docx_revisions' as const,
+    name: 'Word 校对修订版',
+    description: '导出完整译文，仅本阶段修改带可接受或拒绝的真实修订；Word 来源保留排版，其他来源按句段排版。',
+  },
+]).map(choice => ({
+  ...choice,
+  disabledReason: workflowExportReadiness.value?.available_formats.includes(choice.format)
+    ? ''
+    : workflowExportReadiness.value?.unavailable_formats?.[choice.format]
+      || workflowExportReadinessError.value
+      || (loadingWorkflowExportReadiness.value ? '正在检查导出条件…' : '当前批次不支持此格式。'),
+})))
+
+async function loadWorkflowExportReadiness() {
+  const batchId = proofreadingContext.value?.batch_id
+  if (!batchId) return
+  workflowExportReadiness.value = null
+  workflowExportReadinessError.value = ''
+  loadingWorkflowExportReadiness.value = true
+  try {
+    const readiness = await getProofreadingExportReadiness(batchId)
+    if (proofreadingContext.value?.batch_id === batchId) workflowExportReadiness.value = readiness
+  } catch (error) {
+    workflowExportReadinessError.value = getErrorMessage(error, '无法获取导出条件，请重新打开菜单。')
+  } finally {
+    loadingWorkflowExportReadiness.value = false
+  }
+}
+
+async function toggleWorkflowProofreadingExportMenu() {
+  if (proofreadingExportBlocked.value) return
+  showExportMenu.value = false
+  showProofreadingExportMenu.value = !showProofreadingExportMenu.value
+  if (showProofreadingExportMenu.value) await loadWorkflowExportReadiness()
+}
+
 const proofreadingExportChoices = computed<Array<{
   format: ProofreadingExportFormat
   name: string
   description: string
-}>>(() => hasWorkflowProofreading.value ? [{
-  format: 'proofreading_audit_xlsx',
-  name: 'Excel 校对报告',
-  description: '导出当前校对阶段句段的原译文、校对后译文和修改理由。',
-}] : proofreadingContext.value?.pair_format === 'xlsx' ? [
+}>>(() => hasWorkflowProofreading.value ? workflowProofreadingExportChoices.value : proofreadingContext.value?.pair_format === 'xlsx' ? [
   orderedWordExportChoice,
   {
     format: 'proofreading_audit_xlsx',
@@ -857,6 +901,7 @@ async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
   const batchId = proofreadingContext.value?.batch_id
   if (proofreadingExportBlocked.value || !batchId) return
   showProofreadingExportMenu.value = false
+  showExportMenu.value = false
   proofreadingExporting.value = true
   proofreadingExportProgress.value = 0
   pageError.value = ''
@@ -866,9 +911,9 @@ async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
     }
     const readiness = await getProofreadingExportReadiness(batchId)
     if (!readiness.available_formats.includes(format)) {
-      throw new Error(format === 'proofreading_docx_target_revisions'
+      throw new Error(readiness.unavailable_formats?.[format] || (format === 'proofreading_docx_target_revisions'
         ? '该批次未保存目标 DOCX 原件，无法导出目标原格式修订版。请重新导入双文档。'
-        : '当前批次不支持所选导出格式。')
+        : '当前批次不支持所选导出格式。'))
     }
     let acknowledgeWarnings = false
     if (readiness.has_warnings && format !== 'proofreading_audit_xlsx') {
@@ -878,7 +923,7 @@ async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
           `总计 ${readiness.total} 条，未确认 ${readiness.unconfirmed} 条。`,
           `缺译 ${readiness.missing_translation} 条，增译 ${readiness.translation_only} 条，`,
           `其中未校对增译 ${readiness.translation_only_unreviewed} 条，LLM 失败 ${readiness.llm_failed} 条。`,
-          '仍然导出时，缺译会被明确标记。',
+          '仍然导出时，空白译文会明确标记；有删除修订的内容接受修订后为空。',
         ].join(''),
         confirmText: '仍然导出',
         cancelText: '返回检查',
@@ -902,7 +947,9 @@ async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
       task.filename || '双语校对版',
     )
     downloadBlob(response.data, filename)
-    const successMessage = format === 'proofreading_docx_target_revisions'
+    const successMessage = format === 'proofreading_docx_revisions'
+      ? '已导出 Word 校对修订版'
+      : format === 'proofreading_docx_target_revisions'
       ? '已导出目标原格式 Word（含修订）'
       : format === 'proofreading_docx_layout'
       ? filename.includes('顺序优先') || filename.endsWith('_上下对照.docx')
@@ -911,7 +958,7 @@ async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
       : format === 'proofreading_docx_ordered'
         ? '已导出上下对照 Word'
         : format === 'proofreading_audit_xlsx'
-          ? '已导出原文译文对齐表'
+          ? hasWorkflowProofreading.value ? '已导出 Excel 校对报告' : '已导出原文译文对齐表'
           : '已导出校对版 Excel（保留原工作簿）'
     toast.success(successMessage)
   } catch (error) {
@@ -3090,11 +3137,12 @@ const targetPreviewSupported = computed(() => {
 })
 
 const exportButtonLabel = computed(() => (
-  exporting.value ? `导出中 ${exportProgress.value}%` : t('common.actions.export')
+  proofreadingExporting.value ? proofreadingExportButtonLabel.value
+    : exporting.value ? `导出中 ${exportProgress.value}%` : t('common.actions.export')
 ))
 
 const exportButtonTitle = computed(() => (
-  exporting.value
+  proofreadingExporting.value ? proofreadingExportButtonLabel.value : exporting.value
     ? (exportMessage.value || `导出中 ${exportProgress.value}%`)
     : `${t('common.actions.export')} ${getTaskExportFormatLabel(segmentStore.fileRecord?.filename)}`
 ))
@@ -7334,7 +7382,7 @@ const alignmentRedoStack = alignmentOperations.redoStack
 const alignmentRefreshPending = alignmentOperations.pendingRefresh
 const alignmentStructureBusy = computed(() => alignmentAdvancing.value || alignmentOperations.busy.value || Boolean(alignmentRefreshPending.value) || proofreadingExporting.value)
 const proofreadingExportBlocked = computed(() => (
-  proofreadingExporting.value || manualSaving.value || !proofreadingContext.value?.batch_id
+  proofreadingExporting.value || exporting.value || manualSaving.value || !proofreadingContext.value?.batch_id
   || ['aligning', 'queued', 'running', 'canceling'].includes(proofreadingContext.value?.batch_status || '')
   || (isAlignmentWorkbench.value && alignmentStructureBusy.value)
 ))
@@ -9210,7 +9258,7 @@ async function loadExportOptions() {
 }
 
 async function toggleExportMenu() {
-  if (exporting.value) {
+  if (exporting.value || proofreadingExporting.value) {
     return
   }
   if (showExportMenu.value) {
@@ -9219,7 +9267,8 @@ async function toggleExportMenu() {
   }
 
   // 加载导出选项
-  await loadExportOptions()
+  showProofreadingExportMenu.value = false
+  await Promise.all([loadExportOptions(), ...(hasWorkflowProofreading.value ? [loadWorkflowExportReadiness()] : [])])
   showExportMenu.value = true
 }
 
@@ -9265,7 +9314,7 @@ async function exportWithTypeForFile(
   wordExportMode: WordExportMode = 'standard',
 ) {
   const targetFileRecordId = fileRecordId || segmentStore.fileRecord?.id || ''
-  if (!targetFileRecordId || exporting.value) return
+  if (!targetFileRecordId || exporting.value || proofreadingExporting.value) return
 
   pageError.value = ''
   exporting.value = true
@@ -10114,16 +10163,21 @@ onBeforeRouteLeave(async () => {
               class="workbench-ribbon__top-action"
               data-testid="workbench-export-button"
               type="button"
-              :disabled="!segmentStore.canExport || exporting"
+              :disabled="(!segmentStore.canExport && !hasWorkflowProofreading) || exporting || proofreadingExporting"
               :title="exportButtonTitle"
               @click="toggleExportMenu"
             >
-              <Loader2 v-if="exporting" class="lucide-spin" :size="15" />
+              <Loader2 v-if="exporting || proofreadingExporting" class="lucide-spin" :size="15" />
               <Download v-else :size="15" />
               <span>{{ exportButtonLabel }}</span>
               <ChevronDown :size="12" />
             </button>
             <div v-if="showExportMenu" class="export-dropdown__menu">
+              <WorkflowProofreadingExportOptions v-if="hasWorkflowProofreading"
+                :choices="workflowProofreadingExportChoices" :disabled="proofreadingExportBlocked"
+                @export="void exportProofreadingWithFormat($event)" />
+              <component :is="hasWorkflowProofreading ? 'details' : 'div'" class="export-dropdown__other">
+              <summary v-if="hasWorkflowProofreading" class="export-dropdown__group-title">其他导出</summary>
               <div class="export-dropdown__group">
                 <div class="export-dropdown__group-title">文件名翻译</div>
                 <div class="export-dropdown__filename-translate">
@@ -10199,6 +10253,7 @@ onBeforeRouteLeave(async () => {
                   </template>
                 </div>
               </template>
+              </component>
             </div>
           </div>
         </div>
@@ -11033,11 +11088,11 @@ onBeforeRouteLeave(async () => {
               class="button workbench-action workbench-action--export"
               data-testid="workbench-export-button-toolbar"
               type="button"
-              :disabled="!segmentStore.canExport || exporting"
+              :disabled="(!segmentStore.canExport && !hasWorkflowProofreading) || exporting || proofreadingExporting"
               :title="exportButtonTitle"
               @click="toggleExportMenu"
             >
-              <Loader2 v-if="exporting" class="lucide-spin" :size="14" />
+              <Loader2 v-if="exporting || proofreadingExporting" class="lucide-spin" :size="14" />
               <Download v-else :size="14" />
               {{ exportButtonLabel }}
               <ChevronDown :size="12" />
@@ -11052,6 +11107,11 @@ onBeforeRouteLeave(async () => {
               {{ t('workbench.exportStyleSettings.button') }}
             </button>
             <div v-if="showExportMenu" class="export-dropdown__menu">
+              <WorkflowProofreadingExportOptions v-if="hasWorkflowProofreading"
+                :choices="workflowProofreadingExportChoices" :disabled="proofreadingExportBlocked"
+                @export="void exportProofreadingWithFormat($event)" />
+              <component :is="hasWorkflowProofreading ? 'details' : 'div'" class="export-dropdown__other">
+              <summary v-if="hasWorkflowProofreading" class="export-dropdown__group-title">其他导出</summary>
               <div class="export-dropdown__group">
                 <div class="export-dropdown__group-title">文件名翻译</div>
                 <div class="export-dropdown__filename-translate">
@@ -11127,6 +11187,7 @@ onBeforeRouteLeave(async () => {
                   </template>
                 </div>
               </template>
+              </component>
             </div>
           </div>
 
@@ -11329,8 +11390,23 @@ onBeforeRouteLeave(async () => {
             <Bot :size="14" />{{ proofreadingGenerationButtonLabel }}
           </button>
           <button v-if="proofreadingContext?.can_cancel && ['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')" class="button" type="button" @click="void cancelCurrentProofreading()">取消校对</button>
-          <button class="button" type="button" :disabled="proofreadingExportBlocked" @click="void exportProofreadingWithFormat('proofreading_audit_xlsx')">导出校对报告</button>
+          <div class="export-dropdown">
+            <button class="button" type="button" data-testid="workflow-proofreading-export-button"
+              :disabled="proofreadingExportBlocked" @click.stop="void toggleWorkflowProofreadingExportMenu()">
+              <Loader2 v-if="proofreadingExporting" class="lucide-spin" :size="14" />
+              <Download v-else :size="14" />{{ proofreadingExporting ? proofreadingExportButtonLabel : '导出校对文件' }}<ChevronDown :size="12" />
+            </button>
+            <div v-if="showProofreadingExportMenu" class="export-dropdown__menu">
+              <WorkflowProofreadingExportOptions :choices="workflowProofreadingExportChoices" :disabled="proofreadingExportBlocked"
+                @export="void exportProofreadingWithFormat($event)" />
+            </div>
+          </div>
           <button class="button" type="button" @click="toggleProofreadingRevisionVisible">{{ proofreadingDiffVisible ? '隐藏修订' : '显示修订' }}</button>
+        </div>
+        <div v-if="hasWorkflowProofreading && proofreadingExporting" class="workflow-proofreading-actions"
+          role="progressbar" aria-label="校对文件导出进度" aria-valuemin="0" aria-valuemax="100"
+          :aria-valuenow="Math.round(proofreadingExportProgress)">
+          {{ proofreadingExportButtonLabel }} · {{ Math.round(proofreadingExportProgress) }}%
         </div>
         <div class="panel-header panel-header--compact segment-editor-toolbar">
           <div class="segment-editor-toolbar__title">
@@ -20094,6 +20170,8 @@ onBeforeRouteLeave(async () => {
   color: #6b7c85;
   font-size: 13px;
 }
+
+.export-dropdown__other > summary { cursor: pointer; padding: 10px 12px; border-top: 1px solid #edf0f2; }
 
 .export-dropdown__group + .export-dropdown__group {
   margin-top: 8px;

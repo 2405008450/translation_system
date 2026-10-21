@@ -92,6 +92,7 @@ export interface ProofreadingBatch {
 }
 
 export type ProofreadingExportFormat =
+  | 'proofreading_docx_revisions'
   | 'proofreading_docx_target_revisions'
   | 'proofreading_docx_layout'
   | 'proofreading_docx_ordered'
@@ -109,6 +110,7 @@ export interface ProofreadingExportReadiness {
   translation_only_unreviewed: number
   llm_failed: number
   available_formats: ProofreadingExportFormat[]
+  unavailable_formats?: Partial<Record<ProofreadingExportFormat, string>>
   has_warnings: boolean
 }
 
