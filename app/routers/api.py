@@ -12995,7 +12995,7 @@ def preview_file_record_workflow_transition(
         file_record_id,
         payload,
     )
-    matched_count = query.count()
+    matched_count = len(_filter_writable_segments(db, file_record, current_user, query.all()))
     return {
         "file_record_id": str(file_record_id),
         "from_step": _serialize_workflow_step(from_step),
@@ -13007,26 +13007,15 @@ def preview_file_record_workflow_transition(
     }
 
 
-@router.post("/file-records/{file_record_id}/workflow/transition")
-def transition_file_record_workflow(
-    file_record_id: UUID,
+def _execute_workflow_transition(
+    db: Session,
+    file_record: FileRecord,
+    segments: list[Segment],
+    target_step: ProjectWorkflowStep,
     payload: WorkflowTransitionRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+    current_user: User,
 ):
-    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
-    from_step, target_step = _resolve_workflow_transition_context(db, file_record, payload, current_user)
-    segments = _order_segment_query(
-        _apply_workflow_transition_filters(
-            db,
-            db.query(Segment),
-            file_record_id,
-            payload,
-        ),
-        file_record,
-    ).all()
+    """复用单文件与合并视图的流转副作用，由调用方统一提交事务。"""
     matched_count = len(segments)
     updated_count = 0
     confirmed_segments: list[Segment] = []
@@ -13053,7 +13042,34 @@ def transition_file_record_workflow(
             current_user=current_user,
         )
     if updated_count:
-        sync_file_record_status(db, file_record_id)
+        sync_file_record_status(db, file_record.id)
+    return matched_count, updated_count, auto_tm_summary
+
+
+@router.post("/file-records/{file_record_id}/workflow/transition")
+def transition_file_record_workflow(
+    file_record_id: UUID,
+    payload: WorkflowTransitionRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    from_step, target_step = _resolve_workflow_transition_context(db, file_record, payload, current_user)
+    segments = _order_segment_query(
+        _apply_workflow_transition_filters(
+            db,
+            db.query(Segment),
+            file_record_id,
+            payload,
+        ),
+        file_record,
+    ).all()
+    segments = _filter_writable_segments(db, file_record, current_user, segments)
+    matched_count, updated_count, auto_tm_summary = _execute_workflow_transition(
+        db, file_record, segments, target_step, payload, current_user,
+    )
     db.commit()
     _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
     return {
@@ -14967,12 +14983,25 @@ def get_merge_view_detail(
     files = _get_visible_merge_view_files(db, view, current_user)
     _require_merge_view_openable_files(files, current_user)
     payload = serialize_merge_view_detail(db, view, files)
+    payload["workflow_steps"] = [
+        _serialize_workflow_step(step) for step in _load_project_workflow_steps(db, project.id)
+    ]
     if not can_access_all_projects(current_user):
         visible_ids = [str(file_record.id) for file_record in files]
         payload["file_ids"] = visible_ids
         payload["total_files"] = len(files)
     payload["can_manage"] = _can_manage_merge_view(view, current_user)
     file_workflow_progress = _get_file_workflow_progress(db, [file_record.id for file_record in files])
+    active_step_ids = set()
+    for file_record in files:
+        query = _apply_segment_assignment_visibility_filter(
+            db, db.query(Segment.workflow_step_id).filter(Segment.file_record_id == file_record.id),
+            file_record, current_user,
+        )
+        active_step_ids.update(step_id for (step_id,) in query.distinct().all())
+    first_step_id = _get_first_workflow_step_id(db, project.id)
+    payload["workflow_active_step_ids"] = [str(step_id or first_step_id) for step_id in active_step_ids
+                                           if step_id or first_step_id]
     for file_payload, file_record in zip(payload.get("files", []), files):
         collection_ids = _load_file_record_collection_ids(file_record)
         term_base_ids = _load_file_record_term_base_ids(file_record)
@@ -14993,6 +15022,117 @@ def get_merge_view_detail(
                 file_payload.get("progress", 0),
             )
     return payload
+
+
+def _collect_merge_workflow_transition(
+    db: Session,
+    view_id: UUID,
+    payload: WorkflowTransitionPreviewRequest,
+    current_user: User,
+    *,
+    for_update: bool = False,
+):
+    from app.services.merge_view_service import compute_merge_display_offsets
+
+    _view, project, files = _get_merge_view_context(db, view_id, current_user)
+    steps = {step.id: step for step in _load_project_workflow_steps(db, project.id)}
+    from_step, target_step = steps.get(payload.from_step_id), steps.get(payload.target_step_id)
+    if from_step is None or target_step is None:
+        raise HTTPException(status_code=400, detail="流程阶段不属于当前视图所在项目。")
+    if from_step.sort_order == target_step.sort_order:
+        raise HTTPException(status_code=400, detail="目标流程必须与来源流程不同。")
+    range_end = payload.range_end if payload.range_end is not None else payload.range_start
+    if not payload.all_segments and payload.range_start > range_end:
+        raise HTTPException(status_code=400, detail="句段范围起始值不能大于结束值。")
+
+    if for_update:
+        # 固定顺序锁定文件，校验和写入之间不允许其他任务取得操作锁。
+        db.query(FileRecord).filter(FileRecord.id.in_([file.id for file in files])).order_by(
+            FileRecord.id,
+        ).populate_existing().with_for_update().all()
+    offsets = compute_merge_display_offsets(db, [file.id for file in files])
+    results, eligible = [], []
+    for file_record in files:
+        result = {"file_record_id": str(file_record.id), "filename": file_record.filename,
+                  "matched_count": 0, "updated_count": 0, "skipped_reason": None}
+        results.append(result)
+        try:
+            _require_file_record_work_access(file_record, current_user)
+            if not _can_write_workflow_step(db, file_record, current_user, from_step.id):
+                raise HTTPException(status_code=403, detail="没有来源流程阶段的流转权限。")
+            # 不使用会自行 commit 的单文件锁校验，保证整批事务不会被提前提交。
+            clear_stale_file_operation_lock(db, file_record)
+            if file_record.active_operation:
+                raise HTTPException(status_code=409, detail="文件正在被其他任务锁定。")
+        except HTTPException as error:
+            if error.status_code not in (403, 409):
+                raise
+            result["skipped_reason"] = str(error.detail)
+            continue
+        local_payload = payload.model_copy(update={"all_segments": True})
+        _assign_file_segments_to_first_workflow_step(db, file_record)
+        query = _apply_workflow_transition_filters(db, db.query(Segment), file_record.id, local_payload)
+        if not payload.all_segments:
+            if _file_has_unindexed_display_segments(db, file_record.id):
+                refresh_segment_display_indexes(db, file_record)
+            offset = offsets[file_record.id]
+            query = query.filter(Segment.display_index >= payload.range_start - 1 - offset,
+                                 Segment.display_index <= range_end - 1 - offset)
+        segments = _filter_writable_segments(
+            db, file_record, current_user, _order_segment_query(query, file_record).all(),
+        )
+        result["matched_count"] = len(segments)
+        eligible.append((file_record, segments, result))
+    return from_step, target_step, results, eligible
+
+
+def _merge_workflow_transition_response(view_id, from_step, target_step, results):
+    return {"merge_view_id": str(view_id), "from_step": _serialize_workflow_step(from_step),
+            "target_step": _serialize_workflow_step(target_step), "files": results,
+            "matched_count": sum(item["matched_count"] for item in results),
+            "updated_count": sum(item["updated_count"] for item in results)}
+
+
+@router.post("/merge-views/{view_id}/workflow/transition/preview")
+def preview_merge_view_workflow_transition(
+    view_id: UUID,
+    payload: WorkflowTransitionPreviewRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from_step, target_step, results, _eligible = _collect_merge_workflow_transition(
+        db, view_id, payload, current_user,
+    )
+    return _merge_workflow_transition_response(view_id, from_step, target_step, results)
+
+
+@router.post("/merge-views/{view_id}/workflow/transition")
+def transition_merge_view_workflow(
+    view_id: UUID,
+    payload: WorkflowTransitionRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    summaries = []
+    try:
+        from_step, target_step, results, eligible = _collect_merge_workflow_transition(
+            db, view_id, payload, current_user, for_update=True,
+        )
+        for file_record, segments, result in eligible:
+            if not segments:
+                continue
+            _matched, result["updated_count"], summary = _execute_workflow_transition(
+                db, file_record, segments, target_step, payload, current_user,
+            )
+            summaries.append(summary)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    for summary in summaries:
+        _schedule_auto_tm_processing(background_tasks, summary)
+    return _merge_workflow_transition_response(view_id, from_step, target_step, results)
 
 
 @router.patch("/merge-views/{view_id}")

@@ -16,6 +16,7 @@ import {
 } from '../api/translationReview'
 import type { TranslationReviewReport, TranslationReviewReportItem } from '../types/api'
 import { llmModelOptions } from '../constants/llm'
+import LLMModelSelect from './LLMModelSelect.vue'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import { http } from '../api/http'
 import { useToast } from '../composables/useToast'
@@ -793,10 +794,8 @@ loadExistingReport()
       <!-- AI 模型 -->
       <div class="number-check__settings-group">
         <div class="number-check__settings-label">AI 模型</div>
-        <select class="term-qa-dialog__filter-select" v-model="settingsModel">
-          <option value="">使用配置默认模型</option>
-          <option v-for="m in llmModelOptions" :key="m.id" :value="m.id">{{ m.name }}</option>
-        </select>
+        <LLMModelSelect v-model="settingsModel" aria-label="AI 模型"
+          :options="[{ id: '', name: '使用配置默认模型' }, ...llmModelOptions]" />
       </div>
       <p class="hint-text">每批 50 条句段发送一次 AI 请求；规则文件越长每次消耗 token 越多，建议控制在 2 万字符以内。</p>
   </div>

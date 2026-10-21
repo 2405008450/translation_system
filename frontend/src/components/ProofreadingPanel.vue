@@ -4,6 +4,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { supportsAlignment } from '../utils/workflowCapabilities'
 import Modal from './base/Modal.vue'
+import LLMModelSelect from './LLMModelSelect.vue'
 import {
   PROOFREADING_DEFAULT_OPENROUTER_MODEL, proofreadingOpenRouterModels, type ProofreadingProvider,
 } from '../utils/proofreadingGeneration'
@@ -802,18 +803,16 @@ defineExpose({ refreshBatches })
               </label>
               <label class="field">
                 <span class="field__label">校对模型</span>
-                <select
+                <LLMModelSelect
                   v-model="generationDraft(generationBatch).model"
-                  class="field__control"
+                  aria-label="校对模型"
                   :disabled="generationDraft(generationBatch).provider === 'auto'"
-                >
-                  <option v-if="generationDraft(generationBatch).provider === 'auto'" value="">自动选择默认模型</option>
-                  <option v-if="generationDraft(generationBatch).provider === 'deepseek'" value="deepseek-chat">DeepSeek Chat</option>
-                  <template v-if="generationDraft(generationBatch).provider === 'openrouter'">
-                    <option v-for="option in proofreadingOpenRouterModels(generationDraft(generationBatch).model)"
-                      :key="option.value" :value="option.value">{{ option.label }}</option>
-                  </template>
-                </select>
+                  :options="generationDraft(generationBatch).provider === 'auto'
+                    ? [{ value: '', label: '自动选择默认模型' }]
+                    : generationDraft(generationBatch).provider === 'deepseek'
+                      ? [{ value: 'deepseek-chat', label: 'DeepSeek Chat' }]
+                      : proofreadingOpenRouterModels(generationDraft(generationBatch).model)"
+                />
               </label>
             </div>
             <p class="proofreading-generation-config__hint">

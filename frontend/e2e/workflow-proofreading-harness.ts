@@ -4,6 +4,7 @@ import { createMemoryHistory, createRouter } from 'vue-router'
 import ProjectListView from '../src/views/ProjectListView.vue'
 import ProofreadingPanel from '../src/components/ProofreadingPanel.vue'
 import WorkbenchView from '../src/views/WorkbenchView.vue'
+import Toast from '../src/components/base/Toast.vue'
 import { useAuthStore } from '../src/stores/auth'
 import { i18n } from '../src/i18n'
 import '../src/styles.css'
@@ -25,9 +26,10 @@ async function mount() {
   auth.ready = true
   await router.push('/test')
   await router.isReady()
-  const app = createApp({ render: () => mode === 'list' ? h(ProjectListView)
+  const app = createApp({ render: () => [h(Toast), mode === 'list' ? h(ProjectListView)
+    : mode === 'merge' ? h(WorkbenchView, { mergeViewId: 'view-1', standalone: true })
     : mode === 'workbench' || mode === 'standalone' ? h(WorkbenchView, { id: 'file-1', standalone: true })
-      : h(ProofreadingPanel, { projectId: 'project-1', templateId: mode === 'pure' ? 'proofread_only' : 'proofread' }) })
+      : h(ProofreadingPanel, { projectId: 'project-1', templateId: mode === 'pure' ? 'proofread_only' : 'proofread' })] })
   app.use(pinia).use(router).use(i18n).mount('#app')
 }
 void mount()

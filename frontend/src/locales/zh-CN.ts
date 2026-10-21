@@ -1723,6 +1723,13 @@ export default {
     },
   },
   llm: {
+    pricing: {
+      rate: '输入 ${input} · 输出 ${output} / 百万 token',
+      defaultModel: '按实际调用的模型计费',
+      unavailable: '暂无参考报价，请以服务商价格为准',
+      note: '美元基础参考价，非每次调用费用；缓存、长上下文等以实际账单为准。',
+      source: 'OpenRouter 报价 · 更新于 {date}',
+    },
     scenario: {
       label: '翻译场景',
       standard: '标准翻译',

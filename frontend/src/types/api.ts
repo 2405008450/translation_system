@@ -1124,6 +1124,8 @@ export interface MergeViewLanguagePair {
 
 /** 合并视图详情 */
 export interface MergeViewDetail {
+  workflow_active_step_ids?: string[]
+  workflow_steps?: WorkflowStep[]
   id: string
   project_id: string
   name: string

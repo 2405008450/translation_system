@@ -147,6 +147,7 @@ import { useToast } from '../composables/useToast'
 import { useWorkbenchShortcuts } from '../composables/useWorkbenchShortcuts'
 import { getTaskExportFormatLabel } from '../constants/taskFiles'
 import { llmModelOptions, llmProviderOptions, llmScenarioOptions, llmScopeOptions } from '../constants/llm'
+import LLMModelSelect from '../components/LLMModelSelect.vue'
 import { formatLanguagePair } from '../constants/languages'
 import {
   calculateOverallWorkflowProgress,
@@ -1333,6 +1334,29 @@ const workflowTransitionDirection = ref<WorkflowTransitionDirection>('forward')
 const workflowTransitionLoading = ref(false)
 const workflowTransitionPreviewLoading = ref(false)
 const workflowTransitionMatchedCount = ref<number | null>(null)
+const workflowTransitionScope = ref<'merge_view' | 'current_file'>('merge_view')
+interface WorkflowTransitionFileResult {
+  file_record_id: string
+  filename: string
+  matched_count: number
+  updated_count: number
+  skipped_reason: string | null
+}
+const workflowTransitionFiles = ref<WorkflowTransitionFileResult[]>([])
+const workflowTransitionResult = ref<string>('')
+let workflowTransitionPreviewRequest = 0
+const workflowTransitionEndpoint = computed(() => {
+  if (isMergeWorkbench.value && workflowTransitionScope.value === 'merge_view') {
+    return `/merge-views/${props.mergeViewId}/workflow/transition`
+  }
+  const fileId = isMergeWorkbench.value ? activeMergeViewFile.value?.id : segmentStore.fileRecord?.id
+  return fileId ? `/file-records/${fileId}/workflow/transition` : ''
+})
+const workflowTransitionSegmentTotal = computed(() => (
+  isMergeWorkbench.value && workflowTransitionScope.value === 'current_file'
+    ? activeMergeViewFile.value?.total_segments || 0
+    : segmentStore.totalSegmentCount
+))
 const workflowTransitionForm = reactive({
   all_segments: true,
   range_start: 1,
@@ -2599,7 +2623,11 @@ function getMergeGroupProgressText(segment: Segment) {
   return `${formatLanguagePair(file.source_language, file.target_language)} · ${file.progress}% · ${file.total_segments} 句段`
 }
 const activeSegmentCanWrite = computed(() => Boolean(activeSegment.value?.can_write))
-const workflowSteps = computed(() => segmentStore.fileRecord?.workflow_steps || [])
+const workflowSteps = computed(() => (
+  isMergeWorkbench.value
+    ? segmentStore.mergeViewDetail?.workflow_steps || []
+    : segmentStore.fileRecord?.workflow_steps || []
+))
 const workflowStepById = computed(() => new Map(workflowSteps.value.map((step) => [step.id, step])))
 const currentPageWorkflowReadOnlyNotice = computed(() => {
   if (
@@ -2691,10 +2719,16 @@ const workflowTargetSteps = computed(() => {
   ))
 })
 const canOpenWorkflowTransition = computed(() => (
-  Boolean(activeSegment.value?.workflow_step_id)
-  && activeSegmentCanWrite.value
-  && workflowSteps.value.length > 1
+  workflowSteps.value.length > 1
+  && (isMergeWorkbench.value || (Boolean(activeSegment.value?.workflow_step_id) && activeSegmentCanWrite.value))
 ))
+function workflowSourceStepsForDirection(direction: WorkflowTransitionDirection) {
+  const activeStepIds = segmentStore.mergeViewDetail?.workflow_active_step_ids
+    || [...new Set(segmentStore.segments.map((segment) => segment.workflow_step_id))]
+  return workflowSteps.value.filter((source) => activeStepIds.includes(source.id)
+    && workflowSteps.value.some((target) => direction === 'forward'
+      ? target.sort_order > source.sort_order : target.sort_order < source.sort_order))
+}
 const workflowSourceStatusOptions: Array<{ value: WorkflowSourceStatus; label: string }> = [
   { value: 'none', label: '未翻译' },
   { value: 'exact', label: '完全匹配' },
@@ -2704,9 +2738,10 @@ const workflowSourceStatusOptions: Array<{ value: WorkflowSourceStatus; label: s
 const workflowTransitionHasSourceStatus = computed(() => workflowTransitionForm.source_statuses.length > 0)
 
 function hasWorkflowTransitionTarget(direction: WorkflowTransitionDirection) {
+  if (isMergeWorkbench.value) return workflowSourceStepsForDirection(direction).length > 0
   const stepId = activeSegment.value?.workflow_step_id
   const sourceStep = stepId ? workflowStepById.value.get(stepId) : null
-  if (!sourceStep || !activeSegmentCanWrite.value) return false
+  if (!sourceStep || (!isMergeWorkbench.value && !activeSegmentCanWrite.value)) return false
   return workflowSteps.value.some((step) => (
     direction === 'forward'
       ? step.sort_order > sourceStep.sort_order
@@ -5139,35 +5174,43 @@ function buildWorkflowTransitionPayload() {
 }
 
 async function refreshWorkflowTransitionPreview() {
-  if (!segmentStore.fileRecord || !workflowTransitionForm.from_step_id || !workflowTransitionForm.target_step_id) {
-    workflowTransitionMatchedCount.value = null
-    return
-  }
+  const requestId = ++workflowTransitionPreviewRequest
+  workflowTransitionMatchedCount.value = null
+  workflowTransitionFiles.value = []
+  workflowTransitionResult.value = ''
+  workflowTransitionPreviewLoading.value = false
+  if (!showWorkflowTransitionDialog.value || !workflowTransitionEndpoint.value
+    || !workflowTransitionForm.from_step_id || !workflowTransitionForm.target_step_id
+    || !workflowTransitionHasSourceStatus.value) return
   workflowTransitionPreviewLoading.value = true
   try {
-    const { data } = await http.post<{ matched_count: number }>(
-      `/file-records/${segmentStore.fileRecord.id}/workflow/transition/preview`,
-      buildWorkflowTransitionPayload(),
+    const { data } = await http.post<{ matched_count: number; files?: WorkflowTransitionFileResult[] }>(
+      `${workflowTransitionEndpoint.value}/preview`, buildWorkflowTransitionPayload(),
     )
+    if (requestId !== workflowTransitionPreviewRequest) return
     workflowTransitionMatchedCount.value = data.matched_count
+    workflowTransitionFiles.value = data.files || []
   } catch (error) {
-    workflowTransitionMatchedCount.value = null
+    if (requestId !== workflowTransitionPreviewRequest) return
     toast.error(getErrorMessage(error, '流程预览失败'))
   } finally {
-    workflowTransitionPreviewLoading.value = false
+    if (requestId === workflowTransitionPreviewRequest) workflowTransitionPreviewLoading.value = false
   }
 }
 
 function openWorkflowTransitionDialog(direction: WorkflowTransitionDirection) {
-  if (!canOpenWorkflowTransition.value || !activeSegment.value) {
+  if (!canOpenWorkflowTransition.value || (!isMergeWorkbench.value && !activeSegment.value)) {
     toast.warn('当前句段无可流转的编辑权限')
     return
   }
   workflowTransitionDirection.value = direction
+  workflowTransitionScope.value = isMergeWorkbench.value ? 'merge_view' : 'current_file'
   workflowTransitionForm.all_segments = true
   workflowTransitionForm.range_start = 1
-  workflowTransitionForm.range_end = segmentStore.totalSegmentCount || 1
-  workflowTransitionForm.from_step_id = activeSegment.value.workflow_step_id || workflowSteps.value[0]?.id || ''
+  workflowTransitionForm.range_end = workflowTransitionSegmentTotal.value || 1
+  const candidates = isMergeWorkbench.value ? workflowSourceStepsForDirection(direction) : workflowSteps.value
+  workflowTransitionForm.from_step_id = candidates.find((step) => step.id === activeSegment.value?.workflow_step_id)?.id
+    || candidates[direction === 'forward' ? 0 : candidates.length - 1]?.id || ''
   workflowTransitionForm.source_status = 'all'
   workflowTransitionForm.source_statuses = ['none', 'exact', 'fuzzy', 'confirmed']
   workflowTransitionForm.target_status = 'unconfirmed'
@@ -5179,24 +5222,34 @@ function openWorkflowTransitionDialog(direction: WorkflowTransitionDirection) {
   workflowTransitionForm.target_step_id = target?.id || ''
   workflowTransitionMatchedCount.value = null
   showWorkflowTransitionDialog.value = true
-  void refreshWorkflowTransitionPreview()
 }
 
 async function submitWorkflowTransition() {
-  if (!segmentStore.fileRecord || !workflowTransitionForm.target_step_id) {
-    return
-  }
+  if (!workflowTransitionEndpoint.value || !workflowTransitionForm.target_step_id
+    || workflowTransitionLoading.value || workflowTransitionPreviewLoading.value
+    || !workflowTransitionHasSourceStatus.value || !workflowTransitionMatchedCount.value) return
+  const endpoint = workflowTransitionEndpoint.value
+  const payload = buildWorkflowTransitionPayload()
   workflowTransitionLoading.value = true
+  ++workflowTransitionPreviewRequest
   try {
-    await syncPendingWorkbenchEdits()
-    const { data } = await http.post<{ updated_count: number }>(
-      `/file-records/${segmentStore.fileRecord.id}/workflow/transition`,
-      buildWorkflowTransitionPayload(),
+    if (!await syncPendingWorkbenchEdits()) {
+      toast.error('待编辑内容保存失败，请保存成功后重试流程流转。')
+      return
+    }
+    const { data } = await http.post<{ updated_count: number; files?: WorkflowTransitionFileResult[] }>(
+      endpoint, payload,
     )
+    // 提交成功立即清除旧预览，即使后续刷新失败也不能重复提交旧条件。
+    workflowTransitionMatchedCount.value = null
+    workflowTransitionFiles.value = data.files || []
+    const skipped = workflowTransitionFiles.value.filter((file) => file.skipped_reason)
+    workflowTransitionResult.value = `已流转 ${data.updated_count} 个句段${skipped.length ? `，跳过 ${skipped.length} 个文件` : ''}`
+    toast.success(workflowTransitionResult.value)
     await segmentStore.refreshCurrentSegmentPage()
-    await loadProofreadingBaselines(segmentStore.fileRecord.id)
-    showWorkflowTransitionDialog.value = false
-    toast.success(`已流转 ${data.updated_count} 个句段`)
+    const fileId = isMergeWorkbench.value ? activeMergeViewFile.value?.id : segmentStore.fileRecord?.id
+    if (fileId) await loadProofreadingBaselines(fileId)
+    if (!skipped.length) showWorkflowTransitionDialog.value = false
   } catch (error) {
     toast.error(getErrorMessage(error, '流程流转失败'))
   } finally {
@@ -5204,9 +5257,17 @@ async function submitWorkflowTransition() {
   }
 }
 
+watch(workflowTransitionScope, () => {
+  workflowTransitionForm.all_segments = true
+  workflowTransitionForm.range_start = 1
+  workflowTransitionForm.range_end = workflowTransitionSegmentTotal.value || 1
+}, { flush: 'sync' })
+
 watch(
   () => [
     showWorkflowTransitionDialog.value,
+    workflowTransitionScope.value,
+    workflowTransitionEndpoint.value,
     workflowTransitionForm.all_segments,
     workflowTransitionForm.range_start,
     workflowTransitionForm.range_end,
@@ -5216,10 +5277,9 @@ watch(
     workflowTransitionForm.target_status,
   ],
   () => {
-    if (showWorkflowTransitionDialog.value) {
-      void refreshWorkflowTransitionPreview()
-    }
+    if (!workflowTransitionLoading.value) void refreshWorkflowTransitionPreview()
   },
+  { flush: 'sync' },
 )
 
 watch(
@@ -10326,11 +10386,7 @@ onBeforeRouteLeave(async () => {
         </label>
         <label class="ai-strip__field ai-strip__field--model">
           <span>{{ t('workbench.aiModelShort') }}</span>
-          <select v-model="llmModel" class="field__control">
-            <option v-for="option in llmModelSelectOptions" :key="option.id" :value="option.id">
-              {{ option.name }}
-            </option>
-          </select>
+          <LLMModelSelect v-model="llmModel" :options="llmModelSelectOptions" :aria-label="t('workbench.aiModel')" size="small" />
         </label>
         <button
           v-if="!segmentStore.llmRunning"
@@ -11037,11 +11093,7 @@ onBeforeRouteLeave(async () => {
 
         <label class="field field--compact workbench-toolbar__field workbench-toolbar__field--model">
           <span class="field__label">{{ t('workbench.aiModelShort') }}</span>
-          <select v-model="llmModel" class="field__control" :title="t('workbench.aiModel')">
-            <option v-for="option in llmModelSelectOptions" :key="option.id" :value="option.id">
-              {{ option.name }}
-            </option>
-          </select>
+          <LLMModelSelect v-model="llmModel" :options="llmModelSelectOptions" :aria-label="t('workbench.aiModel')" size="small" />
         </label>
 
         <button
@@ -11370,23 +11422,26 @@ onBeforeRouteLeave(async () => {
         :style="segmentEditorFontStyle"
       >
         <div v-if="hasWorkflowProofreading" class="workflow-proofreading-actions" data-testid="workflow-proofreading-actions">
-          <span>校对阶段 · 当前可处理 {{ proofreadingContext?.eligible_segments || 0 }} 个句段<span v-if="['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')"> · {{ proofreadingContext?.batch_progress || 0 }}%</span></span>
-          <button class="button" type="button" :disabled="!canStartProofreadingGeneration || proofreadingGenerating" @click="openProofreadingGenerateDialog">
-            <Bot :size="14" />{{ proofreadingGenerationButtonLabel }}
-          </button>
-          <button v-if="proofreadingContext?.can_cancel && ['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')" class="button" type="button" @click="void cancelCurrentProofreading()">取消校对</button>
-          <div class="export-dropdown">
-            <button class="button" type="button" data-testid="workflow-proofreading-export-button"
-              :disabled="proofreadingExportBlocked" @click.stop="void toggleWorkflowProofreadingExportMenu()">
-              <Loader2 v-if="proofreadingExporting" class="lucide-spin" :size="14" />
-              <Download v-else :size="14" />{{ proofreadingExporting ? proofreadingExportButtonLabel : '导出校对文件' }}<ChevronDown :size="12" />
+          <span class="workflow-proofreading-actions__summary"><span class="workflow-proofreading-actions__stage"><FileCheck :size="14" />校对阶段</span><span>当前可处理 <strong>{{ proofreadingContext?.eligible_segments || 0 }}</strong> 个句段<span v-if="['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')"> · {{ proofreadingContext?.batch_progress || 0 }}%</span></span></span>
+          <div class="workflow-proofreading-actions__buttons">
+            <button class="button workflow-proofreading-actions__button workflow-proofreading-actions__button--primary" type="button" :disabled="!canStartProofreadingGeneration || proofreadingGenerating" @click="openProofreadingGenerateDialog">
+              <Bot :size="14" />{{ proofreadingGenerationButtonLabel }}
             </button>
-            <div v-if="showProofreadingExportMenu" class="export-dropdown__menu">
-              <WorkflowProofreadingExportOptions :choices="workflowProofreadingExportChoices" :disabled="proofreadingExportBlocked"
-                @export="void exportProofreadingWithFormat($event)" />
+            <button v-if="proofreadingContext?.can_cancel && ['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')" class="button workflow-proofreading-actions__button" type="button" @click="void cancelCurrentProofreading()"><X :size="14" />取消校对</button>
+            <div class="export-dropdown">
+              <button class="button workflow-proofreading-actions__button" type="button" data-testid="workflow-proofreading-export-button"
+                :class="{ 'is-active': showProofreadingExportMenu }" :aria-expanded="showProofreadingExportMenu"
+                :disabled="proofreadingExportBlocked" @click.stop="void toggleWorkflowProofreadingExportMenu()">
+                <Loader2 v-if="proofreadingExporting" class="lucide-spin" :size="14" />
+                <Download v-else :size="14" />{{ proofreadingExporting ? proofreadingExportButtonLabel : '导出校对文件' }}<ChevronDown class="workflow-proofreading-actions__chevron" :size="12" />
+              </button>
+              <div v-if="showProofreadingExportMenu" class="export-dropdown__menu">
+                <WorkflowProofreadingExportOptions :choices="workflowProofreadingExportChoices" :disabled="proofreadingExportBlocked"
+                  @export="void exportProofreadingWithFormat($event)" />
+              </div>
             </div>
+            <button class="button workflow-proofreading-actions__button" :class="{ 'is-active': proofreadingDiffVisible }" type="button" :aria-pressed="proofreadingDiffVisible" @click="toggleProofreadingRevisionVisible"><EyeOff v-if="proofreadingDiffVisible" :size="14" /><Eye v-else :size="14" />{{ proofreadingDiffVisible ? '隐藏修订' : '显示修订' }}</button>
           </div>
-          <button class="button" type="button" @click="toggleProofreadingRevisionVisible">{{ proofreadingDiffVisible ? '隐藏修订' : '显示修订' }}</button>
         </div>
         <div v-if="hasWorkflowProofreading && proofreadingExporting" class="workflow-proofreading-actions"
           role="progressbar" aria-label="校对文件导出进度" aria-valuemin="0" aria-valuemax="100"
@@ -13769,23 +13824,16 @@ onBeforeRouteLeave(async () => {
           </label>
           <label class="field">
             <span class="field__label">校对模型</span>
-            <select
+            <LLMModelSelect
               v-model="proofreadingGenerationDraft.model"
-              class="field__control"
+              aria-label="校对模型"
               :disabled="proofreadingGenerating || proofreadingGenerationDraft.provider === 'auto'"
-            >
-              <option v-if="proofreadingGenerationDraft.provider === 'auto'" value="">自动选择默认模型</option>
-              <option v-if="proofreadingGenerationDraft.provider === 'deepseek'" value="deepseek-chat">DeepSeek Chat</option>
-              <template v-if="proofreadingGenerationDraft.provider === 'openrouter'">
-                <option
-                  v-for="option in proofreadingOpenRouterModelOptions"
-                  :key="option.value"
-                  :value="option.value"
-                >
-                  {{ option.label }}
-                </option>
-              </template>
-            </select>
+              :options="proofreadingGenerationDraft.provider === 'auto'
+                ? [{ value: '', label: '自动选择默认模型' }]
+                : proofreadingGenerationDraft.provider === 'deepseek'
+                  ? [{ value: 'deepseek-chat', label: 'DeepSeek Chat' }]
+                  : proofreadingOpenRouterModelOptions"
+            />
           </label>
         </div>
         <p class="proofreading-generate-dialog__hint">
@@ -14067,14 +14115,8 @@ onBeforeRouteLeave(async () => {
         </div>
         <div class="number-check__settings-group">
           <div class="number-check__settings-label">AI 模型</div>
-          <select class="term-qa-dialog__filter-select" v-model="numberCheckModel">
-            <option value="">使用配置默认模型</option>
-            <option
-              v-for="modelOption in llmModelOptions"
-              :key="modelOption.id"
-              :value="modelOption.id"
-            >{{ modelOption.name }}</option>
-          </select>
+          <LLMModelSelect v-model="numberCheckModel" aria-label="AI 模型"
+            :options="[{ id: '', name: '使用配置默认模型' }, ...llmModelOptions]" />
         </div>
         <div class="number-check__settings-group">
           <div class="number-check__settings-label">显示选项</div>
@@ -14102,14 +14144,8 @@ onBeforeRouteLeave(async () => {
       <div class="number-check__settings-dialog">
         <div class="number-check__settings-group">
           <div class="number-check__settings-label">AI 模型</div>
-          <select class="term-qa-dialog__filter-select" v-model="styleTagCheckModel">
-            <option value="">使用配置默认模型</option>
-            <option
-              v-for="modelOption in llmModelOptions"
-              :key="modelOption.id"
-              :value="modelOption.id"
-            >{{ modelOption.name }}</option>
-          </select>
+          <LLMModelSelect v-model="styleTagCheckModel" aria-label="AI 模型"
+            :options="[{ id: '', name: '使用配置默认模型' }, ...llmModelOptions]" />
         </div>
         <p class="hint-text">设置在下次“开始检查 / 重新标注选中”时生效。批量标注时模型需要连续输出多个 ⟦n⟧ 标签，若某模型经常出现标签格式错误（校验失败率高），可换用其他模型试试。</p>
       </div>
@@ -14130,7 +14166,14 @@ onBeforeRouteLeave(async () => {
       @close="showWorkflowTransitionDialog = false"
     >
       <div class="workflow-transition-dialog">
-        <div class="workflow-transition-grid">
+        <fieldset class="workflow-transition-grid" :disabled="workflowTransitionLoading" >
+          <label v-if="isMergeWorkbench" class="field">
+            <span class="field__label">操作范围</span>
+            <select v-model="workflowTransitionScope" class="field__control" aria-label="操作范围">
+              <option value="merge_view">整个视图</option>
+              <option value="current_file" :disabled="!activeMergeViewFile">当前文件</option>
+            </select>
+          </label>
           <label class="field">
             <span class="field__label">句段范围</span>
             <input v-model.number="workflowTransitionForm.range_start" class="field__control" type="number" min="1" :disabled="workflowTransitionForm.all_segments" />
@@ -14176,15 +14219,23 @@ onBeforeRouteLeave(async () => {
           </label>
           <label class="field">
             <span class="field__label">目标状态</span>
-            <select v-model="workflowTransitionForm.target_status" class="field__control">
+            <select v-model="workflowTransitionForm.target_status" class="field__control" aria-label="目标状态">
               <option value="unconfirmed">未确认</option>
               <option value="confirmed">已确认</option>
             </select>
           </label>
-        </div>
-        <p class="workflow-transition-count">
-          {{ workflowTransitionPreviewLoading ? '正在查询命中句段...' : `已查询出 ${workflowTransitionMatchedCount ?? 0} 个句段` }}
+        </fieldset>
+        <p v-if="isMergeWorkbench" class="workflow-transition-count">
+          {{ workflowTransitionScope === 'merge_view' ? '编号范围按整个视图的全局编号计算，覆盖所有分页。' : `编号范围按当前文件计算：${activeMergeViewFile?.filename || '未选择文件'}` }}
         </p>
+        <p class="workflow-transition-count" role="status">
+          {{ workflowTransitionResult || (workflowTransitionPreviewLoading ? '正在查询命中句段...' : workflowTransitionMatchedCount === null ? '暂无有效预览，请检查流转条件。' : `已查询出 ${workflowTransitionMatchedCount} 个句段`) }}
+        </p>
+        <ul v-if="workflowTransitionFiles.length" class="workflow-transition-count" aria-label="逐文件流转结果">
+          <li v-for="file in workflowTransitionFiles" :key="file.file_record_id">
+            {{ file.filename }}：{{ file.skipped_reason ? `跳过，${file.skipped_reason}` : workflowTransitionResult ? `已流转 ${file.updated_count} 个句段` : `命中 ${file.matched_count} 个句段` }}
+          </li>
+        </ul>
       </div>
 
       <template #footer>
@@ -14194,7 +14245,7 @@ onBeforeRouteLeave(async () => {
         <button
           class="button button--primary"
           type="button"
-          :disabled="workflowTransitionLoading || !workflowTransitionForm.target_step_id || !workflowTransitionHasSourceStatus || (workflowTransitionMatchedCount ?? 0) === 0"
+          :disabled="workflowTransitionLoading || workflowTransitionPreviewLoading || !workflowTransitionForm.target_step_id || !workflowTransitionHasSourceStatus || (workflowTransitionMatchedCount ?? 0) === 0"
           @click="void submitWorkflowTransition()"
         >
           <Loader2 v-if="workflowTransitionLoading" class="lucide-spin" :size="14" />
@@ -14411,8 +14462,117 @@ onBeforeRouteLeave(async () => {
 </template>
 
 <style scoped>
-.workflow-proofreading-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border-color, #dbe3ed); }
-.workflow-proofreading-actions > span { margin-right: auto; font-size: 13px; }
+.workflow-proofreading-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.workflow-proofreading-actions__summary,
+.workflow-proofreading-actions__buttons,
+.workflow-proofreading-actions__stage {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.workflow-proofreading-actions__summary {
+  flex: 1 1 auto;
+  gap: 12px;
+}
+
+.workflow-proofreading-actions__stage {
+  gap: 5px;
+  padding: 3px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--brand-050);
+  color: var(--brand-700);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.workflow-proofreading-actions__summary strong {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.workflow-proofreading-actions__buttons {
+  margin-left: auto;
+}
+
+.workflow-proofreading-actions .workflow-proofreading-actions__button {
+  min-height: 32px;
+  padding: 6px 10px;
+  gap: 6px;
+  border-color: var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface-0);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 18px;
+  white-space: nowrap;
+  box-shadow: none;
+  transform: none;
+}
+
+.workflow-proofreading-actions__button:not(:disabled):hover,
+.workflow-proofreading-actions__button.is-active {
+  border-color: var(--brand-500);
+  background: var(--brand-050);
+  color: var(--brand-700);
+}
+
+.workflow-proofreading-actions .workflow-proofreading-actions__button--primary {
+  border-color: var(--brand-700);
+  background: var(--brand-700);
+  color: #fff;
+}
+
+.workflow-proofreading-actions .workflow-proofreading-actions__button--primary:not(:disabled):hover {
+  border-color: var(--brand-650);
+  background: var(--brand-650);
+  color: #fff;
+}
+
+.workflow-proofreading-actions__button:focus-visible {
+  outline: 2px solid var(--brand-500);
+  outline-offset: 2px;
+}
+
+.workflow-proofreading-actions__button .lucide {
+  width: 14px;
+  height: 14px;
+  transform: none;
+}
+
+.workflow-proofreading-actions .button:not(:disabled):hover .lucide {
+  transform: none;
+}
+
+.workflow-proofreading-actions__button .workflow-proofreading-actions__chevron {
+  width: 12px;
+  height: 12px;
+}
+
+.workflow-proofreading-actions__button[aria-expanded='true'] .workflow-proofreading-actions__chevron {
+  rotate: 180deg;
+}
+
+@media (max-width: 640px) {
+  .workflow-proofreading-actions__buttons {
+    width: 100%;
+    margin-left: 0;
+  }
+}
 
 .workbench-page.is-workbench-mode-pending > :not(.workbench-mode-loading) {
   display: none !important;
@@ -17072,6 +17232,10 @@ onBeforeRouteLeave(async () => {
 }
 
 .workflow-transition-grid {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
   align-items: end;

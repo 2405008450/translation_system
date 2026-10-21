@@ -21,6 +21,7 @@ import type {
 import { consumeLLMStream } from '../utils/llmStream'
 import { isProgressComplete } from '../utils/progress'
 import ResourceImportDialog from './ResourceImportDialog.vue'
+import LLMModelSelect from './LLMModelSelect.vue'
 import Modal from './base/Modal.vue'
 
 interface ProjectFileItem {
@@ -2098,11 +2099,7 @@ onBeforeUnmount(() => {
           </label>
           <label class="field">
             <span class="field__label">{{ t('projectDetail.preTranslate.llm.model') }}</span>
-            <select v-model="llmModel" class="field__control" :disabled="running || !useLlm">
-              <option v-for="option in llmModelOptions" :key="option.id" :value="option.id">
-                {{ option.name }}
-              </option>
-            </select>
+            <LLMModelSelect v-model="llmModel" :options="llmModelOptions" :disabled="running || !useLlm" />
           </label>
           <label class="field">
             <span class="field__label">{{ t('projectDetail.preTranslate.llm.scope') }}</span>

@@ -1292,6 +1292,11 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   async function refreshCurrentSegmentPage() {
+    if (mergeViewId.value) {
+      await refreshMergeViewDetail()
+      await refreshMergeViewPage(resolveCurrentMergeQuery())
+      return true
+    }
     if (!fileRecord.value) {
       return false
     }

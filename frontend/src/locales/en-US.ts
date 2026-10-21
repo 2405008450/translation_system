@@ -810,6 +810,13 @@ const overrides = {
     },
   },
   llm: {
+    pricing: {
+      rate: 'Input ${input} · Output ${output} / 1M tokens',
+      defaultModel: 'Billed according to the model actually used',
+      unavailable: 'No reference price; check provider pricing',
+      note: 'Base reference rates in USD, not per call. Caching, long context and other charges may vary.',
+      source: 'OpenRouter pricing · Updated {date}',
+    },
     scenario: {
       label: 'Translation scenario',
       standard: 'Standard translation',
