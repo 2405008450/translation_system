@@ -371,6 +371,8 @@ export interface PretranslationMatchAnalysisPreviewResponse {
   tm_applied_words: number
   repeat_segments: number
   repeat_words: number
+  skipped_protected_segments?: number
+  skipped_protected_words?: number
   skipped_confirmed_segments: number
   skipped_confirmed_words: number
 }
@@ -543,6 +545,10 @@ export interface Segment {
   target_text: string
   target_html?: string | null
   status: string
+  auto_write_protection?: 'none' | 'protected' | 'released'
+  auto_write_protection_reason?: 'tm_exact' | 'manual' | null
+  auto_write_protection_updated_at?: string | null
+  auto_write_protection_updated_by_id?: string | null
   project_sync_disabled?: boolean
   project_sync_origin?: ProjectSyncOrigin | null
   version: number

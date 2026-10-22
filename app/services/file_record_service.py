@@ -1,5 +1,7 @@
 import hashlib
 from app.services.docx_segmentation import new_import_options
+from app.services.auto_write_protection import automatic_write_allowed, set_auto_write_protection
+
 import json
 import logging
 import re
@@ -46,7 +48,7 @@ from app.services.automatic_numbering import (
     is_word_document_filename,
     strip_segment_automatic_numbering_prefix,
 )
-from app.services.normalizer import build_source_hash
+from app.services.normalizer import build_source_hash, normalize_text
 from app.services.revision_service import create_revision
 from app.services.segment_status import apply_segment_status, resolve_unconfirmed_segment_status
 from app.services.task_file_service import build_task_workspace
@@ -622,6 +624,8 @@ def _create_file_record_from_workspace(
             display_index=sequence_index,
             segment_metadata=seg_metadata_json,
         )
+        if segment.source == "tm" and segment.status == "exact" and normalize_text(segment.target_text):
+            set_auto_write_protection(segment, "protected", reason="tm_exact")
         db.add(segment)
         created_segments.append(segment)
 
@@ -680,6 +684,8 @@ def create_txt_file_record_with_segments(
             sequence_index=index,
             display_index=index,
         )
+        if segment.source == "tm" and segment.status == "exact" and normalize_text(segment.target_text):
+            set_auto_write_protection(segment, "protected", reason="tm_exact")
         db.add(segment)
         created_segments.append(segment)
 
@@ -1149,6 +1155,8 @@ def attach_source_document_to_file_record(
             display_index=sequence_index,
             segment_metadata=seg_metadata_json,
         )
+        if segment.source == "tm" and segment.status == "exact" and normalize_text(segment.target_text):
+            set_auto_write_protection(segment, "protected", reason="tm_exact")
         db.add(segment)
         created_segments.append(segment)
 
@@ -1394,7 +1402,7 @@ def update_segment_target(
     file_id = db.query(Segment.file_record_id).filter(Segment.id == segment_id).scalar()
     if file_id:
         lock_file_project(db, file_id)
-    segment = db.query(Segment).filter(Segment.id == segment_id).first()
+    segment = db.query(Segment).filter(Segment.id == segment_id).with_for_update().populate_existing().first()
     if not segment:
         return None
 
@@ -1405,6 +1413,8 @@ def update_segment_target(
     )
     # target_text 永远存纯文本；不触碰 target_layout_text（只由样式标记检查/人工标签
     # 编辑接口写入，译文本身的编辑与它解耦，靠 hash 判定是否失效）。
+    if source != "manual" and not automatic_write_allowed(segment, entrypoint="segment_update"):
+        return segment
     before_text = segment.target_text
     segment.target_text = target_text
     segment.target_html = target_html if target_html else None
@@ -1474,7 +1484,7 @@ def update_segment_by_sentence_id(
             Segment.file_record_id == file_record_id,
             Segment.sentence_id == sentence_id,
         )
-    segment = query.first()
+    segment = query.with_for_update().populate_existing().first()
     if not segment:
         return None
 
@@ -1484,6 +1494,8 @@ def update_segment_by_sentence_id(
         target_html,
     )
     # target_text 永远存纯文本；不触碰 target_layout_text（同上）。
+    if source != "manual" and not automatic_write_allowed(segment, entrypoint="segment_update"):
+        return segment
     before_text = segment.target_text
     segment.target_text = target_text
     segment.target_html = target_html if target_html else None
@@ -1653,6 +1665,8 @@ def batch_update_segments(
         # target_text 永远存纯文本；不触碰 target_layout_text（同上）。
         track_revision = bool(item.get("track_revision", True))
         confirm = bool(item.get("confirm", False))
+        if source != "manual" and not automatic_write_allowed(segment, entrypoint="batch_segment_update"):
+            continue
         segment.target_text = target_text
         segment.target_html = target_html if target_html else None
         segment.source = source

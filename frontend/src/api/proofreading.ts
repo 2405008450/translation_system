@@ -73,6 +73,7 @@ export interface ProofreadingBatch {
   cancel_requested?: boolean
   total_segments: number
   changed_segments: number
+  skipped_protected_segments?: number
   skipped_segments: number
   failed_segments: number
   export_status: 'idle' | 'queued' | 'running' | 'completed' | 'failed'

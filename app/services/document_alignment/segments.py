@@ -13,6 +13,7 @@ from app.models import (
 from app.services.analytics_service import count_source_words
 from app.services.document_storage import save_source_file
 from app.services.normalizer import build_source_hash
+from app.services.auto_write_protection import is_auto_write_protected
 from app.services.proofreading import IMPORTED_TRANSLATION_SOURCE
 from app.services.workflow_capabilities import proofreading_step_id
 from app.services.reference_sync_service import attach_project_reference_bases_to_file
@@ -185,7 +186,8 @@ def ensure_document_pair_segments_complete(
                 # 对齐模式下句段尚未人工校对，可以随边界调整同步原始译文；
                 # 已经产生人工校对内容的历史任务必须保留 target_text。
                 if (
-                    alignment_changed
+                    not is_auto_write_protected(segment)
+                    and alignment_changed
                     and getattr(batch, "workflow_stage", "not_applicable") == "alignment"
                 ):
                     # 对齐关系或对齐文本已经变化时，新 pair 是该句段的新权威基线。
@@ -201,7 +203,7 @@ def ensure_document_pair_segments_complete(
                     segment.source = IMPORTED_TRANSLATION_SOURCE if pair.target_text else "none"
                     segment.llm_provider = None
                     segment.llm_model = None
-                elif (
+                elif not is_auto_write_protected(segment) and (
                     segment.status != "confirmed"
                     or existing_baseline is None
                     or (segment.target_text or "") == (existing_baseline.original_target_text or "")

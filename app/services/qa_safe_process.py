@@ -481,6 +481,12 @@ def apply_reviewed_qa_suggestion(
     current_user: User,
 ) -> tuple[Segment | None, str]:
     """应用用户已审核的 AI 建议，并保留格式、修订和 LLM 来源信息。"""
+    from app.services.auto_write_protection import automatic_write_allowed
+    from app.services.review_sync import lock_file_project
+    lock_file_project(db, segment.file_record_id)
+    db.refresh(segment, with_for_update=True)
+    if not automatic_write_allowed(segment, entrypoint="qa_ai_fix"):
+        return None, "句段已启用自动修改保护，请先解除保护。"
     current_text = segment.target_text or ""
     if target_text_hash(current_text) != expected_target_hash:
         return None, "译文已变更，请重新运行一键处理"

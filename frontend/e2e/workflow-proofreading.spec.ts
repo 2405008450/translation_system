@@ -65,6 +65,13 @@ async function mockApi(page: Page, standalone = false, options: { batchStatus?: 
       term_base_names: [], qa_term_base_names: [], term_base_write_names: [], document_parse_options: {}, document_statistics: {},
       can_write: true, can_manage: true, can_export: true, is_edit_locked: false, reference_files: [],
     }
+    else if (path.endsWith('/segments/auto-write-protection')) {
+      const body = route.request().postDataJSON()
+      data = { updated_count: body.items.length, items: body.items.map((item: { segment_id: string; expected_version: number }) => ({
+        segment_id: item.segment_id, version: item.expected_version + 1, updated: true,
+        auto_write_protection: body.state, auto_write_protection_reason: 'manual',
+      })) }
+    }
     else if (path.endsWith('/revision-settings')) data = { track_changes: true }
     else if (path.endsWith('/comments')) data = { items: [], total: 0 }
     else if (path.endsWith('/segments/changes')) data = { items: [], segments: [], has_more: false }
@@ -424,4 +431,43 @@ test('翻译校对和独立校对默认选择 Argon，模型选项保持唯一�
   await expect(dialog.locator('.llm-model-select')).toContainText('Gemini 4 Argon')
   expect(starts).toEqual([])
   expect(errors).toEqual([])
+})
+
+
+test('保护开关使用版本校验，保留人工编辑并提供筛选', async ({ page }) => {
+  const errors = await mockApi(page)
+  await page.goto('/e2e/workflow-proofreading-harness.html?mode=workbench')
+  const first = page.getByTestId('segment-auto-write-protection').first()
+  await expect(first).toHaveAttribute('aria-pressed', 'false')
+  const request = page.waitForRequest(req => req.url().endsWith('/segments/auto-write-protection') && req.method() === 'POST')
+  await first.click()
+  expect((await request).postDataJSON()).toEqual({ state: 'protected', items: [{ segment_id: 'segment-0', expected_version: 1 }] })
+  await expect(first).toHaveAttribute('aria-pressed', 'true')
+  await expect(first).toHaveAttribute('title', /自动修改已保护/)
+  await page.screenshot({ path: '../logs/auto-write-protection-workbench.png', fullPage: true })
+  await expect(page.locator('.segment-row__cell--target [contenteditable="true"]').first()).toBeVisible()
+  const release = page.waitForRequest(req => req.url().endsWith('/segments/auto-write-protection') && req.method() === 'POST')
+  await first.click()
+  expect((await release).postDataJSON()).toEqual({ state: 'released', items: [{ segment_id: 'segment-0', expected_version: 2 }] })
+  await expect(first).toHaveAttribute('aria-pressed', 'false')
+  await expect(page.getByRole('button', { name: '保护选中', exact: true })).toBeVisible()
+  expect(errors).toEqual([])
+})
+
+
+test('批量保护支持选中行，冲突项保留保护状态', async ({ page }) => {
+  await mockApi(page)
+  await page.goto('/e2e/workflow-proofreading-harness.html?mode=workbench')
+  await page.getByRole('button', { name: '选择句段', exact: true }).first().click()
+  const request = page.waitForRequest(req => req.url().endsWith('/segments/auto-write-protection') && req.method() === 'POST')
+  await page.getByRole('button', { name: '保护选中', exact: true }).click()
+  expect((await request).postDataJSON().state).toBe('protected')
+  const toggle = page.getByTestId('segment-auto-write-protection').first()
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true')
+  await page.route('**/segments/auto-write-protection', route => route.fulfill({ json: {
+    updated_count: 0, items: [{ segment_id: 'segment-0', error: 'version_conflict', current_version: 3 }],
+  } }))
+  await page.getByRole('button', { name: '解除选中保护', exact: true }).click()
+  await expect(page.getByText('1 条句段因权限或版本变化未更新，请刷新后重试。')).toBeVisible()
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true')
 })

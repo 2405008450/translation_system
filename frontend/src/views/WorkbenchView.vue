@@ -217,7 +217,7 @@ type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes' | 'refer
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
-type SegmentDisplayScope = 'all' | 'project_sync_only' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'pending_confirmation' | 'confirmed_only' | 'empty_target' | 'proofreading_changed' | 'proofreading_failed' | 'proofreading_translation_only' | 'proofreading_missing_translation'
+type SegmentDisplayScope = 'auto_write_protected' | 'all' | 'project_sync_only' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'pending_confirmation' | 'confirmed_only' | 'empty_target' | 'proofreading_changed' | 'proofreading_failed' | 'proofreading_translation_only' | 'proofreading_missing_translation'
 type ProofreadingAlignmentScope = 'proofreading_translation_only' | 'proofreading_missing_translation'
 type RevisionMenuKind = 'track' | 'accept' | 'reject'
 type ResourceSearchMode = 'exact' | 'fuzzy'
@@ -330,6 +330,7 @@ type ProofreadingBaselineResponse = {
     can_generate?: boolean
     can_cancel?: boolean
     eligible_segments?: number
+    skipped_protected_segments?: number
     workflow_step_id?: string
     batch_kind: 'xlsx_columns' | 'document_pair' | 'workflow_segments'
     workflow_stage?: 'not_applicable' | 'import' | 'alignment' | 'proofreading'
@@ -569,6 +570,7 @@ async function pollProofreadingGeneration(batchId: string) {
       proofreadingContext.value.batch_status = batch.status
       proofreadingContext.value.batch_progress = batch.progress
       proofreadingContext.value.failed_segments = batch.failed_segments
+      proofreadingContext.value.skipped_protected_segments = batch.skipped_protected_segments || 0
     }
     if (['queued', 'running', 'canceling'].includes(batch.status)) {
       proofreadingGenerationPollTimer = window.setTimeout(() => {
@@ -2991,6 +2993,7 @@ const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; 
     { value: 'none_only', label: t('workbench.search.scopes.noneOnly') },
     { value: 'pending_confirmation', label: '待确认译文' },
     { value: 'confirmed_only', label: '已确认译文' },
+    { value: 'auto_write_protected', label: '自动修改已保护' },
     { value: 'empty_target', label: '空译文' },
     { value: 'proofreading_translation_only', label: '仅显示增译' },
     { value: 'proofreading_missing_translation', label: '仅显示漏译' },
@@ -2998,6 +3001,7 @@ const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; 
     { value: 'proofreading_failed', label: '仅显示生成失败' },
   ]
   const proofreadingScopes: SegmentDisplayScope[] = [
+    'auto_write_protected',
     'all',
     'proofreading_translation_only',
     'proofreading_missing_translation',
@@ -3062,6 +3066,9 @@ function resolveWorkbenchMatchStatus(segment: Segment) {
 
 function matchesSegmentDisplayScope(segment: Segment) {
   const matchStatus = resolveWorkbenchMatchStatus(segment)
+  if (segmentDisplayScope.value === 'auto_write_protected') {
+    return segment.auto_write_protection === 'protected'
+  }
   if (segmentDisplayScope.value === 'project_sync_only') {
     return matchStatus === 'project_sync'
   }
@@ -4583,6 +4590,52 @@ async function updateSegmentTargetLayout(sentenceId: string, targetLayoutText: s
       message: getErrorMessage(error, '译文可能已发生变化，请重试。'),
     })
   }
+}
+
+const protectionUpdating = ref(false)
+async function setAutoWriteProtection(state: 'protected' | 'released', keys: string[]) {
+  const segments = segmentStore.segments.filter(item => keys.includes(segmentKeyOf(item)) && item.can_write !== false)
+  if (!segments.length || protectionUpdating.value) return
+  protectionUpdating.value = true
+  try {
+    if (!await saveNow()) return
+    const byFile = new Map<string, Segment[]>()
+    for (const segment of segments) {
+      const fileId = segment.file_record_id || activeWorkbenchFileId.value || segmentStore.fileRecord?.id || ''
+      if (!fileId) continue
+      byFile.set(fileId, [...(byFile.get(fileId) || []), segment])
+    }
+    let conflicts = 0
+    for (const [fileId, rows] of byFile) {
+      for (let offset = 0; offset < rows.length; offset += 1000) {
+        const { data } = await http.post<{ items: Array<{ segment_id: string; error?: string; version?: number;
+          auto_write_protection?: Segment['auto_write_protection']; auto_write_protection_reason?: Segment['auto_write_protection_reason'] }> }>(
+          `/files/${fileId}/segments/auto-write-protection`, {
+            state, items: rows.slice(offset, offset + 1000).map(row => ({ segment_id: row.id, expected_version: row.version })),
+          },
+        )
+        for (const result of data.items) {
+          if (result.error) { conflicts += 1; continue }
+          const segment = segmentStore.segments.find(row => row.id === result.segment_id)
+          if (segment && result.version) {
+            segment.version = result.version
+            segment.auto_write_protection = result.auto_write_protection
+            segment.auto_write_protection_reason = result.auto_write_protection_reason
+          }
+        }
+      }
+    }
+    if (conflicts) toast.warn(`${conflicts} 条句段因权限或版本变化未更新，请刷新后重试。`)
+  } catch (error) {
+    toast.error({ title: '保护设置失败', message: getErrorMessage(error, '请刷新后重试。') })
+  } finally { protectionUpdating.value = false }
+}
+function toggleAutoWriteProtection(key: string) {
+  const segment = segmentStore.segments.find(item => segmentKeyOf(item) === key)
+  if (segment) void setAutoWriteProtection(segment.auto_write_protection === 'protected' ? 'released' : 'protected', [key])
+}
+function setSelectedAutoWriteProtection(state: 'protected' | 'released') {
+  void setAutoWriteProtection(state, [...selectedSentenceIds.value])
 }
 
 async function toggleProjectSegmentSync(sentenceId: string, disabled: boolean) {
@@ -9946,6 +9999,8 @@ onBeforeRouteLeave(async () => {
           <span>{{ isAlignmentWorkbench ? '原文与原始译文边界调整' : '已有译文二次校对' }} · {{ currentLanguagePair }} · {{ proofreadingContext?.sheet_name || 'Excel' }}</span>
         </div>
         <div class="workbench-ribbon__top-actions" :aria-label="isAlignmentWorkbench ? '对齐编辑操作' : '校对编辑操作'">
+          <button class="workbench-ribbon__top-action" type="button" :disabled="protectionUpdating || !selectedSentenceIds.size" @click="setSelectedAutoWriteProtection('protected')">保护选中</button>
+          <button class="workbench-ribbon__top-action" type="button" :disabled="protectionUpdating || !selectedSentenceIds.size" @click="setSelectedAutoWriteProtection('released')">解除选中保护</button>
           <template v-if="isAlignmentWorkbench">
             <button class="workbench-ribbon__top-action" type="button" :disabled="alignmentStructureBusy || !alignmentUndoStack.length" @click="void undoAlignmentWorkbench()">
               <Undo2 :size="15" /><span>撤回</span>
@@ -10159,6 +10214,7 @@ onBeforeRouteLeave(async () => {
         <span v-if="proofreadingContext?.user_instructions" class="proofreading-workbench-toolbar__info-item proofreading-workbench-toolbar__prompt" :title="proofreadingContext.user_instructions">
           <Info :size="13" />提示词：<strong>{{ proofreadingContext.user_instructions }}</strong>
         </span>
+        <span v-if="proofreadingContext?.skipped_protected_segments" class="proofreading-workbench-toolbar__info-item">已跳过保护译文 {{ proofreadingContext.skipped_protected_segments }} 条</span>
         <span class="proofreading-workbench-toolbar__legend">蓝色下划线为新增，红色删除线为删除</span>
       </div>
       <div v-else class="proofreading-workbench-toolbar__info-strip">
@@ -10182,6 +10238,8 @@ onBeforeRouteLeave(async () => {
           <span>{{ isMergeWorkbench ? workbenchHeaderDescription : currentLanguagePair }}</span>
         </div>
         <div class="workbench-ribbon__top-actions" aria-label="任务操作">
+          <button class="workbench-ribbon__top-action" type="button" :disabled="protectionUpdating || !selectedSentenceIds.size" @click="setSelectedAutoWriteProtection('protected')">保护选中</button>
+          <button class="workbench-ribbon__top-action" type="button" :disabled="protectionUpdating || !selectedSentenceIds.size" @click="setSelectedAutoWriteProtection('released')">解除选中保护</button>
           <button
             class="workbench-ribbon__top-action"
             data-testid="workbench-save-button"
@@ -12151,6 +12209,7 @@ onBeforeRouteLeave(async () => {
                       @update-source="handleSegmentSourceUpdate"
                       @update-target-layout="updateSegmentTargetLayout"
                       @toggle-project-sync="toggleProjectSegmentSync"
+                      @toggle-auto-write-protection="toggleAutoWriteProtection"
                       @apply-partial-revision="handleApplyPartialRevision"
                       @ctrl-click="handleSegmentClick"
                       @toggle-selection="handleSegmentClick"
@@ -13808,6 +13867,7 @@ onBeforeRouteLeave(async () => {
       @close="showProofreadingGenerateDialog = false"
     >
       <div class="proofreading-generate-dialog">
+        <p class="hint-text">受保护译文跳过自动校对，仍可能作为只读上下文。需要修改时请先解除保护；人工编辑不受影响。</p>
         <div class="proofreading-generate-dialog__fields">
           <label class="field">
             <span class="field__label">模型提供方</span>

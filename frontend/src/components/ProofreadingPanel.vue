@@ -651,6 +651,7 @@ defineExpose({ refreshBatches })
               <span>共 {{ batch.total_segments }} 条</span>
               <span>修改 {{ batch.changed_segments }}</span>
               <span>缺失 {{ batch.skipped_segments }}</span>
+              <span v-if="batch.skipped_protected_segments">保护跳过 {{ batch.skipped_protected_segments }}</span>
               <span :class="{ 'is-error': batch.failed_segments > 0 }">失败 {{ batch.failed_segments }}</span>
             </small>
             <span class="proofreading-batch__percent">{{ batch.progress }}%</span>

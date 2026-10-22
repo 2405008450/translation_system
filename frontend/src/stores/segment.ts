@@ -3126,6 +3126,9 @@ export const useSegmentStore = defineStore('segment', () => {
       const errorCount = Number(data.error_count || 0)
       const total = Number(data.total || llmPlannedCount.value || updatedCount + errorCount)
       finishLLMCompletion(updatedCount, errorCount, total)
+      if (Number(data.skipped_protected_segments || 0) > 0) {
+        llmMessage.value += `；已跳过 ${data.skipped_protected_segments} 条受保护译文`
+      }
     }
   }
 

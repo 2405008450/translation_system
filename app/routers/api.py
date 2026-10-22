@@ -4,6 +4,9 @@ API 路由模块 - 文件上传、解析和导出接口
 支持多种文档格式的上传、解析和导出。
 """
 import asyncio
+from app.services.auto_write_protection import (
+    automatic_write_allowed, is_auto_write_protected, set_auto_write_protection, inherit_auto_write_protection,
+)
 from app.services.docx_segmentation import new_import_options
 from copy import deepcopy
 import hashlib
@@ -1876,6 +1879,16 @@ class SegmentProjectSyncUpdate(BaseModel):
     disabled: bool
 
 
+class SegmentProtectionItem(BaseModel):
+    segment_id: UUID
+    expected_version: int = Field(ge=1)
+
+
+class SegmentProtectionUpdate(BaseModel):
+    items: list[SegmentProtectionItem] = Field(min_length=1, max_length=1000)
+    state: Literal["protected", "released"]
+
+
 class SegmentProjectSyncTrigger(BaseModel):
     expected_version: int = Field(ge=1)
     trigger: Literal["blur"] = "blur"
@@ -2098,6 +2111,7 @@ def _serialize_pretranslation_task(task: PretranslationTask) -> dict[str, Any]:
         "total_segments": int(task.total_segments or 0),
         "unique_segments": int(task.unique_segments or 0),
         "deduplicated_segments": int(task.deduplicated_segments or 0),
+        "skipped_protected_segments": int(task.skipped_protected_segments or 0),
         "processed_segments": int(task.processed_segments or 0),
         "updated_segments": int(task.updated_segments or 0),
         "error_segments": int(task.error_segments or 0),
@@ -2382,6 +2396,7 @@ def _run_pretranslation_tm_stage(task_id: UUID, options: dict[str, Any]) -> None
         task_id,
         progress=35,
         message=f"TM 预匹配完成，更新 {int(result.get('updated', 0))} 条",
+        skipped_protected_segments=int(result.get("skipped_protected_segments", 0)),
         current_action="tm_done",
     )
 
@@ -2469,6 +2484,7 @@ async def _run_pretranslation_llm_stage(task_id: UUID, options: dict[str, Any]) 
                         total_segments=total,
                         unique_segments=int(payload.get("unique_total") or 0),
                         deduplicated_segments=int(payload.get("deduplicated_count") or 0),
+                        skipped_protected_segments=int(payload.get("skipped_protected_segments") or 0),
                         progress=45 if total else 92,
                         message=(
                             f"LLM 预翻译进行中：0/{total}"
@@ -2530,6 +2546,7 @@ async def _run_pretranslation_llm_stage(task_id: UUID, options: dict[str, Any]) 
                         error_segments=errors,
                         progress=95,
                         message="LLM 预翻译写入完成",
+                        skipped_protected_segments=int(payload.get("skipped_protected_segments") or 0),
                         current_action="llm_done",
                     )
 
@@ -2818,6 +2835,8 @@ def preview_pretranslation_match_analysis(
         "tm_applied_words": workload["tm_applied_words"],
         "repeat_segments": workload["repeat_segments"],
         "repeat_words": workload["repeat_words"],
+        "skipped_protected_segments": skipped_confirmed["protected_count"],
+        "skipped_protected_words": skipped_confirmed["protected_words"],
         "skipped_confirmed_segments": skipped_confirmed["segment_count"],
         "skipped_confirmed_words": skipped_confirmed["word_count"],
     }
@@ -3622,7 +3641,7 @@ def _load_pretranslation_match_analysis_segments_for_files(
     file_segments: dict[UUID, list[DocumentMatchSegment]] = {
         file_record.id: [] for file_record in files
     }
-    skipped_confirmed = {"segment_count": 0, "word_count": 0}
+    skipped_confirmed = {"segment_count": 0, "word_count": 0, "protected_count": 0, "protected_words": 0}
     if not file_segments:
         return file_segments, skipped_confirmed
 
@@ -3642,6 +3661,7 @@ def _load_pretranslation_match_analysis_segments_for_files(
             Segment.display_text,
             Segment.source_word_count,
             Segment.status,
+            Segment.auto_write_protection,
         )
         .filter(Segment.file_record_id.in_(list(file_segments.keys())))
         .order_by(
@@ -3651,8 +3671,12 @@ def _load_pretranslation_match_analysis_segments_for_files(
         )
         .all()
     )
-    for file_record_id, source_text, display_text, source_word_count, status in segments:
+    for file_record_id, source_text, display_text, source_word_count, status, protection in segments:
         word_count = _segment_preview_word_count(source_text, source_word_count)
+        if protection == "protected":
+            skipped_confirmed["protected_count"] += 1
+            skipped_confirmed["protected_words"] += word_count
+            continue
         if skip_confirmed and status == "confirmed":
             skipped_confirmed["segment_count"] += 1
             skipped_confirmed["word_count"] += word_count
@@ -5700,23 +5724,31 @@ def _llm_segment_should_translate(
     *,
     sentence_id: str | None = None,
 ) -> bool:
+    if not automatic_write_allowed(segment, entrypoint="llm_selection"):
+        return False
     if not _llm_scope_allows_segment(segment, scope, sentence_id=sentence_id):
         return False
     if _llm_scope_allows_protected_reuse(scope):
         return True
-    return not is_llm_protected_reuse_segment(segment)
+    return (getattr(segment, "auto_write_protection", None) == "released"
+            or not is_llm_protected_reuse_segment(segment))
 
 
 def _get_llm_write_skip_reason(segment: Segment, task: LLMTranslationTask, scope: str) -> str | None:
+    if not automatic_write_allowed(segment, entrypoint="llm_writeback"):
+        return "句段已启用自动修改保护，已跳过 LLM 写回。"
     base_version = int(getattr(task, "base_version", 0) or 0)
     current_version = int(getattr(segment, "version", 0) or 0)
     version_changed = bool(base_version and current_version != base_version)
 
+    if version_changed and getattr(segment, "auto_write_protection_updated_at", None) is not None:
+        return "句段版本或保护状态已变化，已跳过旧 LLM 写回。"
     if (segment.source_text or "") != (task.source_text or ""):
         return "句段原文已变化，已跳过 LLM 写回。"
     if (
         version_changed
         and not _llm_scope_allows_protected_reuse(scope)
+        and getattr(segment, "auto_write_protection", None) != "released"
         and is_llm_protected_reuse_segment(segment)
     ):
         return "句段已被 TM 或项目同步更新为 100% 复用结果，已跳过 LLM 写回。"
@@ -5800,6 +5832,8 @@ def _build_llm_translation_tasks(
     sentence_id: str | None = None,
     source_filename: str | None = None,
     translation_scenario: LLMTranslationScenario = "standard",
+    current_user: User | None = None,
+    workload_stats: dict[str, int] | None = None,
 ) -> list[LLMTranslationTask]:
     statuses_by_scope = LLM_STATUSES_BY_SCOPE
     target_statuses: set[str] | None = None
@@ -5812,6 +5846,14 @@ def _build_llm_translation_tasks(
         if target_statuses is None:
             raise ValueError(f"不支持的 scope: {scope}")
     segments = list_segments_for_file_record(db, file_record_id)
+    writable_ids = None
+    if current_user is not None:
+        file = db.get(FileRecord, file_record_id)
+        visible_ids = {row.id for row in _apply_segment_assignment_visibility_filter(
+            db, db.query(Segment.id).filter(Segment.file_record_id == file_record_id), file, current_user,
+        ).all()}
+        segments = [segment for segment in segments if segment.id in visible_ids]
+        writable_ids = {segment.id for segment in _filter_writable_segments(db, file, current_user, segments)}
     tm_target_text_map = get_tm_target_text_map(
         db,
         [segment.matched_source_text for segment in segments if segment.matched_source_text],
@@ -5830,6 +5872,10 @@ def _build_llm_translation_tasks(
     clean_numbering = is_word_document_filename(source_filename)
     tasks: list[LLMTranslationTask] = []
     for segment in segments:
+        if (workload_stats is not None and is_auto_write_protected(segment)
+                and (writable_ids is None or segment.id in writable_ids)
+                and (scope != "current_segment" or segment.sentence_id == current_sentence_id)):
+            workload_stats["skipped_protected_segments"] = workload_stats.get("skipped_protected_segments", 0) + 1
         effective_status = _llm_effective_segment_status(segment)
         should_translate = True
         if scope == "current_segment":
@@ -5846,6 +5892,8 @@ def _build_llm_translation_tasks(
         ):
             should_translate = False
 
+        if writable_ids is not None and segment.id not in writable_ids:
+            should_translate = False
         if not should_translate and not include_context:
             continue
 
@@ -12073,6 +12121,10 @@ def _serialize_workbench_segment(
         "target_text": seg.target_text,
         "target_html": seg.target_html,
         "status": seg.status,
+        "auto_write_protection": seg.auto_write_protection or "none",
+        "auto_write_protection_reason": seg.auto_write_protection_reason,
+        "auto_write_protection_updated_at": seg.auto_write_protection_updated_at.isoformat() if seg.auto_write_protection_updated_at else None,
+        "auto_write_protection_updated_by_id": str(seg.auto_write_protection_updated_by_id) if seg.auto_write_protection_updated_by_id else None,
         "project_sync_disabled": bool(getattr(seg, "project_sync_disabled", False)),
         "project_sync_origin": _serialize_project_sync_origin(seg),
         **segment_sync_info(seg),
@@ -12263,6 +12315,8 @@ def _resolve_unconfirmed_segment_status(segment: Segment) -> str:
 def _apply_segment_scope_filter(query, scope: str):
     normalized_scope = (scope or "all").strip().lower()
     status_conditions = segment_effective_status_conditions(Segment)
+    if normalized_scope == "auto_write_protected":
+        return query.filter(Segment.auto_write_protection == "protected")
     if normalized_scope == "project_sync_only":
         return query.filter(status_conditions["project_sync"])
     if normalized_scope == "exact_only":
@@ -14217,13 +14271,10 @@ def _filter_tm_rematch_segments(
     *,
     skip_confirmed: bool,
 ) -> tuple[list[Segment], int]:
-    if not skip_confirmed:
-        return segments, 0
-
     matchable_segments: list[Segment] = []
     skipped_count = 0
     for segment in segments:
-        if segment.status == "confirmed":
+        if is_auto_write_protected(segment) or (skip_confirmed and segment.status == "confirmed"):
             skipped_count += 1
             continue
         matchable_segments.append(segment)
@@ -14273,8 +14324,9 @@ def rematch_file_record(
     segments = list_segments_for_file_record(db, file_record_id)
     segments = _filter_writable_segments(db, file_record, current_user, segments)
     if not segments:
-        return {"exact": 0, "fuzzy": 0, "skipped": 0, "updated": 0}
+        return {"exact": 0, "fuzzy": 0, "skipped": 0, "updated": 0, "skipped_protected_segments": 0}
 
+    skipped_protected_segments = sum(is_auto_write_protected(segment) for segment in segments)
     matchable_segments, skipped_count = _filter_tm_rematch_segments(
         segments,
         skip_confirmed=payload.skip_confirmed,
@@ -14300,6 +14352,13 @@ def rematch_file_record(
     clean_numbering = is_word_document_filename(file_record.filename)
 
     for segment, match in zip(matchable_segments, matches, strict=False):
+        loaded_version = int(segment.version or 1)
+        db.refresh(segment, with_for_update=True)
+        if not automatic_write_allowed(segment, entrypoint="tm_rematch") or int(segment.version or 1) != loaded_version:
+            skipped_count += 1
+            if is_auto_write_protected(segment):
+                skipped_protected_segments += 1
+            continue
         before = (
             segment.target_text,
             segment.status,
@@ -14310,6 +14369,7 @@ def rematch_file_record(
             segment.matched_creator_name,
             segment.matched_created_at,
             segment.matched_updated_at,
+            segment.auto_write_protection,
         )
 
         segment.score = float(match.score or 0)
@@ -14334,7 +14394,9 @@ def rematch_file_record(
                 skipped_count += 1
                 continue
             segment.target_text = target_text
+            segment.target_html = None
             segment.source = "tm"
+            set_auto_write_protection(segment, "protected", reason="tm_exact", actor_id=current_user.id)
             apply_segment_status(
                 segment,
                 "confirmed" if payload.auto_confirm_exact else "exact",
@@ -14373,6 +14435,7 @@ def rematch_file_record(
             segment.matched_creator_name,
             segment.matched_created_at,
             segment.matched_updated_at,
+            segment.auto_write_protection,
         )
         if before != after:
             segment.last_modified_by_id = current_user.id
@@ -14393,6 +14456,7 @@ def rematch_file_record(
 
     db.commit()
     return {
+        "skipped_protected_segments": skipped_protected_segments,
         "exact": exact_count,
         "fuzzy": fuzzy_count,
         "skipped": skipped_count,
@@ -16209,6 +16273,48 @@ def update_segment_target_layout(
     }
 
 
+@router.post("/files/{file_record_id}/segments/auto-write-protection")
+def update_segment_auto_write_protection(
+    file_record_id: UUID,
+    payload: SegmentProtectionUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    from app.services.review_sync import lock_file_project
+    lock_file_project(db, file_record_id)
+    file = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    ids = {item.segment_id for item in payload.items}
+    rows = db.query(Segment).filter(Segment.file_record_id == file.id, Segment.id.in_(ids)).order_by(
+        Segment.id,
+    ).with_for_update().populate_existing().all()
+    by_id = {segment.id: segment for segment in rows}
+    writable = {segment.id for segment in _filter_writable_segments(db, file, current_user, rows)}
+    results = []
+    seen = set()
+    for item in payload.items:
+        if item.segment_id in seen:
+            continue
+        seen.add(item.segment_id)
+        segment = by_id.get(item.segment_id)
+        result = {"segment_id": str(item.segment_id)}
+        if segment is None:
+            result["error"] = "not_found"
+        elif segment.id not in writable:
+            result["error"] = "no_write_access"
+        elif int(segment.version or 1) != item.expected_version:
+            result.update(error="version_conflict", current_version=int(segment.version or 1))
+        else:
+            changed = set_auto_write_protection(segment, payload.state, reason="manual", actor_id=current_user.id)
+            result.update(updated=changed, version=int(segment.version or 1),
+                          auto_write_protection=segment.auto_write_protection,
+                          auto_write_protection_reason=segment.auto_write_protection_reason)
+        results.append(result)
+    db.commit()
+    publish_segment_changes([file.id])
+    return {"updated_count": sum(bool(item.get("updated")) for item in results), "items": results}
+
+
 @router.patch("/file-records/{file_record_id}/segments/{sentence_id}/project-sync")
 def update_segment_project_sync(
     file_record_id: UUID,
@@ -16548,6 +16654,7 @@ def split_segment(
         cell_index=segment.cell_index,
         sequence_index=new_sequence_index,
     )
+    inherit_auto_write_protection(new_segment, segment)
     apply_segment_status(new_segment, _resolve_unconfirmed_segment_status(new_segment))
     db.add(new_segment)
 
@@ -16832,6 +16939,9 @@ def merge_segment(
         first_metadata["merged_entities"] = merged_entities
         
         first_seg.segment_metadata = _json.dumps(first_metadata, ensure_ascii=False)
+
+    if is_auto_write_protected(second_seg) and not is_auto_write_protected(first_seg):
+        inherit_auto_write_protection(first_seg, second_seg)
 
     # 更新第一个句段
     first_seg.source_text = merged_source.strip()
@@ -17952,11 +18062,6 @@ async def llm_translate_file_record(
     if body.scope == "current_segment" and not normalize_text(body.sentence_id or ""):
         raise HTTPException(status_code=400, detail="当前句段范围需要提供 sentence_id。")
     requested_model = normalize_text(body.model or "") or None
-    try:
-        validate_provider_choice(body.provider, model_override=requested_model)
-    except LLMConfigurationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     guidelines = _resolve_llm_guidelines(db, file_record, body)
     if "glossary_base_ids" in body.model_fields_set:
         glossary_bases = _validate_glossary_base_ids(db, body.glossary_base_ids)
@@ -17972,6 +18077,7 @@ async def llm_translate_file_record(
             "词汇表",
         )
 
+    workload_stats: dict[str, int] = {}
     translation_tasks = _build_llm_translation_tasks(
         db=db,
         file_record_id=file_record_id,
@@ -17984,8 +18090,16 @@ async def llm_translate_file_record(
         sentence_id=body.sentence_id,
         source_filename=get_file_record_source_filename(file_record),
         translation_scenario=body.translation_scenario,
+        current_user=current_user,
+        workload_stats=workload_stats,
     )
+    skipped_protected_segments = workload_stats.get("skipped_protected_segments", 0)
     deduplication = _deduplicate_llm_translation_tasks(translation_tasks)
+    if any(task.should_translate for task in translation_tasks):
+        try:
+            validate_provider_choice(body.provider, model_override=requested_model)
+        except LLMConfigurationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     target_task_by_sentence_id = {
         task.sentence_id: task
         for task in translation_tasks
@@ -18079,6 +18193,7 @@ async def llm_translate_file_record(
                         continue
 
                     try:
+                        fdb.refresh(segment, with_for_update=True)
                         _require_segment_work_access(fdb, fr, segment, user)
                     except HTTPException as exc:
                         events.append((
@@ -18100,6 +18215,7 @@ async def llm_translate_file_record(
                                     "sentence_id": sentence_id,
                                     "status": segment.status,
                                     "message": skip_reason,
+                                    "reason_code": "auto_write_protected" if is_auto_write_protected(segment) else "changed",
                                 },
                             ))
                             continue
@@ -18214,6 +18330,7 @@ async def llm_translate_file_record(
                 "total": total_count,
                 "unique_total": deduplication.unique_total,
                 "deduplicated_count": deduplication.deduplicated_count,
+                "skipped_protected_segments": skipped_protected_segments,
             },
         )
 
@@ -18224,6 +18341,8 @@ async def llm_translate_file_record(
                     "file_record_id": str(file_record_id),
                     "updated_count": 0,
                     "error_count": 0,
+                    "skipped_protected_segments": skipped_protected_segments,
+                    "message": f"没有需要翻译的句段，已跳过 {skipped_protected_segments} 条受保护译文。",
                     "total": 0,
                 },
             )
@@ -18237,7 +18356,7 @@ async def llm_translate_file_record(
             return bool(callable(request_cancel_check) and request_cancel_check())
 
         async def flush_pending():
-            nonlocal updated_count, error_count, skipped_count, pending_results
+            nonlocal updated_count, error_count, skipped_count, skipped_protected_segments, pending_results
             if not pending_results:
                 return
             batch = pending_results
@@ -18249,6 +18368,8 @@ async def llm_translate_file_record(
                     error_count += 1
                 elif event_name == "skipped":
                     skipped_count += 1
+                    if event_data.get("reason_code") == "auto_write_protected":
+                        skipped_protected_segments += 1
                 yield _sse_event(event_name, event_data)
 
         async for result in iter_batch_translate(
@@ -18297,6 +18418,7 @@ async def llm_translate_file_record(
                     "updated_count": updated_count,
                     "error_count": error_count,
                     "skipped_count": skipped_count,
+                    "skipped_protected_segments": skipped_protected_segments,
                     "total": total_count,
                 },
             )

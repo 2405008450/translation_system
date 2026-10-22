@@ -476,6 +476,10 @@ REQUIRED_SCHEMA = {
         "created_at",
     },
     "segments": {
+        "auto_write_protection",
+        "auto_write_protection_reason",
+        "auto_write_protection_updated_at",
+        "auto_write_protection_updated_by_id",
         "workflow_step_id",
         "source_hash",
         "project_sync_disabled",
@@ -522,6 +526,7 @@ REQUIRED_SCHEMA = {
         "total_segments",
         "unique_segments",
         "deduplicated_segments",
+        "skipped_protected_segments",
         "processed_segments",
         "updated_segments",
         "error_segments",
@@ -2104,6 +2109,9 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ON pretranslation_runs (created_at)
             """,
             """
+            ALTER TABLE IF EXISTS pretranslation_tasks ADD COLUMN IF NOT EXISTS skipped_protected_segments INTEGER NOT NULL DEFAULT 0
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_pretranslation_tasks_run_id
             ON pretranslation_tasks (run_id)
             """,
@@ -2476,6 +2484,13 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS segments
             ADD COLUMN IF NOT EXISTS source_word_count INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS auto_write_protection VARCHAR(20) NOT NULL DEFAULT 'none',
+            ADD COLUMN IF NOT EXISTS auto_write_protection_reason VARCHAR(40),
+            ADD COLUMN IF NOT EXISTS auto_write_protection_updated_at TIMESTAMP WITHOUT TIME ZONE,
+            ADD COLUMN IF NOT EXISTS auto_write_protection_updated_by_id UUID REFERENCES users(id) ON DELETE SET NULL
             """,
             """
             ALTER TABLE IF EXISTS segments

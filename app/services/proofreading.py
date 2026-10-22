@@ -5,6 +5,9 @@
 """
 from __future__ import annotations
 
+from app.services.proofreading_context import attach_neighbor_context, pack_readonly_context
+from app.services.auto_write_protection import automatic_write_allowed, is_auto_write_protected
+
 import asyncio
 import hashlib
 import json
@@ -588,6 +591,7 @@ def _pack_groups(groups: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
             + sum(len(value) for value in group["variants"])
             + len(json.dumps(group.get("glossary_references", []), ensure_ascii=False))
             + len(json.dumps(group.get("tm_reference", {}), ensure_ascii=False))
+            + len(json.dumps(group.get("readonly_context", []), ensure_ascii=False))
             + 200
         )
         if current and (len(current) >= PROOFREADING_BATCH_SIZE or current_chars + item_chars > PROOFREADING_BATCH_CHAR_LIMIT):
@@ -670,6 +674,13 @@ def _build_prompt(
     rules_text: str,
     user_instructions: str = "",
 ) -> str:
+    context = pack_readonly_context(groups)
+    # 上下文与待校对项使用相同换行编码，防止模型误解版式换行。
+    for item in context["readonly_context"]:
+        for field in ("source_text", "target_text"):
+            item[field] = _encode_line_break_placeholders(item[field])
+    logger.info("proofreading context items=%s chars=%s", len(context["readonly_context"]),
+                len(json.dumps(context, ensure_ascii=False)))
     items = []
     for seq, group in enumerate(groups):
         variants = "\n".join(
@@ -697,7 +708,7 @@ def _build_prompt(
             f"  原文：{source_label}\n"
             f"  现有译文候选：\n{variants}{references}"
         )
-    rules = rules_text.strip() or "准确、自然、简洁；保留数字、占位符、标签和专有名词；同一原文必须输出同一译文。"
+    rules = rules_text.strip() or "准确、自然、简洁；保留数字、占位符、标签和专有名词；结合各句段上下文保持术语一致。"
     user_rules = user_instructions.strip()
     user_section = f"\n【本批次用户校对要求】\n{user_rules}\n" if user_rules else ""
     return (
@@ -712,6 +723,9 @@ def _build_prompt(
         "版式换行在原文和译文中以 ⟦LB_1⟧、⟦LB_2⟧ 等占位符表示。reviewed_target_text 必须在与现有译文相同的位置"
         "原样保留全部 ⟦LB_n⟧ 占位符（数量和顺序一致），不得改写为真实换行、删除或合并；"
         "若现有译文不含占位符，则输出也不得包含。\n\n"
+        + "只读参考 readonly_context 仅用于理解上下文，禁止为参考项返回修改。"
+        + "仅返回 editable_items 中列出的 sid，不能用 seq 替代 sid。\n"
+        + json.dumps(context, ensure_ascii=False) + "\n\neditable_items：\n"
         + "\n\n".join(items)
     )
 
@@ -810,14 +824,8 @@ async def _review_group_batch(
             sid = str(item.get("sid") or "")
             group = pending_by_sid.get(sid)
             if group is None:
-                try:
-                    seq = int(item.get("seq"))
-                except (TypeError, ValueError):
-                    continue
-                if not 0 <= seq < len(pending):
-                    continue
-                group = pending[seq]
-                sid = group["sid"]
+                logger.warning("ignored proofreading result outside editable whitelist sid=%s", sid)
+                continue
             text_value = _decode_line_break_placeholders(str(item.get("reviewed_target_text") or "")).strip()
             try:
                 _validate_reviewed_text(
@@ -941,7 +949,7 @@ async def generate_batch(
 
     batch.status = "running"
     batch.progress = 1
-    batch.message = "正在整理重复原文。"
+    batch.message = "正在整理校对句段与只读上下文。"
     batch.error_message = ""
     db.commit()
 
@@ -1000,6 +1008,7 @@ async def generate_batch(
         bindings_by_language[binding.target_language].append(binding)
 
     total_groups = 0
+    skipped_protected_ids = set()
     loaded_versions: dict[UUID, int] = {}
     grouped_by_language: dict[str, list[dict[str, Any]]] = {}
     for target_language, language_bindings in bindings_by_language.items():
@@ -1023,8 +1032,19 @@ async def generate_batch(
             .order_by(ProofreadingSegmentBaseline.sheet_index, ProofreadingSegmentBaseline.row_index)
             .all()
         )
-        groups_by_hash: dict[str, dict[str, Any]] = {}
+        from app.routers.api import _filter_writable_segments
+        context_readable_ids = set()
+        for context_file_id in {s.file_record_id for _, s in rows}:
+            context_file = db.get(FileRecord, context_file_id)
+            context_readable_ids.update(s.id for s in _filter_writable_segments(
+                db, context_file, current_user, [s for _, s in rows if s.file_record_id == context_file_id],
+            ))
+        groups_by_id: dict[str, dict[str, Any]] = {}
         for baseline, segment in rows:
+            if is_auto_write_protected(segment):
+                if current_user and (can_access_all_projects(current_user) or segment.id in context_readable_ids):
+                    skipped_protected_ids.add(segment.id)
+                continue
             if allowed_ids is not None and segment.id not in allowed_ids:
                 continue
             if retry_scope == "failed_only" and segment.id not in failed_segment_ids:
@@ -1033,14 +1053,14 @@ async def generate_batch(
             if not normalize_text(candidate_text) or segment.status == "confirmed":
                 continue
             loaded_versions[segment.id] = int(segment.version or 1)
-            source_hash = segment.source_hash or build_source_hash(segment.source_text)
             try:
                 segment_metadata = json.loads(segment.segment_metadata or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
                 segment_metadata = {}
-            group = groups_by_hash.setdefault(source_hash, {
+            group = groups_by_id.setdefault(str(segment.id), {
                 "sid": str(segment.id),
                 "source_text": segment.source_text,
+                "file_record_id": segment.file_record_id,
                 "variants": [],
                 "segments": [],
                 "translation_only": bool(segment_metadata.get("translation_only")),
@@ -1051,19 +1071,23 @@ async def generate_batch(
             group["segments"].append((
                 _BaselineSnapshot(baseline.original_target_text), _SegmentSnapshot(segment.id),
             ))
-        groups = list(groups_by_hash.values())
-        file_record = db.get(FileRecord, language_bindings[0].file_record_id)
-        if file_record and groups:
-            _attach_reference_context(
-                db,
-                file_record,
-                groups,
-                source_language=batch.source_language,
-                target_language=target_language,
-            )
+        groups = list(groups_by_id.values())
+        attach_neighbor_context(db, rows, groups, current_user)
+        for reference_file_id in dict.fromkeys(group["file_record_id"] for group in groups):
+            file_record = db.get(FileRecord, reference_file_id)
+            file_groups = [group for group in groups if group["file_record_id"] == reference_file_id]
+            if file_record:
+                _attach_reference_context(
+                    db, file_record, file_groups,
+                    source_language=batch.source_language,
+                    target_language=target_language,
+                )
         grouped_by_language[target_language] = groups
         total_groups += len(groups)
 
+    config = batch_config(batch)
+    config["skipped_protected_segments"] = len(skipped_protected_ids)
+    batch.config_json = json.dumps(config, ensure_ascii=False)
     processed_groups = 0
     for target_language, groups in grouped_by_language.items():
         for packed in _pack_groups(groups):
@@ -1104,12 +1128,14 @@ async def generate_batch(
                     Segment.id.in_(packed_segment_ids),
                 ).order_by(Segment.id).with_for_update().populate_existing().all()
             }
+            skipped_protected_ids.update(s.id for s in current_segments.values() if is_auto_write_protected(s))
             for group in packed:
                 group["segments"] = [
                     (baseline, current_segments[segment.id]) for baseline, segment in group["segments"]
                     if segment.id in current_segments
                     and int(current_segments[segment.id].version or 1) == loaded_versions.get(segment.id)
                     and current_segments[segment.id].status != "confirmed"
+                    and automatic_write_allowed(current_segments[segment.id], entrypoint="proofreading_writeback")
                 ]
 
             if restricted_mode:
@@ -1153,7 +1179,7 @@ async def generate_batch(
                     continue
                 reviewed_text = result["reviewed_target_text"]
                 for baseline, segment in group["segments"]:
-                    if segment.status == "confirmed" or int(segment.version or 1) != loaded_versions.get(segment.id):
+                    if is_auto_write_protected(segment) or segment.status == "confirmed" or int(segment.version or 1) != loaded_versions.get(segment.id):
                         continue
                     resolved_segment_ids.append(segment.id)
                     before_text = segment.target_text or ""
@@ -1227,11 +1253,19 @@ async def generate_batch(
     for file_id in file_ids:
         sync_file_record_status(db, file_id)
     _refresh_batch_change_stats(db, batch)
-    unresolved_failed_count = len(get_latest_generation_error_segment_ids(db, batch.id))
+    failed_ids = get_latest_generation_error_segment_ids(db, batch.id)
+    unresolved_failed_count = db.query(Segment).filter(
+        Segment.id.in_(failed_ids), Segment.auto_write_protection != "protected",
+    ).count() if failed_ids else 0
+    config = batch_config(batch)
+    config["skipped_protected_segments"] = len(skipped_protected_ids)
+    batch.config_json = json.dumps(config, ensure_ascii=False)
     batch.failed_segments = unresolved_failed_count
     batch.progress = 100
     batch.status = "partial_failed" if unresolved_failed_count else "completed"
     batch.message = "校对部分完成。" if unresolved_failed_count else "校对完成，可复核或导出。"
+    if not total_groups:
+        batch.message = f"没有需要校对的句段，已跳过 {len(skipped_protected_ids)} 条受保护译文。"
     batch.finished_at = _utcnow_naive()
     report.total_segments = checked_count
     report.checked_segments = checked_count
@@ -1482,6 +1516,7 @@ def serialize_batch(db: Session, batch: ProofreadingBatch) -> dict[str, Any]:
         "cancel_requested": bool(getattr(batch, "cancel_requested", False)),
         "total_segments": batch.total_segments,
         "changed_segments": batch.changed_segments,
+        "skipped_protected_segments": int(config.get("skipped_protected_segments", 0)),
         "skipped_segments": batch.skipped_segments,
         "failed_segments": batch.failed_segments,
         "export_status": batch.export_status,

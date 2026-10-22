@@ -545,14 +545,19 @@ def apply_item(
         return "manual_only"
     if item.locate_status in _LOCATE_UNAPPLICABLE:
         return "manual_only"
+    from app.services.review_sync import lock_file_project
+    lock_file_project(db, item.file_record_id)
     segment = db.query(Segment).filter(
         Segment.file_record_id == item.file_record_id,
         Segment.sentence_id == item.sentence_id,
-    ).first()
+    ).with_for_update().populate_existing().first()
     if not segment:
         item.status = _ITEM_STALE
         db.flush()
         return "stale"
+    from app.services.auto_write_protection import automatic_write_allowed
+    if not automatic_write_allowed(segment, entrypoint="review_suggestion_apply"):
+        return "manual_only"
     latest_target = segment.target_text or ""
     if item.apply_mode == "anchor":
         anchor = item.replace_anchor or ""

@@ -264,12 +264,12 @@ def generate_proofreading_batch(
     workflow_ids = None
     if batch.batch_kind == "workflow_segments" or not can_access_all_projects(current_user):
         workflow_ids = [str(segment.id) for segment in eligible_workflow_segments(db, batch, current_user)]
-        if not workflow_ids:
+        if not workflow_ids and not eligible_workflow_segments(db, batch, current_user, include_protected=True):
             raise HTTPException(403, "当前没有有权校对的未确认非空句段。")
     if batch.status in {"queued", "running", "canceling"}:
         raise HTTPException(status_code=409, detail="当前校对批次正在运行。")
     if batch.status not in {"ready", "partial_failed", "failed", "canceled"} and not (
-        batch.status == "completed" and eligible_workflow_segments(db, batch, current_user)
+        batch.status == "completed" and eligible_workflow_segments(db, batch, current_user, include_protected=True)
     ):
         raise HTTPException(status_code=409, detail=f"当前状态（{batch.status}）不可启动校对。")
     if getattr(batch, "batch_kind", "xlsx_columns") == "document_pair" and getattr(batch, "workflow_stage", "not_applicable") != "proofreading":
@@ -286,10 +286,20 @@ def generate_proofreading_batch(
             raise HTTPException(409, "当前分配范围内没有可重试的失败项。")
     if retry_scope == "failed_only" and not get_latest_generation_error_segment_ids(db, batch.id):
         raise HTTPException(status_code=409, detail="当前批次没有可重试的生成失败项。")
-    try:
-        validate_provider_choice(provider=provider, model_override=model)
-    except LLMConfigurationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    pending_query = db.query(Segment.id).join(
+        ProofreadingSegmentBaseline, ProofreadingSegmentBaseline.segment_id == Segment.id,
+    ).filter(
+        ProofreadingSegmentBaseline.batch_id == batch.id,
+        Segment.status != "confirmed", Segment.auto_write_protection != "protected",
+        Segment.target_text != "",
+    )
+    if workflow_ids is not None:
+        pending_query = pending_query.filter(Segment.id.in_([UUID(value) for value in workflow_ids]))
+    if pending_query.first() is not None:
+        try:
+            validate_provider_choice(provider=provider, model_override=model)
+        except LLMConfigurationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         batch_config = json.loads(batch.config_json or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -562,10 +572,14 @@ def get_file_proofreading_baselines(
             else latest_report.model if latest_report else ""
         )
         eligible = eligible_workflow_segments(db, batch, current_user)
+        protected_count = sum(s.auto_write_protection == "protected" for s in eligible_workflow_segments(
+            db, batch, current_user, include_protected=True,
+        ))
         proofreading_context = {
-            "can_generate": bool(eligible),
+            "can_generate": bool(eligible or protected_count),
             "can_cancel": can_access_all_projects(current_user) or generation.get("started_by_id") == str(current_user.id),
             "eligible_segments": len(eligible),
+            "skipped_protected_segments": protected_count,
             "workflow_step_id": str(config.get("workflow_step_id") or ""),
             "pair_format": "xlsx" if batch and is_xlsx_pair(batch) else "document",
             "batch_id": str(binding.batch_id),

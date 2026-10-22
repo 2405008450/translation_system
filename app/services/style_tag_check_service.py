@@ -692,6 +692,12 @@ def apply_style_tag_check_item(db: Session, item: StyleTagCheckReportItem) -> St
         raise HTTPException(status_code=400, detail="没有可应用的标注建议。")
 
     segment = _get_item_segment(db, item)
+    from app.services.review_sync import lock_file_project
+    from app.services.auto_write_protection import automatic_write_allowed
+    lock_file_project(db, segment.file_record_id)
+    db.refresh(segment, with_for_update=True)
+    if not automatic_write_allowed(segment, entrypoint="ai_style_tag_apply"):
+        raise HTTPException(status_code=409, detail="句段已启用自动修改保护，请先解除保护再应用 AI 标注。")
     current_target = segment.target_text or ""
     # 二次校验：应用时译文可能已被改动，必须重新确认一致性，避免标签错位
     if strip_format_tags(suggested) != current_target:

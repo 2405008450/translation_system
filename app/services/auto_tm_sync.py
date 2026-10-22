@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.auto_write_protection import automatic_write_allowed, set_auto_write_protection
+
 import logging
 import json
 from dataclasses import dataclass
@@ -342,8 +344,12 @@ def refresh_unconfirmed_segment_matches(
         if not segments:
             break
 
-        source_sentences = [segment.source_text for segment in segments]
-        auxiliary_sentences = [segment.display_text for segment in segments]
+        matchable = [segment for segment in segments if automatic_write_allowed(segment, entrypoint="auto_tm_selection")]
+        if not matchable:
+            offset += chunk_size
+            continue
+        source_sentences = [segment.source_text for segment in matchable]
+        auxiliary_sentences = [segment.display_text for segment in matchable]
         matches, _ = match_sentences_with_stats(
             db=db,
             sentences=source_sentences,
@@ -355,7 +361,11 @@ def refresh_unconfirmed_segment_matches(
             include_fuzzy=include_fuzzy,
         )
 
-        for segment, match in zip(segments, matches, strict=False):
+        for segment, match in zip(matchable, matches, strict=False):
+            loaded_version = int(segment.version or 1)
+            db.refresh(segment, with_for_update=True)
+            if not automatic_write_allowed(segment, entrypoint="auto_tm_rematch") or int(segment.version or 1) != loaded_version:
+                continue
             if not include_fuzzy and match.status != "exact":
                 continue
             before = (
@@ -397,6 +407,8 @@ def refresh_unconfirmed_segment_matches(
                 segment.target_html = None
                 apply_segment_status(segment, match.status)
                 segment.source = "tm"
+                if match.status == "exact" and segment.auto_write_protection != "released":
+                    set_auto_write_protection(segment, "protected", reason="tm_exact")
             after = (
                 segment.target_text,
                 segment.target_html,

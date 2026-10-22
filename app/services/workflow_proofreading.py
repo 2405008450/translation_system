@@ -1,6 +1,7 @@
 """为普通翻译工作流关联校对批次，不复制文件或句段。"""
 from __future__ import annotations
 
+
 import json
 from datetime import datetime, timezone
 from uuid import UUID
@@ -33,7 +34,7 @@ def can_read_workflow_file(db: Session, file: FileRecord, user: User) -> bool:
     ).first() is not None
 
 
-def eligible_workflow_segments(db: Session, batch: ProofreadingBatch, user: User | None) -> list[Segment]:
+def eligible_workflow_segments(db: Session, batch: ProofreadingBatch, user: User | None, *, include_protected: bool = False) -> list[Segment]:
     if user is None or not user.is_active:
         return []
     # 沿用工作台已有的阶段、显示序号及分配区间权限。
@@ -50,7 +51,8 @@ def eligible_workflow_segments(db: Session, batch: ProofreadingBatch, user: User
         segments = db.query(Segment).filter(
             Segment.file_record_id == file.id,
             Segment.workflow_step_id == UUID(str(step_id)),
-            Segment.status != "confirmed",
+            ((Segment.status != "confirmed") & (Segment.auto_write_protection != "protected"))
+            | ((Segment.auto_write_protection == "protected") if include_protected else False),
         ).all()
         result.extend(segment for segment in _filter_writable_segments(db, file, user, segments)
                       if (segment.target_text or "").strip())

@@ -49,6 +49,9 @@ tests/*
 !tests/test_mixed_translation.py
 !tests/test_alignment_structure.py
 !tests/test_workflow_proofreading.py
+!tests/test_auto_write_protection.py
+!tests/test_auto_tm_sync.py
+!tests/test_proofreading.py
 !tests/test_merge_workflow_transition.py
 !tests/test_deploy_proxy.py
 记忆库下载/

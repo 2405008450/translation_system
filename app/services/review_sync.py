@@ -1,6 +1,8 @@
 """人工修订同步：基线、关联修订和持久化任务与普通翻译同步隔离。"""
 from __future__ import annotations
 
+from app.services.auto_write_protection import automatic_write_allowed, is_auto_write_protected
+
 import logging
 from time import monotonic
 from datetime import datetime
@@ -246,6 +248,9 @@ def process_task(db: Session, task_id: UUID) -> dict | None:
             continue
         member = members.get(segment.id)
         revision = db.get(SegmentRevision, member.revision_id) if member and member.revision_id else None
+        if not automatic_write_allowed(segment, entrypoint="review_sync"):
+            _skip(result, "auto_write_protected")
+            continue
         if segment.project_sync_disabled:
             _skip(result, "sync_disabled")
             continue
@@ -344,6 +349,9 @@ def resolve_group(db: Session, revision: SegmentRevision, status: str, user: Use
         if not segment or not entry or entry.status != "pending" or segment.version != item.version or segment.target_text != item.after_text:
             item.active = False
             _skip(result, "independently_modified")
+            continue
+        if segment.id != revision.segment_id and is_auto_write_protected(segment):
+            _skip(result, "auto_write_protected")
             continue
         if not can_write(db, segment, user) or segment.project_sync_disabled:
             item.active = False

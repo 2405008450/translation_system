@@ -101,6 +101,7 @@ const emit = defineEmits<{
   ctrlClick: [sentenceId: string, event: MouseEvent]
   toggleSelection: [sentenceId: string, event: MouseEvent]
   toggleProjectSync: [sentenceId: string, disabled: boolean]
+  toggleAutoWriteProtection: [sentenceId: string]
 }>()
 
 const editorRef = ref<HTMLDivElement | null>(null)
@@ -3027,6 +3028,18 @@ watch(
   >
     <div class="segment-row__meta">
       <span class="segment-row__index">{{ index + 1 }}</span>
+      <button
+        class="segment-row__sync-toggle"
+        type="button"
+        data-testid="segment-auto-write-protection"
+        :disabled="disabled || segment.can_write === false"
+        :aria-pressed="segment.auto_write_protection === 'protected'"
+        :title="segment.auto_write_protection === 'protected'
+          ? `自动修改已保护（${segment.auto_write_protection_reason === 'tm_exact' ? 'TM 100% 已采用' : '人工保护'}）；点击解除保护，仍可人工编辑`
+          : '保护译文：阻止自动修改，仍可人工编辑'"
+        :aria-label="segment.auto_write_protection === 'protected' ? '解除自动修改保护' : '保护译文'"
+        @click.stop="emit('toggleAutoWriteProtection', segmentKey)"
+      ><span aria-hidden="true">{{ segment.auto_write_protection === 'protected' ? '🔒' : '🔓' }}</span></button>
       <span v-if="isAlignmentTranslationOnly" class="segment-row__alignment-issue-badge is-translation-only">增译</span>
       <span v-else-if="isAlignmentMissingTranslation" class="segment-row__alignment-issue-badge is-missing">漏译</span>
       <span v-if="isAlignmentCrossCell" class="segment-row__alignment-issue-badge is-cross-cell" title="同一侧包含多个表格单元格">跨格</span>

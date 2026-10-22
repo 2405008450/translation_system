@@ -577,6 +577,7 @@ class PretranslationTask(Base):
     total_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     unique_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     deduplicated_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    skipped_protected_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     processed_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     updated_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     error_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
@@ -1061,6 +1062,14 @@ class Segment(Base):
     target_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     target_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="none")
+    auto_write_protection: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="none", server_default=text("'none'"),
+    )
+    auto_write_protection_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    auto_write_protection_updated_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    auto_write_protection_updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
     project_sync_disabled: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,

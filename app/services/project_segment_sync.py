@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.auto_write_protection import automatic_write_allowed, is_auto_write_protected
+
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -568,7 +570,7 @@ def converge_pretranslation_llm_segments(
 
         summary.duplicate_group_count += 1
         for target in targets:
-            if target.id == canonical.id or (target.target_text or "") == canonical_text:
+            if is_auto_write_protected(target) or target.id == canonical.id or (target.target_text or "") == canonical_text:
                 continue
             _apply_pretranslation_convergence_translation(
                 db,
@@ -646,6 +648,10 @@ def _apply_pretranslation_convergence_translation(
     canonical_text: str,
     current_user: User | None,
 ) -> None:
+    db.flush()
+    db.refresh(target, with_for_update=True)
+    if not automatic_write_allowed(target, entrypoint="pretranslation_convergence"):
+        return
     before_text = target.target_text or ""
     target.target_text = canonical_text
     target.target_html = None
@@ -757,12 +763,14 @@ def _apply_candidate_to_targets(
     current_file_id: UUID,
     current_user,
 ) -> None:
+    db.flush()
     for target in targets:
         if target.id == candidate.segment.id:
             continue
+        db.refresh(target, with_for_update=True)
         if target.project_sync_disabled:
             continue
-        if not _is_safe_project_sync_target(target):
+        if not automatic_write_allowed(target, entrypoint="project_sync") or not _is_safe_project_sync_target(target):
             summary.protected_count += 1
             continue
 
@@ -850,7 +858,7 @@ def _build_candidate(segment: Segment) -> _SyncCandidate | None:
 
 def _is_safe_project_sync_target(segment: Segment) -> bool:
     """同步只能覆盖空值或自动生成值；所有确认内容和人工/导入稿均受保护。"""
-    if segment.status == "confirmed":
+    if is_auto_write_protected(segment) or segment.status == "confirmed":
         return False
     if not normalize_text(segment.target_text):
         return True
@@ -871,6 +879,8 @@ def _set_project_sync_origin(segment: Segment, candidate: _SyncCandidate) -> boo
 
 
 def _clear_project_synced_segment_fields(segment: Segment) -> bool:
+    if not automatic_write_allowed(segment, entrypoint="project_sync_clear"):
+        return False
     changed = False
     fields = {
         "target_text": "",

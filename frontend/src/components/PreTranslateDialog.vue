@@ -69,6 +69,7 @@ interface PretranslationTaskStatus {
   total_segments: number
   unique_segments: number
   deduplicated_segments: number
+  skipped_protected_segments?: number
   processed_segments: number
   updated_segments: number
   error_segments: number
@@ -674,6 +675,7 @@ function buildTaskStatusText(task: PretranslationTaskStatus) {
     const total = Math.max(task.total_segments, task.processed_segments)
     parts.push(`${task.processed_segments}/${total}`)
   }
+  if (task.skipped_protected_segments) parts.push(`保护跳过 ${task.skipped_protected_segments} 条`)
   if (task.unique_segments > 0 && task.deduplicated_segments > 0) {
     parts.push(`唯一 ${task.unique_segments}，去重 ${task.deduplicated_segments}`)
   }
@@ -1761,6 +1763,7 @@ onBeforeUnmount(() => {
             </label>
           </div>
 
+          <p class="hint-text">采用 TM 100% 匹配后自动保护；自动确认仅影响确认状态。受保护译文跳过自动翻译和校对，仍可能作为只读上下文。</p>
           <div class="ptd-checks">
             <label><input v-model="tmSkipConfirmed" type="checkbox" :disabled="running || !useTm" />{{ t('projectDetail.preTranslate.tm.skipConfirmed') }}</label>
             <label><input v-model="tmOverwriteFuzzy" type="checkbox" :disabled="running || !useTm" />{{ t('projectDetail.preTranslate.tm.overwriteFuzzy') }}</label>
@@ -1771,6 +1774,7 @@ onBeforeUnmount(() => {
             v-if="useTm && selectedTmCollectionIds.length > 0"
             class="ptd-workload-preview"
           >
+            <p v-if="workloadPreview?.skipped_protected_segments" class="hint-text">已跳过 {{ workloadPreview.skipped_protected_segments }} 条受保护译文。</p>
             <div class="ptd-workload-preview__head">
               <div>
                 <strong>TM 工作量预估</strong>
