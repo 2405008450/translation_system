@@ -1,4 +1,10 @@
 <script setup lang="ts">
+import {
+  previewMergeProofreading, startMergeProofreading, listMergeProofreadingRuns,
+  cancelMergeProofreadingRun, getMergeProofreadingExportReadiness,
+  startMergeProofreadingExport, downloadMergeProofreadingExport,
+  type MergeProofreadingRun, type MergeProofreadingPreview,
+} from '../api/mergeProofreading'
 import axios from 'axios'
 import {
   ArrowLeft,
@@ -461,7 +467,7 @@ const workflowExportReadiness = ref<ProofreadingExportReadiness | null>(null)
 const workflowExportReadinessError = ref('')
 const loadingWorkflowExportReadiness = ref(false)
 type ProofreadingProvider = 'auto' | 'deepseek' | 'openrouter'
-type ProofreadingRetryScope = 'all' | 'failed_only'
+type ProofreadingRetryScope = 'all' | 'failed_only' | 'unreviewed'
 const showProofreadingGenerateDialog = ref(false)
 const proofreadingGenerating = ref(false)
 const proofreadingGenerateError = ref('')
@@ -477,7 +483,22 @@ const proofreadingGenerationDraft = reactive<{
   retryScope: 'all',
 })
 let proofreadingGenerationPollTimer: number | null = null
-const hasWorkflowProofreading = computed(() => proofreadingContext.value?.batch_kind === 'workflow_segments')
+const mergeProofreadingScope = ref<'merge_view' | 'current_file'>('merge_view')
+const mergeProofreadingContexts = ref<Record<string, ProofreadingBaselineResponse>>({})
+const mergeProofreadingRuns = ref<MergeProofreadingRun[]>([])
+const mergeProofreadingPreview = ref<MergeProofreadingPreview | null>(null)
+const mergeExportReadiness = ref<MergeProofreadingPreview | null>(null)
+const mergeProofreadingPreviewLoading = ref(false)
+let mergeProofreadingRequest = 0
+let mergeContextRequest = 0
+let mergeRunRequest = 0
+let mergeProofreadingDisposed = false
+let mergeProofreadingTimer: number | null = null
+const mergeProofreadingActive = computed(() => mergeProofreadingRuns.value.find(run => run.kind === 'proofreading' && ['queued', 'running', 'canceling'].includes(run.status)))
+const mergeExportActive = computed(() => mergeProofreadingRuns.value.find(run => run.kind === 'export' && ['queued', 'running', 'canceling'].includes(run.status)))
+const mergeProofreadingSelectedFile = computed(() => mergeProofreadingScope.value === 'current_file' ? activeWorkbenchFileId.value || undefined : undefined)
+const hasWorkflowProofreading = computed(() => proofreadingContext.value?.batch_kind === 'workflow_segments'
+  || Boolean(props.mergeViewId && segmentStore.mergeViewDetail?.workflow_steps?.some(step => step.step_type === 'proofread')))
 const proofreadingPhaseLabel = computed(() => isDocumentPairProofreading.value
   ? (isAlignmentWorkbench.value ? '阶段 2/3 · 对齐' : '阶段 3/3 · 校对')
   : '阶段 2/2 · 校对（无需对齐）')
@@ -513,11 +534,14 @@ const proofreadingExportButtonLabel = computed(() => {
   }
   return proofreadingContext.value?.batch_kind === 'document_pair' ? '导出译文' : '导出校对版'
 })
-const canStartProofreadingGeneration = computed(() => (
+const canStartProofreadingGeneration = computed(() => props.mergeViewId
+  ? !mergeProofreadingActive.value && (mergeProofreadingScope.value === 'merge_view' || Boolean(activeWorkbenchFileId.value))
+  : (
   proofreadingContext.value?.can_generate !== false
   && ['ready', 'partial_failed', 'failed', 'canceled', 'completed'].includes(proofreadingContext.value?.batch_status || '')
 ))
 const proofreadingGenerationButtonLabel = computed(() => {
+  if (props.mergeViewId && mergeProofreadingActive.value) return 'LLM 校对中'
   const status = proofreadingContext.value?.batch_status || ''
   if (status === 'canceled') return '重新开始校对'
   if (status === 'partial_failed' || status === 'failed') return '重试 LLM 校对'
@@ -543,7 +567,18 @@ function proofreadingProviderDescription(provider: ProofreadingProvider) {
 
 function openProofreadingGenerateDialog() {
   const context = proofreadingContext.value
-  if (!context || !canStartProofreadingGeneration.value) return
+  if (!canStartProofreadingGeneration.value) return
+  if (props.mergeViewId) {
+    proofreadingGenerationDraft.retryScope = 'unreviewed'
+    proofreadingGenerationDraft.provider = 'openrouter'
+    proofreadingGenerationDraft.model = PROOFREADING_DEFAULT_OPENROUTER_MODEL
+    proofreadingGenerationDraft.userInstructions = context?.user_instructions || ''
+    proofreadingGenerateError.value = ''
+    showProofreadingGenerateDialog.value = true
+    void refreshMergeProofreadingPreview()
+    return
+  }
+  if (!context) return
   proofreadingGenerationDraft.provider = ['auto', 'deepseek', 'openrouter'].includes(context.provider)
     ? context.provider as ProofreadingProvider
     : 'auto'
@@ -553,6 +588,127 @@ function openProofreadingGenerateDialog() {
   proofreadingGenerationDraft.retryScope = context.failed_segments > 0 ? 'failed_only' : 'all'
   proofreadingGenerateError.value = ''
   showProofreadingGenerateDialog.value = true
+}
+
+function mergeProofreadingStatus(status: string) {
+  return ({ queued: '排队中', dispatched: '等待执行', pending: '待处理', running: '进行中', canceling: '取消中',
+    completed: '已完成', partial_failed: '部分完成', failed: '失败', skipped: '已跳过', canceled: '已取消' } as Record<string, string>)[status] || status
+}
+function mergeProofreadingPayload() {
+  return {
+    file_id: mergeProofreadingSelectedFile.value,
+    provider: proofreadingGenerationDraft.provider,
+    model: proofreadingGenerationDraft.model || undefined,
+    user_instructions: proofreadingGenerationDraft.userInstructions.trim(),
+    retry_scope: proofreadingGenerationDraft.retryScope,
+  }
+}
+async function refreshMergeProofreadingPreview() {
+  const request = ++mergeProofreadingRequest
+  mergeProofreadingPreview.value = null
+  mergeProofreadingPreviewLoading.value = true
+  try {
+    const result = await previewMergeProofreading(props.mergeViewId!, mergeProofreadingPayload())
+    if (request === mergeProofreadingRequest) mergeProofreadingPreview.value = result
+  } catch (error) {
+    if (request === mergeProofreadingRequest) proofreadingGenerateError.value = getErrorMessage(error, '校对范围预览失败')
+  } finally {
+    if (request === mergeProofreadingRequest) mergeProofreadingPreviewLoading.value = false
+  }
+}
+function selectActiveMergeProofreadingContext() {
+  if (!props.mergeViewId) return
+  proofreadingContext.value = mergeProofreadingContexts.value[activeWorkbenchFileId.value || '']?.proofreading_context || null
+}
+async function loadMergeProofreadingContexts() {
+  if (!props.mergeViewId) return
+  const request = ++mergeContextRequest
+  const fileIds = [...new Set(segmentStore.segments.map(segment => segment.file_record_id).filter(Boolean))]
+  if (!fileIds.length) return
+  try {
+    const { data } = await http.get<{ files: Array<ProofreadingBaselineResponse & { file_record_id: string }> }>(
+      `/merge-views/${props.mergeViewId}/proofreading/context`, { params: { file_ids: fileIds.join(',') } },
+    )
+    if (request !== mergeContextRequest) return
+    // 当前页按文件整体替换，避免一个文件的响应清空其他文件的修订。
+    const contexts: Record<string, ProofreadingBaselineResponse> = {}
+    for (const file of data.files || []) contexts[file.file_record_id] = file
+    mergeProofreadingContexts.value = contexts
+    const items = Object.values(contexts).flatMap(context => context.items)
+    proofreadingBaselines.value = Object.fromEntries(items.map(item => [item.segment_id, item.original_target_text]))
+    proofreadingReviewedIds.value = new Set(items.filter(item => item.llm_reviewed).map(item => item.segment_id))
+    proofreadingReviewItems.value = Object.fromEntries(items.filter(item => item.review_suggestion || item.review_category)
+      .map(item => [item.segment_id, { reason: item.review_suggestion, category: item.review_category, confidence: item.review_confidence }]))
+    selectActiveMergeProofreadingContext()
+  } catch (error) { pageError.value = getErrorMessage(error, '合并视图校对结果加载失败') }
+}
+async function submitMergeProofreading() {
+  if (!props.mergeViewId || proofreadingGenerating.value || mergeProofreadingPreviewLoading.value || !mergeProofreadingPreview.value?.pending) return
+  proofreadingGenerating.value = true
+  proofreadingGenerateError.value = ''
+  try {
+    if (!await syncPendingWorkbenchEdits()) throw new Error('当前编辑尚未保存，已取消生成。')
+    const run = await startMergeProofreading(props.mergeViewId, mergeProofreadingPayload())
+    mergeProofreadingRuns.value = [run, ...mergeProofreadingRuns.value.filter(value => value.kind !== 'proofreading')]
+    showProofreadingGenerateDialog.value = false
+    toast.success('校对任务已开始，将按文件顺序处理。')
+    await pollMergeProofreadingRuns()
+  } catch (error) { proofreadingGenerateError.value = getErrorMessage(error, '启动校对失败') }
+  finally { proofreadingGenerating.value = false }
+}
+async function pollMergeProofreadingRuns() {
+  if (!props.mergeViewId || mergeProofreadingDisposed) return
+  const request = ++mergeRunRequest
+  if (mergeProofreadingTimer !== null) window.clearTimeout(mergeProofreadingTimer)
+  try {
+    const previous = mergeProofreadingRuns.value.map(run => run.files.map(file => file.status).join(',')).join('|')
+    const runs = await listMergeProofreadingRuns(props.mergeViewId)
+    if (request !== mergeRunRequest || mergeProofreadingDisposed) return
+    mergeProofreadingRuns.value = runs
+    const next = runs.map(run => run.files.map(file => file.status).join(',')).join('|')
+    if (previous !== next && previous) {
+      if (segmentStore.dirtyCount === 0) await segmentStore.refreshCurrentSegmentPage()
+      await loadMergeProofreadingContexts()
+    }
+    if (!runs.some(run => ['queued', 'running', 'canceling'].includes(run.status))) return
+  } catch { /* 网络恢复后继续读取持久化任务，不重新提交校对。 */ }
+  if (request === mergeRunRequest && !mergeProofreadingDisposed) mergeProofreadingTimer = window.setTimeout(() => void pollMergeProofreadingRuns(), 2000)
+}
+async function cancelMergeRun(run: MergeProofreadingRun) {
+  try {
+    await cancelMergeProofreadingRun(props.mergeViewId!, run.id)
+    await pollMergeProofreadingRuns()
+  } catch (error) { pageError.value = getErrorMessage(error, '取消任务失败，请重试') }
+}
+async function downloadMergeProofreadingRun(run: MergeProofreadingRun) {
+  try {
+    const response = await downloadMergeProofreadingExport(props.mergeViewId!, run.id)
+    downloadBlob(response.data, resolveDownloadFilename(response.headers['content-disposition'], '校对文件.zip'))
+  } catch (error) { pageError.value = getErrorMessage(error, '下载校对文件失败') }
+}
+async function exportMergeProofreading(format: ProofreadingExportFormat) {
+  if (!props.mergeViewId || proofreadingExportBlocked.value) return
+  proofreadingExporting.value = true
+  showProofreadingExportMenu.value = false
+  showExportMenu.value = false
+  try {
+    if (!await syncPendingWorkbenchEdits()) throw new Error('当前编辑尚未保存，已取消导出。')
+    const readiness = await getMergeProofreadingExportReadiness(props.mergeViewId, mergeProofreadingSelectedFile.value)
+    mergeExportReadiness.value = readiness
+    if (!readiness.format_file_counts[format]) throw new Error('没有支持所选格式的文件。')
+    let acknowledge = false
+    if (readiness.has_warnings && format !== 'proofreading_audit_xlsx') {
+      acknowledge = await confirm({ title: '部分文件仍有待处理内容', message: readiness.files.map(file =>
+        `${file.filename}：${file.skipped_reason || `未确认 ${file.readiness?.unconfirmed || 0} 条，缺译 ${file.readiness?.missing_translation || 0} 条，失败 ${file.readiness?.llm_failed || 0} 条`}`
+      ).join('；'), confirmText: '仍然导出', cancelText: '返回检查' })
+      if (!acknowledge) return
+    }
+    const run = await startMergeProofreadingExport(props.mergeViewId, format, acknowledge, mergeProofreadingSelectedFile.value)
+    mergeProofreadingRuns.value = [run, ...mergeProofreadingRuns.value.filter(value => value.kind !== 'export')]
+    toast.success('已开始打包导出，完成后可在任务列表下载。')
+    await pollMergeProofreadingRuns()
+  } catch (error) { pageError.value = getErrorMessage(error, '批量导出失败') }
+  finally { proofreadingExporting.value = false }
 }
 
 function clearProofreadingGenerationPollTimer() {
@@ -599,6 +755,7 @@ async function pollProofreadingGeneration(batchId: string) {
 }
 
 async function submitProofreadingGeneration() {
+  if (props.mergeViewId) return submitMergeProofreading()
   const batchId = proofreadingContext.value?.batch_id
   if (!batchId || proofreadingGenerating.value) return
   proofreadingGenerating.value = true
@@ -630,6 +787,10 @@ async function submitProofreadingGeneration() {
 }
 
 async function cancelCurrentProofreading() {
+  if (props.mergeViewId && mergeProofreadingActive.value) {
+    await cancelMergeRun(mergeProofreadingActive.value)
+    return
+  }
   const batchId = proofreadingContext.value?.batch_id
   if (!batchId) return
   try {
@@ -642,7 +803,8 @@ async function cancelCurrentProofreading() {
 }
 
 function proofreadingOriginalTarget(segment: Segment) {
-  if (hasWorkflowProofreading.value && segment.workflow_step_id !== proofreadingContext.value?.workflow_step_id) return null
+  const context = props.mergeViewId ? mergeProofreadingContexts.value[segment.file_record_id || '']?.proofreading_context : proofreadingContext.value
+  if (hasWorkflowProofreading.value && segment.workflow_step_id !== context?.workflow_step_id) return null
   return proofreadingBaselines.value[segment.id] ?? null
 }
 
@@ -683,7 +845,7 @@ function proofreadingSuggestionFor(segment: Segment): ProofreadingSuggestion {
   }
 
   const originalTarget = proofreadingBaselines.value[segment.id]
-  const batchStatus = proofreadingContext.value?.batch_status || ''
+  const batchStatus = (props.mergeViewId ? mergeProofreadingContexts.value[segment.file_record_id || '']?.proofreading_context : proofreadingContext.value)?.batch_status || ''
   if (hasWorkflowProofreading.value && !proofreadingReviewedIds.value.has(segment.id)) {
     return { text: '此句段尚未完成 LLM 校对，可由有权操作的校对人员启动。', label: '待校对', tone: 'pending' }
   }
@@ -800,7 +962,10 @@ const workflowProofreadingExportChoices = computed(() => ([
   },
 ]).map(choice => ({
   ...choice,
-  disabledReason: workflowExportReadiness.value?.available_formats.includes(choice.format)
+  name: props.mergeViewId ? `${choice.name}（${mergeExportReadiness.value?.format_file_counts[choice.format] || 0} 个文件）` : choice.name,
+  disabledReason: props.mergeViewId
+    ? mergeExportReadiness.value?.format_file_counts[choice.format] ? '' : workflowExportReadinessError.value || '当前范围没有支持此格式的文件。'
+    : workflowExportReadiness.value?.available_formats.includes(choice.format)
     ? ''
     : workflowExportReadiness.value?.unavailable_formats?.[choice.format]
       || workflowExportReadinessError.value
@@ -808,6 +973,17 @@ const workflowProofreadingExportChoices = computed(() => ([
 })))
 
 async function loadWorkflowExportReadiness() {
+  if (props.mergeViewId) {
+    loadingWorkflowExportReadiness.value = true
+    workflowExportReadinessError.value = ''
+    try {
+      mergeExportReadiness.value = await getMergeProofreadingExportReadiness(props.mergeViewId, mergeProofreadingSelectedFile.value)
+    } catch (error) {
+      mergeExportReadiness.value = null
+      workflowExportReadinessError.value = getErrorMessage(error, '导出条件检查失败')
+    } finally { loadingWorkflowExportReadiness.value = false }
+    return
+  }
   const batchId = proofreadingContext.value?.batch_id
   if (!batchId) return
   workflowExportReadiness.value = null
@@ -886,6 +1062,7 @@ const proofreadingExportChoices = computed<Array<{
 ))
 
 async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
+  if (props.mergeViewId) return exportMergeProofreading(format)
   const batchId = proofreadingContext.value?.batch_id
   if (proofreadingExportBlocked.value || !batchId) return
   showProofreadingExportMenu.value = false
@@ -957,6 +1134,10 @@ async function exportProofreadingWithFormat(format: ProofreadingExportFormat) {
 }
 
 async function loadProofreadingBaselines(fileRecordId: string) {
+  if (props.mergeViewId) {
+    clearProofreadingGenerationPollTimer()
+    return loadMergeProofreadingContexts()
+  }
   proofreadingBaselines.value = {}
   proofreadingReviewItems.value = {}
   isProofreadingWorkbench.value = false
@@ -7480,8 +7661,9 @@ const alignmentRedoStack = alignmentOperations.redoStack
 const alignmentRefreshPending = alignmentOperations.pendingRefresh
 const alignmentStructureBusy = computed(() => alignmentAdvancing.value || alignmentOperations.busy.value || Boolean(alignmentRefreshPending.value) || proofreadingExporting.value)
 const proofreadingExportBlocked = computed(() => (
-  proofreadingExporting.value || exporting.value || manualSaving.value || !proofreadingContext.value?.batch_id
-  || ['aligning', 'queued', 'running', 'canceling'].includes(proofreadingContext.value?.batch_status || '')
+  proofreadingExporting.value || exporting.value || manualSaving.value || Boolean(mergeExportActive.value)
+  || (!props.mergeViewId && !proofreadingContext.value?.batch_id)
+  || (!props.mergeViewId && ['aligning', 'queued', 'running', 'canceling'].includes(proofreadingContext.value?.batch_status || ''))
   || (isAlignmentWorkbench.value && alignmentStructureBusy.value)
 ))
 type AlignmentTextPatch = { source_text?: string; target_text?: string }
@@ -8888,6 +9070,8 @@ async function loadMergeViewTask() {
       ),
     })
     await replaceSegmentPageQueryIfNeeded()
+    await loadMergeProofreadingContexts()
+    await pollMergeProofreadingRuns()
     // 合并模式：禁用批注/项目同步轮询等单文件特性（一期）
     commentStore.resetState()
     workbenchGuidelines.value = ''
@@ -9808,7 +9992,21 @@ watch(() => props.mergeViewId, () => {
   }
 })
 
+watch(() => segmentStore.dirtyCount, (count, previous) => {
+  if (props.mergeViewId && previous > 0 && count === 0 && mergeProofreadingRuns.value.some(run => run.kind === 'proofreading')) {
+    void segmentStore.refreshCurrentSegmentPage().then(loadMergeProofreadingContexts)
+  }
+})
+watch(() => segmentStore.segments.map(segment => segment.file_record_id).join(','), () => {
+  if (props.mergeViewId) void loadMergeProofreadingContexts()
+})
+watch(() => [mergeProofreadingScope.value, proofreadingGenerationDraft.retryScope, activeWorkbenchFileId.value], () => {
+  if (props.mergeViewId && showProofreadingGenerateDialog.value) void refreshMergeProofreadingPreview()
+  if (props.mergeViewId && showProofreadingExportMenu.value) void loadWorkflowExportReadiness()
+})
+
 watch(() => segmentStore.activeFileRecordId, () => {
+  if (props.mergeViewId) selectActiveMergeProofreadingContext()
   if (!segmentStore.mergeViewId) {
     return
   }
@@ -9936,6 +10134,11 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  mergeProofreadingDisposed = true
+  ++mergeRunRequest
+  ++mergeContextRequest
+  ++mergeProofreadingRequest
+  if (mergeProofreadingTimer !== null) window.clearTimeout(mergeProofreadingTimer)
   for (const timer of alignmentTextSaveTimers.values()) window.clearTimeout(timer)
   alignmentTextSaveTimers.clear()
   stopBottomDrawerResize?.()
@@ -11480,12 +11683,16 @@ onBeforeRouteLeave(async () => {
         :style="segmentEditorFontStyle"
       >
         <div v-if="hasWorkflowProofreading" class="workflow-proofreading-actions" data-testid="workflow-proofreading-actions">
-          <span class="workflow-proofreading-actions__summary"><span class="workflow-proofreading-actions__stage"><FileCheck :size="14" />校对阶段</span><span>当前可处理 <strong>{{ proofreadingContext?.eligible_segments || 0 }}</strong> 个句段<span v-if="['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')"> · {{ proofreadingContext?.batch_progress || 0 }}%</span></span></span>
+          <span class="workflow-proofreading-actions__summary"><span class="workflow-proofreading-actions__stage"><FileCheck :size="14" />校对阶段</span><span v-if="props.mergeViewId">{{ mergeProofreadingScope === 'merge_view' ? `整个视图 · ${segmentStore.mergeViewDetail?.total_files || 0} 个文件` : `当前文件 · ${activeMergeViewFile?.filename || '未选择'}` }}</span><span v-else>当前可处理 <strong>{{ proofreadingContext?.eligible_segments || 0 }}</strong> 个句段<span v-if="['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')"> · {{ proofreadingContext?.batch_progress || 0 }}%</span></span></span>
           <div class="workflow-proofreading-actions__buttons">
+            <select v-if="props.mergeViewId" v-model="mergeProofreadingScope" class="field__control" aria-label="校对操作范围" :disabled="proofreadingGenerating || proofreadingExporting">
+              <option value="merge_view">整个视图</option>
+              <option value="current_file" :disabled="!activeWorkbenchFileId">当前文件</option>
+            </select>
             <button class="button workflow-proofreading-actions__button workflow-proofreading-actions__button--primary" type="button" :disabled="!canStartProofreadingGeneration || proofreadingGenerating" @click="openProofreadingGenerateDialog">
               <Bot :size="14" />{{ proofreadingGenerationButtonLabel }}
             </button>
-            <button v-if="proofreadingContext?.can_cancel && ['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')" class="button workflow-proofreading-actions__button" type="button" @click="void cancelCurrentProofreading()"><X :size="14" />取消校对</button>
+            <button v-if="props.mergeViewId ? mergeProofreadingActive?.can_cancel : proofreadingContext?.can_cancel && ['queued', 'running', 'canceling'].includes(proofreadingContext?.batch_status || '')" class="button workflow-proofreading-actions__button" type="button" @click="void cancelCurrentProofreading()"><X :size="14" />取消校对</button>
             <div class="export-dropdown">
               <button class="button workflow-proofreading-actions__button" type="button" data-testid="workflow-proofreading-export-button"
                 :class="{ 'is-active': showProofreadingExportMenu }" :aria-expanded="showProofreadingExportMenu"
@@ -11496,11 +11703,23 @@ onBeforeRouteLeave(async () => {
               <div v-if="showProofreadingExportMenu" class="export-dropdown__menu">
                 <WorkflowProofreadingExportOptions :choices="workflowProofreadingExportChoices" :disabled="proofreadingExportBlocked"
                   @export="void exportProofreadingWithFormat($event)" />
+                <ul v-if="props.mergeViewId && mergeExportReadiness" class="merge-export-readiness">
+                  <li v-for="file in mergeExportReadiness.files" :key="file.file_record_id">{{ file.filename }}：{{ file.skipped_reason || Object.values(file.unavailable_formats || {}).join('；') || '可导出' }}</li>
+                </ul>
               </div>
             </div>
             <button class="button workflow-proofreading-actions__button" :class="{ 'is-active': proofreadingDiffVisible }" type="button" :aria-pressed="proofreadingDiffVisible" @click="toggleProofreadingRevisionVisible"><EyeOff v-if="proofreadingDiffVisible" :size="14" /><Eye v-else :size="14" />{{ proofreadingDiffVisible ? '隐藏修订' : '显示修订' }}</button>
           </div>
         </div>
+        <details v-if="props.mergeViewId && mergeProofreadingRuns.length" class="merge-proofreading-tasks" open data-testid="merge-proofreading-tasks">
+          <summary>校对与导出任务</summary>
+          <section v-for="run in mergeProofreadingRuns.slice(0, 5)" :key="run.id">
+            <strong>{{ run.kind === 'export' ? '打包导出' : 'LLM 校对' }} · {{ run.progress }}% · {{ mergeProofreadingStatus(run.status) }}</strong>
+            <button v-if="run.can_cancel" class="button" @click="cancelMergeRun(run)">取消任务</button>
+            <button v-if="run.download_available" class="button" @click="downloadMergeProofreadingRun(run)">下载校对文件 ZIP</button>
+            <ul><li v-for="file in run.files" :key="file.file_record_id">{{ file.filename }}：{{ file.progress }}% · {{ file.message || mergeProofreadingStatus(file.status) }}</li></ul>
+          </section>
+        </details>
         <div v-if="hasWorkflowProofreading && proofreadingExporting" class="workflow-proofreading-actions"
           role="progressbar" aria-label="校对文件导出进度" aria-valuemin="0" aria-valuemax="100"
           :aria-valuenow="Math.round(proofreadingExportProgress)">
@@ -13901,6 +14120,10 @@ onBeforeRouteLeave(async () => {
         </p>
         <fieldset class="proofreading-generate-dialog__scope" :disabled="proofreadingGenerating">
           <legend>校对范围</legend>
+          <label v-if="props.mergeViewId" class="proofreading-generate-dialog__scope-option">
+            <input v-model="proofreadingGenerationDraft.retryScope" type="radio" value="unreviewed">
+            <span><strong>补齐尚未校对的内容</strong><small>跳过内容未变的成功句段，保护译文和已确认句段保持不变。</small></span>
+          </label>
           <label class="proofreading-generate-dialog__scope-option">
             <input v-model="proofreadingGenerationDraft.retryScope" type="radio" value="all">
             <span>
@@ -13910,13 +14133,13 @@ onBeforeRouteLeave(async () => {
           </label>
           <label
             class="proofreading-generate-dialog__scope-option"
-            :class="{ 'is-disabled': !proofreadingContext?.failed_segments }"
+            :class="{ 'is-disabled': !props.mergeViewId && !proofreadingContext?.failed_segments }"
           >
             <input
               v-model="proofreadingGenerationDraft.retryScope"
               type="radio"
               value="failed_only"
-              :disabled="!proofreadingContext?.failed_segments"
+              :disabled="!props.mergeViewId && !proofreadingContext?.failed_segments"
             >
             <span>
               <strong>仅重试生成失败项</strong>
@@ -13939,6 +14162,13 @@ onBeforeRouteLeave(async () => {
           />
           <small>提示词会追加到系统和项目校对规则中；此流程直接调用 LLM，不使用 TM / 词汇表。</small>
         </label>
+        <div v-if="props.mergeViewId" data-testid="merge-proofreading-preview">
+          <p>{{ mergeProofreadingScope === 'merge_view' ? '整个视图（包含全部分页）' : '当前文件' }} · {{ mergeProofreadingPreviewLoading ? '正在检查…' : `待校对 ${mergeProofreadingPreview?.pending || 0} 条` }}</p>
+          <ul><li v-for="file in mergeProofreadingPreview?.files || []" :key="file.file_record_id">
+            {{ file.filename }}：{{ file.skipped_reason || `待校对 ${file.pending} 条` }} · 已完成 {{ file.reviewed }} 条 · 保护 {{ file.protected }} 条
+            <span v-if="file.legacy_unverified">（历史记录无法确认，将重新校对 {{ file.legacy_unverified }} 条）</span>
+          </li></ul>
+        </div>
         <p v-if="proofreadingGenerateError" class="form-message is-error">{{ proofreadingGenerateError }}</p>
       </div>
 
@@ -13946,7 +14176,7 @@ onBeforeRouteLeave(async () => {
         <button class="button" type="button" :disabled="proofreadingGenerating" @click="showProofreadingGenerateDialog = false">
           取消
         </button>
-        <button class="button button--primary" type="button" :disabled="proofreadingGenerating" @click="void submitProofreadingGeneration()">
+        <button class="button button--primary" type="button" :disabled="proofreadingGenerating || (Boolean(props.mergeViewId) && (mergeProofreadingPreviewLoading || !mergeProofreadingPreview?.pending))" @click="void submitProofreadingGeneration()">
           <Loader2 v-if="proofreadingGenerating" class="lucide-spin" :size="14" />
           <Bot v-else :size="14" />
           {{ proofreadingGenerating ? '正在启动' : '开始 LLM 校对' }}
@@ -17286,6 +17516,9 @@ onBeforeRouteLeave(async () => {
   opacity: 0.52;
 }
 
+.merge-proofreading-tasks { padding: 12px 16px; border-bottom: 1px solid var(--border-color, #e5e7eb); max-height: 240px; overflow: auto; }
+.merge-proofreading-tasks section { margin-top: 10px; }
+.merge-proofreading-tasks ul { margin: 6px 0; }
 .workflow-transition-dialog {
   display: grid;
   gap: 14px;

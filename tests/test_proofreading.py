@@ -6,6 +6,7 @@ from io import BytesIO
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
+from zipfile import ZipFile
 
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import create_engine
@@ -101,7 +102,33 @@ def _workbook_bytes(*, with_formula: bool = False) -> bytes:
     return stream.getvalue()
 
 
+def _template_workbook_bytes() -> bytes:
+    from openpyxl.drawing.image import Image
+    from PIL import Image as PillowImage
+
+    workbook = load_workbook(BytesIO(_workbook_bytes()))
+    sheet = workbook.active
+    sheet.merge_cells("A5:C5")
+    sheet["A5"] = "界面说明"
+    picture = BytesIO()
+    PillowImage.new("RGB", (8, 8), "white").save(picture, format="PNG")
+    picture.seek(0)
+    sheet.add_image(Image(picture), "A6")
+    untouched = workbook.create_sheet("保留模板")
+    untouched["A1"] = "不参与校对"
+    output = BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
+
+
 class ProofreadingPreviewTests(unittest.TestCase):
+    def test_preview_allows_images_and_merges_with_template_preservation(self):
+        result = preview_workbook(_template_workbook_bytes(), "template.xlsx")
+        self.assertTrue(all(sheet["supported"] for sheet in result["sheets"]))
+        self.assertEqual(result["sheets"][0]["blocked_reasons"], [])
+        self.assertIn("图片和图表不参与处理", result["sheets"][0]["capability_message"])
+
     def test_preview_detects_columns_languages_and_samples(self):
         result = preview_workbook(_workbook_bytes(), "sample.xlsx")
 
@@ -158,6 +185,52 @@ class ProofreadingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.engine.dispose()
         self.storage_patch.stop()
         self.storage.cleanup()
+
+    async def test_complex_template_import_export_preserves_images_and_original_parts(self):
+        raw = _template_workbook_bytes()
+        mappings = [{
+            "sheet_index": 0, "header_row": 1, "source_column": 1,
+            "targets": [
+                {"target_column": 3, "target_language": "de-DE"},
+                {"target_column": 2, "target_language": "fr-FR"},
+            ],
+        }]
+        with patch("app.services.proofreading.attach_project_reference_bases_to_file"):
+            batch = create_batch_from_workbook(
+                self.db, project=self.project, current_user=self.user,
+                raw_bytes=raw, filename="template.xlsx", source_language="en-US", mappings=mappings,
+            )
+        bindings = self.db.query(ProofreadingColumnBinding).order_by(ProofreadingColumnBinding.target_column).all()
+        self.assertEqual([binding.output_column for binding in bindings], [4, 5])
+        # 图片不产生校对片段；只有映射的单元格文字被导入。
+        self.assertEqual(batch.total_segments, 6)
+        segment = self.db.query(Segment).filter(Segment.target_text == "Distance totale").one()
+        segment.target_text = "修订文字\n%1 <&>"
+        self.db.commit()
+        exported, filename = export_batch_xlsx(self.db, batch)
+        self.assertEqual(filename, "template_校对版.xlsx")
+        with ZipFile(BytesIO(raw)) as before, ZipFile(BytesIO(exported)) as after:
+            self.assertEqual(before.namelist(), after.namelist())
+            # 除选中的工作表 XML 外，所有图片、绘图锚点、样式和未选表都逐字节相同。
+            for name in before.namelist():
+                if name != "xl/worksheets/sheet1.xml":
+                    self.assertEqual(before.read(name), after.read(name), name)
+        original = load_workbook(BytesIO(raw))
+        result = load_workbook(BytesIO(exported))
+        try:
+            source, sheet = original.active, result.active
+            self.assertEqual(str(source.merged_cells), str(sheet.merged_cells))
+            self.assertEqual(len(sheet._images), 1)
+            self.assertEqual(sheet["D2"].value, "修订文字\n%1 <&>")
+            self.assertEqual(sheet["E2"].value, "Gesamtstrecke")
+            self.assertEqual(sheet["D1"].value, "描述 - 法语 (French)（校对版）")
+            self.assertEqual(sheet.column_dimensions["D"].width, 28)
+            for row in source:
+                for cell in row:
+                    self.assertEqual(sheet.cell(cell.row, cell.column).value, cell.value)
+        finally:
+            original.close()
+            result.close()
 
     async def test_manual_pair_range_merge_is_atomic_locked_and_contiguous(self):
         batch = ProofreadingBatch(

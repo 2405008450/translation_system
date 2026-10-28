@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from uuid import UUID
@@ -14,6 +15,16 @@ from app.services.workflow_capabilities import WORKFLOW_PROOFREADING_KIND, is_st
 
 ACTIVE_STATUSES = {"queued", "running", "canceling"}
 
+
+
+def proofreading_fingerprint(segment: Segment, baseline: ProofreadingSegmentBaseline) -> str:
+    # 基线时间在重新进入校对阶段时改变，避免沿用上一轮成功标记。
+    content = [str(baseline.created_at), segment.source_text or "", segment.target_text or ""]
+    return hashlib.sha256(json.dumps(content, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def segment_already_reviewed(segment: Segment, baseline: ProofreadingSegmentBaseline) -> bool:
+    return bool(baseline.reviewed_fingerprint and baseline.reviewed_fingerprint == proofreading_fingerprint(segment, baseline))
 
 def batch_config(batch: ProofreadingBatch) -> dict:
     try:
@@ -110,6 +121,8 @@ def prepare_workflow_proofreading(
             db.add(baseline)
             changed = True
         elif segment.id in (refresh_segment_ids or set()):
+            baseline.reviewed_fingerprint = None
+            baseline.reviewed_at = None
             baseline.original_target_text = segment.target_text or ""
             baseline.created_at = datetime.now(timezone.utc).replace(tzinfo=None)
             segment.llm_provider = None

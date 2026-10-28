@@ -31,7 +31,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.auth import can_access_all_projects
 
 from app.services.workflow_capabilities import is_standalone_proofreading, proofreading_step_id
-from app.services.workflow_proofreading import batch_config, eligible_workflow_segments
+from app.services.workflow_proofreading import batch_config, eligible_workflow_segments, proofreading_fingerprint
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models import (
@@ -92,6 +92,8 @@ def proofreading_error_message(error: Exception | str) -> str:
 @dataclass(frozen=True)
 class _BaselineSnapshot:
     original_target_text: str
+    id: UUID
+    created_at: datetime
 
 
 @dataclass(frozen=True)
@@ -244,12 +246,8 @@ def _unsafe_sheet_structure_reasons(worksheet: Any) -> list[str]:
     reasons: list[str] = []
     if formula_count:
         reasons.append(f"包含 {formula_count} 个公式单元格")
-    if worksheet.merged_cells.ranges:
-        reasons.append(f"包含 {len(worksheet.merged_cells.ranges)} 个合并区域")
     if worksheet.tables:
         reasons.append(f"包含 {len(worksheet.tables)} 个 Excel Table")
-    if getattr(worksheet, "_images", None) or getattr(worksheet, "_charts", None):
-        reasons.append("包含图片或图表")
     if getattr(getattr(worksheet, "data_validations", None), "dataValidation", None):
         reasons.append("包含数据验证区域")
     if len(getattr(worksheet, "conditional_formatting", [])):
@@ -257,6 +255,14 @@ def _unsafe_sheet_structure_reasons(worksheet: Any) -> list[str]:
     if getattr(worksheet, "_pivots", None):
         reasons.append("包含数据透视表")
     return reasons
+
+
+def _preserve_workbook_template(workbook: Any) -> bool:
+    """有复杂布局时直接保留原始压缩包，校对结果追加到末尾。"""
+    return any(
+        sheet.merged_cells.ranges or getattr(sheet, "_images", None) or getattr(sheet, "_charts", None)
+        for sheet in workbook.worksheets
+    )
 
 
 def preview_workbook(raw_bytes: bytes, filename: str) -> dict[str, Any]:
@@ -318,7 +324,10 @@ def preview_workbook(raw_bytes: bytes, filename: str) -> dict[str, Any]:
                 "blocked_reasons": blocked_reasons,
                 "capability_message": (
                     "可通过双 Excel 位置对齐校对文字并导出独立报告；当前列映射模式暂不支持在此表插入校对列。"
-                    if blocked_reasons else "支持同表原文列与译文列校对。"
+                    if blocked_reasons else (
+                        "支持校对；图片和图表不参与处理，原模板保留，校对结果列追加到工作表末尾。"
+                        if _preserve_workbook_template(workbook) else "支持同表原文列与译文列校对。"
+                    )
                 ),
             })
     finally:
@@ -378,6 +387,8 @@ def _validate_mapping(workbook: Any, mappings: list[dict[str, Any]], source_lang
             targets.append({"target_column": target_column, "target_language": target_language})
         if not targets:
             raise ValueError(f"工作表“{worksheet.title}”至少需要一个译文列。")
+        if int(worksheet.max_column or 1) + sum(1 for index, _ in seen_targets if index == sheet_index) > 16384:
+            raise ValueError(f"工作表“{worksheet.title}”没有空间追加校对列。")
         normalized_mappings.append({
             "sheet_index": sheet_index,
             "header_row": header_row,
@@ -452,12 +463,22 @@ def create_batch_from_workbook(
         total_segments = 0
         skipped_segments = 0
         first_step = proofreading_step_id(project)
+        preserve_template = _preserve_workbook_template(workbook)
+        output_columns = {
+            (sheet_index, target_column): int(workbook.worksheets[sheet_index].max_column or 1) + offset
+            for sheet_index in {mapping["sheet_index"] for mapping in normalized_mappings}
+            for offset, target_column in enumerate(sorted(
+                target["target_column"]
+                for mapping in normalized_mappings if mapping["sheet_index"] == sheet_index
+                for target in mapping["targets"]
+            ), start=1)
+        }
         for mapping in normalized_mappings:
             worksheet = workbook.worksheets[mapping["sheet_index"]]
             header_row = mapping["header_row"]
             source_column = mapping["source_column"]
             source_header = _cell_text(worksheet.cell(row=header_row, column=source_column).value)
-            for target in mapping["targets"]:
+            for target in sorted(mapping["targets"], key=lambda item: item["target_column"]):
                 target_column = target["target_column"]
                 target_language = target["target_language"]
                 file_record = file_records[target_language]
@@ -470,7 +491,10 @@ def create_batch_from_workbook(
                     header_row=header_row,
                     source_column=source_column,
                     target_column=target_column,
-                    output_column=target_column + 1,
+                    output_column=(
+                        output_columns[(mapping["sheet_index"], target_column)]
+                        if preserve_template else target_column + 1
+                    ),
                     source_header=source_header,
                     target_header=target_header,
                     target_language=target_language,
@@ -963,6 +987,9 @@ async def generate_batch(
     restricted_mode = workflow_mode or not can_access_all_projects(current_user)
     generation = batch_config(batch).get("generation", {})
     requested_ids = generation.get("segment_ids")
+    if retry_scope == "failed_only" and requested_ids is not None:
+        # 排队前已按失败记录、权限和内容指纹筛选；也包含中断而未形成失败报告的句段。
+        failed_segment_ids.update(UUID(value) for value in requested_ids)
     allowed_ids = {UUID(value) for value in requested_ids} if requested_ids is not None else None
     if restricted_mode:
         eligible_ids = {segment.id for segment in eligible_workflow_segments(db, batch, current_user)}
@@ -1069,7 +1096,7 @@ async def generate_batch(
                 group["variants"].append(candidate_text)
             # 跨模型调用只保留普通值，不能保留会隐式访问数据库的 ORM 对象。
             group["segments"].append((
-                _BaselineSnapshot(baseline.original_target_text), _SegmentSnapshot(segment.id),
+                _BaselineSnapshot(baseline.original_target_text, baseline.id, baseline.created_at), _SegmentSnapshot(segment.id),
             ))
         groups = list(groups_by_id.values())
         attach_neighbor_context(db, rows, groups, current_user)
@@ -1128,11 +1155,15 @@ async def generate_batch(
                     Segment.id.in_(packed_segment_ids),
                 ).order_by(Segment.id).with_for_update().populate_existing().all()
             }
+            current_baselines = {baseline.id: baseline for baseline in db.query(ProofreadingSegmentBaseline).filter(
+                ProofreadingSegmentBaseline.segment_id.in_(packed_segment_ids),
+            ).populate_existing().all()}
             skipped_protected_ids.update(s.id for s in current_segments.values() if is_auto_write_protected(s))
             for group in packed:
                 group["segments"] = [
-                    (baseline, current_segments[segment.id]) for baseline, segment in group["segments"]
-                    if segment.id in current_segments
+                    (current_baselines[baseline.id], current_segments[segment.id]) for baseline, segment in group["segments"]
+                    if baseline.id in current_baselines and current_baselines[baseline.id].created_at == baseline.created_at
+                    and segment.id in current_segments
                     and int(current_segments[segment.id].version or 1) == loaded_versions.get(segment.id)
                     and current_segments[segment.id].status != "confirmed"
                     and automatic_write_allowed(current_segments[segment.id], entrypoint="proofreading_writeback")
@@ -1188,9 +1219,13 @@ async def generate_batch(
                     segment.llm_provider = actual_provider
                     segment.llm_model = actual_model
                     segment.last_modified_by_id = actor_id
+                    # 无需修改也属于成功校对；指纹必须记录模型写回后的内容。
+                    baseline.reviewed_at = _utcnow_naive()
                     if before_text == reviewed_text:
+                        baseline.reviewed_fingerprint = proofreading_fingerprint(segment, baseline)
                         continue
                     segment.target_text = reviewed_text
+                    baseline.reviewed_fingerprint = proofreading_fingerprint(segment, baseline)
                     segment.target_html = None
                     segment.version = int(segment.version or 1) + 1
                     segment.last_modified_by_id = actor_id
@@ -1361,6 +1396,27 @@ def export_batch_xlsx(db: Session, batch: ProofreadingBatch) -> tuple[bytes, str
         raise ValueError("原始 Excel 文件缺失。")
     workbook = load_workbook(BytesIO(raw_bytes), read_only=False, data_only=False)
     try:
+        if _preserve_workbook_template(workbook):
+            from app.services.proofreading_xlsx_template import append_proofreading_columns
+
+            columns = []
+            for binding in bindings:
+                header = binding.target_header or f"{LANGUAGE_LABELS.get(binding.target_language, binding.target_language)}译文"
+                baseline_rows = (
+                    db.query(ProofreadingSegmentBaseline, Segment)
+                    .join(Segment, Segment.id == ProofreadingSegmentBaseline.segment_id)
+                    .filter(ProofreadingSegmentBaseline.binding_id == binding.id)
+                    .all()
+                )
+                columns.append({
+                    "sheet_index": binding.sheet_index,
+                    "target_column": binding.target_column,
+                    "header_row": binding.header_row,
+                    "header": f"{header}（校对版）",
+                    "values": {baseline.row_index: segment.target_text or "" for baseline, segment in baseline_rows},
+                })
+            content = append_proofreading_columns(raw_bytes, workbook, columns)
+            return content, f"{Path(batch.filename).stem}_校对版.xlsx"
         for binding in bindings:
             worksheet = workbook.worksheets[binding.sheet_index]
             insert_at = binding.target_column + 1

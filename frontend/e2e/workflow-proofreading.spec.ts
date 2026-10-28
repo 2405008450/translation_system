@@ -17,8 +17,11 @@ const segments = [0, 1].map((index) => ({
   sequence_index: index, score: 0, block_type: 'paragraph', block_index: index, qa_issues: [],
 }))
 
-async function mockApi(page: Page, standalone = false, options: { batchStatus?: string; wordUnavailable?: boolean; normalWorkflow?: boolean; documentPair?: boolean } = {}) {
+async function mockApi(page: Page, standalone = false, options: { batchStatus?: string; wordUnavailable?: boolean; normalWorkflow?: boolean; documentPair?: boolean; formula?: boolean } = {}) {
   const errors: string[] = []
+  const fileSegments = options.formula ? segments.map(segment => segment.sentence_id === 's0'
+    ? { ...segment, source_text: '⟦MATH_1⟧圆柱销', display_text: '⟦MATH_1⟧圆柱销', target_text: '⟦MATH_1⟧ Dowel pin' }
+    : segment) : segments
   page.on('pageerror', (error) => { errors.push(error.message); console.error('Browser error:', error.message) })
   await page.route('http://127.0.0.1:5182/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname.replace('/api', '')
@@ -53,12 +56,12 @@ async function mockApi(page: Page, standalone = false, options: { batchStatus?: 
         workflow_step_id: 'step-2',
         workflow_stage: 'proofreading', batch_status: options.batchStatus || 'ready', sheet_name: '测试资料', provider: 'auto', model: '',
         user_instructions: '', can_generate: true, eligible_segments: 1, failed_segments: 0 },
-      items: [{ segment_id: 'segment-0', sentence_id: 's0', original_target_text: 'Traduction initiale',
+      items: [{ segment_id: 'segment-0', sentence_id: 's0', original_target_text: options.formula ? '⟦MATH_1⟧ Cylindrical Pin' : 'Traduction initiale',
         review_category: 'accuracy', review_suggestion: '统一术语', llm_reviewed: true }],
     }
     else if (path === '/file-records/file-1') data = {
       id: 'file-1', project_id: 'project-1', filename: 'source.txt', status: 'in_progress',
-      source_language: 'en-US', target_language: 'fr-FR', segments, total_segments: 2,
+      source_language: 'en-US', target_language: 'fr-FR', segments: fileSegments, total_segments: 2,
       status_stats: { total: 2, confirmed: 0, none: 2, exact: 0, fuzzy: 0 },
       workflow_steps: workflow, workflow_progress: workflow.map((step) => ({ ...step, total_segments: 2, completed_segments: 0 })),
       collection_ids: [], term_base_ids: [], qa_term_base_ids: [], term_base_write_ids: [],
@@ -76,12 +79,38 @@ async function mockApi(page: Page, standalone = false, options: { batchStatus?: 
     else if (path.endsWith('/comments')) data = { items: [], total: 0 }
     else if (path.endsWith('/segments/changes')) data = { items: [], segments: [], has_more: false }
     else if (path.endsWith('/segments/events')) return route.fulfill({ status: 404, body: '' })
-    else if (path.endsWith('/segments')) data = { segments, total_segments: 2, matched_segments: 2, skip: 0, limit: 100 }
+    else if (path.endsWith('/segments')) data = { segments: fileSegments, total_segments: 2, matched_segments: 2, skip: 0, limit: 100 }
     else if (path.includes('/reference-match')) data = { items: [], matches: [] }
     await route.fulfill({ json: data })
   })
   return errors
 }
+
+test('公式占位符在校对差异渲染和再次保存后保留下划线', async ({ page }) => {
+  const errors = await mockApi(page, false, { formula: true })
+  const saved: string[] = []
+  page.on('request', request => {
+    if (request.method() !== 'PUT' && request.method() !== 'POST') return
+    const body = request.postDataJSON()
+    for (const item of body?.items || body?.segments || body?.updates || []) {
+      if (item.sentence_id === 's0' && typeof item.target_text === 'string') saved.push(item.target_text)
+    }
+  })
+  await page.goto('/e2e/workflow-proofreading-harness.html?mode=workbench')
+  const editor = page.getByTestId('segment-target-editor').first()
+  const acceptedText = () => editor.evaluate(element => Array.from(element.childNodes)
+    .filter(node => !(node instanceof Element && node.getAttribute('data-revision-type') === 'delete'))
+    .map(node => node.textContent || '').join(''))
+  await expect(editor).toHaveAttribute('data-revision-visible', 'true')
+  expect(await acceptedText()).toBe('⟦MATH_1⟧ Dowel pin')
+  await editor.focus()
+  await page.keyboard.press('End')
+  await page.keyboard.type('!')
+  await page.getByTestId('segment-target-editor').last().focus()
+  await expect.poll(acceptedText).toBe('⟦MATH_1⟧ Dowel pin!')
+  await expect.poll(() => saved).toContain('⟦MATH_1⟧ Dowel pin!')
+  expect(errors).toEqual([])
+})
 
 test('五种模板按名称区分，独立流程展示准确阶段', async ({ page }) => {
   const errors = await mockApi(page)
@@ -106,6 +135,32 @@ test('纯校对只提供表格列映射', async ({ page }) => {
   await expect(page.getByTestId('proofreading-import-spreadsheet')).toBeVisible()
   await expect(page.getByTestId('proofreading-import-document-pair')).toHaveCount(0)
   await expect(page.getByText('原文与译文按行对应，映射列后直接校对，无需对齐。')).toBeVisible()
+})
+
+test('含图片模板可显示保留提示并继续配置列映射', async ({ page }) => {
+  const errors = await mockApi(page)
+  await page.route('**/projects/project-1/proofreading/preview', route => route.fulfill({ json: {
+    preview_token: 'template-preview', filename: 'template.xlsx', file_hash: 'template-hash',
+    sheets: [{ sheet_index: 0, name: '总表', header_row: 2, max_row: 731, max_column: 23,
+      supported: true, blocked_reasons: [],
+      capability_message: '支持校对；图片和图表不参与处理，原模板保留，校对结果列追加到工作表末尾。',
+      header_candidates: [{ row_index: 2, values: ['中文', '英语'] }],
+      columns: [
+        { index: 1, letter: 'A', header: '中文', samples: ['文件'], suggested_role: 'source', suggested_language: 'zh-CN' },
+        { index: 2, letter: 'B', header: '英语', samples: ['File'], suggested_role: 'target', suggested_language: 'en-US' },
+      ],
+    }],
+  } }))
+  await page.goto('/e2e/workflow-proofreading-harness.html?mode=pure')
+  await page.locator('input[type="file"][accept=".xlsx"]').setInputFiles({
+    name: 'template.xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', buffer: Buffer.from('mock'),
+  })
+  await expect(page.getByText('支持校对；图片和图表不参与处理，原模板保留，校对结果列追加到工作表末尾。')).toBeVisible()
+  await expect(page.locator('.proofreading-sheet__settings')).toBeVisible()
+  await expect(page.locator('.proofreading-sheet__head input')).toBeChecked()
+  await page.locator('.proofreading-source-language select').selectOption('zh-CN')
+  await expect(page.getByRole('button', { name: '创建校对批次' })).toBeEnabled()
+  expect(errors).toEqual([])
 })
 
 test('对齐-校对只提供双文档导入', async ({ page }) => {

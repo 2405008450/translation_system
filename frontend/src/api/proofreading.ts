@@ -170,7 +170,7 @@ export async function generateProofreadingBatch(
     provider: 'auto' | 'deepseek' | 'openrouter'
     model?: string
     user_instructions?: string
-    retry_scope?: 'all' | 'failed_only'
+    retry_scope?: 'all' | 'failed_only' | 'unreviewed'
   },
 ) {
   await http.post(`/proofreading-batches/${batchId}/generate`, payload)

@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 
 from sqlalchemy import BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, Uuid, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -3080,6 +3081,9 @@ class ProofreadingSegmentBaseline(Base):
     source_cell_ref: Mapped[str] = mapped_column(String(20), nullable=False)
     target_cell_ref: Mapped[str] = mapped_column(String(20), nullable=False)
     original_target_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    reviewed_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reviewed_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+
     created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=False), server_default=func.now(), nullable=False)
 
     batch: Mapped["ProofreadingBatch"] = relationship("ProofreadingBatch", back_populates="baselines")
@@ -3182,3 +3186,35 @@ class TranslationReviewAgentRun(Base):
     finished_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
 
     report: Mapped["TranslationReviewReport"] = relationship("TranslationReviewReport", back_populates="agent_runs")
+
+
+class MergeProofreadingRun(Base):
+    """合并视图校对或导出的持久化协调任务。"""
+    __tablename__ = "merge_proofreading_runs"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=UUID_SQL_DEFAULT)
+    view_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("project_merge_views.id", ondelete="CASCADE"), index=True)
+    created_by_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"))
+    kind: Mapped[str] = mapped_column(String(20), default="proofreading")
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    options_json: Mapped[str] = mapped_column(Text, default="{}")
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    result_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=func.now())
+    updated_at: Mapped[DateTime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=func.now(), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+
+class MergeProofreadingItem(Base):
+    __tablename__ = "merge_proofreading_items"
+    __table_args__ = (UniqueConstraint("run_id", "file_record_id", name="uq_merge_proofreading_run_file"),)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=UUID_SQL_DEFAULT)
+    run_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("merge_proofreading_runs.id", ondelete="CASCADE"), index=True)
+    file_record_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("file_records.id", ondelete="CASCADE"))
+    filename: Mapped[str] = mapped_column(String(500), default="")
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    batch_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("proofreading_batches.id", ondelete="SET NULL"), nullable=True)
+    child_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    export_task_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("file_export_tasks.id", ondelete="SET NULL"), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending")
+    message: Mapped[str] = mapped_column(Text, default="")
+    counts_json: Mapped[str] = mapped_column(Text, default="{}")
+    updated_at: Mapped[DateTime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=func.now(), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))

@@ -590,7 +590,8 @@ defineExpose({ refreshBatches })
             <p class="form-message">{{ sheet.capability_message }}</p>
             <p class="form-message">如需双文档对齐，请新建“对齐-校对”工作流项目。</p>
           </template>
-          <div v-else-if="sheetDrafts[sheet.sheet_index].enabled" class="proofreading-sheet__settings">
+          <p v-if="sheet.supported && sheet.capability_message" class="form-message">{{ sheet.capability_message }}</p>
+          <div v-if="sheet.supported && sheetDrafts[sheet.sheet_index].enabled" class="proofreading-sheet__settings">
             <label class="field">
               <span class="field__label">表头行</span>
               <input v-model.number="sheetDrafts[sheet.sheet_index].headerRow" class="field__control" type="number" min="1" :max="sheet.max_row">

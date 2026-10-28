@@ -161,8 +161,9 @@ MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 BILINGUAL_LAYOUT_SOURCE_FIRST = "source_first"
 BILINGUAL_LAYOUT_TARGET_FIRST = "target_first"
 BlockKey = tuple[str, int, int | None, int | None]
-MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_\d+⟧|\[\[MATH_\d+\]\]")
-MATH_PLACEHOLDER_TOKEN_RE = re.compile(r"^(?:⟦|\[\[)(MATH_\d+)(?:⟧|\]\])$")
+# 兼容历史数据中丢失下划线的占位符；编号、数量和顺序仍须与原文完全一致。
+MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_?\d+⟧|\[\[MATH_?\d+\]\]")
+MATH_PLACEHOLDER_TOKEN_RE = re.compile(r"^(?:⟦MATH_?(\d+)⟧|\[\[MATH_?(\d+)\]\])$")
 ENGLISH_BOUNDARY_TRAILING_RE = re.compile(r"[,;:.!?][\"')\]\}]*$")
 ENGLISH_WORD_LEADING_RE = re.compile(r"^[\"'“‘(\[]*[A-Za-z0-9]")
 # 支持的格式标签
@@ -787,6 +788,15 @@ def export_translated_docx(
         if include_revision_marks
         else {}
     )
+    # Word 不支持页眉页脚批注；文字修订照常导出，修改理由仍保留在校对报告。
+    header_footer_ids = {
+        str(segment["sentence_id"]) for segment in source_segments
+        if str(segment.get("block_type") or "").startswith(("header", "footer"))
+    }
+    revisions_by_sentence_id = {
+        sid: replace(revision, comment_text="") if sid in header_footer_ids else revision
+        for sid, revision in revisions_by_sentence_id.items()
+    }
     revisions_by_sentence_id, sentence_comments = _prepare_revision_comments(raw_bytes, revisions_by_sentence_id)
     math_placeholders_by_sentence_id = {
         str(segment["sentence_id"]): dict(segment.get("math_placeholders") or {})
@@ -3130,6 +3140,7 @@ def _replace_block_tokens(
     previous_replacement = ""
     previous_span: SentenceSpan | None = None
     pending_revision_markers: list[tuple[str, ExportSegment, str, str]] = []
+    revision_comment_boundaries: dict[str, tuple[bool, bool]] = {}
     pending_format_markers: list[tuple[str, str]] = []
     format_reference_runs: dict[str, list[ET.Element | None]] = {}
     for span in spans:
@@ -3219,12 +3230,18 @@ def _replace_block_tokens(
                 has_custom_target_html = False
 
         if expected_math_placeholders:
-            _queue_math_sentence_replacement(
-                tokens=tokens,
-                span=span,
-                replacement=replacement,
-                expected_math_placeholders=expected_math_placeholders,
-            )
+            try:
+                _queue_math_sentence_replacement(
+                    tokens=tokens,
+                    span=span,
+                    replacement=replacement,
+                    expected_math_placeholders=expected_math_placeholders,
+                    segment=segment,
+                    pending_revision_markers=pending_revision_markers,
+                    revision_comment_boundaries=revision_comment_boundaries,
+                )
+            except ValueError as exc:
+                raise ValueError(f"{exc} 句段：{segment.sentence_id}") from exc
         elif has_custom_target_html:
             format_marker = (
                 f"{FORMAT_MARKER_PREFIX}{len(pending_format_markers)}{FORMAT_MARKER_SUFFIX}"
@@ -3250,7 +3267,7 @@ def _replace_block_tokens(
 
     _apply_token_edits(tokens)
     _expand_formatted_markers(tokens, pending_format_markers, format_reference_runs)
-    _expand_word_revision_markers(tokens, pending_revision_markers)
+    _expand_word_revision_markers(tokens, pending_revision_markers, revision_comment_boundaries)
     _mark_segments_consumed(segments)
 
 
@@ -3330,6 +3347,7 @@ def _build_revision_marker(revision_key: str, marker_index: int) -> str:
 def _expand_word_revision_markers(
     tokens: list[TextToken],
     pending_markers: list[tuple[str, ExportSegment, str, str]],
+    comment_boundaries: Mapping[str, tuple[bool, bool]] | None = None,
 ) -> None:
     paragraphs: list[ET.Element] = []
     seen_paragraph_ids: set[int] = set()
@@ -3381,7 +3399,19 @@ def _expand_word_revision_markers(
                 original_span_text,
             ),
         )
-        for node in wrap_sentence_comment(revision_nodes, segment.revision.comment_id):
+        if comment_boundaries is not None and marker in comment_boundaries:
+            # 含公式句段由多个文字区域组成，批注只在整句首尾落一次锚点。
+            at_start, at_end = comment_boundaries[marker]
+            comment_id = segment.revision.comment_id
+            if comment_id is not None:
+                start, end, reference = wrap_sentence_comment([], comment_id)
+                revision_nodes = ([start] if at_start else []) + revision_nodes + (
+                    [end, reference] if at_end else []
+                )
+            wrapped_nodes = revision_nodes
+        else:
+            wrapped_nodes = wrap_sentence_comment(revision_nodes, segment.revision.comment_id)
+        for node in wrapped_nodes:
             parent.insert(insert_index, node)
             insert_index += 1
 
@@ -3898,6 +3928,9 @@ def _queue_math_sentence_replacement(
     span: SentenceSpan,
     replacement: str,
     expected_math_placeholders: list[str],
+    segment: ExportSegment | None = None,
+    pending_revision_markers: list[tuple[str, ExportSegment, str, str]] | None = None,
+    revision_comment_boundaries: dict[str, tuple[bool, bool]] | None = None,
 ) -> None:
     text_parts = _split_replacement_around_math_placeholders(replacement, expected_math_placeholders)
     if text_parts is None:
@@ -3914,11 +3947,47 @@ def _queue_math_sentence_replacement(
     if len(math_tokens) != len(expected_math_placeholders):
         raise ValueError("导出失败：段落中的数学公式结构与句段映射不一致。")
 
+    before_parts = None
+    if (
+        segment is not None and segment.revision is not None
+        and not segment.source_structure_changed and segment.target_html is None
+        and pending_revision_markers is not None and revision_comment_boundaries is not None
+        and len({id(token.container_element) for token in sentence_tokens}) == 1
+        and all(
+            token.container_element is not None
+            and token.container_element.tag == _qn("w", "p")
+            and not token.is_hyperlink and token.field_instruction_prefix is None
+            and token.preserved_word_symbol is None
+            and (
+                token.is_math
+                or (token.run_element is not None and token.run_element in list(token.container_element))
+            )
+            for token in sentence_tokens
+        )
+    ):
+        baseline = _resolve_word_revision_baseline(segment, _collect_span_text(tokens, span, use_source=True))
+        before_parts = _split_replacement_around_math_placeholders(baseline, expected_math_placeholders)
+
     for index, replacement_text in enumerate(text_parts):
         region_start = span.start if index == 0 else math_tokens[index - 1].end
         region_end = span.end if index == len(math_tokens) else math_tokens[index].start
         before_token = math_tokens[index - 1] if index > 0 else None
         after_token = math_tokens[index] if index < len(math_tokens) else _find_first_token_starting_at_or_after(tokens, span.end)
+        if before_parts is not None:
+            # 公式作为原始 OOXML 原子保留，只为两侧文字生成真实增删修订。
+            region_revision = replace(
+                segment.revision,
+                revision_key=f"{segment.revision.revision_key}:math-region:{index}",
+                before_text=before_parts[index], after_text=replacement_text,
+            )
+            region_segment = replace(
+                segment, source_text="", display_text="", numbering_text="", matched_source_text="",
+                target_text=replacement_text, math_placeholders={}, revision=region_revision,
+            )
+            marker = _build_revision_marker(region_revision.revision_key, len(pending_revision_markers))
+            pending_revision_markers.append((marker, region_segment, replacement_text, before_parts[index]))
+            revision_comment_boundaries[marker] = (index == 0, index == len(math_tokens))
+            replacement_text = marker
         _queue_text_region_replacement(
             tokens=tokens,
             region_start=region_start,
@@ -3951,7 +4020,7 @@ def _canonical_math_placeholder(placeholder: str) -> str:
     match = MATH_PLACEHOLDER_TOKEN_RE.match(placeholder)
     if not match:
         return placeholder
-    return f"⟦{match.group(1)}⟧"
+    return f"⟦MATH_{match.group(1) or match.group(2)}⟧"
 
 
 def _collect_tokens_overlapping_span(

@@ -5,7 +5,8 @@ export interface DiffSegment {
   text: string
 }
 
-const TOKEN_PATTERN = /[a-zA-Z0-9]+(?:[-'][a-zA-Z0-9]+)*|[\u4e00-\u9fff]|\s+|[^\s\w\u4e00-\u9fff]+/g
+// 兜底分支只排除前面已匹配的字符，不能用 \w，否则下划线无分支匹配而被丢弃。
+const TOKEN_PATTERN = /[a-zA-Z0-9]+(?:[-'][a-zA-Z0-9]+)*|[\u4e00-\u9fff]|\s+|[^\sa-zA-Z0-9\u4e00-\u9fff]+/g
 const WORD_TOKEN_PATTERN = /^[a-zA-Z0-9]+(?:[-'][a-zA-Z0-9]+)*$/
 
 function mergeSegment(segments: DiffSegment[], nextSegment: DiffSegment) {

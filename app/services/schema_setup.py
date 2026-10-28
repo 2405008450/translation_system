@@ -36,6 +36,8 @@ LEGACY_REQUIRED_EXISTING_TABLES = (
     "translation_memory_entries",
 )
 REQUIRED_SCHEMA = {
+    "merge_proofreading_runs": {"id", "view_id", "status"},
+    "merge_proofreading_items": {"id", "run_id", "status"},
     "review_sync_groups": {"id", "source_version", "generation"},
     "review_sync_members": {"id", "revision_id", "version"},
     "review_sync_tasks": {"id", "generation", "result"},
@@ -678,7 +680,7 @@ REQUIRED_SCHEMA = {
         "target_column",
         "target_language",
     },
-    "proofreading_segment_baselines": {
+    "proofreading_segment_baselines": {"reviewed_fingerprint", "reviewed_at",
         "id",
         "batch_id",
         "binding_id",
@@ -4193,4 +4195,6 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
     from app.services.review_sync_schema import schema_statements
     statements.extend(schema_statements())
     statements.extend(ALIGNMENT_STAGE_MIGRATIONS)
+    from app.services.merge_proofreading_schema import schema_statements as merge_schema_statements
+    statements.extend(merge_schema_statements())
     return statements

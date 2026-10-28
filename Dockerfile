@@ -107,6 +107,18 @@ RUN python -m pip install --upgrade pip \
 # 在镜像构建阶段下载并初始化 PP-OCRv6；运行容器无需联网获取模型。
 RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, enable_mkldnn=False, device='cpu')"
 
+# ODA Qt6 还需要独立的 OpenGL/EGL 库；libgl1 不会自动安装这两个库。
+# 放在模型初始化之后，避免补齐转换器依赖时重新下载 OCR 模型。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libopengl0 libegl1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && oda_binary="$(find /usr/bin/ODAFileConverter_* -maxdepth 1 -type f -name ODAFileConverter -print -quit)" \
+    && ldd "$oda_binary" > /tmp/oda-dependencies.txt \
+    && ldd "$(dirname "$oda_binary")/plugins/platforms/libqxcb.so" >> /tmp/oda-dependencies.txt \
+    && cat /tmp/oda-dependencies.txt \
+    && ! grep -q 'not found' /tmp/oda-dependencies.txt \
+    && rm /tmp/oda-dependencies.txt
+
 COPY app ./app
 COPY scripts ./scripts
 COPY prompt_templates ./prompt_templates

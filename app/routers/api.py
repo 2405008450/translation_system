@@ -1747,6 +1747,10 @@ def _build_import_arq_functions():
     return [arq_func(job, timeout=timeout) for job in jobs]
 
 
+from app.services.merge_proofreading import (
+    merge_proofreading_tick, merge_proofreading_item_job, merge_proofreading_archive_job, recover_merge_proofreading_runs,
+)
+
 class MaintenanceWorkerSettings:
     queue_name = ARQ_MAINTENANCE_QUEUE_NAME
     keep_result = 0
@@ -1757,12 +1761,20 @@ class MaintenanceWorkerSettings:
         get_settings().arq_max_jobs,
     )
     functions = _build_import_arq_functions() + [
+        merge_proofreading_tick,
+        arq_func(merge_proofreading_archive_job, timeout=1800, max_tries=1) if arq_func else merge_proofreading_archive_job,
+        arq_func(merge_proofreading_item_job, timeout=1800, max_tries=1) if arq_func else merge_proofreading_item_job,
         spelling_grammar_qa_segments_job,
         spelling_grammar_qa_project_job,
         auto_tm_background_job,
         auto_tm_rematch_background_job,
         project_segment_sync_job,
     ]
+    if arq_func:
+        from arq import cron
+        cron_jobs = [cron(recover_merge_proofreading_runs, second={0, 15, 30, 45}, run_at_startup=True)]
+    else:
+        cron_jobs = []
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
 

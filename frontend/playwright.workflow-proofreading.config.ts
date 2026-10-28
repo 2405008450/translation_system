@@ -1,7 +1,7 @@
 import { defineConfig, devices } from '@playwright/test'
 
 export default defineConfig({
-  testDir: './e2e', testMatch: ['workflow-proofreading.spec.ts', 'merge-workflow-transition.spec.ts'], workers: 1,
+  testDir: './e2e', testMatch: ['workflow-proofreading.spec.ts', 'merge-workflow-transition.spec.ts', 'merge-proofreading.spec.ts'], workers: 1,
   timeout: 30_000, reporter: 'list',
   use: { baseURL: 'http://127.0.0.1:5182', ...devices['Desktop Chrome'], channel: 'chrome', screenshot: 'only-on-failure' },
   webServer: {

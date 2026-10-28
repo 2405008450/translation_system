@@ -9,14 +9,14 @@ from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.services.workflow_capabilities import is_standalone_proofreading
 from app.services.workflow_proofreading import (
     batch_config, can_read_workflow_file, eligible_workflow_segments,
-    prepare_workflow_proofreading,
+    prepare_workflow_proofreading, segment_already_reviewed,
 )
 from app.auth import can_access_all_projects, get_current_user, require_business_manager
 from app.database import get_db
@@ -79,7 +79,7 @@ class ProofreadingGenerateRequest(BaseModel):
     provider: Literal["auto", "deepseek", "openrouter"] = "auto"
     model: str | None = None
     user_instructions: str = Field(default="", max_length=12000)
-    retry_scope: Literal["all", "failed_only"] = "all"
+    retry_scope: Literal["all", "failed_only", "unreviewed"] = "all"
 
 
 class ProofreadingExportTaskRequest(BaseModel):
@@ -249,19 +249,19 @@ def remove_proofreading_batch(
     return {"message": "任务已删除。"}
 
 
-@router.post("/proofreading-batches/{batch_id}/generate")
-def generate_proofreading_batch(
-    batch_id: UUID,
-    payload: ProofreadingGenerateRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
+def prepare_proofreading_generation(db, batch_id, payload, current_user, *, segment_ids=None, merge_run_id=None):
+    """统一准备单文件或合并视图子任务，由调用方提交后调度。"""
     batch = db.query(ProofreadingBatch).filter_by(id=batch_id).with_for_update().populate_existing().first()
     if batch is None:
         raise HTTPException(404, "校对任务不存在。")
     _require_batch_access(db, batch, current_user)
     workflow_ids = None
+    if batch.batch_kind == "workflow_segments":
+        from app.services.file_operation_lock_service import clear_stale_file_operation_lock
+        for file in db.query(FileRecord).join(ProofreadingColumnBinding).filter(ProofreadingColumnBinding.batch_id == batch.id):
+            clear_stale_file_operation_lock(db, file)
+            if file.active_operation:
+                raise HTTPException(409, "文件正在被其他任务锁定。")
     if batch.batch_kind == "workflow_segments" or not can_access_all_projects(current_user):
         workflow_ids = [str(segment.id) for segment in eligible_workflow_segments(db, batch, current_user)]
         if not workflow_ids and not eligible_workflow_segments(db, batch, current_user, include_protected=True):
@@ -281,10 +281,30 @@ def generate_proofreading_batch(
     retry_scope = payload.retry_scope
     if workflow_ids is not None and retry_scope == "failed_only":
         failed_ids = get_latest_generation_error_segment_ids(db, batch.id)
+        if batch.status in {"failed", "canceled"}:
+            generation_ids = json.loads(batch.config_json or "{}").get("generation", {}).get("segment_ids", [])
+            for baseline, segment in db.query(ProofreadingSegmentBaseline, Segment).join(Segment).filter(ProofreadingSegmentBaseline.batch_id == batch.id):
+                if str(segment.id) in generation_ids and not segment_already_reviewed(segment, baseline):
+                    failed_ids.add(segment.id)
         workflow_ids = [value for value in workflow_ids if UUID(value) in failed_ids]
         if not workflow_ids:
             raise HTTPException(409, "当前分配范围内没有可重试的失败项。")
-    if retry_scope == "failed_only" and not get_latest_generation_error_segment_ids(db, batch.id):
+    if payload.retry_scope == "unreviewed":
+        rows = db.query(ProofreadingSegmentBaseline, Segment).join(Segment).filter(
+            ProofreadingSegmentBaseline.batch_id == batch.id,
+        ).all()
+        pending_ids = {str(segment.id) for baseline, segment in rows if not segment_already_reviewed(segment, baseline)}
+        if workflow_ids is None:
+            workflow_ids = list(pending_ids)
+        else:
+            workflow_ids = [value for value in workflow_ids if value in pending_ids]
+        if not workflow_ids:
+            raise HTTPException(409, "没有尚未校对的句段。")
+    if segment_ids is not None:
+        workflow_ids = [value for value in (workflow_ids or []) if value in segment_ids]
+        if not workflow_ids:
+            raise HTTPException(409, "当前范围没有可校对句段。")
+    if retry_scope == "failed_only" and workflow_ids is None and not get_latest_generation_error_segment_ids(db, batch.id):
         raise HTTPException(status_code=409, detail="当前批次没有可重试的生成失败项。")
     pending_query = db.query(Segment.id).join(
         ProofreadingSegmentBaseline, ProofreadingSegmentBaseline.segment_id == Segment.id,
@@ -313,6 +333,7 @@ def generate_proofreading_batch(
         "retry_scope": retry_scope,
         "started_by_id": str(current_user.id),
         "run_id": str(uuid4()),
+        **({"merge_run_id": str(merge_run_id)} if merge_run_id else {}),
         **({"segment_ids": workflow_ids} if workflow_ids is not None else {}),
     }
     batch.config_json = json.dumps(batch_config, ensure_ascii=False)
@@ -327,6 +348,22 @@ def generate_proofreading_batch(
     batch.export_filename = ""
     batch.export_path = ""
     batch.finished_at = None
+    return batch, batch_config
+
+
+@router.post("/proofreading-batches/{batch_id}/generate")
+def generate_proofreading_batch(
+    batch_id: UUID,
+    payload: ProofreadingGenerateRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    batch, batch_config = prepare_proofreading_generation(db, batch_id, payload, current_user)
+    provider = batch_config["generation"]["provider"]
+    model = batch_config["generation"]["model"] or None
+    user_instructions = batch_config["generation"]["user_instructions"]
+    retry_scope = batch_config["generation"]["retry_scope"]
     queued_batch_id = batch.id
     queued_user_id = current_user.id
     db.commit()
@@ -608,7 +645,7 @@ def get_file_proofreading_baselines(
                 "segment_id": str(segment.id),
                 "sentence_id": segment.sentence_id,
                 "original_target_text": baseline.original_target_text,
-                "llm_reviewed": segment.source == "llm_review" and bool(segment.llm_provider),
+                "llm_reviewed": segment_already_reviewed(segment, baseline) if workflow_mode else segment.source == "llm_review" and bool(segment.llm_provider),
                 "review_suggestion": (
                     proofreading_error_message(review_items_by_segment[segment.id].reason)
                     if segment.id in review_items_by_segment
@@ -635,3 +672,115 @@ def get_file_proofreading_baselines(
             for baseline, segment in rows
         ]
     }
+
+
+# 合并视图只协调普通工作流文件，仍复用每个文件的校对批次。
+class MergeProofreadingRequest(ProofreadingGenerateRequest):
+    retry_scope: Literal["all", "failed_only", "unreviewed"] = "unreviewed"
+    file_id: UUID | None = None
+
+
+class MergeProofreadingExportRequest(ProofreadingExportTaskRequest):
+    file_id: UUID | None = None
+
+
+@router.get("/merge-views/{view_id}/proofreading/context")
+def merge_proofreading_context(view_id: UUID, file_ids: str = "", db: Session = Depends(get_db),
+                               current_user: User = Depends(get_current_user)):
+    from app.services.merge_proofreading import context
+    _, files = context(db, view_id, current_user)
+    requested = set(file_ids.split(",")) if file_ids else None
+    return {"files": [{"file_record_id": str(file.id), **get_file_proofreading_baselines(file.id, db, current_user)}
+                      for file in files if requested is None or str(file.id) in requested]}
+
+
+@router.post("/merge-views/{view_id}/proofreading/preview")
+def preview_merge_proofreading(view_id: UUID, payload: MergeProofreadingRequest,
+                               db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    from app.services.merge_proofreading import preview
+    return preview(db, view_id, current_user, payload.model_dump(mode="json"))
+
+
+@router.get("/merge-views/{view_id}/proofreading/export-readiness")
+def merge_proofreading_export_readiness(view_id: UUID, file_id: UUID | None = None,
+                                       db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    from app.services.merge_proofreading import preview
+    return preview(db, view_id, current_user, {"file_id": str(file_id) if file_id else None}, "export")
+
+
+async def _start_merge_proofreading(db, view_id, user, payload, kind):
+    from app.services.merge_proofreading import create_run, dispatch_run, serialize_run, context
+    from app.models import MergeProofreadingItem
+    run = create_run(db, view_id, user, payload.model_dump(mode="json"), kind)
+    try:
+        await dispatch_run(run.id)
+    except Exception as error:
+        run.status = "failed"
+        for item in db.query(MergeProofreadingItem).filter_by(run_id=run.id, status="pending"):
+            item.status, item.message = "failed", "后台队列不可用，任务未开始，请重试。"
+        db.commit()
+        raise HTTPException(503, "后台队列不可用，任务未开始，请重试。") from error
+    _, files = context(db, view_id, user)
+    return JSONResponse(status_code=202, content=serialize_run(db, run, {file.id for file in files}))
+
+
+@router.post("/merge-views/{view_id}/proofreading/runs")
+async def start_merge_proofreading(view_id: UUID, payload: MergeProofreadingRequest,
+                                  db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return await _start_merge_proofreading(db, view_id, current_user, payload, "proofreading")
+
+
+@router.post("/merge-views/{view_id}/proofreading/export-tasks")
+async def start_merge_proofreading_export(view_id: UUID, payload: MergeProofreadingExportRequest,
+                                         db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return await _start_merge_proofreading(db, view_id, current_user, payload, "export")
+
+
+@router.get("/merge-views/{view_id}/proofreading/runs")
+def list_merge_proofreading_runs(view_id: UUID, db: Session = Depends(get_db),
+                                 current_user: User = Depends(get_current_user)):
+    from app.models import MergeProofreadingRun
+    from app.services.merge_proofreading import context, serialize_run
+    _, files = context(db, view_id, current_user)
+    query = db.query(MergeProofreadingRun).filter_by(view_id=view_id)
+    if not can_access_all_projects(current_user):
+        query = query.filter_by(created_by_id=current_user.id)
+    runs = query.order_by(MergeProofreadingRun.created_at.desc()).limit(20).all()
+    return {"items": [serialize_run(db, run, {file.id for file in files}) for run in runs]}
+
+
+@router.get("/merge-views/{view_id}/proofreading/runs/{run_id}")
+def get_merge_proofreading_run(view_id: UUID, run_id: UUID, db: Session = Depends(get_db),
+                               current_user: User = Depends(get_current_user)):
+    from app.services.merge_proofreading import get_run, serialize_run
+    run, visible = get_run(db, view_id, run_id, current_user)
+    return serialize_run(db, run, visible)
+
+
+@router.post("/merge-views/{view_id}/proofreading/runs/{run_id}/cancel")
+def cancel_merge_proofreading_run(view_id: UUID, run_id: UUID, db: Session = Depends(get_db),
+                                  current_user: User = Depends(get_current_user)):
+    from app.services.merge_proofreading import get_run, cancel_run, serialize_run
+    from app.models import MergeProofreadingRun
+    run, visible = get_run(db, view_id, run_id, current_user)
+    run = db.query(MergeProofreadingRun).filter_by(id=run.id).with_for_update().populate_existing().one()
+    cancel_run(db, run, current_user)
+    return serialize_run(db, run, visible)
+
+
+@router.get("/merge-views/{view_id}/proofreading/runs/{run_id}/download")
+def download_merge_proofreading_export(view_id: UUID, run_id: UUID, db: Session = Depends(get_db),
+                                       current_user: User = Depends(get_current_user)):
+    from datetime import timedelta
+    from app.models import MergeProofreadingItem
+    from app.services.merge_proofreading import get_run, now
+    run, visible = get_run(db, view_id, run_id, current_user)
+    item_file_ids = {value for (value,) in db.query(MergeProofreadingItem.file_record_id).filter_by(run_id=run.id)}
+    if not item_file_ids.issubset(visible):
+        raise HTTPException(403, "部分文件已失去访问权限，无法下载整包。")
+    if run.kind != "export" or run.status not in {"completed", "partial_failed", "canceled"} or not run.result_path:
+        raise HTTPException(409, "打包导出尚未完成或没有成功文件。")
+    if now() - run.created_at > timedelta(hours=24) or not Path(run.result_path).is_file():
+        raise HTTPException(410, "导出文件已过期，请重新导出。")
+    return FileResponse(run.result_path, media_type="application/zip", filename=f"校对文件_{run.id.hex[:8]}.zip",
+                        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})

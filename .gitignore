@@ -53,7 +53,9 @@ tests/*
 !tests/test_auto_tm_sync.py
 !tests/test_proofreading.py
 !tests/test_merge_workflow_transition.py
+!tests/test_merge_proofreading.py
 !tests/test_deploy_proxy.py
+!tests/test_math_placeholder_export.py
 记忆库下载/
 术语库下载/
 tools/yicat_cookies.json
