@@ -12,6 +12,8 @@ pptx_layout_integration.py —— 把 PPTX 版式优化接入系统导出流程�
             "enabled": true,           # 是否启用 PPTX 版式优化（默认关闭）
             "mode": "model_scale",     # model_scale / shrink / both / expand
             "model": "",               # 可选：视觉模型 id（复用系统 LLM provider）
+            "use_vision": true,        # false = 纯程序估算，不渲染、不调用模型（默认 true）
+            "allow_enlarge": false,    # 是否允许放大偏小字号（默认 false）
         }
     }
 """
@@ -53,6 +55,9 @@ def apply_pptx_layout_settings(
 
     mode = str(pptx.get("mode") or "").strip() or None
     model = str(pptx.get("model") or "").strip() or None
+    # 缺省保持旧行为：使用视觉模型；缺省不放大字号。
+    use_vision = bool(pptx.get("use_vision", True))
+    allow_enlarge = bool(pptx.get("allow_enlarge", False))
 
     try:
         # 延迟导入：避免包加载期引入 pptx/pdf2image 等硬依赖。
@@ -67,6 +72,8 @@ def apply_pptx_layout_settings(
             pptx_bytes,
             mode=mode or DEFAULT_MODE,
             model=resolved_model,
+            use_vision=use_vision,
+            allow_enlarge=allow_enlarge,
             report_context=report_context,
         )
     except Exception:  # noqa: BLE001

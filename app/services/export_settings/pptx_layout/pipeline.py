@@ -57,17 +57,21 @@ def optimize_pptx_layout(
     mode: str = DEFAULT_MODE,
     model: str | None = None,
     max_expand=None,
+    use_vision: bool = True,
+    allow_enlarge: bool = False,
     report_context: dict | None = None,
 ) -> bytes:
     """对 PPTX 字节执行版式优化，返回调整后的字节；失败或无调整时返回原始字节。
 
+    use_vision=False 时不渲染截图、不调用视觉模型，只用启发式估算（仅会扩高/缩字）。
+    allow_enlarge=False 时即使模型判定 underflow 也不放大字号。
     若提供 report_context，则把本次的 AI 判断与实际调整结果落库（失败不影响导出）。
     """
     if mode not in VALID_MODES:
         mode = DEFAULT_MODE
 
-    resolved_provider = vlm_provider()
-    resolved_model = resolve_vlm_model(model)
+    resolved_provider = vlm_provider() if use_vision else ""
+    resolved_model = resolve_vlm_model(model) if use_vision else ""
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="pptx_layout_"))
     input_path = tmp_dir / "input.pptx"
@@ -81,9 +85,14 @@ def optimize_pptx_layout(
         if not candidates:
             return pptx_bytes
 
-        tag_map = _build_tag_map(candidates)
-        _make_annotated(input_path, candidates, annotated_path)
-        results, vlm_used = _analyze_all_pages(annotated_path, candidates, tag_map, mode=mode, model=model)
+        if use_vision:
+            tag_map = _build_tag_map(candidates)
+            _make_annotated(input_path, candidates, annotated_path)
+            results, vlm_used = _analyze_all_pages(
+                annotated_path, candidates, tag_map, mode=mode, model=model
+            )
+        else:
+            results, vlm_used = _estimate_fallback(candidates), False
         if not results:
             _safe_persist_report(
                 report_context, mode=mode, provider=resolved_provider, model=resolved_model,
@@ -92,7 +101,8 @@ def optimize_pptx_layout(
             return pptx_bytes
 
         applied, item_records = _apply_results(
-            input_path, results, output_path, candidates, mode=mode, max_expand=max_expand
+            input_path, results, output_path, candidates,
+            mode=mode, max_expand=max_expand, allow_enlarge=allow_enlarge,
         )
         _safe_persist_report(
             report_context, mode=mode, provider=resolved_provider, model=resolved_model,
@@ -230,6 +240,7 @@ def _apply_results(
     *,
     mode: str,
     max_expand,
+    allow_enlarge: bool = False,
 ) -> tuple[bool, list[dict]]:
     """把结果写回原始 pptx 对应文本框，返回 (是否有调整, 报告条目列表)。"""
     prs = Presentation(str(input_path))
@@ -245,7 +256,10 @@ def _apply_results(
             shape, xform = find_shape_and_xform_by_uid(prs, uid)
             if shape is None:
                 continue
-            scale = fit_textbox(shape, target, mode=mode, max_expand=max_expand, xform=xform)
+            scale = fit_textbox(
+                shape, target, mode=mode, max_expand=max_expand, xform=xform,
+                allow_enlarge=allow_enlarge,
+            )
             # 判定是否产生实际调整：字号有缩放，或 expand/both 模式移动/放大了框
             geometry_changed = (
                 mode in ("expand", "both")

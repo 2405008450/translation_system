@@ -291,6 +291,10 @@ const overrides = {
         modeLabel: 'Adjustment mode',
         modelLabel: 'Vision model',
         modelHint: 'Always called via OpenRouter; pick one of the multimodal models below.',
+        useVision: 'Verify with a vision model',
+        useVisionHint: 'When off, overflow is estimated by program from text amount, font size and box size. No screenshots or model calls: faster but less accurate, and it only grows boxes or shrinks fonts.',
+        allowEnlarge: 'Allow enlarging undersized fonts',
+        allowEnlargeHint: 'When on, boxes the vision model judges as having clearly small text get a larger font. Off by default: shrink only.',
         modes: {
           model_scale: 'Shrink font only (safest)',
           shrink: 'Keep box · shrink font',
@@ -300,8 +304,8 @@ const overrides = {
         modeHints: {
           model_scale: 'Keeps box position and size; only shrinks font by the overflow ratio. Least disruptive.',
           shrink: 'Keeps the original box and shrinks the font by area ratio to fit the text.',
-          both: 'Moves/enlarges the box as suggested by the vision model, then shrinks the font if still needed.',
-          expand: 'Enlarges/moves the text box as suggested by the vision model; font size unchanged.',
+          both: 'Moves/enlarges the box as suggested by the vision model (or program estimate), then shrinks the font if still needed.',
+          expand: 'Enlarges/moves the text box as suggested by the vision model (or program estimate); font size unchanged.',
         },
       },
     },

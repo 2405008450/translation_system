@@ -127,10 +127,6 @@ def _balance_json(text: str) -> str:
     return text + suffix
 
 
-import json
-import re
-from json_repair import repair_json
-
 def _extract_json_payload(raw_content: str) -> dict:
     """从模型返回中稳健地提取 JSON 对象。
 
@@ -202,7 +198,7 @@ def _parse_results(raw_content: str) -> dict[str, dict]:
 _FALLBACK_VLM_PROVIDER = "openrouter"
 _FALLBACK_VLM_MODELS = (
     "google/gemini-3.1-pro-preview",
-    "google/gemini-3.6-flash",
+    "google/gemini-3.8-flash",
     "anthropic/claude-sonnet-5",
     "anthropic/claude-fable-5",
 )

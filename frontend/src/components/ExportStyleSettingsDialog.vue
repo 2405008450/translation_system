@@ -7,6 +7,10 @@ export interface PptxLayoutSettings {
   enabled: boolean
   mode: PptxLayoutMode
   model: string
+  // false = 不调用视觉模型，仅用程序估算溢出（不渲染截图、无模型费用）。
+  use_vision: boolean
+  // 是否允许把偏小的字号放大（默认关闭，避免“仅缩字号”类模式意外放大）。
+  allow_enlarge: boolean
 }
 
 export interface ExportStyleSettings {
@@ -22,7 +26,7 @@ export const PPTX_LAYOUT_MODES: PptxLayoutMode[] = ['model_scale', 'shrink', 'bo
 // 视觉复核仅走 OpenRouter，模型固定为以下几个（均支持多模态）。
 export const PPTX_LAYOUT_VLM_MODELS = [
   'google/gemini-3.1-pro-preview',
-  'google/gemini-3.6-flash',
+  'google/gemini-3.8-flash',
   'anthropic/claude-sonnet-5',
   'anthropic/claude-fable-5',
 ] as const
@@ -30,7 +34,13 @@ export const PPTX_LAYOUT_VLM_MODELS = [
 export const DEFAULT_PPTX_LAYOUT_VLM_MODEL = PPTX_LAYOUT_VLM_MODELS[0]
 
 export function createDefaultPptxLayoutSettings(): PptxLayoutSettings {
-  return { enabled: false, mode: 'model_scale', model: DEFAULT_PPTX_LAYOUT_VLM_MODEL }
+  return {
+    enabled: false,
+    mode: 'model_scale',
+    model: DEFAULT_PPTX_LAYOUT_VLM_MODEL,
+    use_vision: true,
+    allow_enlarge: false,
+  }
 }
 
 export function normalizePptxLayoutSettings(raw: unknown): PptxLayoutSettings {
@@ -45,6 +55,9 @@ export function normalizePptxLayoutSettings(raw: unknown): PptxLayoutSettings {
     enabled: Boolean(source.enabled),
     mode,
     model,
+    // 旧数据没有该字段时保持原行为：使用视觉模型。
+    use_vision: source.use_vision === undefined ? true : Boolean(source.use_vision),
+    allow_enlarge: Boolean(source.allow_enlarge),
   }
 }
 </script>
@@ -616,10 +629,28 @@ watch(() => props.modelValue, () => {
               <span class="field-row__label">{{ t('workbench.exportStyleSettings.pptx.modelLabel') }}</span>
               <span class="field-row__hint">{{ t('workbench.exportStyleSettings.pptx.modelHint') }}</span>
             </div>
-            <select v-model="form.pptx.model" class="field-row__control" :disabled="!form.pptx.enabled">
+            <select
+              v-model="form.pptx.model"
+              class="field-row__control"
+              :disabled="!form.pptx.enabled || !form.pptx.use_vision"
+            >
               <option v-for="m in pptxVlmModels" :key="m" :value="m">{{ m }}</option>
             </select>
           </div>
+          <label class="export-style__enable export-style__pptx-option">
+            <input v-model="form.pptx.use_vision" type="checkbox" :disabled="!form.pptx.enabled">
+            <span>
+              <strong>{{ t('workbench.exportStyleSettings.pptx.useVision') }}</strong>
+              <small>{{ t('workbench.exportStyleSettings.pptx.useVisionHint') }}</small>
+            </span>
+          </label>
+          <label class="export-style__enable export-style__pptx-option">
+            <input v-model="form.pptx.allow_enlarge" type="checkbox" :disabled="!form.pptx.enabled">
+            <span>
+              <strong>{{ t('workbench.exportStyleSettings.pptx.allowEnlarge') }}</strong>
+              <small>{{ t('workbench.exportStyleSettings.pptx.allowEnlargeHint') }}</small>
+            </span>
+          </label>
         </div>
       </section>
 
@@ -692,6 +723,10 @@ watch(() => props.modelValue, () => {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 12px;
+}
+
+.export-style__pptx-option {
+  grid-column: 1 / -1;
 }
 
 .export-style__pptx-fields.is-disabled {

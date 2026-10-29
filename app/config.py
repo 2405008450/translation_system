@@ -171,7 +171,7 @@ class Settings(BaseSettings):
     pptx_layout_vlm_models: list[str] = Field(
         default_factory=lambda: [
             "google/gemini-3.1-pro-preview",
-            "google/gemini-3.6-flash",
+            "google/gemini-3.8-flash",
             "anthropic/claude-sonnet-5",
             "anthropic/claude-fable-5",
         ]
