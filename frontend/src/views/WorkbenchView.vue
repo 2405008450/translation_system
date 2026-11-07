@@ -10377,7 +10377,7 @@ onBeforeRouteLeave(async () => {
             :title="proofreadingDiffVisible ? '关闭跟踪修订显示，只查看校对版' : '开启跟踪修订显示，查看删除和新增内容'"
             @click="toggleProofreadingRevisionVisible"
           >
-            <Columns :size="15" /><span>{{ proofreadingDiffVisible ? '隐藏修订' : '显示修订' }}</span>
+            <Columns :size="15" /><span>显示修订</span>
           </button>
           <button class="workbench-ribbon__top-action proofreading-workbench-toolbar__primary" type="button" :disabled="!activeSegmentCanWrite" @click="confirmCurrentSentence">
             <Check :size="15" /><span>确认当前</span>
@@ -11708,7 +11708,7 @@ onBeforeRouteLeave(async () => {
                 </ul>
               </div>
             </div>
-            <button class="button workflow-proofreading-actions__button" :class="{ 'is-active': proofreadingDiffVisible }" type="button" :aria-pressed="proofreadingDiffVisible" @click="toggleProofreadingRevisionVisible"><EyeOff v-if="proofreadingDiffVisible" :size="14" /><Eye v-else :size="14" />{{ proofreadingDiffVisible ? '隐藏修订' : '显示修订' }}</button>
+            <button class="button workflow-proofreading-actions__button" :class="{ 'is-active': proofreadingDiffVisible }" type="button" :aria-pressed="proofreadingDiffVisible" @click="toggleProofreadingRevisionVisible"><Eye :size="14" />显示修订</button>
           </div>
         </div>
         <details v-if="props.mergeViewId && mergeProofreadingRuns.length" class="merge-proofreading-tasks" open data-testid="merge-proofreading-tasks">

@@ -85,6 +85,7 @@ import {
   type ProofreadingExportFormat,
 } from '../api/proofreading'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
+import { getAssignmentEventScope } from '../utils/assignmentEvents'
 import { matchesSearchKeyword, normalizeSearchKeyword, splitSearchKeywords } from '../utils/search'
 import {
   buildUploadBatches,
@@ -1037,8 +1038,6 @@ const tabs = computed(() => {
     { key: 'assignments' as const, label: '指派记录', disabled: !canAssignProject.value },
     { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: !canManageProject.value },
     { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: !canManageProject.value },
-    { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
-    { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
   ]
   return isProofreadingProject.value
     ? items.filter((item) => item.key !== 'views')
@@ -1920,6 +1919,17 @@ function getProofreadingExportChoices(row: ProjectRow): ProofreadingExportChoice
   const info = row.proofreading
   if (!info?.batch_id) return []
   const stage = info.workflow_stage
+  if (info.batch_kind === 'workflow_segments') {
+    return [{
+      format: 'proofreading_audit_xlsx',
+      name: 'Excel 校对报告',
+      description: '导出原文、校对前后译文、确认状态和修改理由。',
+    }, {
+      format: 'proofreading_docx_revisions',
+      name: 'Word 校对修订版',
+      description: '导出完整译文及可接受或拒绝的校对修订；Word 来源保留排版。',
+    }]
+  }
   if (info.pair_format === 'xlsx') {
     return [
       {
@@ -1983,6 +1993,7 @@ function exportPrimaryProofreadingFile(row: ProjectRow) {
 }
 
 function proofreadingExportSuccessMessage(format: ProofreadingExportFormat) {
+  if (format === 'proofreading_docx_revisions') return '已导出 Word 校对修订版。'
   if (format === 'proofreading_audit_xlsx') return '已导出一一对照 Excel。'
   if (format === 'proofreading_docx_target_revisions') return '已导出目标原格式 Word（含修订）。'
   if (format === 'proofreading_docx_layout') return '已导出校对后译文。'
@@ -6379,7 +6390,7 @@ onBeforeUnmount(() => {
         :class="{ 'is-active': activeTab === tab.key }"
         type="button"
         :disabled="tab.disabled"
-        :title="tab.disabled ? t('projectDetail.common.comingSoon') : undefined"
+        :title="tab.disabled ? '当前账号无管理权限' : undefined"
         @click="!tab.disabled && switchProjectTab(tab.key)"
       >
         {{ tab.label }}
@@ -7720,7 +7731,8 @@ onBeforeUnmount(() => {
               <strong>{{ getAssignmentEventActionLabel(event.action) }}</strong>
               <span>
                 {{ event.file_record_name || '项目级' }} ·
-                {{ getAssigneeDisplayName(event.assignee) || '--' }}
+                {{ getAssigneeDisplayName(event.assignee) || '--' }} ·
+                {{ getAssignmentEventScope(event) }}
               </span>
             </div>
             <div class="assignment-event-item__meta">
@@ -8172,47 +8184,7 @@ onBeforeUnmount(() => {
                 </button>
               </div>
 
-              <div v-if="canManageProject && !isProofreadingProject" class="pd-toolbar-action-group pd-toolbar-action-group--reserved" aria-label="待开放操作">
-                <button
-                  class="button pd-toolbar-action-button"
-                  type="button"
-                  disabled
-                  :title="`${t('projectDetail.files.actions.link')}：${t('projectDetail.common.comingSoon')}`"
-                  :aria-label="t('projectDetail.files.actions.link')"
-                >
-                  <Link :size="15" />
-                </button>
-                <button
-                  class="button pd-toolbar-action-button"
-                  type="button"
-                  disabled
-                  :title="`${t('projectDetail.files.actions.glossary')}：${t('projectDetail.common.comingSoon')}`"
-                  :aria-label="t('projectDetail.files.actions.glossary')"
-                >
-                  <BookOpen :size="15" />
-                </button>
-                <button
-                  class="button pd-toolbar-action-button"
-                  type="button"
-                  disabled
-                  :title="`${t('projectDetail.files.actions.modifyTaskType')}：${t('projectDetail.common.comingSoon')}`"
-                  :aria-label="t('projectDetail.files.actions.modifyTaskType')"
-                >
-                  <Clock3 :size="15" />
-                </button>
-              </div>
 
-              <div v-if="!isProofreadingProject" class="pd-toolbar-action-group pd-toolbar-action-group--utility" aria-label="视图设置">
-                <button
-                  class="button pd-toolbar-action-button"
-                  type="button"
-                  disabled
-                  :title="`${t('projectDetail.files.actions.columns')}：${t('projectDetail.common.comingSoon')}`"
-                  :aria-label="t('projectDetail.files.actions.columns')"
-                >
-                  <Settings2 :size="14" />
-                </button>
-              </div>
 
               <div v-if="canManageProject" class="pd-toolbar-action-group pd-toolbar-action-group--danger" aria-label="危险操作">
                 <button

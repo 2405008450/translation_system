@@ -633,6 +633,21 @@ body.modal-open {
   color: var(--sidebar-text-bright);
 }
 
+.brand-logo__image {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  border-radius: 6px;
+}
+
+.auth-brand-logo {
+  width: 72px;
+  height: 72px;
+  object-fit: contain;
+  border-radius: 12px;
+  margin-bottom: 12px;
+}
+
 .brand-logo.is-collapsed {
   width: 38px;
   height: 38px;
@@ -663,12 +678,24 @@ body.modal-open {
   letter-spacing: 2px;
 }
 
+.brand-text__line {
+  display: block;
+  white-space: nowrap;
+}
+
+.brand-text__subtitle {
+  font-size: 12px;
+}
+
 .sidebar-brand h1 {
   margin: 0;
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 700;
   color: var(--sidebar-text-bright);
-  white-space: nowrap;
+  white-space: normal;
+  line-height: 1.5;
+  letter-spacing: 0;
+  text-align: left;
 }
 
 .sidebar-brand p {

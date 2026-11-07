@@ -5,6 +5,7 @@ import { computed, onMounted, ref } from 'vue'
 
 import { http } from '../api/http'
 import type { AssignmentEvent, AssignmentEventsResponse } from '../types/api'
+import { getAssignmentEventScope } from '../utils/assignmentEvents'
 
 const loading = ref(false)
 const pageError = ref('')
@@ -30,6 +31,7 @@ const filteredEvents = computed(() => {
       event.file_record_name || '',
       event.assignee?.nickname || event.assignee?.username || '',
       event.actor?.nickname || event.actor?.username || '',
+      getAssignmentEventScope(event),
     ].some((value) => value.toLowerCase().includes(keyword))
   })
 })
@@ -52,6 +54,7 @@ function formatDate(value: string) {
     hour12: false,
     hour: '2-digit',
     minute: '2-digit',
+    second: '2-digit',
   })}`
 }
 
@@ -95,7 +98,7 @@ onMounted(() => {
             placeholder="搜索项目、文件、译者或操作人"
           />
         </div>
-        <span class="table-toolbar__summary">共 {{ filteredEvents.length }} 条</span>
+        <span class="table-toolbar__summary">最近 {{ events.length }} 条记录 · 当前显示 {{ filteredEvents.length }} 条</span>
       </div>
       <div class="table-toolbar__right">
         <button class="button" type="button" :disabled="loading" @click="loadEvents">
@@ -116,16 +119,17 @@ onMounted(() => {
             <th>操作</th>
             <th>项目</th>
             <th>文件</th>
+            <th>阶段与范围</th>
             <th>译者</th>
             <th>操作人</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="loading">
-            <td colspan="6" class="assignment-table__empty">正在加载...</td>
+            <td colspan="7" class="assignment-table__empty">正在加载...</td>
           </tr>
           <tr v-else-if="filteredEvents.length === 0">
-            <td colspan="6" class="assignment-table__empty">暂无指派记录</td>
+            <td colspan="7" class="assignment-table__empty">暂无指派记录</td>
           </tr>
           <template v-else>
             <tr v-for="event in filteredEvents" :key="event.id">
@@ -135,6 +139,7 @@ onMounted(() => {
               </td>
               <td>{{ event.project_name || '--' }}</td>
               <td>{{ event.file_record_name || '项目级' }}</td>
+              <td>{{ getAssignmentEventScope(event) }}</td>
               <td>{{ getDisplayName(event.assignee) }}</td>
               <td>{{ getDisplayName(event.actor) }}</td>
             </tr>

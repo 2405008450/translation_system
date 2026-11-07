@@ -221,6 +221,7 @@ export interface ProjectAssignmentPayload {
 
 export interface AssignmentEvent {
   id: string
+  workflow_step_name?: string | null
   project_id: string
   project_name: string | null
   file_record_id: string | null

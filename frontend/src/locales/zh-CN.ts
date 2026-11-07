@@ -1,6 +1,6 @@
 export default {
   common: {
-    brand: '翻译工作台',
+    brand: '信实翻译项目管理一体化系统',
     comingSoon: '即将上线',
     notSet: '未设置',
     none: '无',
@@ -138,7 +138,7 @@ export default {
   auth: {
     login: '登录',
     initialize: '初始化超级管理员',
-    subtitleLogin: '输入账号密码进入智慧运营平台',
+    subtitleLogin: '输入账号密码进入信实翻译项目管理一体化系统',
     subtitleInit: '系统当前还没有用户，请先创建超级管理员账号',
     username: '用户名',
     password: '密码',
@@ -226,7 +226,7 @@ export default {
     },
   },
   login: {
-    kicker: '智慧运营平台',
+    kicker: '信实翻译项目管理一体化系统',
   },
   dashboard: {
     title: '数据总览',
@@ -313,7 +313,7 @@ export default {
     },
   },
   appLayout: {
-    brand: '工作台',
+    brand: '信实翻译项目管理一体化系统',
     collapsedBrand: '信实',
   },
   projectList: {
@@ -440,7 +440,7 @@ export default {
     },
     base: {
       title: '基础信息',
-      description: '当前展示项目基础资料和占位字段，便于与后续多文件项目保持一致。',
+      description: '查看项目状态、语言方向、流程阶段和交付期限。',
       expand: '展开',
       collapse: '收起',
       status: '项目状态',
@@ -966,7 +966,7 @@ export default {
     performance: '我的绩效',
     all: '全部',
     incomplete: '未完成',
-    count: '项目数量：{count}',
+    count: '任务数量：{count}',
     selected: '已选中：{count}',
     toolbar: {
       importAssets: '导入语言资产',

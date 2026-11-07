@@ -46,6 +46,8 @@ frontend/.DS_Store
 .claude
 *.xlsx
 tests/*
+!tests/test_project_status.py
+!tests/test_file_record_import_batches.py
 !tests/test_mixed_translation.py
 !tests/test_alignment_structure.py
 !tests/test_workflow_proofreading.py

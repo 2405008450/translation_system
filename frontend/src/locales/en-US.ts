@@ -12,7 +12,7 @@ const overrides = {
     },
   },
   common: {
-    brand: 'Translation Workbench',
+    brand: '信实翻译项目管理一体化系统',
     comingSoon: 'Coming soon',
     notSet: 'Not set',
     none: 'None',
@@ -196,7 +196,7 @@ const overrides = {
   auth: {
     login: 'Log in',
     initialize: 'Initialize super admin',
-    subtitleLogin: 'Enter your account and password to access the Smart Operations Platform',
+    subtitleLogin: 'Enter your account and password to access the Xinshi Translation Project Management System',
     subtitleInit: 'No users exist yet. Create a super admin account first.',
     username: 'Username',
     password: 'Password',
@@ -205,7 +205,7 @@ const overrides = {
     requestError: 'Request failed. Please try again later.',
   },
   login: {
-    kicker: 'Smart Operations Platform',
+    kicker: '信实翻译项目管理一体化系统',
   },
   workbench: {
     exportModes: {
@@ -403,8 +403,8 @@ const overrides = {
     importTaskTimeout: 'Import timed out. Refresh the page later to check the result.',
   },
   appLayout: {
-    brand: 'Workbench',
-    collapsedBrand: 'TM',
+    brand: '信实翻译项目管理一体化系统',
+    collapsedBrand: '信实',
   },
   dashboard: {
     title: 'Data Overview',

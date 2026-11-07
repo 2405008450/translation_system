@@ -198,6 +198,21 @@ test('纯校对工作台阶段编号不包含对齐', async ({ page }) => {
   await expect(page.getByTestId('proofreading-reopen-alignment-button')).toHaveCount(0)
 })
 
+test('显示修订开关的选中状态与实际修订显示一致', async ({ page }) => {
+  await mockApi(page, false, { formula: true })
+  await page.goto('/e2e/workflow-proofreading-harness.html?mode=workbench')
+  const toggle = page.getByTestId('workflow-proofreading-actions').getByRole('button', { name: '显示修订', exact: true })
+  const editor = page.locator('[data-segment-target="true"]').first()
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true')
+  await expect(editor).toHaveAttribute('data-revision-visible', 'true')
+  await toggle.click()
+  await expect(toggle).toHaveAttribute('aria-pressed', 'false')
+  await expect(editor).toHaveAttribute('data-revision-visible', 'false')
+  await toggle.click()
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true')
+  await expect(editor).toHaveAttribute('data-revision-visible', 'true')
+})
+
 test('独立纯校对提供带整句批注的 Word 并使用导出队列', async ({ page }) => {
   const errors = await mockApi(page, true)
   const formats: string[] = []

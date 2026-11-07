@@ -64,6 +64,7 @@ onMounted(async () => {
   <main class="auth-layout">
     <section class="auth-panel">
       <div class="auth-panel__header">
+        <img class="auth-brand-logo" src="/xinshi-logo.jpg" alt="信实翻译 Logo" />
         <div class="section-kicker">{{ t('login.kicker') }}</div>
         <h1>{{ title }}</h1>
         <p>{{ subtitle }}</p>

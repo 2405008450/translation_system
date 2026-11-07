@@ -1382,10 +1382,6 @@ onBeforeUnmount(() => {
             </section>
           </Transition>
         </div>
-        <button class="button" type="button" disabled :title="t('common.comingSoon')">
-          <Settings2 :size="14" />
-          {{ t('projectList.columns') }}
-        </button>
       </div>
     </div>
 

@@ -1470,6 +1470,12 @@ def _run_import_task(task_id: str, payload: dict[str, Any]) -> None:
     try:
         with SessionLocal() as db:
             try:
+                if db.get_bind().dialect.name == "postgresql":
+                    # 解析大文件时可能长时间没有 SQL；仅延长当前导入事务的空闲时限。
+                    timeout_seconds = max(int(get_settings().import_worker_job_timeout_seconds), 60)
+                    db.execute(select(func.set_config(
+                        "idle_in_transaction_session_timeout", f"{timeout_seconds}s", True,
+                    )))
                 raise_if_import_task_canceled(task_id)
                 if payload.get("kind") == "project_source_document":
                     result = _process_project_source_import(db, task_id, payload)
@@ -4046,6 +4052,19 @@ def _calculate_workflow_overall_progress(
     return fallback
 
 
+def _resolve_workflow_status(
+    current_status: str | None,
+    total_segments: int,
+    confirmed_segments: int,
+    workflow_progress: list[dict[str, Any]] | None,
+) -> str:
+    """完成状态与总进度共用流程口径，不能仅凭译文确认就跳过后续校对。"""
+    status = resolve_file_record_status(current_status, total_segments, confirmed_segments)
+    if status == "error" or not workflow_progress or total_segments <= 0:
+        return status
+    return "completed" if _calculate_workflow_overall_progress(workflow_progress, 0) >= 100 else "in_progress"
+
+
 def _get_file_workflow_progress(db: Session, file_record_ids: list[UUID]) -> dict[UUID, list[dict[str, Any]]]:
     if not file_record_ids:
         return {}
@@ -4569,7 +4588,13 @@ def _json_dumps(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-def _serialize_assignment_event(event: AssignmentEvent) -> dict[str, Any]:
+def _serialize_assignment_event(
+    event: AssignmentEvent,
+    workflow_step_names: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    before_payload = json.loads(event.before_payload or "{}")
+    after_payload = json.loads(event.after_payload or "{}")
+    step_id = after_payload.get("workflow_step_id") or before_payload.get("workflow_step_id")
     return {
         "id": str(event.id),
         "project_id": str(event.project_id),
@@ -4581,8 +4606,9 @@ def _serialize_assignment_event(event: AssignmentEvent) -> dict[str, Any]:
         "actor_id": str(event.actor_id) if event.actor_id else None,
         "actor": _serialize_assignee(event.actor),
         "action": event.action,
-        "before_payload": json.loads(event.before_payload or "{}"),
-        "after_payload": json.loads(event.after_payload or "{}"),
+        "before_payload": before_payload,
+        "after_payload": after_payload,
+        "workflow_step_name": (workflow_step_names or {}).get(str(step_id)),
         "created_at": event.created_at.isoformat(),
     }
 
@@ -5599,7 +5625,9 @@ def list_assignment_events(
     if action:
         query = query.filter(AssignmentEvent.action == action)
     events = query.order_by(AssignmentEvent.created_at.desc()).limit(safe_limit).all()
-    return {"items": [_serialize_assignment_event(event) for event in events]}
+    steps_by_project = _load_workflow_steps_by_project(db, list({event.project_id for event in events}))
+    step_names = {str(step.id): step.name for steps in steps_by_project.values() for step in steps}
+    return {"items": [_serialize_assignment_event(event, step_names) for event in events]}
 
 
 @router.get("/projects/{project_id}/assignment-events")
@@ -7339,7 +7367,7 @@ def _build_project_summary_payload(
         progress = _calculate_workflow_overall_progress(workflow_progress, progress)
     pretranslation_progress = calculate_file_record_progress(total_segments, pretranslated_segments)
     effective_status = (
-        resolve_file_record_status("in_progress", total_segments, translated_segments)
+        _resolve_workflow_status("in_progress", total_segments, translated_segments, workflow_progress)
         if total_segments > 0
         else project.status
     )
@@ -7402,10 +7430,11 @@ def _build_project_file_payload(
     if workflow_progress:
         progress = _calculate_workflow_overall_progress(workflow_progress, progress)
     pretranslation_progress = calculate_file_record_progress(total_segments, pretranslated_segments)
-    effective_status = resolve_file_record_status(
+    effective_status = _resolve_workflow_status(
         file_record.status,
         total_segments=total_segments,
-        translated_segments=translated_segments,
+        confirmed_segments=translated_segments,
+        workflow_progress=workflow_progress,
     )
     issue_stats = issue_stats or {"issue_count": 0, "open_issue_count": 0}
     assignee_id = getattr(file_record, "assignee_id", None)
@@ -11903,7 +11932,12 @@ def get_file_records(
             "project_id": str(file_record.project_id) if file_record.project_id else None,
             "project_name": file_record.project.name if file_record.project else None,
             "filename": file_record.filename,
-            "status": file_record.status,
+            "status": _resolve_workflow_status(
+                file_record.status,
+                file_stats.get(file_record.id, {}).get("total", 0),
+                file_stats.get(file_record.id, {}).get("filled", 0),
+                file_workflow_progress.get(file_record.id, []),
+            ),
             "progress": _calculate_workflow_overall_progress(
                 file_workflow_progress.get(file_record.id, []),
                 calculate_file_record_progress(
@@ -15096,6 +15130,12 @@ def get_merge_view_detail(
             file_payload["progress"] = _calculate_workflow_overall_progress(
                 workflow_progress,
                 file_payload.get("progress", 0),
+            )
+            file_payload["status"] = _resolve_workflow_status(
+                file_record.status,
+                file_payload.get("total_segments", 0),
+                file_payload.get("status_stats", {}).get("confirmed", 0),
+                workflow_progress,
             )
     return payload
 
@@ -20374,7 +20414,7 @@ def import_termbase_xlsx(
 @router.get("/termbase/match")
 def match_terms(
     text: str,
-    collection_ids: list[UUID] | None = None,
+    collection_ids: list[UUID] | None = Query(default=None),
     case_sensitive: bool = False,
     db: Session = Depends(get_db),
 ):
@@ -20412,7 +20452,6 @@ def match_terms(
             func.length(TermEntry.source_text) <= len(match_text),
         )
         .order_by(func.length(TermEntry.source_text).desc(), TermEntry.updated_at.desc())
-        .limit(1000)
     )
     if case_sensitive:
         candidate_query = candidate_query.filter(literal(match_text).contains(TermEntry.source_text))
@@ -20421,7 +20460,7 @@ def match_terms(
             literal(match_text.lower()).contains(func.lower(TermEntry.source_text))
         )
 
-    candidate_terms = candidate_query.all()
+    candidate_terms = candidate_query.limit(1000).all()
     term_matches = find_non_overlapping_term_text_matches(
         text,
         candidate_terms,

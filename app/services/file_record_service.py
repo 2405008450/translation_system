@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import case, event, func, or_, update
+from sqlalchemy import case, event, func, insert, or_, update
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -59,6 +59,8 @@ logger = logging.getLogger(__name__)
 _DOCX_EXTENSIONS = {".docx"}
 _WORKSPACE_SOURCE_BYTES_KEY = "_source_bytes"
 _WORKSPACE_SOURCE_FILENAME_KEY = "_source_filename"
+# 分批写入保持事务活跃，并限制待入库对象的数量；由调用方统一提交。
+_SEGMENT_INSERT_BATCH_SIZE = 1000
 
 # 运行中的校对批次不随文件删除联动清理，避免中断后台任务；可先取消再手动删除。
 _ACTIVE_PROOFREADING_STATUSES = {"aligning", "queued", "running", "canceling"}
@@ -282,6 +284,29 @@ def _record_initial_translation_events(db: Session, segments: list[Segment]) -> 
             event_key=f"initial:{segment.id}",
             created_at=segment.created_at,
         )
+
+
+def _insert_initial_segment_batch(db: Session, segments: list[Segment]) -> None:
+    if not segments:
+        return
+    # 使用多行 INSERT，并取回默认 ID、创建时间，供初始翻译事件使用。
+    # 所有行使用一致的列集合，避免有无记忆库保护的句段被拆成逐条 SQL。
+    rows = []
+    for segment in segments:
+        row = {key: value for key, value in vars(segment).items() if key != "_sa_instance_state"}
+        row.setdefault("auto_write_protection", "none")
+        row.setdefault("auto_write_protection_reason", None)
+        row.setdefault("auto_write_protection_updated_at", None)
+        row.setdefault("auto_write_protection_updated_by_id", None)
+        row.setdefault("version", 1)
+        rows.append(row)
+    inserted = db.scalars(
+        insert(Segment).returning(Segment),
+        rows,
+        execution_options={"render_nulls": True},
+    ).all()
+    _record_initial_translation_events(db, inserted)
+    db.flush()
 
 
 def _hash_file_path(source_path: str | Path) -> str:
@@ -626,8 +651,12 @@ def _create_file_record_from_workspace(
         )
         if segment.source == "tm" and segment.status == "exact" and normalize_text(segment.target_text):
             set_auto_write_protection(segment, "protected", reason="tm_exact")
-        db.add(segment)
         created_segments.append(segment)
+        if len(created_segments) >= _SEGMENT_INSERT_BATCH_SIZE:
+            _insert_initial_segment_batch(db, created_segments)
+            created_segments.clear()
+
+    _insert_initial_segment_batch(db, created_segments)
 
     file_record.status = resolve_file_record_status(
         file_record.status,
@@ -644,7 +673,6 @@ def _create_file_record_from_workspace(
         save_source_file_from_path(file_record.id, source_filename, source_path)
         _remember_pending_source_file(db, file_record.id, source_filename)
     db.flush()
-    _record_initial_translation_events(db, created_segments)
     return file_record
 
 

@@ -590,15 +590,6 @@ onBeforeUnmount(() => {
           >
             合并视图
           </button>
-          <button
-            class="tab-item"
-            :class="{ 'is-active': mainTab === 'performance' }"
-            type="button"
-            disabled
-            :title="t('taskList.performanceSoon')"
-          >
-            {{ t('taskList.performance') }}
-          </button>
         </div>
       </div>
 
@@ -693,14 +684,6 @@ onBeforeUnmount(() => {
                 </template>
               </div>
             </div>
-            <button class="button" type="button" disabled :title="t('common.comingSoon')">
-              <Settings2 :size="14" />
-              {{ t('taskList.toolbar.columns') }}
-            </button>
-            <button class="button" type="button" disabled :title="t('common.comingSoon')">
-              <MoreHorizontal :size="14" />
-              {{ t('taskList.toolbar.cardMode') }}
-            </button>
           </div>
         </div>
 

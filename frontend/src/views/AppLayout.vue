@@ -533,10 +533,13 @@ watch(
         <div class="sidebar-brand__top">
           <div class="sidebar-brand__identity sidebar-brand__identity--centered">
             <div class="brand-logo brand-logo--plain" :class="{ 'is-collapsed': sidebarCollapsed }">
-              <div v-if="sidebarCollapsed" class="brand-logo__wordmark">{{ t('appLayout.collapsedBrand') }}</div>
+              <img class="brand-logo__image" src="/xinshi-logo.jpg" alt="信实翻译 Logo" />
             </div>
             <div v-if="!sidebarCollapsed" class="brand-text brand-text--centered">
-              <h1 class="brand-text__title">{{ t('appLayout.brand') }}</h1>
+              <h1 class="brand-text__title" :aria-label="t('appLayout.brand')">
+                <span class="brand-text__line">信实翻译</span>
+                <span class="brand-text__line brand-text__subtitle">项目管理一体化系统</span>
+              </h1>
             </div>
           </div>
         </div>
@@ -729,17 +732,6 @@ watch(
               </template>
             </div>
           </div>
-
-          <button
-            class="shell-header__placeholder"
-            type="button"
-            :title="t('common.comingSoon')"
-            :aria-label="t('shell.topbar.soon', { name: t('shell.topbar.settings') })"
-            disabled
-          >
-            <Settings :size="16" />
-            <span>{{ t('shell.topbar.settings') }}</span>
-          </button>
 
           <div class="shell-language" @click.stop>
             <button
