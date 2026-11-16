@@ -814,7 +814,8 @@ const overrides = {
       rate: 'Input ${input} · Output ${output} / 1M tokens',
       defaultModel: 'Billed according to the model actually used',
       unavailable: 'No reference price; check provider pricing',
-      note: 'Base reference rates in USD, not per call. Caching, long context and other charges may vary.',
+      directProvider: 'Direct DeepSeek billing; see current DeepSeek rates',
+      note: 'Current reference rates in USD, including public discounts, not per call. Caching, long context and service tiers may vary.',
       source: 'OpenRouter pricing · Updated {date}',
     },
     scenario: {

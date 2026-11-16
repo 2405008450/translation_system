@@ -277,7 +277,7 @@ def _build_model_attempts(model: str, settings: Settings) -> list[TermExtraction
     attempts: list[TermExtractionModelAttempt] = []
 
     # 前端的 deepseek/deepseek-chat 是 OpenRouter 模型 ID；直连 DeepSeek 时要使用 deepseek-chat。
-    if selected_model.startswith("deepseek/"):
+    if selected_model in {"deepseek/deepseek-chat", "deepseek/deepseek-reasoner", f"deepseek/{settings.deepseek_model}"}:
         if settings.deepseek_api_key:
             attempts.append(TermExtractionModelAttempt(
                 provider="deepseek",

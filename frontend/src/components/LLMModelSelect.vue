@@ -26,6 +26,7 @@ const accessibleName = computed(() => props.ariaLabel || t('projectDetail.preTra
 
 function priceText(modelId: string) {
   if (!modelId) return t('llm.pricing.defaultModel')
+  if (modelId === 'deepseek/deepseek-chat' || modelId === 'deepseek-chat') return t('llm.pricing.directProvider')
   const price = openRouterModelPricing[modelId]
   return price
     ? t('llm.pricing.rate', { input: price.input, output: price.output })

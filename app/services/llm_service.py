@@ -373,6 +373,9 @@ def _resolve_provider_model(
     if provider.name == "deepseek":
         if selected_model.startswith("deepseek/"):
             direct_model = normalize_text(selected_model.split("/", 1)[1]) or settings.deepseek_model
+            # OpenRouter 的版本化模型 ID 不等于 DeepSeek 直连模型名。
+            if direct_model not in {"deepseek-chat", "deepseek-reasoner", settings.deepseek_model}:
+                return None
         elif "/" not in selected_model:
             direct_model = selected_model
         else:

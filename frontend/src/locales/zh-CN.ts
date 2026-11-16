@@ -1727,7 +1727,8 @@ export default {
       rate: '输入 ${input} · 输出 ${output} / 百万 token',
       defaultModel: '按实际调用的模型计费',
       unavailable: '暂无参考报价，请以服务商价格为准',
-      note: '美元基础参考价，非每次调用费用；缓存、长上下文等以实际账单为准。',
+      directProvider: 'DeepSeek 直连计费，以 DeepSeek 当前报价为准',
+      note: '美元现行参考价，已包含公开优惠，非每次调用费用；缓存、长上下文和特殊档位以实际账单为准。',
       source: 'OpenRouter 报价 · 更新于 {date}',
     },
     scenario: {
