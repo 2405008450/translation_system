@@ -37,9 +37,11 @@ def sync():
     missing = requested - {model["id"] for model in selected}
     if missing:
         raise ValueError(f"目录缺少模型，请人工确认后更新清单：{sorted(missing)}")
-    entries, rates = [], []
+    entries, rates, release_dates = [], [], []
     for model in selected:
         model_id = model["id"]
+        release_date = datetime.fromtimestamp(model["created"], timezone.utc).date().isoformat()
+        release_dates.append(f"  '{model_id}': '{release_date}',")
         if "text" not in model["architecture"]["output_modalities"] or ":batch" in model_id:
             raise ValueError(f"不是同步文本生成模型：{model_id}")
         family = "gemini" if model_id.startswith("google/") else "gpt" if model_id.startswith("openai/") else "deepseek"
@@ -61,6 +63,9 @@ def sync():
         "",
         "export const openRouterModelPricing: Record<string, { input: number; output: number }> = {",
         *rates, "}", "",
+        "// 使用 UTC 发布日期，同日发布的型号可按现行价格排序。",
+        "export const openRouterModelReleaseDates: Record<string, string> = {",
+        *release_dates, "}", "",
     ])
     path.write_text(source, encoding="utf-8")
     (ROOT / "frontend/src/constants/llmPricing.ts").write_text(pricing, encoding="utf-8")

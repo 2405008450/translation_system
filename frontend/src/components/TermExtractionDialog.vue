@@ -18,6 +18,7 @@ import { http } from '../api/http'
 import { pushToast } from '../composables/useToast'
 import { defaultLLMModelId, getLLMModelLabel, llmModelOptions } from '../constants/llm'
 import { formatLanguagePair } from '../constants/languages'
+import { sortModelsForTermExtraction } from '../utils/llmModelSorting'
 import type {
   ExtractedTermDraft,
   TermBase,
@@ -70,7 +71,7 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const router = useRouter()
-const modelOptions = llmModelOptions
+const modelOptions = sortModelsForTermExtraction(llmModelOptions)
 const CREATE_NEW_TERM_BASE_OPTION = '__create_new_term_base__'
 
 const loadingBases = ref(false)
