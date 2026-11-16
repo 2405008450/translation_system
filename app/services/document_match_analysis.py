@@ -51,6 +51,7 @@ class DocumentMatchSegment:
     tm_scope_mode: str = "selected"
     source_language: str | None = None
     target_language: str | None = None
+    count_policy_version: str | None = None
 
 
 Matcher = Callable[
@@ -482,6 +483,8 @@ def _calculate_percent(value: int, total: int) -> float:
 
 
 def _segment_word_count(segment: DocumentMatchSegment) -> int:
+    if getattr(segment, "count_policy_version", None):
+        return int(segment.source_word_count)
     if segment.source_word_count > 0:
         return int(segment.source_word_count)
     return count_source_words(segment.source_text)

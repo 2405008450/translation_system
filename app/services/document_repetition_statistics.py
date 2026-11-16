@@ -5,7 +5,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from uuid import UUID
 
-from app.services.analytics_service import SOURCE_WORD_PATTERN
+from app.services.quotation_counter import word_tokens
 from app.services.normalizer import normalize_text
 
 
@@ -98,7 +98,7 @@ def compute_document_repetition_statistics(
 def _extract_word_tokens(text: str | None) -> list[str]:
     if not text:
         return []
-    return [match.group(0).lower() for match in SOURCE_WORD_PATTERN.finditer(text)]
+    return [token.lower() for token in word_tokens(text)]
 
 
 def _extract_visible_characters(text: str | None) -> list[str]:

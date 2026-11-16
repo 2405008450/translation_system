@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.quotation_statistics import statistics_from_segments
+
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import re
@@ -708,7 +710,7 @@ def build_task_workspace(
         if get_task_file_extension(original_filename) == ".doc":
             workspace["_source_bytes"] = parse_bytes
             workspace["_source_filename"] = parse_filename
-            workspace["document_statistics"] = compute_word_document_statistics(raw_bytes, original_filename)
+            workspace["document_statistics"] = statistics_from_segments(workspace["segments"])
         return workspace
 
     if not supports_task_file(filename):
@@ -786,6 +788,7 @@ def build_task_workspace(
     return {
         "segments": segments,
         "document_html": build_document_html_from_segments(segments),
+        "document_statistics": statistics_from_segments(segments),
         "match_stats": asdict(match_stats),
     }
 

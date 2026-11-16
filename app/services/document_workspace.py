@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.quotation_statistics import statistics_from_segments
+
 import base64
 from collections.abc import Mapping
 import copy
@@ -83,7 +85,7 @@ CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 PAGE_BREAK_SENTINEL = "\uE001"
 PAGE_BREAK_HTML = '<span class="doc-page-break" aria-hidden="true"></span>'
 DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
-DOCX_PARSE_CACHE_VERSION = "14"
+DOCX_PARSE_CACHE_VERSION = "15"
 DOCUMENT_PARSE_MODE_FULL = "full"
 DOCUMENT_PARSE_MODE_BODY_ONLY = "body_only"
 SUPPORTED_DOCUMENT_PARSE_MODES = {
@@ -236,6 +238,7 @@ class InlineFragment:
     render_html: str | None = None
     is_math: bool = False
     math_omml_xml: str | None = None
+    quotation_semantic_text: str | None = None
 
 
 CELL_PARAGRAPH_BREAK_FRAGMENT = InlineFragment(
@@ -930,7 +933,7 @@ def parse_docx_workspace(
     return {
         "document_html": "".join(html_parts) or '<p class="doc-paragraph doc-empty"><br></p>',
         "segments": segments,
-        "document_statistics": compute_docx_statistics(raw_bytes),
+        "document_statistics": statistics_from_segments(segments),
     }
 
 
@@ -1910,6 +1913,9 @@ def _render_paragraph_fragment_group(
                     "math_placeholders": math_placeholders,
                     "segment_metadata": {
                         "source_layout_text": sentence_layout_source,
+                        "quotation_text": raw_sentence_source,
+                        "quotation_semantic_text": _collect_span_text(fragments, span, use_source=True, quotation_semantics=True),
+                        "quotation_excluded_placeholders": list(math_placeholders),
                         "source_layout_formats": source_format_map,
                     },
                 }
@@ -2355,6 +2361,11 @@ def _collect_inline_content(
         embedded_html_parts.extend(child_embedded_html_parts)
         embedded_segments.extend(child_embedded_segments)
 
+    if node.tag == _qn("w", "r"):
+        lang = node.find("w:rPr/w:lang", NS)
+        if lang is not None and (lang.get(_qn("w", "eastAsia")) == "ko-KR" or lang.get(_qn("w", "val")) == "ko-KR"):
+            from app.services.quotation_counter import _is_hangul
+            fragments = [replace(f, quotation_semantic_text="".join("x" if _is_hangul(c) else c for c in f.source_text)) for f in fragments]
     return fragments, embedded_html_parts, embedded_segments
 
 
@@ -3040,6 +3051,7 @@ def _collect_span_text(
     fragments: list[InlineFragment],
     span: SentenceSpan,
     use_source: bool,
+    quotation_semantics: bool = False,
 ) -> str:
     pieces: list[str] = []
     cursor = 0
@@ -3052,6 +3064,8 @@ def _collect_span_text(
             local_start = overlap_start - cursor
             local_end = overlap_end - cursor
             base_text = fragment.source_text if use_source else fragment.display_text
+            if quotation_semantics and fragment.quotation_semantic_text is not None:
+                base_text = fragment.quotation_semantic_text
             pieces.append(base_text[local_start:local_end])
         cursor = next_cursor
 

@@ -1430,9 +1430,6 @@ const termExtractionButtonTitle = computed(() => {
   if (!selectedTermExtractionFile.value || Number(selectedTermExtractionFile.value.total_segments || 0) <= 0) {
     return t('projectDetail.termExtraction.noSegments')
   }
-  if (!selectedTermExtractionFile.value.can_write) {
-    return '无权处理所选任务'
-  }
   if (!selectedTermExtractionSourceLanguage.value || !selectedTermExtractionTargetLanguage.value) {
     return t('projectDetail.termExtraction.languageMissing')
   }
@@ -1517,7 +1514,6 @@ const canCreateEnglishVariantCopy = computed(() => (
 ))
 const canOpenTermExtraction = computed(() => (
   Boolean(selectedTermExtractionFile.value)
-  && Boolean(selectedTermExtractionFile.value?.can_write)
   && Number(selectedTermExtractionFile.value?.total_segments || 0) > 0
   && Boolean(selectedTermExtractionSourceLanguage.value)
   && Boolean(selectedTermExtractionTargetLanguage.value)
@@ -2474,6 +2470,7 @@ function getDocumentMatchAnalysisLabel(key: DocumentMatchAnalysisRowKey) {
 }
 
 function getStatisticsSourceLabel(statistics: DocumentStatistics | null | undefined) {
+  if (statistics?.source === "parsed_text") return "按解析原文统计"
   if (!statistics?.source) {
     return t('projectDetail.stats.sources.notReady')
   }
@@ -2555,7 +2552,9 @@ function formatStatisticsReportOption(report: DocumentStatisticsReport) {
     createdAt,
     files: report.total_files,
     words,
-    scope: t(`projectDetail.stats.scopes.${report.statistics_scope === 'extended' ? 'extended' : 'standard'}`),
+    scope: report.items?.some((item) => item.statistics?.source === "parsed_text")
+      ? "按解析原文统计"
+      : t(`projectDetail.stats.scopes.${report.statistics_scope === 'extended' ? 'extended' : 'standard'}`),
   })
 }
 
@@ -7959,8 +7958,9 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <div class="pd-toolbar-action-strip" aria-label="文件批量操作">
-              <div v-if="!isProofreadingProject" class="pd-toolbar-action-group pd-toolbar-action-group--featured" aria-label="智能处理">
+              <div class="pd-toolbar-action-group pd-toolbar-action-group--featured" aria-label="智能处理">
                 <button
+                  v-if="!isProofreadingProject"
                   class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-action-button--accent"
                   type="button"
                   :disabled="!canOpenPreTranslate"
@@ -8471,24 +8471,7 @@ onBeforeUnmount(() => {
               <Check v-else :size="14" />
               {{ statisticsRunningScope === 'standard' ? t('projectDetail.stats.generating') : t('projectDetail.stats.generate') }}
             </button>
-            <button
-              class="button"
-              data-testid="project-statistics-generate-extended"
-              type="button"
-              :disabled="!canGenerateExtendedStatistics"
-              :title="statisticsSelectedFileIds.size === 0
-                ? t('projectDetail.stats.selectFileFirst')
-                : (!statisticsSelectedFiles.some((row) => isWordProjectFile(row))
-                    ? t('projectDetail.stats.extendedNoWordFiles')
-                    : undefined)"
-              @click="generateDocumentStatisticsTable('extended')"
-            >
-              <Loader2 v-if="statisticsRunningScope === 'extended'" class="lucide-spin" :size="14" />
-              <FileText v-else :size="14" />
-              {{ statisticsRunningScope === 'extended'
-                ? t('projectDetail.stats.generatingExtended')
-                : t('projectDetail.stats.generateExtended') }}
-            </button>
+
             <button
               class="button"
               type="button"
@@ -9201,7 +9184,6 @@ onBeforeUnmount(() => {
       @progress="handlePreTranslateProgress"
     />
     <TermExtractionDialog
-      v-if="!isProofreadingProject"
       :open="showTermExtractionDialog"
       :file="selectedTermExtractionFile"
       :project-source-language="project?.source_language ?? null"

@@ -14,6 +14,7 @@ from xml.etree import ElementTree as ET
 from app.services.adapters.models import BlockNode, DocumentAST
 from app.services.adapters.pptx_inline_tags import strip_format_tags
 from app.services.adapters.xlsx_adapter import MAIN_NS, NS, XlsxAdapter
+from app.services.adapters.xlsx_compat import normalize_xlsx_xml
 from app.services.document_workspace import normalize_document_parse_options
 
 
@@ -164,7 +165,7 @@ class XlsxExporter:
                 entries = cell_replacements.get(sheet_index, {})
                 if entries:
                     original_xml = archive.read(sheet_part)
-                    root = ET.fromstring(original_xml)
+                    root = ET.fromstring(normalize_xlsx_xml(original_xml))
                     for cell in root.findall(".//main:c", NS):
                         cell_ref = cell.get("r", "")
                         replacement = entries.get(cell_ref)
@@ -187,7 +188,7 @@ class XlsxExporter:
 
             for part_name, part_replacements in _group_by_part(replacements, "comment").items():
                 original_xml = archive.read(part_name)
-                root = ET.fromstring(original_xml)
+                root = ET.fromstring(normalize_xlsx_xml(original_xml))
                 comments = root.findall(".//main:comment", NS)
                 for (_, _, comment_index), replacement in part_replacements.items():
                     if comment_index < len(comments):
@@ -196,7 +197,7 @@ class XlsxExporter:
 
             for part_name, part_replacements in _group_by_part(replacements, "drawing_text").items():
                 original_xml = archive.read(part_name)
-                root = ET.fromstring(original_xml)
+                root = ET.fromstring(normalize_xlsx_xml(original_xml))
                 paragraphs = root.findall(".//a:p", NS)
                 for (_, _, paragraph_index), replacement in part_replacements.items():
                     if paragraph_index < len(paragraphs):
@@ -205,7 +206,7 @@ class XlsxExporter:
 
             for part_name, part_replacements in _group_by_part(replacements, "document_property").items():
                 original_xml = archive.read(part_name)
-                root = ET.fromstring(original_xml)
+                root = ET.fromstring(normalize_xlsx_xml(original_xml))
                 children = list(root)
                 for (_, _, property_index), replacement in part_replacements.items():
                     if property_index < len(children):
@@ -228,7 +229,7 @@ class XlsxExporter:
             return None
 
         original_xml = archive.read("xl/workbook.xml")
-        root = ET.fromstring(original_xml)
+        root = ET.fromstring(normalize_xlsx_xml(original_xml))
         sheets = root.findall(".//main:sheets/main:sheet", NS)
         existing_names = [
             sheet.get("name", "")
@@ -512,7 +513,7 @@ def _restore_compatibility_namespace_declarations(root: ET.Element, original_xml
 
 def _extract_namespace_declarations(xml_bytes: bytes) -> dict[str, str]:
     namespaces: dict[str, str] = {}
-    for _, namespace in ET.iterparse(BytesIO(xml_bytes), events=("start-ns",)):
+    for _, namespace in ET.iterparse(BytesIO(normalize_xlsx_xml(xml_bytes)), events=("start-ns",)):
         prefix, uri = namespace
         namespaces.setdefault(prefix or "", uri)
     return namespaces

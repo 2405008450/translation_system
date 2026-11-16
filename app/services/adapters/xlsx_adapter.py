@@ -8,7 +8,6 @@ from typing import Any, Iterable, List, Optional
 from zipfile import BadZipFile, ZipFile
 from xml.etree import ElementTree as ET
 
-from openpyxl import load_workbook
 from openpyxl.cell.rich_text import CellRichText
 from openpyxl.utils import get_column_letter
 
@@ -23,6 +22,7 @@ from app.services.adapters.models import (
     TMImportResult,
 )
 from app.services.adapters.segment_extractor import extract_segments
+from app.services.adapters.xlsx_compat import load_xlsx_workbook, normalize_xlsx_xml
 from app.services.document_workspace import normalize_document_parse_options
 
 
@@ -103,8 +103,8 @@ class XlsxAdapter(FormatAdapter):
 
     def _parse_cell_nodes(self, raw_bytes: bytes, options: dict[str, Any]) -> list[BlockNode]:
         try:
-            workbook = load_workbook(
-                BytesIO(raw_bytes),
+            workbook = load_xlsx_workbook(
+                raw_bytes,
                 read_only=False,
                 data_only=False,
                 rich_text=True,
@@ -149,6 +149,8 @@ class XlsxAdapter(FormatAdapter):
                                     "row": cell.row - 1,
                                     "col": cell.column - 1,
                                     "cell_ref": cell.coordinate,
+                                    "is_hidden": worksheet.sheet_state != "visible" or self._is_hidden_cell(worksheet, cell.row, cell.column),
+                                    "hidden_reason": "hidden_sheet" if worksheet.sheet_state != "visible" else ("hidden_row_or_column" if self._is_hidden_cell(worksheet, cell.row, cell.column) else ""),
                                     "source_layout_text": layout_text,
                                     "source_layout_tagged": layout_text,
                                     "source_layout_html_tagged": layout_text,
@@ -169,7 +171,14 @@ class XlsxAdapter(FormatAdapter):
             return True
         column_letter = get_column_letter(column_index)
         column_dimension = worksheet.column_dimensions.get(column_letter)
-        return bool(column_dimension is not None and column_dimension.hidden)
+        if column_dimension is not None and column_dimension.hidden:
+            return True
+        # ??????????? ColumnDimension??????????
+        return any(
+            dimension.hidden
+            and (dimension.min or 0) <= column_index <= (dimension.max or dimension.min or 0)
+            for dimension in worksheet.column_dimensions.values()
+        )
 
     def _cell_text(self, cell: Any, options: dict[str, Any]) -> str:
         value = cell.value
@@ -416,7 +425,7 @@ class XlsxAdapter(FormatAdapter):
             return self._empty_tm_result()
 
         try:
-            workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
+            workbook = load_xlsx_workbook(raw_bytes, read_only=True, data_only=True)
         except Exception as exc:
             raise ParseError(filename="<unknown>", reason=f"无法解析 XLSX 文件: {exc}") from exc
 
@@ -484,7 +493,7 @@ class XlsxAdapter(FormatAdapter):
                 for name in sorted(archive.namelist()):
                     if not name.startswith(prefix) or not name.endswith(".xml"):
                         continue
-                    yield name, ET.fromstring(archive.read(name))
+                    yield name, ET.fromstring(normalize_xlsx_xml(archive.read(name)))
         except (BadZipFile, ET.ParseError) as exc:
             raise ParseError(filename="<unknown>", reason=f"无法解析 XLSX XML 内容: {exc}") from exc
 
@@ -492,7 +501,7 @@ class XlsxAdapter(FormatAdapter):
         try:
             with ZipFile(BytesIO(raw_bytes)) as archive:
                 try:
-                    return ET.fromstring(archive.read(part_name))
+                    return ET.fromstring(normalize_xlsx_xml(archive.read(part_name)))
                 except KeyError:
                     return None
         except (BadZipFile, ET.ParseError) as exc:

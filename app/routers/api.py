@@ -2005,6 +2005,7 @@ class LLMTranslateRequest(BaseModel):
 
 
 class TermExtractionRequest(BaseModel):
+    mode: Literal["source_suggested", "bilingual_names"] = "source_suggested"
     term_base_id: UUID | None = None
     max_terms: int = Field(default=150, ge=1, le=300)
     models: list[str] = Field(default_factory=lambda: [TERM_EXTRACTION_MODEL])
@@ -3583,7 +3584,7 @@ def _load_document_repetition_statistics_for_files(
         return {}
 
     segments = (
-        db.query(Segment.file_record_id, Segment.source_text)
+        db.query(Segment.file_record_id, Segment.source_text, Segment.segment_metadata)
         .filter(Segment.file_record_id.in_(file_ids))
         .order_by(
             Segment.file_record_id.asc(),
@@ -3592,8 +3593,9 @@ def _load_document_repetition_statistics_for_files(
         )
         .all()
     )
-    for file_record_id, source_text in segments:
-        file_segments.setdefault(file_record_id, []).append(source_text or "")
+    for file_record_id, source_text, metadata in segments:
+        from app.services.quotation_statistics import segment_text
+        file_segments.setdefault(file_record_id, []).append(segment_text(dict(source_text=source_text, segment_metadata=metadata)))
 
     return compute_document_repetition_statistics(file_segments)
 
@@ -3622,7 +3624,7 @@ def _load_document_match_analysis_for_files(
             Segment.file_record_id,
             Segment.source_text,
             Segment.display_text,
-            Segment.source_word_count,
+            Segment.segment_metadata,
         )
         .filter(Segment.file_record_id.in_(list(file_segments.keys())))
         .order_by(
@@ -3632,14 +3634,18 @@ def _load_document_match_analysis_for_files(
         )
         .all()
     )
-    for file_record_id, source_text, display_text, source_word_count in segments:
+    for file_record_id, source_text, display_text, segment_metadata in segments:
+        from app.services.quotation_statistics import segment_text
+        from app.services.quotation_statistics import segment_metrics
+        quote_text = segment_text(dict(source_text=source_text, segment_metadata=segment_metadata))
         source_language, target_language = language_pair_by_file_id.get(file_record_id, (None, None))
         file_segments.setdefault(file_record_id, []).append(
             DocumentMatchSegment(
                 file_id=file_record_id,
-                source_text=source_text or "",
+                source_text=quote_text,
                 display_text=display_text or "",
-                source_word_count=int(source_word_count or 0),
+                source_word_count=segment_metrics(dict(source_text=source_text, segment_metadata=segment_metadata)).word_count,
+                count_policy_version="text-content-v5-parsed",
                 collection_ids=collection_ids_by_file_id.get(file_record_id, ()),
                 source_language=source_language,
                 target_language=target_language,
@@ -11206,29 +11212,22 @@ def compute_project_document_statistics(
             status_code=504,
             detail="文档统计的记忆库匹配超时，未生成不完整报告。请减少本次选择的文件后重试。",
         ) from exc
+    from app.services.quotation_statistics import statistics_from_segments
     for file_record in files:
-        source_filename = get_file_record_source_filename(file_record)
         source_path = get_file_record_source_path(file_record)
         source_size = source_path.stat().st_size if source_path is not None else None
-        if source_path is not None and Path(source_filename).suffix.lower() in SUPPORTED_EXTENSIONS:
-            source_bytes = source_path.read_bytes()
-            statistics = compute_document_statistics(
-                source_bytes,
-                source_filename,
-                options=_get_file_record_document_parse_options(file_record),
-                statistics_scope=statistics_scope,
-            )
-        else:
-            statistics = unavailable_statistics
+        quote_segments = db.query(Segment).filter(Segment.file_record_id == file_record.id).order_by(*SEGMENT_ORDERING, Segment.id.asc()).all()
+        if not quote_segments:
+            raise HTTPException(status_code=422, detail=f"文件 {file_record.filename} 尚无解析句段，请完成解析后再生成报价。")
+        statistics = statistics_from_segments(quote_segments)
         normalized_statistics = normalize_document_statistics(statistics)
         normalized_statistics.update(
             repetition_statistics_by_file_id.get(file_record.id, empty_repetition_statistics())
         )
         match_analysis = match_analysis_by_file_id.get(file_record.id, empty_document_match_analysis())
-        normalized_statistics["match_analysis"] = reconcile_document_match_analysis_words(
-            match_analysis,
-            normalized_statistics.get("words") if isinstance(normalized_statistics.get("words"), int) else None,
-        ) or match_analysis
+        normalized_statistics["match_analysis"] = match_analysis
+        if match_analysis.get("total_words") != normalized_statistics["words"]:
+            raise HTTPException(status_code=409, detail="解析句段在统计过程中发生变化，请重新生成报告。")
         serialized_statistics = serialize_document_statistics(normalized_statistics)
         if statistics_scope == DOCUMENT_STATISTICS_SCOPE_STANDARD:
             file_record.document_statistics = serialized_statistics
@@ -17871,21 +17870,28 @@ def _serialize_term_extraction_items(
             "source_text": item.source_text,
             "target_text": item.target_text,
             "source_normalized": item.source_normalized,
+            "segment_ids": list(item.segment_ids),
+            "inconsistent_translation": item.inconsistent_translation,
         }
         for item in terms
     ]
     if term_base is not None:
-        return build_term_entry_conflict_items(
+        items = build_term_entry_conflict_items(
             db=db,
             term_base=term_base,
             entries=term_items,
         )
+        for entry, term in zip(items, terms):
+            entry.update(segment_ids=list(term.segment_ids), inconsistent_translation=term.inconsistent_translation)
+        return items
     return [
         {
             "index": index,
             "source_text": item["source_text"],
             "target_text": item["target_text"],
             "source_normalized": item["source_normalized"],
+            "segment_ids": item["segment_ids"],
+            "inconsistent_translation": item["inconsistent_translation"],
             "has_conflict": False,
             "conflict": None,
         }
@@ -17917,7 +17923,10 @@ async def extract_file_record_terms(
             raise HTTPException(status_code=404, detail="术语库不存在。")
         _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
 
-    segments = list_segments_for_file_record(db, file_record_id)
+    visible_ids = {row.id for row in _apply_segment_assignment_visibility_filter(
+        db, db.query(Segment.id).filter(Segment.file_record_id == file_record_id), file_record, current_user,
+    ).all()}
+    segments = [segment for segment in list_segments_for_file_record(db, file_record_id) if segment.id in visible_ids]
     if not segments:
         raise HTTPException(status_code=400, detail="当前文件没有可用于术语提取的已解析句段。")
 
@@ -17940,6 +17949,7 @@ async def extract_file_record_terms(
                 max_terms=body.max_terms,
                 model=model,
                 extraction_prompt=body.extraction_prompt,
+                mode=body.mode,
             ))
         except LLMConfigurationError as exc:
             extraction_errors.append({"model": model, "message": str(exc), "status_code": 400})
@@ -17974,7 +17984,7 @@ async def extract_file_record_terms(
         merged_terms = _serialize_term_extraction_items(
             serialize_db,
             serialize_term_base,
-            merge_extracted_terms(extractions, max_terms=body.max_terms),
+            merge_extracted_terms(extractions, max_terms=body.max_terms, bilingual=body.mode == "bilingual_names"),
         )
     default_terms = merged_terms if len(results) > 1 else (results[0]["terms"] if results else [])
     primary_result = results[0] if results else {
@@ -17996,6 +18006,10 @@ async def extract_file_record_terms(
         "target_language": target_language,
         "provider": primary_result["provider"],
         "model": primary_result["model"],
+        "mode": body.mode,
+        "scanned_segments": extractions[0].scanned_segments,
+        "skipped_segments": extractions[0].skipped_segments,
+        "truncated": any(result.truncated for result in extractions) or len({(term.source_normalized, term.target_text if body.mode == "bilingual_names" else "") for result in extractions for term in result.terms}) > body.max_terms,
         "available_models": list(TERM_EXTRACTION_MODEL_OPTIONS),
         "results": results,
         "merged_terms": merged_terms,
@@ -18006,6 +18020,54 @@ async def extract_file_record_terms(
             for error in extraction_errors
         ],
     }
+
+
+class TermExtractionExportEntry(BaseModel):
+    source_text: str = Field(min_length=1, max_length=1000)
+    target_text: str = Field(min_length=1, max_length=1000)
+    segment_ids: list[UUID] = Field(default_factory=list, max_length=10000)
+    inconsistent_translation: bool = False
+
+
+class TermExtractionExportRequest(BaseModel):
+    entries: list[TermExtractionExportEntry] = Field(min_length=1, max_length=300)
+
+
+@router.post("/file-records/{file_record_id}/term-extraction/export-xlsx")
+def export_file_record_terms(
+    file_record_id: UUID, payload: TermExtractionExportRequest,
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    file = get_file_record_model(db, file_record_id)
+    if not file:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+    _require_file_record_read_access(file, current_user)
+    source_language, target_language = _resolve_file_record_language_pair(file)
+    visible = {row.id for row in _apply_segment_assignment_visibility_filter(
+        db, db.query(Segment.id).filter(Segment.file_record_id == file_record_id), file, current_user,
+    ).all()}
+    if any(sid not in visible for entry in payload.entries for sid in entry.segment_ids):
+        raise HTTPException(status_code=403, detail="无权导出所选来源句段。")
+    # 显式使用字符串单元格，避免 Excel 执行公式。
+    from io import BytesIO
+    from openpyxl import Workbook
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "双语专名表"
+    sheet.append(["原文专名", "文中译法", "源语言", "目标语言", "来源句段", "备注"])
+    for entry in payload.entries:
+        sheet.append([entry.source_text, entry.target_text, source_language, target_language,
+                      ", ".join(map(str, entry.segment_ids)), "译法不一致" if entry.inconsistent_translation else ""])
+        for cell in sheet[sheet.max_row]:
+            cell.data_type = "s"
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    for column in "ABCDEF":
+        sheet.column_dimensions[column].width = 36
+    buffer = BytesIO()
+    workbook.save(buffer)
+    workbook.close()
+    return build_xlsx_download_response(f"{file.filename}_双语专名表.xlsx", buffer.getvalue())
 
 
 @router.post("/file-records/{file_record_id}/term-extraction/save")

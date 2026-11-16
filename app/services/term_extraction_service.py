@@ -57,6 +57,8 @@ class ExtractedTerm:
     source_text: str
     target_text: str
     source_normalized: str
+    segment_ids: tuple[str, ...] = ()
+    inconsistent_translation: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,9 @@ class TermExtractionResult:
     terms: list[ExtractedTerm]
     provider: str
     model: str
+    scanned_segments: int = 0
+    skipped_segments: int = 0
+    truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -231,8 +236,21 @@ def _filter_terms(
     return filtered
 
 
-def merge_extracted_terms(results: Iterable[TermExtractionResult], max_terms: int = 150) -> list[ExtractedTerm]:
+def merge_extracted_terms(results: Iterable[TermExtractionResult], max_terms: int = 150, bilingual: bool = False) -> list[ExtractedTerm]:
     safe_max_terms = min(max(int(max_terms or 150), 1), 300)
+    if bilingual:
+        from dataclasses import replace
+        pairs = {}
+        variants = {}
+        for result in results:
+            for term in result.terms:
+                key = (term.source_normalized, normalize_match_text(term.target_text) or term.target_text)
+                previous = pairs.get(key)
+                ids = tuple(dict.fromkeys((previous.segment_ids if previous else ()) + term.segment_ids))
+                pairs[key] = replace(term, segment_ids=ids)
+                variants.setdefault(key[0], set()).add(key[1])
+        return [replace(term, inconsistent_translation=term.inconsistent_translation or len(variants[key[0]]) > 1)
+                for key, term in pairs.items()][:safe_max_terms]
     merged: list[ExtractedTerm] = []
     seen_keys: set[str] = set()
 
@@ -321,8 +339,11 @@ async def extract_terms_from_segments(
     model: str = TERM_EXTRACTION_MODEL,
     extraction_prompt: str = "",
     settings: Settings | None = None,
+    mode: str = "source_suggested",
 ) -> TermExtractionResult:
     config = settings or get_settings()
+    if mode == "bilingual_names":
+        return await _extract_bilingual_names(list(segments), source_language, target_language, max_terms, model, extraction_prompt, config)
     source_texts = _collect_source_texts(segments)
     if not source_texts:
         raise TermExtractionError("当前文件没有可用于术语提取的源文句段。")
@@ -374,3 +395,75 @@ async def extract_terms_from_segments(
         provider=provider,
         model=resolved_model,
     )
+
+
+async def _extract_bilingual_names(
+    segments: list[object],
+    source_language: str,
+    target_language: str,
+    max_terms: int,
+    model: str,
+    extraction_prompt: str,
+    settings: Settings,
+) -> TermExtractionResult:
+    from dataclasses import replace
+
+    rows = []
+    for segment in segments:
+        source = normalize_text(str(getattr(segment, "source_text", "") or ""))
+        target = normalize_text(str(getattr(segment, "target_text", "") or ""))
+        if source and target:
+            rows.append({"segment_id": str(segment.id), "source_text": source, "target_text": target})
+    if not rows:
+        raise TermExtractionError("没有可用双语句段，请先完成双语对齐并保存译文。")
+    chunks = []
+    current = []
+    size = 0
+    for row in rows:
+        row_size = len(json.dumps(row, ensure_ascii=False))
+        if current and size + row_size > TERM_EXTRACTION_CHUNK_MAX_CHARS:
+            chunks.append(current)
+            current, size = [], 0
+        current.append(row)
+        size += row_size
+    if current:
+        chunks.append(current)
+    attempts = _build_model_attempts(model, settings)
+    provider, resolved_model = attempts[0].provider, model
+    found = {}
+    for chunk in chunks:
+        messages = [{"role": "system", "content": (
+            "你是双语专名抽取专家。提取人名、地名、机构、品牌、产品、系统名称及重要专业名词。"
+            "译文必须采用文中实际译法，禁止自行翻译。过滤普通词、整句、日期、纯数字。"
+            "每对专名必须来自同一句段并返回 segment_id，同一原文不同译法分别保留。"
+            '仅输出 JSON：{"terms":[{"source_text":"...","target_text":"...","segment_id":"..."}]}。'
+        )}, {"role": "user", "content": json.dumps({
+            "source_language": source_language, "target_language": target_language,
+            "context": extraction_prompt[:TERM_EXTRACTION_PROMPT_MAX_CHARS], "segments": chunk,
+        }, ensure_ascii=False)}]
+        completion = await _request_term_extraction_completion(messages=messages, attempts=attempts, settings=settings)
+        provider, resolved_model = completion.provider, completion.model
+        by_id = {row["segment_id"]: row for row in chunk}
+        for item in _parse_term_json(completion.content):
+            source = normalize_text(str(item.get("source_text") or ""))
+            target = normalize_text(str(item.get("target_text") or ""))
+            row = by_id.get(str(item.get("segment_id") or ""))
+            if not row or not source or not target or len(source) > 120 or len(target) > 240:
+                continue
+            if PURE_NUMBER_RE.fullmatch(source) or "\n" in source or "\n" in target:
+                continue
+            if not _term_appears_in_source(source, row["source_text"]) or not _term_appears_in_source(target, row["target_text"]):
+                continue
+            if len(source) > 20 and source == row["source_text"]:
+                continue
+            key = (normalize_match_text(source) or source, normalize_match_text(target) or target)
+            previous = found.get(key)
+            ids = tuple(dict.fromkeys((previous.segment_ids if previous else ()) + (row["segment_id"],)))
+            found[key] = ExtractedTerm(source, target, key[0], ids)
+    # 全文扫描完成后再限量，避免只处理文档开头。
+    variants = {}
+    for source_key, target_key in found:
+        variants.setdefault(source_key, set()).add(target_key)
+    terms = [replace(term, inconsistent_translation=len(variants[key[0]]) > 1) for key, term in found.items()]
+    limit = min(max(int(max_terms), 1), 300)
+    return TermExtractionResult(terms[:limit], provider, resolved_model, len(rows), len(segments) - len(rows), len(terms) > limit)

@@ -30,6 +30,7 @@ import Modal from './base/Modal.vue'
 interface ProjectFileItem {
   id: string
   filename: string
+  can_write?: boolean
   total_segments: number
   source_language: string | null
   target_language: string | null
@@ -74,6 +75,9 @@ const CREATE_NEW_TERM_BASE_OPTION = '__create_new_term_base__'
 
 const loadingBases = ref(false)
 const extracting = ref(false)
+const downloading = ref(false)
+const extractionMode = ref<'source_suggested' | 'bilingual_names'>('bilingual_names')
+const extractionSummary = ref('')
 const checkingConflicts = ref(false)
 const saving = ref(false)
 const creatingBase = ref(false)
@@ -175,6 +179,7 @@ const canCreateTermBaseForSave = computed(() => Boolean(
 ))
 const canSave = computed(() => Boolean(
   props.file
+  && props.file.can_write !== false
   && (selectedTermBaseId.value || canCreateTermBaseForSave.value)
   && drafts.value.length > 0
   && saveableCount.value > 0
@@ -192,6 +197,8 @@ function getErrorMessage(error: unknown, fallback: string) {
 
 function resetState() {
   drafts.value = []
+  extractionMode.value = 'bilingual_names'
+  extractionSummary.value = ''
   modelResults.value = []
   mergedTerms.value = []
   selectedVersionKey.value = ''
@@ -390,10 +397,12 @@ async function runExtraction() {
   extracting.value = true
   errorMessage.value = ''
   saveResult.value = null
+  extractionSummary.value = ''
   try {
     const { data } = await http.post<TermExtractionResult>(
       `/file-records/${props.file.id}/term-extraction`,
       {
+        mode: extractionMode.value,
         term_base_id: selectedTermBaseId.value || null,
         max_terms: 150,
         models: selectedModels.value,
@@ -401,6 +410,9 @@ async function runExtraction() {
       },
     )
     applyDefaultVersion(data)
+    extractionSummary.value = extractionMode.value === 'bilingual_names'
+      ? `已扫描 ${data.scanned_segments || 0} 个双语句段，跳过 ${data.skipped_segments || 0} 个空缺句段。${data.truncated ? '结果已截断至条数上限。' : ''}`
+      : ''
     if (data.errors && data.errors.length > 0) {
       errorMessage.value = data.errors
         .map((item) => `${getModelLabel(item.model)}：${item.message}`)
@@ -586,6 +598,29 @@ async function saveTerms() {
   }
 }
 
+async function downloadTerms() {
+  if (!props.file || downloading.value) return
+  const entries = drafts.value.filter(row => row.source_text.trim() && row.target_text.trim())
+  if (!entries.length) return
+  downloading.value = true
+  try {
+    const { data } = await http.post(`/file-records/${props.file.id}/term-extraction/export-xlsx`,
+      { entries: entries.map(row => ({ source_text: row.source_text, target_text: row.target_text,
+        segment_ids: row.segment_ids || [], inconsistent_translation: row.inconsistent_translation || false })) },
+      { responseType: 'blob' })
+    const url = URL.createObjectURL(data)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${props.file.filename}_双语专名表.xlsx`
+    link.click()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  } catch {
+    errorMessage.value = '下载失败，请重试。'
+  } finally {
+    downloading.value = false
+  }
+}
+
 function openTermBase() {
   if (!selectedTermBaseId.value) {
     return
@@ -604,6 +639,16 @@ watch(
     await loadTermBases()
   },
 )
+
+watch(extractionMode, () => {
+  drafts.value = []
+  modelResults.value = []
+  mergedTerms.value = []
+  selectedVersionKey.value = ''
+  extractionSummary.value = ''
+  errorMessage.value = ''
+  saveResult.value = null
+})
 
 watch(selectedTermBaseId, async (next, previous) => {
   if (!props.open || next === previous || extracting.value) {
@@ -635,6 +680,15 @@ watch(selectedTermBaseId, async (next, previous) => {
         </span>
       </div>
 
+      <label class="field">
+        <span class="field__label">提取方式</span>
+        <select v-model="extractionMode" class="field__control" :disabled="extracting || saving">
+          <option value="bilingual_names">文中双语专名（使用已保存译文）</option>
+          <option value="source_suggested">原文术语＋AI 建议译法</option>
+        </select>
+      </label>
+      <p class="hint-text">提取后可直接下载，无需创建术语库。文档修改后请重新提取；“跳过”仅影响入库。</p>
+      <p v-if="extractionSummary" class="hint-text">{{ extractionSummary }}</p>
       <section class="term-extract__target" :class="{ 'is-create-mode': showCreateTermBaseFields }">
         <label class="field">
           <span class="field__label">{{ t('projectDetail.termExtraction.targetBase') }}</span>
@@ -881,6 +935,7 @@ watch(selectedTermBaseId, async (next, previous) => {
                 />
               </td>
               <td>
+                <span v-if="draft.inconsistent_translation" class="tag is-warning">译法不一致</span>
                 <div v-if="draft.conflict" class="term-extract__conflict">
                   <strong>{{ draft.conflict.source_text }}</strong>
                   <span>{{ draft.conflict.target_text }}</span>
@@ -925,6 +980,9 @@ watch(selectedTermBaseId, async (next, previous) => {
 
     <template #footer>
       <div class="term-extract__footer">
+        <button class="button" type="button" :disabled="extracting || saving || downloading || !drafts.some(row => row.source_text.trim() && row.target_text.trim())" @click="downloadTerms">
+          {{ downloading ? '下载中…' : '下载 Excel' }}
+        </button>
         <button class="button" type="button" :disabled="extracting || saving" @click="emit('close')">
           {{ t('common.actions.cancel') }}
         </button>

@@ -107,19 +107,11 @@ def compute_document_statistics(
     *,
     statistics_scope: str = DOCUMENT_STATISTICS_SCOPE_STANDARD,
 ) -> dict[str, Any]:
-    """根据文件类型计算文档统计，同时保持既有 Word 统计口径不变。"""
-    suffix = Path(filename or "").suffix.lower()
-    if suffix == ".pptx":
-        return compute_pptx_document_statistics(raw_bytes, options=options)
-    if suffix == ".idml":
-        return compute_idml_document_statistics(raw_bytes)
-    if suffix in {".doc", ".docx"}:
-        return compute_word_document_statistics(
-            raw_bytes,
-            filename,
-            statistics_scope=statistics_scope,
-        )
-    return compute_adapter_document_statistics(raw_bytes, filename)
+    from app.services.quotation_statistics import parse_quotation
+    try:
+        return parse_quotation(raw_bytes, filename, options=options)["statistics"]
+    except Exception:
+        return _unavailable_statistics_payload()
 
 
 def compute_word_document_statistics(
@@ -1418,6 +1410,9 @@ def _coerce_statistics_payload(value: dict[str, Any]) -> dict[str, Any]:
     )
     for key in STATISTIC_NUMBER_KEYS:
         payload[key] = _to_optional_int(value.get(key))
+    for key in ("count_policy_version", "parser_version", "text_snapshot_sha256"):
+        if key in value:
+            payload[key] = value[key]
     payload["match_analysis"] = normalize_document_match_analysis(value.get("match_analysis"))
     payload["standard_text_metrics"] = _normalize_text_statistics_metrics(
         value.get("standard_text_metrics")
@@ -1525,3 +1520,25 @@ def _to_string_list(value: Any) -> list[str]:
     if isinstance(value, str) and value.strip():
         return [value]
     return []
+
+
+def compute_legacy_document_statistics(
+    raw_bytes: bytes,
+    filename: str,
+    options: dict[str, Any] | None = None,
+    *,
+    statistics_scope: str = DOCUMENT_STATISTICS_SCOPE_STANDARD,
+) -> dict[str, Any]:
+    """根据文件类型计算文档统计，同时保持既有 Word 统计口径不变。"""
+    suffix = Path(filename or "").suffix.lower()
+    if suffix == ".pptx":
+        return compute_pptx_document_statistics(raw_bytes, options=options)
+    if suffix == ".idml":
+        return compute_idml_document_statistics(raw_bytes)
+    if suffix in {".doc", ".docx"}:
+        return compute_word_document_statistics(
+            raw_bytes,
+            filename,
+            statistics_scope=statistics_scope,
+        )
+    return compute_adapter_document_statistics(raw_bytes, filename)

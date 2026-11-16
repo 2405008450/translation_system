@@ -315,6 +315,9 @@ export interface DocumentAdditionalContentStatistics {
 }
 
 export interface DocumentStatistics {
+  count_policy_version?: string
+  parser_version?: string
+  text_snapshot_sha256?: string
   source: string
   engine: string | null
   engine_version: string | null
@@ -1514,6 +1517,8 @@ export interface TermEntryConflict {
 }
 
 export interface ExtractedTermDraft {
+  segment_ids?: string[]
+  inconsistent_translation?: boolean
   index: number
   source_text: string
   target_text: string
@@ -1535,6 +1540,9 @@ export interface TermExtractionModelError {
 }
 
 export interface TermExtractionResult {
+  scanned_segments?: number
+  skipped_segments?: number
+  truncated?: boolean
   file_record: {
     id: string
     filename: string

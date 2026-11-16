@@ -103,6 +103,7 @@ def split_sentence_spans(text: str, *, preserve_dotted_names: bool = False) -> l
     if not normalize_text(scan_text):
         return []
 
+    protected_addresses = [(m.start(), m.end()) for m in re.finditer(r"(?:https?://|www\.)[^\s<>]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", scan_text)]
     spans: list[SentenceSpan] = []
     start: int | None = None
     index = 0
@@ -141,6 +142,10 @@ def split_sentence_spans(text: str, *, preserve_dotted_names: bool = False) -> l
                 if end > start:
                     spans.append(SentenceSpan(start=start, end=end))
                 start = None
+            continue
+
+        if current_char in SENTENCE_ENDINGS and any(lo <= index < hi for lo, hi in protected_addresses):
+            index += 1
             continue
 
         if current_char in SENTENCE_ENDINGS:

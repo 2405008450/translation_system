@@ -224,6 +224,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from app.routers.quotation import router as quotation_router
+app.include_router(quotation_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(api_router, prefix="/api")
 app.include_router(term_base_router, prefix="/api")

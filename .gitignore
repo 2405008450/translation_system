@@ -46,6 +46,7 @@ frontend/.DS_Store
 .claude
 *.xlsx
 tests/*
+!tests/test_xlsx_compat.py
 !tests/test_project_status.py
 !tests/test_file_record_import_batches.py
 !tests/test_mixed_translation.py
@@ -79,3 +80,6 @@ outputs/
 
 docs/
 /migration_20260605_105050/
+
+# Unified quotation regression checks
+!tests/test_quotation_statistics.py

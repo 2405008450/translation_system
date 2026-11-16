@@ -263,6 +263,7 @@ class Settings(BaseSettings):
     project_sync_blur_project_ids: str = ""
     # 句段变更 SSE 推送（依赖 redis_url；不可用时前端自动回退轮询）。
     segment_events_enabled: bool = True
+    quotation_service_token: str = ""
     jwt_secret_key: str = DEFAULT_JWT_SECRET_KEY
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 1440
