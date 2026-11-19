@@ -5,6 +5,10 @@ type LocaleTree = { [key: string]: LocaleNode }
 
 const overrides = {
   resourceImport: {
+    appendDescription: 'Choose a file to append data to the current library.',
+    searchTarget: 'Search by library name',
+    noMatchingTarget: 'No matching libraries',
+    targetEntryCount: '{count} entries',
     result: {
       completed: 'Import completed: {created} added, {updated} overwritten; skipped {duplicates} duplicates, {empty} empty rows and {headers} headers.',
       noChanges: 'No data was written: {created} added, {updated} overwritten; skipped {duplicates} duplicates, {empty} empty rows and {headers} headers.',

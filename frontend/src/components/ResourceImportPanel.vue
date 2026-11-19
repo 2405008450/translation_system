@@ -5,6 +5,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { http } from '../api/http'
+import ResourceImportTarget from './ResourceImportTarget.vue'
 import {
   cancelImportTask,
   isImportTaskAccepted,
@@ -44,10 +45,10 @@ const props = withDefaults(defineProps<{
   sourceLanguage?: string | null
   targetLanguage?: string | null
   contextLabel?: string
-  defaultTMCollectionId?: string
+  defaultTmCollectionId?: string
   defaultGlossaryBaseId?: string
   defaultTermBaseId?: string
-  fixedTMCollectionId?: string
+  fixedTmCollectionId?: string
   fixedGlossaryBaseId?: string
   fixedTermBaseId?: string
 }>(), {
@@ -56,10 +57,10 @@ const props = withDefaults(defineProps<{
   sourceLanguage: null,
   targetLanguage: null,
   contextLabel: '',
-  defaultTMCollectionId: '',
+  defaultTmCollectionId: '',
   defaultGlossaryBaseId: '',
   defaultTermBaseId: '',
-  fixedTMCollectionId: '',
+  fixedTmCollectionId: '',
   fixedGlossaryBaseId: '',
   fixedTermBaseId: '',
 })
@@ -70,6 +71,7 @@ const emit = defineEmits<{
 const { t } = useI18n()
 
 const activeTab = ref<ImportTab>(props.mode === 'all' ? props.initialTab : props.mode)
+const createNewTargets = new Set<ImportTab>()
 
 const tmCollections = ref<TMCollection[]>([])
 const glossaryBases = ref<GlossaryBase[]>([])
@@ -158,7 +160,13 @@ const contextLanguagePair = computed(() => (
   formatLanguagePair(props.sourceLanguage, props.targetLanguage)
 ))
 
-const showTMCreateFields = computed(() => !props.fixedTMCollectionId && !selectedTMCollectionId.value)
+const fixedTargetIds = computed(() => ({
+  tm: props.fixedTmCollectionId,
+  glossary: props.fixedGlossaryBaseId,
+  term: props.fixedTermBaseId,
+}))
+
+const showTMCreateFields = computed(() => !props.fixedTmCollectionId && !selectedTMCollectionId.value)
 const showGlossaryCreateFields = computed(() => !props.fixedGlossaryBaseId && !selectedGlossaryBaseId.value)
 const showTermCreateFields = computed(() => !props.fixedTermBaseId && !selectedTermBaseId.value)
 const fixedTMTargetLabel = computed(() => props.contextLabel || selectedTMCollection.value?.name || '当前记忆库')
@@ -194,7 +202,7 @@ watch(() => props.initialTab, (initialTab) => {
   }
 })
 
-watch(() => props.fixedTMCollectionId, (value) => {
+watch(() => props.fixedTmCollectionId, (value) => {
   if (value) {
     selectedTMCollectionId.value = value
   }
@@ -206,8 +214,8 @@ watch(() => props.fixedGlossaryBaseId, (value) => {
   }
 }, { immediate: true })
 
-watch(() => props.defaultTMCollectionId, (value) => {
-  if (!props.fixedTMCollectionId && value && !selectedTMCollectionId.value) {
+watch(() => props.defaultTmCollectionId, (value) => {
+  if (!props.fixedTmCollectionId && value && !selectedTMCollectionId.value) {
     selectedTMCollectionId.value = value
   }
 }, { immediate: true })
@@ -505,15 +513,23 @@ function findMatchingTermBaseId() {
   ))?.id || ''
 }
 
+function recordTargetChoice(tab: ImportTab, id: string) {
+  if (id) {
+    createNewTargets.delete(tab)
+  } else {
+    createNewTargets.add(tab)
+  }
+}
+
 function ensureDefaultTMCollectionSelection() {
-  if (props.fixedTMCollectionId) {
-    selectedTMCollectionId.value = props.fixedTMCollectionId
+  if (props.fixedTmCollectionId) {
+    selectedTMCollectionId.value = props.fixedTmCollectionId
     return
   }
-  if (selectedTMCollectionId.value) {
+  if (selectedTMCollectionId.value || createNewTargets.has('tm')) {
     return
   }
-  const defaultId = props.defaultTMCollectionId || findMatchingTMCollectionId()
+  const defaultId = props.defaultTmCollectionId || findMatchingTMCollectionId()
   if (defaultId && tmCollections.value.some((collection) => collection.id === defaultId)) {
     selectedTMCollectionId.value = defaultId
   }
@@ -524,7 +540,7 @@ function ensureDefaultGlossaryBaseSelection() {
     selectedGlossaryBaseId.value = props.fixedGlossaryBaseId
     return
   }
-  if (selectedGlossaryBaseId.value) {
+  if (selectedGlossaryBaseId.value || createNewTargets.has('glossary')) {
     return
   }
   const defaultId = props.defaultGlossaryBaseId || findMatchingGlossaryBaseId()
@@ -538,7 +554,7 @@ function ensureDefaultTermBaseSelection() {
     selectedTermBaseId.value = props.fixedTermBaseId
     return
   }
-  if (selectedTermBaseId.value) {
+  if (selectedTermBaseId.value || createNewTargets.has('term')) {
     return
   }
   const defaultId = props.defaultTermBaseId || findMatchingTermBaseId()
@@ -552,7 +568,7 @@ async function loadTMCollections() {
   try {
     const { data } = await http.get<TMCollection[]>('/translation-memory/collections')
     tmCollections.value = data
-    if (!props.fixedTMCollectionId && selectedTMCollectionId.value && !data.some((item) => item.id === selectedTMCollectionId.value)) {
+    if (!props.fixedTmCollectionId && selectedTMCollectionId.value && !data.some((item) => item.id === selectedTMCollectionId.value)) {
       selectedTMCollectionId.value = ''
     }
     ensureDefaultTMCollectionSelection()
@@ -813,7 +829,7 @@ async function previewTMWorkbook() {
   tmImportSummary.value = null
 
   try {
-    const formData = buildTMImportFormData(selectedTMCollectionId.value || props.fixedTMCollectionId)
+    const formData = buildTMImportFormData(selectedTMCollectionId.value || props.fixedTmCollectionId)
     formData.append('preview_limit', '500')
     const { data } = await http.post<TMImportPreview>('/translation-memory/import/preview', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
@@ -890,8 +906,8 @@ async function previewTermWorkbook() {
 }
 
 async function ensureImportCollection() {
-  if (props.fixedTMCollectionId) {
-    return props.fixedTMCollectionId
+  if (props.fixedTmCollectionId) {
+    return props.fixedTmCollectionId
   }
   if (selectedTMCollectionId.value) {
     return selectedTMCollectionId.value
@@ -1177,7 +1193,7 @@ onMounted(() => {
 
 <template>
   <div class="resource-import-panel">
-    <div v-if="hasContext" class="resource-import-panel__context">
+    <div v-if="hasContext && !fixedTargetIds[activeTab]" class="resource-import-panel__context">
       <div class="resource-import-panel__context-copy">
         <strong>{{ contextLabel || t('resourceImport.contextFallback') }}</strong>
         <span>{{ t('resourceImport.contextPair', { pair: contextLanguagePair }) }}</span>
@@ -1223,28 +1239,16 @@ onMounted(() => {
       </p>
 
       <div class="upload-form form-grid-2 resource-import-panel__form">
-        <label class="field">
-          <span class="field__label">{{ t('resourceImport.tm.target') }}</span>
-          <select
-            v-model="selectedTMCollectionId"
-            class="field__control"
-            :disabled="loadingTMCollections || Boolean(props.fixedTMCollectionId)"
-          >
-            <template v-if="props.fixedTMCollectionId">
-              <option :value="props.fixedTMCollectionId">{{ fixedTMTargetLabel }}（当前记忆库）</option>
-            </template>
-            <template v-else>
-              <option value="">{{ t('resourceImport.tm.createNew') }}</option>
-              <option
-                v-for="collection in tmCollections"
-                :key="collection.id"
-                :value="collection.id"
-              >
-                {{ collection.name }}（{{ formatLanguagePair(collection.source_language, collection.target_language) }} / {{ collection.entry_count }} 条）
-              </option>
-            </template>
-          </select>
-        </label>
+        <ResourceImportTarget
+          v-model="selectedTMCollectionId"
+          :label="t('resourceImport.tm.target')"
+          :resources="tmCollections"
+          :create-label="t('resourceImport.tm.createNew')"
+          :fixed-label="fixedTmCollectionId ? fixedTMTargetLabel : undefined"
+          :loading="loadingTMCollections"
+          :disabled="tmImporting || tmPreviewing"
+          @update:model-value="recordTargetChoice('tm', $event)"
+        />
 
         <label class="field">
           <span class="field__label">{{ t('resourceImport.tm.file') }}</span>
@@ -1473,28 +1477,16 @@ onMounted(() => {
       </p>
 
       <div class="upload-form form-grid-2 resource-import-panel__form">
-        <label class="field">
-          <span class="field__label">{{ t('resourceImport.glossary.target') }}</span>
-          <select
-            v-model="selectedGlossaryBaseId"
-            class="field__control"
-            :disabled="loadingGlossaryBases || Boolean(props.fixedGlossaryBaseId)"
-          >
-            <template v-if="props.fixedGlossaryBaseId">
-              <option :value="props.fixedGlossaryBaseId">{{ fixedGlossaryTargetLabel }}（当前词汇表）</option>
-            </template>
-            <template v-else>
-              <option value="">{{ t('resourceImport.glossary.createNew') }}</option>
-              <option
-                v-for="glossaryBase in glossaryBases"
-                :key="glossaryBase.id"
-                :value="glossaryBase.id"
-              >
-                {{ glossaryBase.name }}（{{ formatLanguagePair(glossaryBase.source_language, glossaryBase.target_language) }} / {{ glossaryBase.entry_count }} 条）
-              </option>
-            </template>
-          </select>
-        </label>
+        <ResourceImportTarget
+          v-model="selectedGlossaryBaseId"
+          :label="t('resourceImport.glossary.target')"
+          :resources="glossaryBases"
+          :create-label="t('resourceImport.glossary.createNew')"
+          :fixed-label="fixedGlossaryBaseId ? fixedGlossaryTargetLabel : undefined"
+          :loading="loadingGlossaryBases"
+          :disabled="glossaryImporting || glossaryPreviewing"
+          @update:model-value="recordTargetChoice('glossary', $event)"
+        />
 
         <label class="field">
           <span class="field__label">{{ t('resourceImport.glossary.file') }}</span>
@@ -1696,28 +1688,16 @@ onMounted(() => {
       </p>
 
       <div class="upload-form form-grid-2 resource-import-panel__form">
-        <label class="field">
-          <span class="field__label">{{ t('resourceImport.term.target') }}</span>
-          <select
-            v-model="selectedTermBaseId"
-            class="field__control"
-            :disabled="loadingTermBases || Boolean(props.fixedTermBaseId)"
-          >
-            <template v-if="props.fixedTermBaseId">
-              <option :value="props.fixedTermBaseId">{{ fixedTermTargetLabel }}（当前术语库）</option>
-            </template>
-            <template v-else>
-              <option value="">{{ t('resourceImport.term.createNew') }}</option>
-              <option
-                v-for="termBase in termBases"
-                :key="termBase.id"
-                :value="termBase.id"
-              >
-                {{ termBase.name }}（{{ formatLanguagePair(termBase.source_language, termBase.target_language) }} / {{ termBase.entry_count }} 条）
-              </option>
-            </template>
-          </select>
-        </label>
+        <ResourceImportTarget
+          v-model="selectedTermBaseId"
+          :label="t('resourceImport.term.target')"
+          :resources="termBases"
+          :create-label="t('resourceImport.term.createNew')"
+          :fixed-label="fixedTermBaseId ? fixedTermTargetLabel : undefined"
+          :loading="loadingTermBases"
+          :disabled="termImporting || termPreviewing"
+          @update:model-value="recordTargetChoice('term', $event)"
+        />
 
         <label class="field">
           <span class="field__label">{{ t('resourceImport.term.file') }}</span>

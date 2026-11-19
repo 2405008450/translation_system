@@ -17,10 +17,10 @@ const props = withDefaults(defineProps<{
   sourceLanguage?: string | null
   targetLanguage?: string | null
   contextLabel?: string
-  defaultTMCollectionId?: string
+  defaultTmCollectionId?: string
   defaultGlossaryBaseId?: string
   defaultTermBaseId?: string
-  fixedTMCollectionId?: string
+  fixedTmCollectionId?: string
   fixedGlossaryBaseId?: string
   fixedTermBaseId?: string
 }>(), {
@@ -30,17 +30,22 @@ const props = withDefaults(defineProps<{
   sourceLanguage: null,
   targetLanguage: null,
   contextLabel: '',
-  defaultTMCollectionId: '',
+  defaultTmCollectionId: '',
   defaultGlossaryBaseId: '',
   defaultTermBaseId: '',
-  fixedTMCollectionId: '',
+  fixedTmCollectionId: '',
   fixedGlossaryBaseId: '',
   fixedTermBaseId: '',
 })
 
 const { t } = useI18n()
 const modalTitle = computed(() => props.title || t('resourceImport.title'))
-const modalDescription = computed(() => t('resourceImport.description'))
+const modalDescription = computed(() => {
+  const fixed = (props.mode === 'tm' && props.fixedTmCollectionId)
+    || (props.mode === 'glossary' && props.fixedGlossaryBaseId)
+    || (props.mode === 'term' && props.fixedTermBaseId)
+  return t(fixed ? 'resourceImport.appendDescription' : 'resourceImport.description')
+})
 
 const emit = defineEmits<{
   close: []
@@ -62,10 +67,10 @@ const emit = defineEmits<{
       :source-language="sourceLanguage"
       :target-language="targetLanguage"
       :context-label="contextLabel"
-      :default-tm-collection-id="defaultTMCollectionId"
+      :default-tm-collection-id="defaultTmCollectionId"
       :default-glossary-base-id="defaultGlossaryBaseId"
       :default-term-base-id="defaultTermBaseId"
-      :fixed-tm-collection-id="fixedTMCollectionId"
+      :fixed-tm-collection-id="fixedTmCollectionId"
       :fixed-glossary-base-id="fixedGlossaryBaseId"
       :fixed-term-base-id="fixedTermBaseId"
       @imported="emit('imported', $event)"

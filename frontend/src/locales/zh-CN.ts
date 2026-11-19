@@ -1478,6 +1478,10 @@ export default {
     },
   },
   resourceImport: {
+    appendDescription: '选择文件，将数据追加到当前库。',
+    searchTarget: '输入库名称搜索',
+    noMatchingTarget: '没有找到匹配的库',
+    targetEntryCount: '{count} 条',
     title: '导入语言资产',
     result: {
       completed: '导入完成：新增 {created} 条，覆盖 {updated} 条；跳过重复 {duplicates} 条、空内容 {empty} 条、表头 {headers} 条。',
