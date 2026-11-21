@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { LLM_PRICING_UPDATED_AT } from '../src/constants/llmPricing'
 
 for (const merge of [false, true]) {
   for (const scenario of ['standard', 'mixed']) {
@@ -70,25 +71,27 @@ test('模型下拉框显示小字价格，支持搜索选择并提交对应模�
   await page.locator('label.ptd-switch').filter({ hasText: '启用 TM 预匹配' }).click()
   await page.locator('label.ptd-switch').filter({ hasText: '启用 LLM 翻译' }).click()
   await model.click()
+  const neon = page.getByRole('option', { name: /^Gemini 4 Neon/ })
+  await expect(neon).toContainText('输入 $3 · 输出 $15 / 百万 token')
   const argon = page.getByRole('option', { name: /^Gemini 4 Argon/ })
   await expect(argon).toContainText('输入 $2 · 输出 $10 / 百万 token')
   await expect(argon.locator('small')).toHaveCSS('font-size', '11px')
   await expect(page.getByRole('option', { name: /^Gemini 3.8 Flash/ })).toContainText('输入 $0.825 · 输出 $4.125')
   await expect(page.getByRole('option', { name: /^使用后端默认/ })).toContainText('按实际调用的模型计费')
-  await expect(page.getByText('OpenRouter 报价 · 更新于 2026-10-21', { exact: true })).toBeVisible()
+  await expect(page.getByText(`OpenRouter 报价 · 更新于 ${LLM_PRICING_UPDATED_AT}`, { exact: true })).toBeVisible()
   await expect(page.getByRole('listbox', { name: '模型', exact: true })).toHaveCSS('opacity', '1')
   await page.screenshot({ path: 'test-results/llm-model-pricing-desktop.png', fullPage: true, animations: 'disabled' })
-  await model.fill('GPT-6 Luna')
+  await model.fill('Gemini 4 Neon')
   const filteredOptions = page.getByRole('listbox', { name: '模型', exact: true }).getByRole('option')
   await expect(filteredOptions).toHaveCount(1)
-  await expect(filteredOptions).toContainText('输入 $0.1 · 输出 $0.5 / 百万 token')
+  await expect(filteredOptions).toContainText('输入 $3 · 输出 $15 / 百万 token')
   await model.press('ArrowDown')
   await model.press('Enter')
   await expect(page.getByRole('listbox', { name: '模型', exact: true })).toBeHidden()
   await page.getByRole('button', { name: '开始预翻译', exact: true }).click()
   await expect.poll(() => page.evaluate(() => (window as any).scenarioHarness.requests.length)).toBe(1)
   const requests = await page.evaluate(() => (window as any).scenarioHarness.requests)
-  expect(requests[0].body).toMatchObject({ llm_model: 'openai/gpt-6-luna', llm_provider: 'openrouter' })
+  expect(requests[0].body).toMatchObject({ llm_model: 'google/gemini-4-neon', llm_provider: 'openrouter' })
 })
 
 test('模型价格下拉框在窄屏和深色模式下可见，Escape 仅收起列表', async ({ page }) => {

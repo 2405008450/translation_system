@@ -757,7 +757,7 @@ export default {
         temporaryPrompt: '本次临时提示词',
         modelDefault: '使用后端默认',
         modelTipTitle: '模型选择建议',
-        modelTipBody: '常规预翻译可优先使用 Gemini 3.8 Flash 或 GPT-6 Luna；如果翻译规则较多、术语或风格要求较高，建议使用 Gemini 4 Argon 或 GPT-6.1 Sol。请结合实际译文质量、响应速度和成本选择。',
+        modelTipBody: '常规预翻译可优先使用 Gemini 4 Hydrogen 或 GPT-6.1 Terra（追求更低成本与大批量速度可选 Gemini 3.8 Flash 或 GPT-6 Luna）；如果翻译规则较多、术语或风格要求较高，建议使用 Gemini 4 Neon、Gemini 4 Carbon 或 GPT-6.2 Sol。请结合实际译文质量、响应速度和成本选择。',
         scopeHint: '默认流程会先做记忆库匹配，再只把模糊匹配和无匹配句段交给 LLM；100% 记忆匹配通常不需要模型重写。这里的“精确匹配”和“100% 匹配率”是同一状态。',
         contextModeTitle: '关闭：句段稳定模式；开启：段落上下文严格模式，会要求模型返回结构化 JSON。',
         guidelinesPlaceholder: '输入翻译要求，如术语规范、语气风格等...',

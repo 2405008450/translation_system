@@ -716,7 +716,7 @@ const overrides = {
     preTranslate: {
       llm: {
         modelTipTitle: 'Model selection tip',
-        modelTipBody: 'For routine pre-translation, consider Gemini 3.8 Flash or GPT-6 Luna. For extensive translation rules or strict terminology and style requirements, consider Gemini 4 Argon or GPT-6.1 Sol. Choose based on actual translation quality, response time, and cost.',
+        modelTipBody: 'For routine pre-translation, consider Gemini 4 Hydrogen or GPT-6.1 Terra (or Gemini 3.8 Flash / GPT-6 Luna for lower cost and higher throughput). For extensive translation rules or strict terminology and style requirements, consider Gemini 4 Neon, Gemini 4 Carbon, or GPT-6.2 Sol. Choose based on actual translation quality, response time, and cost.',
         scopeHint: 'The default flow matches TM first, then sends only fuzzy and unmatched segments to the LLM. 100% TM matches usually do not need model rewriting. "Exact match" and "100% match rate" refer to the same state here.',
         contextMode: 'Paragraph context',
         contextModeTitle: 'Off: stable sentence mode. On: strict paragraph context mode with structured JSON output.',

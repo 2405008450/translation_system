@@ -21,7 +21,11 @@ logger = logging.getLogger(__name__)
 
 TERM_EXTRACTION_MODEL = "google/gemini-3.5-flash"
 TERM_EXTRACTION_MODEL_OPTIONS = (
+    "google/gemini-4-neon",
+    "google/gemini-4-hydrogen",
+    "google/gemini-4-carbon",
     "google/gemini-4-argon",
+    "google/gemini-3.8-flash",
     "google/gemini-3.5-flash",
     "google/gemini-3.1-pro-preview",
     "google/gemini-3.1-flash-lite",
@@ -29,6 +33,15 @@ TERM_EXTRACTION_MODEL_OPTIONS = (
     "google/gemini-2.5-pro",
     "google/gemini-2.5-flash",
     "google/gemini-2.5-flash-lite",
+    "openai/gpt-6.2-astra-pro",
+    "openai/gpt-6.2-astra",
+    "openai/gpt-6.2-sol-pro",
+    "openai/gpt-6.2-sol",
+    "openai/gpt-6.1-terra-pro",
+    "openai/gpt-6.1-terra",
+    "openai/gpt-6.1-sol-pro",
+    "openai/gpt-6.1-sol",
+    "openai/gpt-6-luna",
     "openai/gpt-chat-latest",
     "openai/gpt-5.4",
     "openai/gpt-5.4-mini",
@@ -40,6 +53,9 @@ TERM_EXTRACTION_MODEL_OPTIONS = (
     "openai/gpt-5.1-chat",
     "openai/gpt-5-mini",
     "openai/gpt-5-nano",
+    "deepseek/deepseek-v4.1-flash-1017",
+    "deepseek/deepseek-v4.1-flash",
+    "deepseek/deepseek-v4-pro-0813",
     "deepseek/deepseek-chat",
 )
 TERM_EXTRACTION_CHUNK_MAX_CHARS = 8000

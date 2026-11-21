@@ -1,9 +1,14 @@
 // OpenRouter 标准同步调用的现行单价（已包含公开优惠），美元 / 百万 token。
 // pricing.prompt/completion 已为当前价格，不再二次打折；不使用 Batch/Flex 或缓存命中价格替代。
-export const LLM_PRICING_UPDATED_AT = '2026-11-16'
+export const LLM_PRICING_UPDATED_AT = '2026-11-21'
 export const LLM_PRICING_SOURCE_URL = 'https://openrouter.ai/models'
 
 export const openRouterModelPricing: Record<string, { input: number; output: number }> = {
+  'google/gemini-4-neon': { input: 3.000000, output: 15.000000 },
+  'openai/gpt-6.2-astra-pro': { input: 8.000000, output: 40.00000 },
+  'openai/gpt-6.2-astra': { input: 8.000000, output: 40.00000 },
+  'openai/gpt-6.2-sol-pro': { input: 2.000000, output: 10.00000 },
+  'openai/gpt-6.2-sol': { input: 2.000000, output: 10.00000 },
   'google/gemini-4-hydrogen': { input: 1.5000000, output: 7.5000000 },
   'google/gemini-4-carbon': { input: 2.000000, output: 10.00000 },
   'openai/gpt-6.1-terra-pro': { input: 1.000000, output: 5.000000 },
@@ -16,11 +21,12 @@ export const openRouterModelPricing: Record<string, { input: number; output: num
   'openai/gpt-6-luna': { input: 0.1000000, output: 0.5000000 },
   'openai/gpt-6-sol-pro': { input: 2.000000, output: 10.00000 },
   'openai/gpt-6-sol': { input: 2.000000, output: 10.00000 },
-  'deepseek/deepseek-v4.1-flash': { input: 0.14000000, output: 0.42000000 },
+  'deepseek/deepseek-v4.1-flash': { input: 0.0498000000, output: 0.1992000000 },
   'openai/gpt-6-astra': { input: 10.00000, output: 50.00000 },
   'openai/gpt-6-astra-pro': { input: 10.00000, output: 50.00000 },
   'google/gemini-3.8-flash': { input: 0.825000000, output: 4.125000000 },
   'google/gemini-3.7-flash': { input: 0.75000000, output: 3.75000000 },
+  'deepseek/deepseek-v4-pro-0813': { input: 1.32000000, output: 3.96000000 },
   'google/gemini-3.6-flash': { input: 0.75000000, output: 3.75000000 },
   'google/gemini-3.5-flash-lite': { input: 0.3000000, output: 2.5000000 },
   'openai/gpt-5.6-luna': { input: 0.2000000, output: 1.2000000 },
@@ -41,6 +47,11 @@ export const openRouterModelPricing: Record<string, { input: number; output: num
 
 // 使用 UTC 发布日期，同日发布的型号可按现行价格排序。
 export const openRouterModelReleaseDates: Record<string, string> = {
+  'google/gemini-4-neon': '2026-11-18',
+  'openai/gpt-6.2-astra-pro': '2026-11-17',
+  'openai/gpt-6.2-astra': '2026-11-17',
+  'openai/gpt-6.2-sol-pro': '2026-11-17',
+  'openai/gpt-6.2-sol': '2026-11-17',
   'google/gemini-4-hydrogen': '2026-11-12',
   'google/gemini-4-carbon': '2026-11-10',
   'openai/gpt-6.1-terra-pro': '2026-10-26',
@@ -58,6 +69,7 @@ export const openRouterModelReleaseDates: Record<string, string> = {
   'openai/gpt-6-astra-pro': '2026-09-04',
   'google/gemini-3.8-flash': '2026-09-02',
   'google/gemini-3.7-flash': '2026-08-13',
+  'deepseek/deepseek-v4-pro-0813': '2026-08-12',
   'google/gemini-3.6-flash': '2026-07-21',
   'google/gemini-3.5-flash-lite': '2026-07-21',
   'openai/gpt-5.6-luna': '2026-07-09',

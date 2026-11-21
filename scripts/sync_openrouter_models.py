@@ -12,12 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 MODELS_URL = "https://openrouter.ai/api/v1/models"
 # 保留已有模型，同时补齐这些系列当前可用的主要新型号；不混入 Batch 或多模态生成模型。
 ADDITIONS = [
-    "google/gemini-4-hydrogen", "google/gemini-4-carbon", "google/gemini-3.5-flash-lite",
+    "google/gemini-4-neon", "google/gemini-4-hydrogen", "google/gemini-4-carbon", "google/gemini-3.5-flash-lite",
+    "openai/gpt-6.2-astra", "openai/gpt-6.2-astra-pro", "openai/gpt-6.2-sol", "openai/gpt-6.2-sol-pro",
     "openai/gpt-6.1-terra", "openai/gpt-6.1-terra-pro", "openai/gpt-6.1-sol-pro",
     "openai/gpt-6-luna-pro", "openai/gpt-6-sol-pro", "openai/gpt-6-astra-pro",
     "openai/gpt-5.6-sol", "openai/gpt-5.6-sol-pro",
     "deepseek/deepseek-v4.1-flash-1017", "deepseek/deepseek-v4.1-flash",
-    "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-pro-0813", "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash",
 ]
 
 

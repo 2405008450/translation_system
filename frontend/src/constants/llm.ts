@@ -30,6 +30,9 @@ export const llmScenarioOptions: LLMOption<LLMTranslationScenario>[] = [
 ]
 
 export const llmModelShortLabelMap: Record<string, string> = {
+  'google/gemini-4-neon': 'Gemini 4 Neon',
+  'google/gemini-4-hydrogen': 'Gemini 4 Hydrogen',
+  'google/gemini-4-carbon': 'Gemini 4 Carbon',
   'google/gemini-4-argon': 'Gemini 4 Argon',
   'google/gemini-3.8-flash': 'Gemini 3.8 Flash',
   'google/gemini-3.7-flash': 'Gemini 3.7 Flash',
@@ -38,6 +41,13 @@ export const llmModelShortLabelMap: Record<string, string> = {
   'google/gemini-3.1-pro-preview': 'Gemini 3.1 Pro',
   'google/gemini-3.1-flash-lite': 'Gemini 3.1 Lite',
   'google/gemini-3-flash-preview': 'Gemini 3 Flash',
+  'openai/gpt-6.2-astra-pro': 'GPT-6.2 Astra Pro',
+  'openai/gpt-6.2-astra': 'GPT-6.2 Astra',
+  'openai/gpt-6.2-sol-pro': 'GPT-6.2 Sol Pro',
+  'openai/gpt-6.2-sol': 'GPT-6.2 Sol',
+  'openai/gpt-6.1-terra-pro': 'GPT-6.1 Terra Pro',
+  'openai/gpt-6.1-terra': 'GPT-6.1 Terra',
+  'openai/gpt-6.1-sol-pro': 'GPT-6.1 Sol Pro',
   'openai/gpt-6.1-sol': 'GPT-6.1 Sol',
   'openai/gpt-6-luna': 'GPT-6 Luna',
   'openai/gpt-6-sol': 'GPT-6 Sol',
@@ -48,11 +58,19 @@ export const llmModelShortLabelMap: Record<string, string> = {
   'openai/gpt-5.4': 'GPT-5.4',
   'openai/gpt-5.4-mini': 'GPT-5.4 Mini',
   'openai/gpt-5.4-nano': 'GPT-5.4 Nano',
+  'deepseek/deepseek-v4.1-flash-1017': 'DeepSeek V4.1 Flash 1017',
+  'deepseek/deepseek-v4.1-flash': 'DeepSeek V4.1 Flash',
+  'deepseek/deepseek-v4-pro-0813': 'DeepSeek V4 Pro 0813',
   'deepseek/deepseek-chat': 'DeepSeek Chat',
   'deepseek-chat': 'DeepSeek Chat',
 }
 
 export const llmModelOptions: LLMModelOption[] = [
+  { id: 'google/gemini-4-neon', name: "Gemini 4 Neon", family: 'gemini', provider: 'openrouter' },
+  { id: 'openai/gpt-6.2-astra-pro', name: "GPT-6.2 Astra Pro", family: 'gpt', provider: 'openrouter' },
+  { id: 'openai/gpt-6.2-astra', name: "GPT-6.2 Astra", family: 'gpt', provider: 'openrouter' },
+  { id: 'openai/gpt-6.2-sol-pro', name: "GPT-6.2 Sol Pro", family: 'gpt', provider: 'openrouter' },
+  { id: 'openai/gpt-6.2-sol', name: "GPT-6.2 Sol", family: 'gpt', provider: 'openrouter' },
   { id: 'google/gemini-4-hydrogen', name: "Gemini 4 Hydrogen", family: 'gemini', provider: 'openrouter' },
   { id: 'google/gemini-4-carbon', name: "Gemini 4 Carbon", family: 'gemini', provider: 'openrouter' },
   { id: 'openai/gpt-6.1-terra-pro', name: "GPT-6.1 Terra Pro", family: 'gpt', provider: 'openrouter' },
@@ -70,6 +88,7 @@ export const llmModelOptions: LLMModelOption[] = [
   { id: 'openai/gpt-6-astra-pro', name: "GPT-6 Astra Pro", family: 'gpt', provider: 'openrouter' },
   { id: 'google/gemini-3.8-flash', name: "Gemini 3.8 Flash", family: 'gemini', provider: 'openrouter' },
   { id: 'google/gemini-3.7-flash', name: "Gemini 3.7 Flash", family: 'gemini', provider: 'openrouter' },
+  { id: 'deepseek/deepseek-v4-pro-0813', name: "DeepSeek V4 Pro 0813", family: 'deepseek', provider: 'openrouter' },
   { id: 'google/gemini-3.6-flash', name: "Gemini 3.6 Flash", family: 'gemini', provider: 'openrouter' },
   { id: 'google/gemini-3.5-flash-lite', name: "Gemini 3.5 Flash Lite", family: 'gemini', provider: 'openrouter' },
   { id: 'openai/gpt-5.6-luna', name: "GPT-5.6 Luna", family: 'gpt', provider: 'openrouter' },
