@@ -102,6 +102,7 @@ import {
 } from '../api/documentAlignment'
 import { useAlignmentStructureOperations, type AlignmentFocusTarget } from '../composables/useAlignmentStructureOperations'
 import { queryOnlineTerms, type OnlineTermSource } from '../api/onlineTerms'
+import { getSegmentTMCandidates } from '../api/translationMemory'
 import {
   completeAlignment,
   createProofreadingExportTask,
@@ -186,7 +187,6 @@ import type {
   SegmentNextUnconfirmedPositionResponse,
   SegmentPositionResponse,
   SegmentStatusStats,
-  TMMatchCandidate,
   TMCollection,
   TermBase,
   TermEntryRecord,
@@ -2812,6 +2812,32 @@ const workflowSteps = computed(() => (
     : segmentStore.fileRecord?.workflow_steps || []
 ))
 const workflowStepById = computed(() => new Map(workflowSteps.value.map((step) => [step.id, step])))
+const proofreadingTMSelections = reactive(new Map<string, string[]>())
+const activeTMScopeFileId = computed(() => activeSegment.value?.file_record_id || activeWorkbenchFileId.value)
+const activeTMScopeFile = computed(() => activeSegment.value
+  ? getSegmentLanguageContext(activeSegment.value)
+  : activeWorkbenchFileContext.value)
+const canSelectProofreadingTM = computed(() => {
+  if (isAlignmentWorkbench.value || isProofreadingWorkbench.value || !activeTMScopeFileId.value) return false
+  const stepId = activeSegment.value?.workflow_step_id
+  if (!stepId) return hasWorkflowProofreading.value && !activeSegment.value
+  const step = activeTMScopeFile.value?.workflow_progress?.find((item) => item.id === stepId)
+    || workflowStepById.value.get(stepId)
+  return step ? step.step_type === 'proofread'
+    : proofreadingContext.value?.batch_kind === 'workflow_segments' && proofreadingContext.value.workflow_step_id === stepId
+})
+const activeTMCollectionIds = computed(() => {
+  const fileId = activeTMScopeFileId.value
+  return canSelectProofreadingTM.value && fileId ? proofreadingTMSelections.get(fileId) || [] : []
+})
+
+function updateProofreadingTMSelection(ids: string[]) {
+  const fileId = activeTMScopeFileId.value
+  if (!canSelectProofreadingTM.value || !fileId) return
+  if (ids.length) proofreadingTMSelections.set(fileId, [...ids])
+  else proofreadingTMSelections.delete(fileId)
+}
+
 const currentPageWorkflowReadOnlyNotice = computed(() => {
   if (
     isMergeWorkbench.value
@@ -4231,18 +4257,29 @@ async function applyMatchResultByIndex(index: number) {
     return
   }
 
-  const fileRecordId = activeWorkbenchFileId.value
+  const collectionIds = activeTMCollectionIds.value
+  const fileRecordId = activeTMScopeFileId.value
   const segmentId = activeSegment.value.id
+  const sourceText = activeSegment.value.source_text
   if (!fileRecordId || !segmentId) {
     toast.warn(t('workbench.messages.noMatchResultAtIndex', { index: index + 1 }))
     return
   }
 
+  const isRequestCurrent = () => activeTMScopeFileId.value === fileRecordId
+    && activeSegment.value?.id === segmentId
+    && activeSegment.value.source_text === sourceText
+    && activeSegmentCanWrite.value
+    && activeTMCollectionIds.value === collectionIds
+
   pageError.value = ''
   try {
-    const { data } = await http.get<{
-      candidates: TMMatchCandidate[]
-    }>(`/file-records/${fileRecordId}/segments/${segmentId}/tm-candidates`)
+    const { data } = await getSegmentTMCandidates(fileRecordId, segmentId, collectionIds)
+    if (!isRequestCurrent()) return
+    if (data.timed_out) {
+      toast.warn('记忆库匹配超时。')
+      return
+    }
     const candidate = data.candidates?.[index] ?? null
     if (!candidate?.target_text) {
       toast.warn(t('workbench.messages.noMatchResultAtIndex', { index: index + 1 }))
@@ -4250,7 +4287,7 @@ async function applyMatchResultByIndex(index: number) {
     }
     handleReplaceText(candidate.target_text)
   } catch (error) {
-    pageError.value = getErrorMessage(error, t('workbench.errors.sidePanel'))
+    if (isRequestCurrent()) pageError.value = getErrorMessage(error, t('workbench.errors.sidePanel'))
   }
 }
 
@@ -9854,6 +9891,10 @@ function handleReplaceText(text: string) {
   if (!activeSegment.value) {
     return
   }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
 
   const sentenceId = segmentKeyOf(activeSegment.value)
   updateSegmentTarget(
@@ -9867,6 +9908,10 @@ function handleReplaceText(text: string) {
 
 function handleAppendText(text: string) {
   if (!activeSegment.value) {
+    return
+  }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
     return
   }
 
@@ -9977,6 +10022,7 @@ function handleSegmentSourceActivate(sentenceId: string) {
 }
 
 watch(() => props.id, () => {
+  proofreadingTMSelections.clear()
   if (props.mergeViewId) {
     void loadMergeViewTask()
   } else {
@@ -9985,6 +10031,7 @@ watch(() => props.id, () => {
 })
 
 watch(() => props.mergeViewId, () => {
+  proofreadingTMSelections.clear()
   if (props.mergeViewId) {
     void loadMergeViewTask()
   } else if (props.id) {
@@ -13782,8 +13829,13 @@ onBeforeRouteLeave(async () => {
             :term-matches="activeTermMatches"
             :qa-term-items="activeTermQAItemsForSegment"
             :active-source-text="activeSegmentSourceText"
-            :file-record-id="activeWorkbenchFileId"
+            :file-record-id="activeTMScopeFileId"
+            :tm-scope-enabled="canSelectProofreadingTM"
+            :tm-source-language="activeTMScopeFile?.source_language || null"
+            :tm-target-language="activeTMScopeFile?.target_language || null"
+            :tm-collection-ids="activeTMCollectionIds"
             :reference-match-result="referenceMatchResult"
+            @update:tm-collection-ids="updateProofreadingTMSelection"
             @replace-text="handleReplaceText"
             @append-text="handleAppendText"
             @resource-entry-changed="handleMatchPanelResourceEntryChanged"

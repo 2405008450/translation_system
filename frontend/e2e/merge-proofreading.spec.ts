@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 
-async function setup(page: Page, options: { running?: boolean; failure?: boolean } = {}) {
+async function setup(page: Page, options: { running?: boolean; failure?: boolean; tmMatching?: boolean } = {}) {
   const requests: Array<{ path: string; body: any }> = []
   const errors: string[] = []
   let runs: any[] = []
@@ -11,14 +11,14 @@ async function setup(page: Page, options: { running?: boolean; failure?: boolean
   const files = [1, 2, 3].map(index => ({ id: `file-${index}`, filename: `文件${index}.txt`,
     total_segments: 1, status_stats: { total: 1, none: 1, confirmed: 0, exact: 0, fuzzy: 0 },
     status: 'in_progress', progress: 0, can_write: true, is_edit_locked: false,
-    source_language: 'en-US', target_language: 'fr-FR', collection_ids: [], term_base_ids: [],
+    source_language: 'en-US', target_language: options.tmMatching && index === 2 ? 'de-DE' : 'fr-FR', collection_ids: [], term_base_ids: [],
     qa_term_base_ids: [], term_base_write_ids: [],
   }))
   const rows = files.map((file, index) => ({ id: `segment-${index}`, file_record_id: file.id, filename: file.filename,
     sentence_id: `s${index}`, source_text: `Source ${index}`, display_text: `Source ${index}`,
     target_text: `Target ${index}`, status: 'none', source: 'manual', version: 1,
     display_index: index, sequence_index: 0, workflow_step_id: 'proofread', workflow_step_name: '校对',
-    can_write: true, score: 0, block_type: 'paragraph', block_index: index, qa_issues: [],
+    can_write: !options.tmMatching || index !== 1, score: 0, block_type: 'paragraph', block_index: index, qa_issues: [],
   }))
   const counts = (file: typeof files[number]) => ({ file_record_id: file.id, filename: file.filename,
     pending: 1, reviewed: 0, protected: 0, failed: 0, skipped_reason: null, available_formats: ['proofreading_audit_xlsx'],
@@ -83,6 +83,7 @@ async function setup(page: Page, options: { running?: boolean; failure?: boolean
     else if (path.endsWith('/segments/changes')) data = { segments: [], has_more: false }
     else if (path.endsWith('/segments/events')) return route.fulfill({ status: 404, body: '' })
     else if (path.endsWith('/comments')) data = { items: [], total: 0 }
+    else if (path.endsWith('/match-result')) data = null
     await route.fulfill({ json: data })
   })
   await page.goto('/e2e/workflow-proofreading-harness.html?mode=merge')
@@ -106,6 +107,37 @@ test('三文件均加载自己的修改理由，默认补齐整个视图', async
     .toMatchObject({ retry_scope: 'unreviewed' })
   await expect(page.getByTestId('merge-proofreading-tasks')).toContainText('文件3.txt')
   expect(errors).toEqual([])
+})
+
+test('合并校对按句段所属文件加载语言对并恢复临时选库', async ({ page }) => {
+  await setup(page, { tmMatching: true })
+  await page.route(/\/translation-memory\/collections\?/, route => {
+    const language = new URL(route.request().url()).searchParams.get('target_language')
+    return route.fulfill({ json: [{ id: language, name: language === 'de-DE' ? '德语记忆库' : '法语记忆库' }] })
+  })
+  const scopes: Array<[string, string | null]> = []
+  await page.route('**/tm-candidates*', route => {
+    const url = new URL(route.request().url())
+    scopes.push([url.pathname.split('/')[3]!, url.searchParams.get('collection_ids')])
+    return route.fulfill({ json: { candidates: [{
+      entry_id: 'entry-1', source_text: 'Source', target_text: '候选译文', collection_name: '记忆库', score: 0.9,
+    }] } })
+  })
+  await page.getByRole('button', { name: '匹配信息', exact: true }).click()
+  const picker = page.getByTestId('proofreading-tm-collections')
+  await picker.click()
+  await page.getByRole('option', { name: '法语记忆库' }).click()
+  await expect.poll(() => scopes.at(-1)).toEqual(['file-1', 'fr-FR'])
+  await page.getByText('Source 1', { exact: true }).first().click()
+  await expect.poll(() => scopes.at(-1)).toEqual(['file-2', null])
+  await expect(page.getByRole('button', { name: '应用', exact: true })).toBeDisabled()
+  await picker.click()
+  await expect(page.getByRole('option', { name: '德语记忆库' })).toBeVisible()
+  await page.getByText('Source 0', { exact: true }).first().click()
+  await expect(picker.getByText('法语记忆库', { exact: true })).toBeVisible()
+  await page.reload()
+  await page.getByRole('button', { name: '匹配信息', exact: true }).click()
+  await expect.poll(() => scopes.at(-1)).toEqual(['file-1', null])
 })
 
 test('当前文件只提交选中文件并可切换失败重试', async ({ page }) => {

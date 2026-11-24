@@ -54,6 +54,7 @@ tests/*
 !tests/test_workflow_proofreading.py
 !tests/test_auto_write_protection.py
 !tests/test_auto_tm_sync.py
+!tests/test_tm_candidates_endpoint.py
 !tests/test_proofreading.py
 !tests/test_merge_workflow_transition.py
 !tests/test_merge_proofreading.py

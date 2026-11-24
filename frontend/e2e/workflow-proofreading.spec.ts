@@ -17,11 +17,15 @@ const segments = [0, 1].map((index) => ({
   sequence_index: index, score: 0, block_type: 'paragraph', block_index: index, qa_issues: [],
 }))
 
-async function mockApi(page: Page, standalone = false, options: { batchStatus?: string; wordUnavailable?: boolean; normalWorkflow?: boolean; documentPair?: boolean; formula?: boolean } = {}) {
+async function mockApi(page: Page, standalone = false, options: { batchStatus?: string; wordUnavailable?: boolean; normalWorkflow?: boolean; documentPair?: boolean; formula?: boolean; allProofread?: boolean } = {}) {
   const errors: string[] = []
-  const fileSegments = options.formula ? segments.map(segment => segment.sentence_id === 's0'
-    ? { ...segment, source_text: '⟦MATH_1⟧圆柱销', display_text: '⟦MATH_1⟧圆柱销', target_text: '⟦MATH_1⟧ Dowel pin' }
-    : segment) : segments
+  const fileSegments = segments.map(segment => {
+    if (options.formula && segment.sentence_id === 's0') {
+      return { ...segment, source_text: '⟦MATH_1⟧圆柱销', display_text: '⟦MATH_1⟧圆柱销', target_text: '⟦MATH_1⟧ Dowel pin' }
+    }
+    if (options.allProofread) return { ...segment, workflow_step_id: 'step-2', workflow_step_name: '校对' }
+    return segment
+  })
   page.on('pageerror', (error) => { errors.push(error.message); console.error('Browser error:', error.message) })
   await page.route('http://127.0.0.1:5182/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname.replace('/api', '')
@@ -80,11 +84,91 @@ async function mockApi(page: Page, standalone = false, options: { batchStatus?: 
     else if (path.endsWith('/segments/changes')) data = { items: [], segments: [], has_more: false }
     else if (path.endsWith('/segments/events')) return route.fulfill({ status: 404, body: '' })
     else if (path.endsWith('/segments')) data = { segments: fileSegments, total_segments: 2, matched_segments: 2, skip: 0, limit: 100 }
+    else if (path.endsWith('/match-result')) data = null
     else if (path.includes('/reference-match')) data = { items: [], matches: [] }
     await route.fulfill({ json: data })
   })
   return errors
 }
+
+test('校对匹配可多选未绑定记忆库，丢弃过期结果并重试超时', async ({ page }) => {
+  const errors = await mockApi(page, false, { allProofread: true })
+  const scopes: string[][] = []
+  let finishOldRequest!: () => void
+  const oldRequest = new Promise<void>(resolve => { finishOldRequest = resolve })
+  let shouldTimeOut = true
+  let shouldDelay = true
+  const savedTargets: string[] = []
+  await page.route('**/file-records/file-1/segments', route => {
+    if (route.request().method() !== 'PUT') return route.fallback()
+    const update = route.request().postDataJSON().updates[0]
+    savedTargets.push(update.target_text)
+    return route.fulfill({ json: { updated_count: 1, conflicts: [], segments: [
+      { ...segments[0], target_text: update.target_text, target_html: update.target_html, version: 2 },
+    ] } })
+  })
+  await page.route(/\/translation-memory\/collections\?/, route => {
+    const params = new URL(route.request().url()).searchParams
+    expect(params.get('source_language')).toBe('en-US')
+    expect(params.get('target_language')).toBe('fr-FR')
+    return route.fulfill({ json: [{ id: 'extra-a', name: '供应商记忆库' }, { id: 'extra-b', name: '产品记忆库' }] })
+  })
+  await page.route('**/tm-candidates*', async route => {
+    const ids = new URL(route.request().url()).searchParams.getAll('collection_ids')
+    scopes.push(ids)
+    if (ids.length === 1 && shouldDelay) {
+      shouldDelay = false
+      await oldRequest
+    }
+    if (ids.length === 2 && shouldTimeOut) {
+      shouldTimeOut = false
+      return route.fulfill({ json: { timed_out: true, candidates: [] } })
+    }
+    return route.fulfill({ json: { candidates: [{
+      entry_id: 'entry-1', source_text: 'Source 0', target_text: ids.join(' / ') || '文件默认候选',
+      collection_name: ids.length ? '供应商记忆库' : '文件记忆库', score: 1,
+    }] } })
+  })
+  await page.goto('/e2e/workflow-proofreading-harness.html?mode=workbench')
+  const panelButton = page.getByRole('button', { name: '匹配信息', exact: true })
+  await panelButton.click()
+  const picker = page.getByTestId('proofreading-tm-collections')
+  const candidates = page.getByRole('table', { name: '匹配信息列表' })
+  await expect(candidates).toContainText('文件默认候选')
+  await picker.click()
+  await page.getByRole('option', { name: '供应商记忆库' }).click()
+  try {
+    await expect.poll(() => scopes).toContainEqual(['extra-a'])
+    await page.getByRole('option', { name: '产品记忆库' }).click()
+    await picker.getByRole('combobox').press('Escape')
+    await expect(page.getByText('记忆库匹配超时。')).toBeVisible()
+    await page.getByRole('button', { name: '重试匹配' }).click()
+    await expect(candidates).toContainText('extra-a / extra-b')
+  } finally {
+    finishOldRequest()
+  }
+  await expect(candidates).toContainText('extra-a / extra-b')
+  await page.getByRole('button', { name: '应用', exact: true }).click()
+  await expect.poll(() => savedTargets).toContain('extra-a / extra-b')
+  const editor = page.getByTestId('segment-target-editor').first()
+  await panelButton.click()
+  await expect(picker).toHaveCount(0)
+  const previousRequestCount = scopes.length
+  await editor.focus()
+  await page.keyboard.press('Control+1')
+  await expect.poll(() => scopes.slice(previousRequestCount)).toContainEqual(['extra-a', 'extra-b'])
+  await panelButton.click()
+  await expect(candidates).toContainText('extra-a / extra-b')
+  const nextSegmentRequest = page.waitForRequest(request =>
+    request.url().includes('/segments/segment-1/tm-candidates')
+    && new URL(request.url()).searchParams.getAll('collection_ids').join(',') === 'extra-a,extra-b')
+  await page.getByTestId('segment-target-editor').last().click()
+  await nextSegmentRequest
+  await page.getByRole('button', { name: '恢复文件设置' }).click()
+  await expect(candidates).toContainText('文件默认候选')
+  await expect(picker).toBeVisible()
+  expect(errors).toEqual([])
+})
 
 test('公式占位符在校对差异渲染和再次保存后保留下划线', async ({ page }) => {
   const errors = await mockApi(page, false, { formula: true })

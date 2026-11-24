@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from functools import partial
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Literal, Optional
+from typing import Annotated, Any, Dict, Iterable, List, Literal, Optional
 from urllib.parse import quote, unquote, urlparse
 from uuid import UUID, uuid4
 
@@ -14214,6 +14214,7 @@ def get_segment_tm_candidates(
     max_candidates: int = 5,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    collection_ids: Annotated[list[UUID] | None, Query()] = None,
 ):
     """获取指定句段的 TM 匹配候选列表，兼容句段 UUID 和 sentence_id。"""
     file_record = get_file_record_model(db, file_record_id)
@@ -14242,21 +14243,25 @@ def get_segment_tm_candidates(
     if not segment:
         raise HTTPException(status_code=404, detail="句段不存在。")
 
-    # 优先使用 collection_ids_json（多记忆库），回退到 collection_id（单记忆库）
-    collection_ids: list[UUID] = []
-    if file_record.collection_ids_json and file_record.collection_ids_json != "[]":
-        try:
-            parsed_ids = json.loads(file_record.collection_ids_json)
-            collection_ids = [UUID(cid) for cid in parsed_ids if cid]
-        except (json.JSONDecodeError, ValueError):
-            pass
-    if not collection_ids and file_record.collection_id:
-        collection_ids = [file_record.collection_id]
-    matcher_collection_ids = (
-        None
-        if getattr(file_record, "tm_scope_mode", "selected") == "language_pair_all"
-        else collection_ids
-    )
+    if collection_ids is None:
+        collection_ids = _load_file_record_collection_ids(file_record)
+        matcher_collection_ids = (
+            None
+            if getattr(file_record, "tm_scope_mode", "selected") == "language_pair_all"
+            else collection_ids
+        )
+    else:
+        collection_ids = list(dict.fromkeys(collection_ids))
+        collections = db.query(MemoryBase).filter(MemoryBase.id.in_(collection_ids)).all()
+        if len(collections) != len(collection_ids):
+            raise HTTPException(status_code=404, detail="选择的 TM 记忆库不存在。")
+        if not file_record.source_language or not file_record.target_language or any(
+            collection.source_language != file_record.source_language
+            or collection.target_language != file_record.target_language
+            for collection in collections
+        ):
+            raise HTTPException(status_code=400, detail="所选记忆库的语言对与文档语言对不一致。")
+        matcher_collection_ids = collection_ids
 
     timed_out = False
     try:

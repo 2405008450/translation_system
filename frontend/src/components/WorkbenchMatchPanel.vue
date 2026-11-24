@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import axios from 'axios'
 import { Pencil, Save, Trash2, X } from 'lucide-vue-next'
+import { NSelect } from 'naive-ui'
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -14,10 +15,12 @@ import type {
   TermEntryRecord,
   TermMatch,
   TMEntryRecord,
+  TMCollection,
   TMMatchCandidate,
   WorkbenchQAResultItem,
 } from '../types/api'
 import { http } from '../api/http'
+import { getSegmentTMCandidates } from '../api/translationMemory'
 import { useConfirm } from '../composables/useConfirm'
 import { pushToast } from '../composables/useToast'
 import { useAuthStore } from '../stores/auth'
@@ -78,6 +81,10 @@ const props = defineProps<{
   qaTermItems: WorkbenchQAResultItem[]
   activeSourceText: string
   fileRecordId: string | null
+  tmScopeEnabled: boolean
+  tmSourceLanguage: string | null
+  tmTargetLanguage: string | null
+  tmCollectionIds: string[]
   referenceMatchResult: ReferenceMatchResult | null
 }>()
 
@@ -85,6 +92,7 @@ const emit = defineEmits<{
   (e: 'replaceText', text: string): void
   (e: 'appendText', text: string): void
   (e: 'resourceEntryChanged', kind: EditableMatchKind): void
+  (e: 'update:tmCollectionIds', ids: string[]): void
 }>()
 
 const { t } = useI18n()
@@ -93,6 +101,16 @@ const confirm = useConfirm()
 
 const tmCandidates = ref<TMMatchCandidate[]>([])
 const loadingCandidates = ref(false)
+const candidateError = ref('')
+const tmCollections = ref<TMCollection[]>([])
+const loadingCollections = ref(false)
+const collectionError = ref(false)
+const hasTMLanguagePair = computed(() => Boolean(props.tmSourceLanguage && props.tmTargetLanguage))
+const tmCollectionOptions = computed(() => tmCollections.value.map(collection => ({
+  label: collection.name,
+  value: collection.id,
+})))
+let collectionRequestId = 0
 const selectedRowId = ref('')
 const selectedRowPinned = ref(false)
 const editingRowId = ref('')
@@ -253,9 +271,44 @@ const selectedMatchRow = computed(() => {
   return matchRows.value.find((row) => row.id === selectedRowId.value) ?? matchRows.value[0] ?? null
 })
 
-function buildTMCandidateCacheKey(segmentId: string, fileRecordId: string, sourceText: string) {
-  return [fileRecordId, segmentId, sourceText].join(':')
+async function loadTMCollections() {
+  const requestId = ++collectionRequestId
+  tmCollections.value = []
+  collectionError.value = false
+  loadingCollections.value = false
+  if (!props.tmScopeEnabled || !hasTMLanguagePair.value) return
+
+  loadingCollections.value = true
+  try {
+    const { data } = await http.get<TMCollection[]>('/translation-memory/collections', {
+      params: { source_language: props.tmSourceLanguage, target_language: props.tmTargetLanguage },
+    })
+    if (requestId === collectionRequestId) tmCollections.value = data
+  } catch {
+    if (requestId === collectionRequestId) collectionError.value = true
+  } finally {
+    if (requestId === collectionRequestId) loadingCollections.value = false
+  }
 }
+
+watch(
+  () => [props.tmScopeEnabled, props.tmSourceLanguage, props.tmTargetLanguage],
+  loadTMCollections,
+  { immediate: true },
+)
+
+const tmCandidateQuery = computed(() => {
+  const segmentId = props.segment?.id || ''
+  const fileRecordId = props.fileRecordId || ''
+  const collectionIds = [...props.tmCollectionIds].sort()
+  return {
+    segmentId,
+    fileRecordId,
+    collectionIds,
+    key: JSON.stringify([fileRecordId, segmentId, props.segment?.source_text, collectionIds]),
+  }
+})
+type TMCandidateQuery = typeof tmCandidateQuery.value
 
 function clearCandidateLoadTimer() {
   if (candidateLoadTimer !== null) {
@@ -264,56 +317,23 @@ function clearCandidateLoadTimer() {
   }
 }
 
-function scheduleTMCandidatesLoad(segmentId: string, fileRecordId: string, sourceText: string) {
-  const requestId = ++candidateRequestId
-  clearCandidateLoadTimer()
-  candidateLoadTimer = window.setTimeout(() => {
-    candidateLoadTimer = null
-    void loadTMCandidates(segmentId, fileRecordId, sourceText, requestId)
-  }, CANDIDATE_DEBOUNCE_MS)
-}
-
-async function loadTMCandidates(
-  segmentId: string,
-  fileRecordId: string,
-  sourceText: string,
-  requestId: number,
-) {
-  if (!segmentId || !fileRecordId) {
-    tmCandidates.value = []
-    loadingCandidates.value = false
-    return
-  }
-
-  const cacheKey = buildTMCandidateCacheKey(segmentId, fileRecordId, sourceText)
-  const cached = tmCandidateCache.get(cacheKey)
-  if (cached && cached.expiresAt > Date.now()) {
-    if (requestId !== candidateRequestId) return
-    tmCandidates.value = cached.candidates
-    loadingCandidates.value = false
-    return
-  }
-
-  loadingCandidates.value = true
+async function loadTMCandidates(query: TMCandidateQuery, requestId: number) {
   try {
-    const { data } = await http.get<{
-      segment_id: string
-      source_text: string
-      candidates: TMMatchCandidate[]
-    }>(`/file-records/${fileRecordId}/segments/${segmentId}/tm-candidates`)
-
-    if (requestId === candidateRequestId) {
-      const candidates = data.candidates || []
-      tmCandidates.value = candidates
-      tmCandidateCache.set(cacheKey, {
-        candidates,
-        expiresAt: Date.now() + CANDIDATE_CACHE_TTL_MS,
-      })
+    const { data } = await getSegmentTMCandidates(query.fileRecordId, query.segmentId, query.collectionIds)
+    if (requestId !== candidateRequestId) return
+    if (data.timed_out) {
+      candidateError.value = '记忆库匹配超时。'
+      return
     }
+    const candidates = data.candidates || []
+    tmCandidates.value = candidates
+    tmCandidateCache.set(query.key, {
+      candidates,
+      expiresAt: Date.now() + CANDIDATE_CACHE_TTL_MS,
+    })
   } catch (error) {
-    console.error('Failed to load TM candidates:', error)
     if (requestId === candidateRequestId) {
-      tmCandidates.value = []
+      candidateError.value = getErrorMessage(error, '记忆库匹配失败。')
     }
   } finally {
     if (requestId === candidateRequestId) {
@@ -322,35 +342,34 @@ async function loadTMCandidates(
   }
 }
 
-watch(
-  () => [props.segment?.id ?? '', props.fileRecordId ?? '', props.segment?.source_text ?? ''],
-  ([segmentId, fileRecordId, sourceText]) => {
-    candidateRequestId += 1
-    clearCandidateLoadTimer()
-    selectedRowId.value = ''
-    selectedRowPinned.value = false
-    tmCandidates.value = []
+function queueCurrentTMCandidates() {
+  const requestId = ++candidateRequestId
+  clearCandidateLoadTimer()
+  selectedRowId.value = ''
+  selectedRowPinned.value = false
+  tmCandidates.value = []
+  candidateError.value = ''
+  loadingCandidates.value = false
+  const query = tmCandidateQuery.value
+  if (!query.segmentId || !query.fileRecordId) return
 
-    if (!segmentId || !fileRecordId) {
-      loadingCandidates.value = false
-      return
-    }
+  const cached = tmCandidateCache.get(query.key)
+  if (cached && cached.expiresAt > Date.now()) {
+    tmCandidates.value = cached.candidates
+    return
+  }
 
-    const cacheKey = buildTMCandidateCacheKey(segmentId, fileRecordId, sourceText)
-    const cached = tmCandidateCache.get(cacheKey)
-    if (cached && cached.expiresAt > Date.now()) {
-      tmCandidates.value = cached.candidates
-      loadingCandidates.value = false
-      return
-    }
+  loadingCandidates.value = true
+  candidateLoadTimer = window.setTimeout(() => {
+    candidateLoadTimer = null
+    void loadTMCandidates(query, requestId)
+  }, CANDIDATE_DEBOUNCE_MS)
+}
 
-    loadingCandidates.value = true
-    scheduleTMCandidatesLoad(segmentId, fileRecordId, sourceText)
-  },
-  { immediate: true },
-)
+watch(() => tmCandidateQuery.value.key, queueCurrentTMCandidates, { immediate: true })
 
 onBeforeUnmount(() => {
+  collectionRequestId += 1
   candidateRequestId += 1
   clearCandidateLoadTimer()
 })
@@ -744,14 +763,9 @@ function removeTMCandidate(entryId: string) {
   tmCandidateCache.clear()
 }
 
-async function refreshCurrentTMCandidates() {
-  const segmentId = props.segment?.id || ''
-  const fileRecordId = props.fileRecordId || ''
-  const sourceText = props.segment?.source_text || ''
-  if (!segmentId || !fileRecordId) return
+function refreshCurrentTMCandidates() {
   tmCandidateCache.clear()
-  const requestId = ++candidateRequestId
-  await loadTMCandidates(segmentId, fileRecordId, sourceText, requestId)
+  queueCurrentTMCandidates()
 }
 
 async function saveEntryEdit(row: MatchDisplayRow) {
@@ -855,6 +869,49 @@ defineExpose({
       <span v-if="matchRows.length > 0" class="match-panel__count">{{ matchRows.length }}</span>
     </div>
 
+    <section v-if="tmScopeEnabled" class="match-panel__tm-scope" aria-label="匹配记忆库">
+      <div class="match-panel__tm-scope-heading">
+        <strong>匹配记忆库</strong>
+        <button
+          v-if="tmCollectionIds.length"
+          class="button button--sm"
+          type="button"
+          @click="emit('update:tmCollectionIds', [])"
+        >恢复文件设置</button>
+      </div>
+      <NSelect
+        data-testid="proofreading-tm-collections"
+        :value="tmCollectionIds"
+        :options="tmCollectionOptions"
+        :loading="loadingCollections"
+        :disabled="!hasTMLanguagePair || loadingCollections || collectionError || !tmCollectionOptions.length"
+        :input-props="{ 'aria-label': '匹配记忆库', role: 'combobox' }"
+        :menu-props="{ role: 'listbox', 'aria-label': '匹配记忆库', 'aria-multiselectable': true }"
+        :node-props="option => ({ role: 'option', 'aria-selected': tmCollectionIds.includes(String(option.value)) })"
+        placeholder="使用文件设置"
+        size="small"
+        :max-tag-count="2"
+        multiple
+        filterable
+        clearable
+        @update:value="emit('update:tmCollectionIds', $event || [])"
+        @keydown.esc.stop
+      />
+      <p v-if="!hasTMLanguagePair" role="status">当前文件的语言对尚未就绪。</p>
+      <p v-else-if="collectionError" role="status">记忆库列表加载失败。</p>
+      <p v-else-if="!loadingCollections && !tmCollectionOptions.length" role="status">当前语言对没有可选的记忆库。</p>
+      <button
+        v-if="hasTMLanguagePair && !loadingCollections && !tmCollectionOptions.length"
+        class="button button--sm"
+        type="button"
+        @click="void loadTMCollections()"
+      >重新加载记忆库</button>
+    </section>
+    <div v-if="tmScopeEnabled && candidateError" class="match-panel__tm-error" role="status">
+      <span>{{ candidateError }}</span>
+      <button class="button button--sm" type="button" @click="refreshCurrentTMCandidates">重试匹配</button>
+    </div>
+
     <div class="match-panel__body">
       <div class="match-summary">
         <div v-if="loadingCandidates && matchRows.length === 0" class="match-summary-message">
@@ -896,7 +953,7 @@ defineExpose({
           </tbody>
         </table>
 
-        <div v-else class="match-summary-message">
+        <div v-else-if="!tmScopeEnabled || !candidateError" class="match-summary-message">
           {{ t('matchPanel.noMatch') }}
         </div>
       </div>
@@ -1003,7 +1060,7 @@ defineExpose({
           <button
             class="button match-detail__apply"
             type="button"
-            :disabled="!selectedMatchRow.applyText"
+            :disabled="!selectedMatchRow.applyText || !segment?.can_write"
             @click="applyMatchRow(selectedMatchRow)"
           >
             应用
@@ -1043,6 +1100,34 @@ defineExpose({
   font-size: 13px;
   font-weight: 700;
   line-height: 1.3;
+}
+
+.match-panel__tm-scope,
+.match-panel__tm-error {
+  flex: 0 0 auto;
+  padding: 8px 14px;
+  border-bottom: 1px solid #d8e4e7;
+  font-size: 12px;
+}
+
+.match-panel__tm-scope-heading,
+.match-panel__tm-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.match-panel__tm-scope-heading {
+  margin-bottom: 6px;
+}
+
+.match-panel__tm-scope p {
+  margin: 6px 0 0;
+}
+
+.match-panel__tm-scope p + button {
+  margin-top: 4px;
 }
 
 .match-panel__count {
